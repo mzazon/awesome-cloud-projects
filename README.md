@@ -4,11 +4,11 @@ Level up your cloud knowledge and experience!
 
 A curated collection of cloud architecture recipes, tutorials, and real-world solutions across Amazon Web Services (AWS), Microsoft Azure, and Google Cloud Platform (GCP).
 
-Every and every one contains a problem/solution format, diagram, command line steps to accomplish the solution, and (*IMPORTANT!*) cleanup steps, to ensure you do not incur runaway costs. As a bonus, all popular formats of infrastructure as code that you can take, deploy, and customize to your liking (Terraform, CloudFormation, AWS CDK (typescript and python both), Azure Bicep, and even Bash shell scripts that run a cloud provider CLI commands.
+Every and every one brings together a few cloud services to build a working scenario. Each contains a problem/solution format, diagram, command line steps to accomplish the solution, a short discussion section, and (*IMPORTANT!*) cleanup steps, to ensure you do not incur runaway costs. As a bonus, all popular formats of infrastructure as code that you can take, deploy, and customize to your liking (Terraform, CloudFormation, AWS CDK (typescript and python both), Azure Bicep, and even Bash shell scripts that run a cloud provider CLI commands.
 
 > We recommend that you use your cloud providers "Cloud Shell" to run these commands to get learning quickly!
 
-The format of these recipes has been inspired by [AWS Cookbook, by O'Reilly Media](https://www.oreilly.com/library/view/aws-cookbook/9781492092599/). As a co-author of this book, my readers feedback about the format and approach was overwhealmingly positive. So I brought this format to this new batch of content to help readers build cloud skills using real-world scenarios.
+The format of these recipes has been inspired by [AWS Cookbook, by O'Reilly Media](https://www.oreilly.com/library/view/aws-cookbook/9781492092599/). As a co-author of this book, my readers feedback about the format and approach was overwhealmingly positive with many readers using this content to gain experience they can talk about during job interviews. So I brought this format to this new batch of content to help readers build cloud skills across the top 3 public cloud providers using real-world scenarios.
 
 [![Awesome](https://awesome.re/badge.svg)](https://awesome.re)
 [![GitHub stars](https://img.shields.io/github/stars/YOUR_USERNAME/awesome-cloud-projects.svg?style=social&label=Star)](https://github.com/mzazon/awesome-cloud-projects)
