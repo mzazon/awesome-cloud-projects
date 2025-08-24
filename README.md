@@ -8,7 +8,7 @@ Every and every one contains a problem/solution format, diagram, command line st
 
 > We recommend that you use your cloud providers "Cloud Shell" to run these commands to get learning quickly!
 
-The format of these recipes has been inspired by AWS Cookbook, by O'Reilly Media. As a co-author of this book, my readers feedback about the format and approach was overwhealmingly positive. So I brought this format to this new batch of content to help readers build cloud skills using real-world scenarios.
+The format of these recipes has been inspired by [AWS Cookbook, by O'Reilly Media](https://www.oreilly.com/library/view/aws-cookbook/9781492092599/). As a co-author of this book, my readers feedback about the format and approach was overwhealmingly positive. So I brought this format to this new batch of content to help readers build cloud skills using real-world scenarios.
 
 [![Awesome](https://awesome.re/badge.svg)](https://awesome.re)
 [![GitHub stars](https://img.shields.io/github/stars/YOUR_USERNAME/awesome-cloud-projects.svg?style=social&label=Star)](https://github.com/mzazon/awesome-cloud-projects)
