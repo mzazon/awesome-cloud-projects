@@ -1,22 +1,26 @@
 # 🌟 Awesome Cloud Projects
 
-A curated collection of cloud architecture recipes, tutorials, and real-world solutions across AWS, Azure, and Google Cloud Platform.
+Level up your cloud knowledge and experience!
+
+A curated collection of cloud architecture recipes, tutorials, and real-world solutions across Amazon Web Services (AWS), Microsoft Azure, and Google Cloud Platform (GCP).
+
+Every and every one contains a problem/solution format, diagram, command line steps to accomplish the solution, and (*IMPORTANT!*) cleanup steps, to ensure you do not incur runaway costs. As a bonus, all popular formats of infrastructure as code that you can take, deploy, and customize to your liking (Terraform, CloudFormation, AWS CDK (typescript and python both), Azure Bicep, and even Bash shell scripts that run a cloud provider CLI commands.
+
+> We recommend that you use your cloud providers "Cloud Shell" to run these commands to get learning quickly!
+
+The format of these recipes has been inspired by AWS Cookbook, by O'Reilly Media. As a co-author of this book, my readers feedback about the format and approach was overwhealmingly positive. So I brought this format to this new batch of content to help readers build cloud skills using real-world scenarios.
 
 [![Awesome](https://awesome.re/badge.svg)](https://awesome.re)
-[![GitHub stars](https://img.shields.io/github/stars/YOUR_USERNAME/awesome-cloud-projects.svg?style=social&label=Star)](https://github.com/YOUR_USERNAME/awesome-cloud-projects)
-[![GitHub forks](https://img.shields.io/github/forks/YOUR_USERNAME/awesome-cloud-projects.svg?style=social&label=Fork)](https://github.com/YOUR_USERNAME/awesome-cloud-projects/fork)
+[![GitHub stars](https://img.shields.io/github/stars/YOUR_USERNAME/awesome-cloud-projects.svg?style=social&label=Star)](https://github.com/mzazon/awesome-cloud-projects)
+[![GitHub forks](https://img.shields.io/github/forks/YOUR_USERNAME/awesome-cloud-projects.svg?style=social&label=Fork)](https://github.com/mzazon/awesome-cloud-projects/fork)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> A comprehensive collection of production-ready cloud architecture patterns, implementation guides, and best practices for building scalable applications on major cloud platforms.
+> A curated collection of cloud architecture recipes, tutorials, and real-world solutions across Amazon Web Services (AWS), Microsoft Azure, and Google Cloud Platform (GCP).
 
 ## 📊 Project Statistics
 
 - **Total Projects**: 800+- **AWS Projects**: 402- **AZURE Projects**: 188- **GCP Projects**: 210- **Categories**: 12
-- **Average Difficulty**: 259.5/4.0
-
-### 🏆 Most Used Services
-- **Lambda**: 176 recipes- **Cloudwatch**: 144 recipes- **S3**: 136 recipes- **Iam**: 110 recipes- **Cloud Functions**: 74 recipes
-## 📚 Table of Contents
+- **Average Difficulty**: 2.5/4.0
 
 - [🖥️ Compute & Infrastructure](#compute--infrastructure) (163 projects)- [🗄️ Storage & Data Management](#storage--data-management) (40 projects)- [🛢️ Databases & Analytics](#databases--analytics) (177 projects)- [🌐 Networking & Content Delivery](#networking--content-delivery) (53 projects)- [🔐 Security & Identity](#security--identity) (85 projects)- [🤖 AI & Machine Learning](#ai--machine-learning) (79 projects)- [🛠️ Application Development & Deployment](#application-development--deployment) (88 projects)- [📊 Monitoring & Management](#monitoring--management) (51 projects)- [🔗 Integration & Messaging](#integration--messaging) (20 projects)- [📱 IoT & Edge Computing](#iot--edge-computing) (23 projects)- [🎬 Media & Content](#media--content) (16 projects)- [🏢 Specialized Solutions](#specialized-solutions) (5 projects)
 ---
@@ -1799,10 +1803,10 @@ If you use these recipes in your projects, please consider:
 
 ## 📞 Support & Community
 
-- 🐛 **Bug Reports**: [Open an Issue](https://github.com/YOUR_USERNAME/awesome-cloud-projects/issues)
-- 💡 **Feature Requests**: [Start a Discussion](https://github.com/YOUR_USERNAME/awesome-cloud-projects/discussions)
-- 💬 **Questions**: Join our [Community Chat](#)
-- 📧 **Contact**: [maintainer@example.com](mailto:maintainer@example.com)
+- 🐛 **Bug Reports**: [Open an Issue](https://github.com/mzazon/awesome-cloud-projects/issues)
+- 💡 **Feature Requests**: [Start a Discussion](https://github.com/mzazon/awesome-cloud-projects/discussions)
+- 💬 **Questions**: Join our [Community Chat](#) (coming soon)
+- 📧 **Contact**: [maintainer@example.com](mailto:mzazon@gmail.com)
 
 ---
 
