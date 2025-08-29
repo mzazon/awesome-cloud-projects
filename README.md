@@ -1,6 +1,6 @@
 # 🌟 Awesome Cloud Projects
 
-Level up your cloud knowledge and experience! Get something to talk about during your next interview, or see how 
+Level up your cloud knowledge and experience! Get something to talk about during your next interview, see how cloud services are used together, get experience and see how the cloud providers services work. Real solutions from real professions and organizations.
 
 A curated collection of cloud architecture recipes, tutorials, and real-world solutions across Amazon Web Services (AWS), Microsoft Azure, and Google Cloud Platform (GCP).
 
@@ -9,6 +9,8 @@ Each and every project brings together a few cloud services to build a working s
 > We recommend that you use your cloud providers "Cloud Shell" to run these commands to get learning quickly! Just make sure to set up budget alerts with your chosen provider.
 
 The format of these recipes has been inspired by [AWS Cookbook, by O'Reilly Media](https://www.oreilly.com/library/view/aws-cookbook/9781492092599/). As a co-author of this book, my readers' feedback about the format and approach was overwhealmingly positive with many readers using this content to gain experience they can talk about during job interviews. So I brought the format to this batch of content to help readers build cloud skills across the top 3 public cloud providers using real-world scenarios.
+
+> NOTE: These all use the cloud provider CLI (Command Line Interfaces) rather than GUI (browser consoles). One of the first things you should learn about cloud providers is that their interfaces are just APIs that perform actions on infrastructure. Because of that, it is important to understand the parameters that go into API requests to services! The CLI is the perfect way to learn this. Dust off your terminal window or preferred cloud shell and enjoy!
 
 [![Awesome](https://awesome.re/badge.svg)](https://awesome.re)
 [![GitHub stars](https://img.shields.io/github/stars/mzazon/awesome-cloud-projects.svg?style=social&label=Star)](https://github.com/mzazon/awesome-cloud-projects)
