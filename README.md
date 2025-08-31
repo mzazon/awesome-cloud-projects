@@ -23,6 +23,10 @@ The format of these recipes has been inspired by [AWS Cookbook, by O'Reilly Medi
 - **Total Projects**: 800+- **AWS Projects**: 402- **AZURE Projects**: 188- **GCP Projects**: 210- **Categories**: 12
 - **Average Difficulty**: 2.5/4.0
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=mzazon/awesome-cloud-projects&type=Date)](https://www.star-history.com/#mzazon/awesome-cloud-projects&Date)
+
 - [🖥️ Compute & Infrastructure](#compute--infrastructure) (163 projects)- [🗄️ Storage & Data Management](#storage--data-management) (40 projects)- [🛢️ Databases & Analytics](#databases--analytics) (177 projects)- [🌐 Networking & Content Delivery](#networking--content-delivery) (53 projects)- [🔐 Security & Identity](#security--identity) (85 projects)- [🤖 AI & Machine Learning](#ai--machine-learning) (79 projects)- [🛠️ Application Development & Deployment](#application-development--deployment) (88 projects)- [📊 Monitoring & Management](#monitoring--management) (51 projects)- [🔗 Integration & Messaging](#integration--messaging) (20 projects)- [📱 IoT & Edge Computing](#iot--edge-computing) (23 projects)- [🎬 Media & Content](#media--content) (16 projects)- [🏢 Specialized Solutions](#specialized-solutions) (5 projects)
 ---
 
