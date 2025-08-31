@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure DevOps, Azure SignalR Service, Azure Monitor, Azure Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: devops, monitoring, real-time, dashboard, signalr, azure-functions, automation
 recipe-generator-version: 1.3
@@ -71,8 +71,8 @@ graph TB
 
 1. Azure subscription with permission to create resources in a resource group
 2. Azure DevOps organization with project administration permissions
-3. Azure CLI v2.37.0 or later installed and configured
-4. Node.js v16 or later for local development and testing
+3. Azure CLI v2.50.0 or later installed and configured
+4. Node.js v20 LTS or later for local development and testing
 5. Git client for source code management
 6. Estimated cost: $25-50/month for development environment (Functions, SignalR, App Service, Monitor)
 
@@ -178,7 +178,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
        --storage-account ${STORAGE_ACCOUNT_NAME} \
        --consumption-plan-location ${LOCATION} \
        --runtime node \
-       --runtime-version 18 \
+       --runtime-version 20 \
        --functions-version 4
    
    # Configure SignalR connection in Function App
@@ -348,7 +348,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
        --name ${WEB_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --plan ${APP_SERVICE_PLAN_NAME} \
-       --runtime "NODE|18-lts"
+       --runtime "NODE:20-lts"
    
    # Configure Web App settings
    az webapp config appsettings set \
@@ -612,8 +612,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
        --name "FunctionAppErrors" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Web/sites/${FUNCTION_APP_NAME}" \
-       --condition "count Microsoft.Web/sites FunctionExecutionCount > 0" \
-       --condition "count Microsoft.Web/sites FunctionErrors > 5" \
+       --condition "avg FunctionErrors > 5" \
        --action "ag-monitoring-webhook" \
        --description "Alert when Function App has errors"
    
@@ -622,7 +621,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
        --name "SignalRConnectionIssues" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.SignalRService/signalR/${SIGNALR_NAME}" \
-       --condition "count Microsoft.SignalRService/signalR ConnectionCount < 1" \
+       --condition "avg ConnectionCount < 1" \
        --action "ag-monitoring-webhook" \
        --description "Alert when SignalR has no active connections"
    
@@ -794,6 +793,8 @@ The serverless approach using Azure Functions consumption plan provides cost-eff
 
 From an operational perspective, this architecture enables proactive monitoring rather than reactive troubleshooting by providing immediate visibility into deployment pipeline health and infrastructure performance. The unified dashboard approach consolidates multiple monitoring streams into a single interface, reducing context switching and improving incident response times. The solution's extensibility allows for easy integration of additional Azure services like Azure Application Insights, Azure Service Bus, or custom metrics from third-party tools. For comprehensive guidance on monitoring best practices, review the [Azure Monitor documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/) and [Azure DevOps monitoring strategies](https://learn.microsoft.com/en-us/azure/devops/report/dashboards/overview).
 
+The real-time capabilities provided by Azure SignalR Service transform traditional reactive monitoring into proactive operational awareness. Unlike polling-based solutions that introduce latency and consume unnecessary resources, SignalR's push-based architecture ensures immediate notification of critical events. This approach is particularly valuable in high-velocity deployment environments where rapid feedback loops are essential for maintaining system reliability and meeting service level objectives.
+
 > **Tip**: Configure Azure Application Insights integration with your Function App to gain deeper insights into function performance, dependency tracking, and error analysis. This provides comprehensive observability for troubleshooting and optimization opportunities.
 
 ## Challenge
@@ -806,9 +807,9 @@ Extend this solution by implementing these advanced monitoring capabilities:
 
 3. **Add Historical Analytics**: Implement Azure Cosmos DB storage for long-term event retention and create Power BI dashboards for trend analysis, success rate tracking, and capacity planning insights.
 
-4. **Enhance Security Monitoring**: Integrate Azure Security Center and Azure Sentinel to monitor infrastructure security events alongside DevOps activities, creating a unified security operations dashboard.
+4. **Enhance Security Monitoring**: Integrate Azure Security Center and Microsoft Sentinel to monitor infrastructure security events alongside DevOps activities, creating a unified security operations dashboard.
 
-5. **Implement Multi-Environment Support**: Extend the solution to support multiple Azure DevOps organizations and projects, with environment-specific dashboards and role-based access control using Azure Active Directory integration.
+5. **Implement Multi-Environment Support**: Extend the solution to support multiple Azure DevOps organizations and projects, with environment-specific dashboards and role-based access control using Microsoft Entra ID integration.
 
 ## Infrastructure Code
 

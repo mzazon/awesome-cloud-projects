@@ -1,0 +1,314 @@
+# Infrastructure Manager Configuration for URL Safety Validation
+# This configuration deploys a complete URL safety validation system using
+# Google Cloud Web Risk API, Cloud Functions, and Cloud Storage
+
+# Define input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    default: "url-safety-project"
+  
+  region:
+    type: string
+    description: "GCP region for resources"
+    default: "us-central1"
+  
+  function_name:
+    type: string
+    description: "Name for the Cloud Function"
+    default: "url-validator"
+  
+  bucket_suffix:
+    type: string
+    description: "Suffix for bucket names to ensure uniqueness"
+    default: ""
+
+# Define local variables for resource naming
+locals:
+  # Generate unique suffix if not provided
+  unique_suffix: ${var.bucket_suffix != "" ? var.bucket_suffix : formatdate("YYYYMMDD-hhmmss", timestamp())}
+  
+  # Bucket names with project ID and unique suffix
+  audit_bucket_name: "url-validation-logs-${var.project_id}-${local.unique_suffix}"
+  cache_bucket_name: "url-validation-cache-${var.project_id}-${local.unique_suffix}"
+  
+  # Function name with suffix for uniqueness
+  function_name_full: "${var.function_name}-${local.unique_suffix}"
+
+# Enable required Google Cloud APIs
+resources:
+  # Enable Cloud Functions API
+  cloudfunctions_api:
+    type: gcp-types/serviceusage-v1:services
+    name: cloudfunctions.googleapis.com
+    properties:
+      name: projects/${var.project_id}/services/cloudfunctions.googleapis.com
+    
+  # Enable Web Risk API
+  webrisk_api:
+    type: gcp-types/serviceusage-v1:services
+    name: webrisk.googleapis.com
+    properties:
+      name: projects/${var.project_id}/services/webrisk.googleapis.com
+    metadata:
+      dependsOn:
+        - cloudfunctions_api
+
+  # Enable Cloud Storage API
+  storage_api:
+    type: gcp-types/serviceusage-v1:services
+    name: storage.googleapis.com
+    properties:
+      name: projects/${var.project_id}/services/storage.googleapis.com
+
+  # Enable Cloud Build API (required for Cloud Functions deployment)
+  cloudbuild_api:
+    type: gcp-types/serviceusage-v1:services
+    name: cloudbuild.googleapis.com
+    properties:
+      name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+
+  # Create Cloud Storage bucket for audit logs
+  audit_logs_bucket:
+    type: gcp-types/storage-v1:buckets
+    name: ${local.audit_bucket_name}
+    properties:
+      name: ${local.audit_bucket_name}
+      location: ${var.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Keep audit logs for 1 year
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90   # Move to coldline storage after 90 days
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        purpose: "audit-logs"
+        recipe: "url-safety-validation"
+    metadata:
+      dependsOn:
+        - storage_api
+
+  # Create Cloud Storage bucket for caching validation results
+  cache_bucket:
+    type: gcp-types/storage-v1:buckets
+    name: ${local.cache_bucket_name}
+    properties:
+      name: ${local.cache_bucket_name}
+      location: ${var.region}
+      storageClass: STANDARD
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30   # Delete cache entries after 30 days
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        purpose: "validation-cache"
+        recipe: "url-safety-validation"
+    metadata:
+      dependsOn:
+        - storage_api
+
+  # Create service account for Cloud Function
+  function_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    name: url-validator-sa
+    properties:
+      accountId: url-validator-sa-${local.unique_suffix}
+      displayName: "URL Validator Service Account"
+      description: "Service account for URL validation Cloud Function"
+    metadata:
+      dependsOn:
+        - cloudfunctions_api
+
+  # Grant Web Risk API usage permission to service account
+  webrisk_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: webrisk-user-binding
+    properties:
+      resource: ${var.project_id}
+      role: roles/webrisk.user
+      member: serviceAccount:$(ref.function_service_account.email)
+    metadata:
+      dependsOn:
+        - function_service_account
+        - webrisk_api
+
+  # Grant Storage Object Admin permission for audit logs bucket
+  audit_storage_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: audit-storage-binding
+    properties:
+      resource: ${var.project_id}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.function_service_account.email)
+    metadata:
+      dependsOn:
+        - function_service_account
+        - audit_logs_bucket
+
+  # Grant Storage Object Admin permission for cache bucket
+  cache_storage_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: cache-storage-binding
+    properties:
+      resource: ${var.project_id}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.function_service_account.email)
+    metadata:
+      dependsOn:
+        - function_service_account
+        - cache_bucket
+
+  # Deploy Cloud Function for URL validation
+  # Note: This creates the function resource but requires manual code upload
+  url_validator_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    name: ${local.function_name_full}
+    properties:
+      location: projects/${var.project_id}/locations/${var.region}
+      function:
+        name: projects/${var.project_id}/locations/${var.region}/functions/${local.function_name_full}
+        description: "URL safety validation using Web Risk API"
+        sourceArchiveUrl: gs://url-validator-source-${var.project_id}/function-source.zip
+        entryPoint: validate_url
+        runtime: python311
+        timeout: 60s
+        availableMemoryMb: 256
+        maxInstances: 100
+        serviceAccountEmail: $(ref.function_service_account.email)
+        environmentVariables:
+          GOOGLE_CLOUD_PROJECT: ${var.project_id}
+          AUDIT_BUCKET: ${local.audit_bucket_name}
+          CACHE_BUCKET: ${local.cache_bucket_name}
+        httpsTrigger:
+          securityLevel: SECURE_OPTIONAL
+        labels:
+          purpose: "url-validation"
+          recipe: "url-safety-validation"
+    metadata:
+      dependsOn:
+        - cloudfunctions_api
+        - cloudbuild_api
+        - webrisk_binding
+        - audit_storage_binding
+        - cache_storage_binding
+
+  # Create IAM binding to allow unauthenticated access to the function
+  function_invoker_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: function-invoker-binding
+    properties:
+      resource: ${var.project_id}
+      role: roles/cloudfunctions.invoker
+      member: allUsers
+    metadata:
+      dependsOn:
+        - url_validator_function
+
+  # Create monitoring alert policy for function errors
+  error_alert_policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    name: url-validator-error-policy
+    properties:
+      displayName: "URL Validator Function Errors"
+      documentation:
+        content: "Alert when URL validator function has high error rate"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "Function error rate"
+          conditionThreshold:
+            filter: resource.type="cloud_function" AND resource.labels.function_name="${local.function_name_full}"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.1  # 10% error rate
+            duration: 300s       # 5 minutes
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.labels.function_name
+      combiner: OR
+      enabled: true
+      notificationChannels: []  # Add notification channels as needed
+    metadata:
+      dependsOn:
+        - url_validator_function
+
+  # Create source code bucket for Cloud Function deployment
+  source_bucket:
+    type: gcp-types/storage-v1:buckets
+    name: url-validator-source-${var.project_id}
+    properties:
+      name: url-validator-source-${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        purpose: "function-source"
+        recipe: "url-safety-validation"
+    metadata:
+      dependsOn:
+        - storage_api
+
+# Define outputs for external consumption
+outputs:
+  function_url:
+    description: "URL of the deployed Cloud Function"
+    value: $(ref.url_validator_function.httpsTrigger.url)
+
+  function_name:
+    description: "Name of the deployed Cloud Function"
+    value: ${local.function_name_full}
+
+  audit_bucket_name:
+    description: "Name of the audit logs bucket"
+    value: ${local.audit_bucket_name}
+
+  cache_bucket_name:
+    description: "Name of the cache bucket"
+    value: ${local.cache_bucket_name}
+
+  service_account_email:
+    description: "Email of the service account used by the function"
+    value: $(ref.function_service_account.email)
+
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+
+  region:
+    description: "Deployment region"
+    value: ${var.region}
+
+  source_bucket_name:
+    description: "Name of the source code bucket"
+    value: url-validator-source-${var.project_id}
+
+# Deployment metadata
+metadata:
+  version: "1.0"
+  template:
+    name: "url-safety-validation-web-risk-functions"
+    description: "Complete URL safety validation system using Web Risk API and Cloud Functions"
+    author: "Google Cloud Infrastructure Manager"
+    tags:
+      - security
+      - url-validation
+      - web-risk
+      - cloud-functions
+      - serverless

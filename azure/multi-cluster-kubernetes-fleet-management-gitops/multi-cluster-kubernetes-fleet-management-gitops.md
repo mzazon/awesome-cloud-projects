@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure Kubernetes Fleet Manager, Azure Service Operator, Azure Container Registry, Azure Key Vault
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: kubernetes, multi-cluster, fleet-management, gitops, infrastructure-as-code
 recipe-generator-version: 1.3
@@ -77,25 +77,31 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with Owner or Contributor permissions
-2. Azure CLI v2.46.0 or later installed and configured (or use Azure Cloud Shell)
+2. Azure CLI v2.70.0 or later installed and configured (or use Azure Cloud Shell)
 3. kubectl v1.28+ installed for Kubernetes cluster management
 4. Helm v3.12+ installed for deploying Azure Service Operator
 5. Basic understanding of Kubernetes concepts and Azure services
 6. Estimated cost: ~$400-600/month for 3 small AKS clusters and associated resources
 
+> **Note**: Azure Kubernetes Fleet Manager requires Azure CLI extension v1.5.2 or later. The extension will be installed automatically during the preparation steps.
+
 ## Preparation
 
 ```bash
-# Set environment variables
-export RESOURCE_GROUP="rg-fleet-demo"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-fleet-demo-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export FLEET_NAME="multicluster-fleet"
 export SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
-# Generate unique suffixes for global resources
+# Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
 export ACR_NAME="acrfleet${RANDOM_SUFFIX}"
 export KV_NAME="kv-fleet-${RANDOM_SUFFIX}"
+
+# Install Fleet CLI extension
+az extension add --name fleet
+az extension update --name fleet
 
 # Create resource group
 az group create \
@@ -231,7 +237,7 @@ echo "✅ Service Principal created for Azure Service Operator"
            --overwrite-existing
        
        # Install cert-manager
-       kubectl apply -f https://github.com/jetstack/cert-manager/releases/download/v1.14.1/cert-manager.yaml
+       kubectl apply -f https://github.com/jetstack/cert-manager/releases/download/v1.14.4/cert-manager.yaml
        
        # Wait for cert-manager to be ready
        kubectl wait --for=condition=ready pod \
@@ -333,6 +339,9 @@ echo "✅ Service Principal created for Azure Service Operator"
    # Switch to second cluster
    kubectl config use-context aks-fleet-2
    
+   # Create namespace for Azure resources if it doesn't exist
+   kubectl create namespace azure-resources --dry-run=client -o yaml | kubectl apply -f -
+   
    # Create Key Vault via ASO
    cat <<EOF | kubectl apply -f -
    apiVersion: keyvault.azure.com/v1api20210401preview
@@ -415,7 +424,7 @@ echo "✅ Service Principal created for Azure Service Operator"
        --upgrade-type Full \
        --kubernetes-version 1.28.5 \
        --node-image-selection Latest \
-       --update-strategy-name update-strategy.json
+       --update-strategy-stages @update-strategy.json
    
    echo "✅ Fleet-wide update strategy configured"
    ```

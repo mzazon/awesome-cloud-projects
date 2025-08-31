@@ -4,12 +4,12 @@ id: 9f8e7d6c
 category: devops
 difficulty: 200
 subject: azure
-services: Azure Bicep, Azure Event Grid, Azure Container Instances, Azure DevOps
+services: Azure Bicep, Azure Event Grid, Azure Container Instances, Azure Functions
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: infrastructure-as-code, event-driven, automation, deployment
 recipe-generator-version: 1.3
@@ -80,12 +80,12 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for consistent naming
+# Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-bicep-eventgrid-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
-# Generate unique suffix for globally unique resource names
+# Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
 
 # Create the main resource group
@@ -290,7 +290,7 @@ echo "📝 Event Grid topic name: ${EVENT_GRID_TOPIC}"
    Creating a sample Bicep template demonstrates the infrastructure-as-code patterns that will be automated. Bicep's declarative syntax and built-in validation ensure infrastructure is defined consistently and correctly. This template showcases parameter usage, resource dependencies, and output values that can be consumed by downstream processes.
 
    ```bash
-   # Create sample Bicep template
+   # Create sample Bicep template with latest API version
    cat > storage-account.bicep << 'EOF'
    @description('Storage account name')
    param storageAccountName string
@@ -305,7 +305,7 @@ echo "📝 Event Grid topic name: ${EVENT_GRID_TOPIC}"
    @description('Storage SKU')
    param storageSku string = 'Standard_LRS'
    
-   resource storageAccount 'Microsoft.Storage/storageAccounts@2021-04-01' = {
+   resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
      name: storageAccountName
      location: location
      sku: {
@@ -316,6 +316,7 @@ echo "📝 Event Grid topic name: ${EVENT_GRID_TOPIC}"
        supportsHttpsTrafficOnly: true
        allowBlobPublicAccess: false
        minimumTlsVersion: 'TLS1_2'
+       defaultToOAuthAuthentication: true
      }
    }
    
@@ -334,36 +335,7 @@ echo "📝 Event Grid topic name: ${EVENT_GRID_TOPIC}"
    echo "✅ Sample Bicep template uploaded"
    ```
 
-7. **Configure Event Grid Subscription with Container Instance Handler**:
-
-   Creating an Event Grid subscription with Azure Container Instances as the event handler establishes the automated deployment pipeline. This configuration ensures that whenever a deployment event is published to the Event Grid topic, a new container instance is automatically provisioned to execute the deployment. The serverless nature of Container Instances means you only pay for the actual deployment execution time.
-
-   ```bash
-   # Create deployment script for Event Grid handler
-   cat > event-handler.json << EOF
-   {
-     "properties": {
-       "destination": {
-         "endpointType": "WebHook",
-         "properties": {
-           "endpointUrl": "https://placeholder.webhook.site/deploy"
-         }
-       },
-       "filter": {
-         "subjectBeginsWith": "/deployments/",
-         "includedEventTypes": ["Microsoft.EventGrid.CustomEvent"]
-       }
-     }
-   }
-   EOF
-   
-   # Note: In production, you would create an Azure Function
-   # or Logic App to handle events and trigger Container Instances
-   
-   echo "✅ Event handler configuration prepared"
-   ```
-
-8. **Create Azure Function for Event Processing**:
+7. **Create Azure Function for Event Processing**:
 
    Azure Functions provides the serverless compute layer that processes Event Grid events and triggers Container Instance deployments. This event-driven approach ensures deployments only run when needed, optimizing costs while maintaining rapid response times. The function handles event validation, parameter extraction, and container orchestration with built-in retry logic.
 
@@ -379,7 +351,7 @@ echo "📝 Event Grid topic name: ${EVENT_GRID_TOPIC}"
        --location ${LOCATION} \
        --sku Standard_LRS
    
-   # Create Function App
+   # Create Function App with latest runtime
    az functionapp create \
        --name ${FUNCTION_APP} \
        --resource-group ${RESOURCE_GROUP} \
@@ -403,7 +375,7 @@ echo "📝 Event Grid topic name: ${EVENT_GRID_TOPIC}"
 
    The Function App now provides the event processing logic that bridges Event Grid events with Container Instance deployments. This serverless architecture scales automatically based on event volume while maintaining sub-second response times.
 
-9. **Deploy Complete Event-Driven Infrastructure**:
+8. **Deploy Complete Event-Driven Infrastructure**:
 
    Bringing all components together creates a complete event-driven infrastructure deployment system. This final configuration establishes the event flow from source to deployment execution, enabling automated infrastructure provisioning based on business events. The solution provides enterprise-grade reliability with built-in monitoring and error handling.
 

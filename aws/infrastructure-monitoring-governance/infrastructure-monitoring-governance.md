@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: cloudtrail, config, systems-manager
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: monitoring, cloudtrail, config, systems-manager, compliance
 recipe-generator-version: 1.3
@@ -316,11 +316,18 @@ echo "✅ Preparation complete. Bucket: ${MONITORING_BUCKET}"
        --ops-item-type "Infrastructure"
    
    # Enable Systems Manager inventory collection
-   aws ssm put-inventory \
-       --instance-id $(aws ec2 describe-instances \
-           --query 'Reservations[0].Instances[0].InstanceId' --output text) \
-       --items TypeName=AWS:Application,SchemaVersion=1.0,Content='[{"Name":"Infrastructure-Monitoring","Publisher":"AWS","Version":"1.0"}]' \
-       2>/dev/null || echo "No EC2 instances found for inventory"
+   FIRST_INSTANCE_ID=$(aws ec2 describe-instances \
+       --query 'Reservations[0].Instances[0].InstanceId' \
+       --output text 2>/dev/null)
+   
+   if [ "$FIRST_INSTANCE_ID" != "None" ] && [ -n "$FIRST_INSTANCE_ID" ]; then
+       aws ssm put-inventory \
+           --instance-id ${FIRST_INSTANCE_ID} \
+           --items TypeName=AWS:Application,SchemaVersion=1.0,Content='[{"Name":"Infrastructure-Monitoring","Publisher":"AWS","Version":"1.0"}]' \
+           2>/dev/null || echo "Note: Instance inventory setup skipped"
+   else
+       echo "Note: No EC2 instances found for inventory collection"
+   fi
    
    echo "✅ Systems Manager configured with maintenance window: ${MAINTENANCE_WINDOW_ID}"
    ```
@@ -456,7 +463,7 @@ echo "✅ Preparation complete. Bucket: ${MONITORING_BUCKET}"
    # Create Lambda function
    aws lambda create-function \
        --function-name InfrastructureRemediation \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role \
        --handler remediation-lambda.lambda_handler \
        --zip-file fileb://remediation-lambda.zip \
@@ -627,9 +634,11 @@ This infrastructure monitoring solution provides comprehensive visibility into y
 
 The integration between these services creates a powerful monitoring ecosystem. CloudTrail events can trigger Config rule evaluations, while Config compliance changes can initiate Systems Manager automation workflows. The SNS integration ensures that security teams receive immediate notifications of critical events, while the CloudWatch dashboard provides real-time visibility into compliance status and operational metrics.
 
-Cost optimization is achieved through intelligent data lifecycle management. CloudTrail logs are stored in S3 with versioning enabled, allowing for automatic archival to cheaper storage classes. Config snapshots are retained based on compliance requirements, and Systems Manager automation reduces manual operational overhead. The solution scales automatically with your infrastructure, making it suitable for organizations of any size.
+Cost optimization is achieved through intelligent data lifecycle management. CloudTrail logs are stored in S3 with versioning enabled, allowing for automatic archival to cheaper storage classes through [S3 Lifecycle policies](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html). Config snapshots are retained based on compliance requirements, and Systems Manager automation reduces manual operational overhead. The solution scales automatically with your infrastructure, making it suitable for organizations of any size.
 
-Security best practices are embedded throughout the architecture, including IAM roles with least-privilege permissions, encrypted data at rest and in transit, and comprehensive audit logging. This foundation supports compliance frameworks such as SOC 2, PCI DSS, and GDPR while providing the visibility needed for effective security operations.
+Security best practices are embedded throughout the architecture, including IAM roles with least-privilege permissions, encrypted data at rest and in transit, and comprehensive audit logging. This foundation supports compliance frameworks such as SOC 2, PCI DSS, and GDPR while providing the visibility needed for effective security operations. The [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles guide the implementation to ensure operational excellence, security, reliability, performance efficiency, and cost optimization.
+
+> **Note**: The Lambda function uses Python 3.12 runtime, which is the recommended version for new deployments. Python 3.9 will be deprecated in December 2025 according to AWS Lambda runtime deprecation schedule.
 
 ## Challenge
 

@@ -1,0 +1,249 @@
+# Infrastructure Manager Configuration for Word Count API with Cloud Functions
+# This configuration deploys a serverless word count API using Google Cloud Functions
+# and Cloud Storage for file processing capabilities.
+
+# Import statements for additional templates (if needed)
+imports: []
+
+# Input variables for customization
+info:
+  title: Word Count API with Cloud Functions
+  author: Infrastructure Manager
+  description: |
+    Deploys a serverless word count API using Google Cloud Functions (2nd generation)
+    and Cloud Storage for file processing capabilities. The solution provides HTTP
+    endpoints for text analysis including word count, character count, paragraph
+    count, and estimated reading time.
+  version: "1.0"
+
+# Template properties for parameterization
+properties:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for resource deployment"
+    
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    
+  function_name:
+    type: string
+    description: "Name for the Cloud Function"
+    default: "word-count-api"
+    
+  bucket_name_suffix:
+    type: string
+    description: "Suffix for the Cloud Storage bucket name"
+    default: "files"
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: project-services-cloudfunctions
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/{{ properties.project_id }}/services/cloudfunctions.googleapis.com
+      
+  - name: project-services-storage
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/{{ properties.project_id }}/services/storage.googleapis.com
+      
+  - name: project-services-cloudbuild
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/{{ properties.project_id }}/services/cloudbuild.googleapis.com
+      
+  - name: project-services-run
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/{{ properties.project_id }}/services/run.googleapis.com
+
+  # Cloud Storage bucket for file processing
+  - name: word-count-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: word-count-{{ properties.bucket_name_suffix }}-{{ properties.project_id }}
+      location: {{ properties.region }}
+      storageClass: STANDARD
+      # Enable uniform bucket-level access for better security
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Lifecycle management to control costs
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              matchesStorageClass:
+                - STANDARD
+      # Versioning disabled for cost optimization
+      versioning:
+        enabled: false
+      # Public access prevention for security
+      publicAccessPrevention: enforced
+    metadata:
+      dependsOn:
+        - project-services-storage
+
+  # IAM binding for Cloud Function to access Storage bucket
+  - name: storage-bucket-iam
+    type: gcp-types/storage-v1:buckets.setIamPolicy
+    properties:
+      bucket: $(ref.word-count-storage-bucket.name)
+      policy:
+        bindings:
+          - role: roles/storage.objectViewer
+            members:
+              - serviceAccount:{{ properties.project_id }}@appspot.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - word-count-storage-bucket
+
+  # Cloud Function source code archive placeholder
+  # Note: In a real deployment, source code would be uploaded separately
+  # This demonstrates the bucket structure for function deployment
+  - name: function-source-placeholder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.word-count-storage-bucket.name)
+      name: function-source.zip
+      # Placeholder for function source code
+      # In practice, this would be uploaded via gcloud or CI/CD pipeline
+      contentType: application/zip
+    metadata:
+      dependsOn:
+        - word-count-storage-bucket
+
+  # Cloud Function (2nd generation) for word count API
+  - name: word-count-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/{{ properties.project_id }}/locations/{{ properties.region }}
+      functionId: {{ properties.function_name }}
+      function:
+        displayName: "Word Count API Function"
+        description: "HTTP API for text analysis and word counting"
+        
+        # Build configuration
+        buildConfig:
+          runtime: python312
+          entryPoint: word_count_api
+          source:
+            storageSource:
+              bucket: $(ref.word-count-storage-bucket.name)
+              object: function-source.zip
+          environmentVariables:
+            GOOGLE_FUNCTION_TARGET: word_count_api
+            
+        # Service configuration for Cloud Run
+        serviceConfig:
+          # Memory and CPU allocation
+          availableMemory: 256Mi
+          availableCpu: "0.167"  # 1/6 vCPU
+          
+          # Timeout configuration
+          timeoutSeconds: 60
+          
+          # Auto-scaling configuration
+          maxInstanceCount: 10
+          minInstanceCount: 0
+          
+          # Runtime environment variables
+          environmentVariables:
+            GCP_PROJECT: {{ properties.project_id }}
+            FUNCTION_REGION: {{ properties.region }}
+            STORAGE_BUCKET: $(ref.word-count-storage-bucket.name)
+          
+          # Service account configuration
+          serviceAccountEmail: {{ properties.project_id }}@appspot.gserviceaccount.com
+          
+          # Ingress settings for HTTP access
+          ingressSettings: ALLOW_ALL
+          
+        # Labels for resource management
+        labels:
+          deployment-tool: infrastructure-manager
+          recipe-name: word-count-api-functions
+          environment: development
+          
+    metadata:
+      dependsOn:
+        - project-services-cloudfunctions
+        - project-services-run
+        - function-source-placeholder
+        - storage-bucket-iam
+
+  # HTTP trigger configuration for the Cloud Function
+  - name: function-http-trigger
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions.setIamPolicy
+    properties:
+      resource: $(ref.word-count-function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers  # Allow unauthenticated access
+    metadata:
+      dependsOn:
+        - word-count-function
+
+# Outputs for verification and integration
+outputs:
+  - name: function_name
+    description: "Name of the deployed Cloud Function"
+    value: $(ref.word-count-function.name)
+    
+  - name: function_url
+    description: "HTTP URL for the Cloud Function API"
+    value: $(ref.word-count-function.serviceConfig.uri)
+    
+  - name: storage_bucket_name
+    description: "Name of the Cloud Storage bucket for file processing"
+    value: $(ref.word-count-storage-bucket.name)
+    
+  - name: project_id
+    description: "Google Cloud Project ID used for deployment"
+    value: {{ properties.project_id }}
+    
+  - name: region
+    description: "Google Cloud region used for deployment"
+    value: {{ properties.region }}
+    
+  - name: function_status
+    description: "Current status of the Cloud Function"
+    value: $(ref.word-count-function.state)
+
+# Additional configuration notes:
+# 
+# 1. Function Source Code:
+#    Before deploying, you must upload the function source code to the storage bucket.
+#    The source should include:
+#    - main.py: The Python function code with word count logic
+#    - requirements.txt: Python dependencies (google-cloud-storage, functions-framework)
+#
+# 2. Deployment Steps:
+#    a) Upload source code: gcloud storage cp function-source.zip gs://BUCKET_NAME/
+#    b) Deploy infrastructure: gcloud infra-manager deployments apply DEPLOYMENT_NAME
+#    c) Test the API endpoint returned in outputs
+#
+# 3. Security Considerations:
+#    - Function allows unauthenticated access for demonstration purposes
+#    - In production, consider adding authentication via IAM or API keys
+#    - Storage bucket uses uniform bucket-level access for security
+#    - Function runs with minimal required permissions
+#
+# 4. Cost Optimization:
+#    - Storage lifecycle rule deletes objects after 30 days
+#    - Function configured with minimal memory (256Mi) and CPU allocation
+#    - Auto-scaling with maximum 10 instances to control costs
+#    - No persistent storage or always-on resources
+#
+# 5. Monitoring and Troubleshooting:
+#    - Function logs are automatically sent to Cloud Logging
+#    - Use "gcloud functions logs read" to view execution logs
+#    - Monitor function performance via Cloud Monitoring
+#    - Storage access patterns can be monitored via Cloud Storage logs

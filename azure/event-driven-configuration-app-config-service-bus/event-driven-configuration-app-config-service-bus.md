@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure App Configuration, Azure Service Bus, Azure Functions, Azure Logic Apps
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: configuration-management, event-driven-architecture, microservices, automation, messaging
 recipe-generator-version: 1.3
@@ -78,18 +78,20 @@ graph TB
 4. Knowledge of Azure Functions development and deployment processes
 5. Estimated cost: $15-25 per month for development/testing workloads (depends on message volume and function execution frequency)
 
-> **Note**: This solution follows Azure Well-Architected Framework principles for reliability and scalability. See the [Azure Architecture Center](https://docs.microsoft.com/en-us/azure/architecture/) for comprehensive guidance on event-driven architectures.
+> **Warning**: Remember to clean up resources after testing to avoid unnecessary charges. Service Bus Standard tier and App Configuration Standard tier have ongoing costs even when not actively used.
+
+> **Note**: This solution follows Azure Well-Architected Framework principles for reliability and scalability. See the [Azure Architecture Center](https://learn.microsoft.com/en-us/azure/architecture/) for comprehensive guidance on event-driven architectures.
 
 ## Preparation
 
 ```bash
+# Generate unique suffix for resource names first
+RANDOM_SUFFIX=$(openssl rand -hex 3)
+
 # Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-config-management-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
-
-# Generate unique suffix for resource names
-RANDOM_SUFFIX=$(openssl rand -hex 3)
 
 # Set resource names with unique suffixes
 export APP_CONFIG_NAME="appconfig-${RANDOM_SUFFIX}"
@@ -121,7 +123,8 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --sku standard \
-       --enable-public-network true
+       --enable-public-network true \
+       --assign-identity
    
    # Store connection string for later use
    export APP_CONFIG_CONNECTION_STRING=$(az appconfig credential list \
@@ -145,7 +148,8 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --name ${SERVICE_BUS_NAMESPACE} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --sku Standard
+       --sku Standard \
+       --mi-system-assigned
    
    # Create Service Bus topic for configuration changes
    az servicebus topic create \
@@ -245,7 +249,8 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --consumption-plan-location ${LOCATION} \
        --runtime node \
        --runtime-version 18 \
-       --functions-version 4
+       --functions-version 4 \
+       --assign-identity
    
    # Configure Function App settings
    az functionapp config appsettings set \
@@ -258,50 +263,21 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    echo "✅ Function App created: ${FUNCTION_APP_NAME}"
    ```
 
-   The Function App is now configured with the necessary connection strings and runtime environment to process configuration change events from Service Bus and interact with App Configuration for retrieving updated settings.
+   The Function App is now configured with the necessary connection strings and runtime environment to process configuration change events from Service Bus and interact with App Configuration for retrieving updated settings. The system-assigned managed identity provides secure authentication without storing credentials in code.
 
 6. **Create Azure Logic Apps for Complex Configuration Workflows**:
 
    Azure Logic Apps provides visual workflow orchestration for complex configuration management scenarios that require multiple steps, conditional logic, and integration with external systems. This low-code approach enables rapid development of sophisticated configuration automation workflows.
 
    ```bash
-   # Create Logic App
-   az logic workflow create \
+   # Create Logic App with Consumption plan
+   az logicapp create \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --definition '{
-         "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-         "contentVersion": "1.0.0.0",
-         "parameters": {},
-         "triggers": {
-           "When_a_message_is_received": {
-             "type": "ServiceBus",
-             "inputs": {
-               "host": {
-                 "connection": {
-                   "name": "@parameters(\"$connections\")[\"servicebus\"][\"connectionId\"]"
-                 }
-               },
-               "method": "get",
-               "path": "/topics/@{encodeURIComponent(\"'${SERVICE_BUS_TOPIC}'\")}/subscriptions/@{encodeURIComponent(\"worker-services\")}/messages/head",
-               "queries": {
-                 "subscriptionType": "Main"
-               }
-             }
-           }
-         },
-         "actions": {
-           "Process_Configuration_Change": {
-             "type": "Http",
-             "inputs": {
-               "method": "POST",
-               "uri": "https://example.com/webhook",
-               "body": "@triggerBody()"
-             }
-           }
-         }
-       }'
+       --storage-account ${STORAGE_ACCOUNT_NAME}
+   
+   # Note: Logic App workflow definition will be configured through Azure portal
+   # or ARM template for complex Service Bus integration
    
    echo "✅ Logic App created: ${LOGIC_APP_NAME}"
    ```
@@ -501,7 +477,11 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    # Wait for event propagation
    sleep 30
    
-   # Check Function App logs
+   # Check Function App logs (may take a few minutes to appear)
+   az monitor app-insights query \
+       --app ${FUNCTION_APP_NAME} \
+       --analytics-query "traces | where timestamp > ago(10m) | order by timestamp desc" \
+       --resource-group ${RESOURCE_GROUP} || \
    az functionapp logs tail \
        --name ${FUNCTION_APP_NAME} \
        --resource-group ${RESOURCE_GROUP}
@@ -535,12 +515,17 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    echo "✅ Event Grid subscription deleted"
    ```
 
-2. **Delete Function App and Storage Account**:
+2. **Delete Function App, Logic App, and Storage Account**:
 
    ```bash
    # Delete Function App
    az functionapp delete \
        --name ${FUNCTION_APP_NAME} \
+       --resource-group ${RESOURCE_GROUP}
+   
+   # Delete Logic App
+   az logicapp delete \
+       --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP}
    
    # Delete Storage Account
@@ -549,7 +534,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --resource-group ${RESOURCE_GROUP} \
        --yes
    
-   echo "✅ Function App and Storage Account deleted"
+   echo "✅ Function App, Logic App, and Storage Account deleted"
    ```
 
 3. **Remove Service Bus Resources**:
@@ -590,11 +575,11 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
 ## Discussion
 
-This event-driven configuration management architecture demonstrates the power of Azure's managed services for building scalable, responsive configuration systems. Azure App Configuration provides the centralized configuration store with enterprise-grade features including versioning, point-in-time restore, and feature flags, while Azure Service Bus ensures reliable message delivery even under high load conditions. The combination eliminates the polling overhead common in traditional configuration management approaches and provides near-instantaneous configuration propagation across distributed services. For comprehensive guidance on event-driven architectures, see the [Azure Event-Driven Architecture documentation](https://docs.microsoft.com/en-us/azure/architecture/guide/architecture-styles/event-driven) and [Azure App Configuration best practices](https://docs.microsoft.com/en-us/azure/azure-app-configuration/howto-best-practices).
+This event-driven configuration management architecture demonstrates the power of Azure's managed services for building scalable, responsive configuration systems. Azure App Configuration provides the centralized configuration store with enterprise-grade features including versioning, point-in-time restore, and feature flags, while Azure Service Bus ensures reliable message delivery even under high load conditions. The combination eliminates the polling overhead common in traditional configuration management approaches and provides near-instantaneous configuration propagation across distributed services. For comprehensive guidance on event-driven architectures, see the [Azure Event-Driven Architecture documentation](https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles/event-driven) and [Azure App Configuration best practices](https://learn.microsoft.com/en-us/azure/azure-app-configuration/howto-best-practices).
 
 The integration between Azure Event Grid and Service Bus creates a robust event routing infrastructure that can handle thousands of configuration changes per second while maintaining message ordering and delivery guarantees. This architecture follows the Azure Well-Architected Framework principles by implementing proper retry mechanisms, dead letter queues, and monitoring capabilities. The use of Azure Functions for event processing provides automatic scaling and cost optimization, ensuring that configuration processing resources are only consumed when needed.
 
-From an operational perspective, this solution significantly reduces the complexity of managing configuration changes across large-scale microservices deployments. The event-driven approach enables advanced scenarios such as configuration validation, approval workflows, and rollback mechanisms through Azure Logic Apps integration. For monitoring and observability, consider integrating with Azure Monitor and Application Insights to track configuration change patterns and system health. The [Azure Monitor documentation](https://docs.microsoft.com/en-us/azure/azure-monitor/) provides comprehensive guidance on implementing monitoring strategies for event-driven architectures.
+From an operational perspective, this solution significantly reduces the complexity of managing configuration changes across large-scale microservices deployments. The event-driven approach enables advanced scenarios such as configuration validation, approval workflows, and rollback mechanisms through Azure Logic Apps integration. For monitoring and observability, consider integrating with Azure Monitor and Application Insights to track configuration change patterns and system health. The [Azure Monitor documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/) provides comprehensive guidance on implementing monitoring strategies for event-driven architectures.
 
 > **Tip**: Use Azure App Configuration's feature flags capability to implement gradual rollouts of configuration changes. This approach allows you to test configuration changes with a subset of users before applying them system-wide, reducing the risk of configuration-related incidents.
 

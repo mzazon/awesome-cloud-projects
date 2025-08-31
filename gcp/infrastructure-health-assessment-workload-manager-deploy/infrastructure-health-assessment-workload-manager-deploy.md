@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Workload Manager, Cloud Deploy, Cloud Monitoring, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-24
 passed-qa: null
 tags: infrastructure, assessment, automation, devops, monitoring, ci-cd
 recipe-generator-version: 1.3
@@ -70,7 +70,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with billing enabled and appropriate permissions
-2. gcloud CLI v400.0.0+ installed and configured (or Cloud Shell)
+2. gcloud CLI v450.0.0+ installed and configured (or Cloud Shell)
 3. Basic understanding of Google Cloud infrastructure services and CI/CD concepts
 4. Familiarity with YAML configuration files and infrastructure as code principles
 5. Estimated cost: $50-100 for resources created during this recipe (varies by usage)
@@ -90,6 +90,7 @@ RANDOM_SUFFIX=$(openssl rand -hex 3)
 export CLUSTER_NAME="health-cluster-${RANDOM_SUFFIX}"
 export DEPLOYMENT_PIPELINE="health-pipeline-${RANDOM_SUFFIX}"
 export FUNCTION_NAME="health-assessor-${RANDOM_SUFFIX}"
+export EVALUATION_NAME="infrastructure-health-${RANDOM_SUFFIX}"
 
 # Set default project and region configuration
 gcloud config set project ${PROJECT_ID}
@@ -193,39 +194,25 @@ echo "✅ APIs enabled for infrastructure health assessment"
 
 4. **Configure Cloud Workload Manager Assessment**:
 
-   Cloud Workload Manager provides automated workload evaluation against Google Cloud best practices and custom rules. Configuring assessment rules establishes the evaluation framework that continuously monitors infrastructure health, detects configuration drift, and identifies security and performance optimization opportunities.
+   Cloud Workload Manager provides automated workload evaluation against Google Cloud best practices and custom rules. The evaluation configuration establishes systematic assessment of your infrastructure, enabling detection of misconfigurations, security issues, and performance optimization opportunities.
 
    ```bash
-   # Create assessment configuration file
-   cat > workload-assessment.yaml << EOF
-   apiVersion: workloadmanager.googleapis.com/v1
-   kind: Evaluation
-   metadata:
-     name: infrastructure-health-assessment
-   spec:
-     schedule: "0 */6 * * *"  # Every 6 hours
-     workloadType: "kubernetes"
-     resourceFilters:
-       - resource: "//container.googleapis.com/projects/${PROJECT_ID}/zones/${ZONE}/clusters/${CLUSTER_NAME}"
-     rules:
-       - ruleId: "security-scan"
-         description: "Security configuration assessment"
-         enabled: true
-       - ruleId: "performance-check"
-         description: "Performance optimization assessment"
-         enabled: true
-       - ruleId: "cost-optimization"
-         description: "Cost optimization recommendations"
-         enabled: true
-     outputConfig:
-       gcsDestination:
-         uri: "gs://${PROJECT_ID}-health-assessments/evaluations/"
-   EOF
+   # Create Workload Manager evaluation
+   gcloud workload-manager evaluations create ${EVALUATION_NAME} \
+       --location=${REGION} \
+       --description="Infrastructure health assessment" \
+       --workload-type="CUSTOM" \
+       --schedule="0 */6 * * *" \
+       --project-scopes=${PROJECT_ID}
    
-   echo "✅ Workload Manager assessment configuration created"
+   # Verify evaluation was created
+   gcloud workload-manager evaluations describe ${EVALUATION_NAME} \
+       --location=${REGION}
+   
+   echo "✅ Workload Manager evaluation configured: ${EVALUATION_NAME}"
    ```
 
-   The assessment configuration defines comprehensive evaluation rules covering security, performance, and cost optimization, ensuring thorough infrastructure health monitoring with automated scheduling and result storage.
+   The evaluation configuration enables automated assessment scheduling with comprehensive monitoring of infrastructure health, providing the foundation for continuous governance and compliance monitoring.
 
 5. **Deploy Cloud Function for Assessment Processing**:
 
@@ -298,25 +285,27 @@ echo "✅ APIs enabled for infrastructure health assessment"
    
    # Create requirements file
    cat > requirements.txt << EOF
-   functions-framework==3.5.0
-   google-cloud-pubsub==2.20.1
-   google-cloud-storage==2.10.0
+   functions-framework==3.8.0
+   google-cloud-pubsub==2.24.0
+   google-cloud-storage==2.14.0
    EOF
    
    # Deploy Cloud Function
    gcloud functions deploy ${FUNCTION_NAME} \
+       --gen2 \
        --runtime=python311 \
        --trigger-bucket=${PROJECT_ID}-health-assessments \
        --entry-point=process_health_assessment \
        --memory=256MB \
        --timeout=60s \
-       --set-env-vars=PROJECT_ID=${PROJECT_ID}
+       --set-env-vars=PROJECT_ID=${PROJECT_ID} \
+       --region=${REGION}
    
    cd ..
    echo "✅ Cloud Function deployed for assessment processing"
    ```
 
-   The assessment processing function is now deployed and will automatically trigger when new evaluation reports are uploaded to Cloud Storage, providing intelligent analysis and workflow orchestration for infrastructure health management.
+   The assessment processing function is now deployed using the 2nd generation Cloud Functions runtime and will automatically trigger when new evaluation reports are uploaded to Cloud Storage, providing intelligent analysis and workflow orchestration for infrastructure health management.
 
 6. **Create Cloud Deploy Delivery Pipeline**:
 
@@ -395,7 +384,7 @@ echo "✅ APIs enabled for infrastructure health assessment"
            fsGroup: 2000
          containers:
          - name: policy-enforcer
-           image: gcr.io/google-containers/pause:3.1
+           image: gcr.io/google-containers/pause:3.9
            securityContext:
              allowPrivilegeEscalation: false
              readOnlyRootFilesystem: true
@@ -498,18 +487,19 @@ echo "✅ APIs enabled for infrastructure health assessment"
 
 ## Validation & Testing
 
-1. **Verify Workload Manager Assessment Execution**:
+1. **Verify Workload Manager Evaluation Configuration**:
 
    ```bash
    # Check Workload Manager evaluation status
    gcloud workload-manager evaluations list \
        --location=${REGION}
    
-   # Verify assessment reports in storage
-   gsutil ls gs://${PROJECT_ID}-health-assessments/evaluations/
+   # Verify evaluation details
+   gcloud workload-manager evaluations describe ${EVALUATION_NAME} \
+       --location=${REGION}
    ```
 
-   Expected output: List of evaluation instances and stored assessment reports
+   Expected output: List of evaluations and detailed configuration showing schedule and target projects
 
 2. **Test Cloud Function Assessment Processing**:
 
@@ -519,10 +509,12 @@ echo "✅ APIs enabled for infrastructure health assessment"
    gsutil cp test-assessment.json gs://${PROJECT_ID}-health-assessments/
    
    # Check function logs
-   gcloud functions logs read ${FUNCTION_NAME} --limit=10
+   gcloud functions logs read ${FUNCTION_NAME} \
+       --region=${REGION} \
+       --limit=10
    ```
 
-   Expected output: Function execution logs showing assessment processing
+   Expected output: Function execution logs showing assessment processing and Pub/Sub message publishing
 
 3. **Validate Cloud Deploy Pipeline Configuration**:
 
@@ -532,24 +524,28 @@ echo "✅ APIs enabled for infrastructure health assessment"
    
    # Check pipeline targets
    gcloud deploy targets list --region=${REGION}
+   
+   # Describe pipeline details
+   gcloud deploy delivery-pipelines describe ${DEPLOYMENT_PIPELINE} \
+       --region=${REGION}
    ```
 
-   Expected output: Configured pipeline and target information
+   Expected output: Configured pipeline and target information with staging and production environments
 
 4. **Test End-to-End Assessment Workflow**:
 
    ```bash
-   # Create a test release for remediation deployment
-   gcloud deploy releases create test-release-001 \
-       --delivery-pipeline=${DEPLOYMENT_PIPELINE} \
-       --region=${REGION} \
-       --images=remediation=gcr.io/google-containers/pause:3.1
+   # Run evaluation manually for testing
+   gcloud workload-manager evaluations run ${EVALUATION_NAME} \
+       --location=${REGION}
    
-   # Monitor deployment progress
-   gcloud deploy rollouts list \
-       --delivery-pipeline=${DEPLOYMENT_PIPELINE} \
-       --region=${REGION}
+   # Check evaluation execution
+   gcloud workload-manager evaluations list \
+       --location=${REGION} \
+       --filter="name:${EVALUATION_NAME}"
    ```
+
+   Expected output: Successful evaluation execution with status updates
 
 ## Cleanup
 
@@ -568,7 +564,9 @@ echo "✅ APIs enabled for infrastructure health assessment"
 
    ```bash
    # Delete Cloud Function
-   gcloud functions delete ${FUNCTION_NAME} --quiet
+   gcloud functions delete ${FUNCTION_NAME} \
+       --region=${REGION} \
+       --quiet
    
    # Delete Pub/Sub topics and subscriptions
    gcloud pubsub subscriptions delete health-deployment-trigger --quiet
@@ -578,7 +576,18 @@ echo "✅ APIs enabled for infrastructure health assessment"
    echo "✅ Serverless components cleaned up"
    ```
 
-3. **Delete GKE Cluster and Storage Resources**:
+3. **Delete Workload Manager Evaluation**:
+
+   ```bash
+   # Delete Workload Manager evaluation
+   gcloud workload-manager evaluations delete ${EVALUATION_NAME} \
+       --location=${REGION} \
+       --quiet
+   
+   echo "✅ Workload Manager evaluation deleted"
+   ```
+
+4. **Delete GKE Cluster and Storage Resources**:
 
    ```bash
    # Delete GKE cluster
@@ -592,11 +601,10 @@ echo "✅ APIs enabled for infrastructure health assessment"
    echo "✅ Infrastructure resources deleted"
    ```
 
-4. **Clean Up Configuration Files**:
+5. **Clean Up Configuration Files**:
 
    ```bash
    # Remove local configuration files
-   rm -f workload-assessment.yaml
    rm -f clouddeploy.yaml
    rm -f health-alert-policy.json
    rm -f lifecycle.json

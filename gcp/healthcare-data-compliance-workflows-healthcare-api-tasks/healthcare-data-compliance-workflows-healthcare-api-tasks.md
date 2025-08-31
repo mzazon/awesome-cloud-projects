@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Healthcare API, Cloud Tasks, Cloud Functions, Cloud Audit Logs
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: healthcare, fhir, compliance, phi, audit, security, workflows
 recipe-generator-version: 1.3
@@ -138,7 +138,7 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
 
 1. **Create Healthcare Dataset and FHIR Store**:
 
-   The Cloud Healthcare API provides a secure, HIPAA-compliant foundation for storing and processing healthcare data in standardized formats. Creating a dataset establishes the organizational boundary for healthcare resources, while the FHIR store enables RESTful access to clinical data following HL7 FHIR standards. This setup ensures that PHI is handled according to healthcare industry regulations from the moment it enters your system.
+   The Cloud Healthcare API provides a secure, HIPAA-compliant foundation for storing and processing healthcare data in standardized formats. Creating a dataset establishes the organizational boundary for healthcare resources, while the FHIR store enables RESTful access to clinical data following HL7 FHIR R4 standards. This setup ensures that PHI is handled according to healthcare industry regulations from the moment it enters your system.
 
    ```bash
    # Create healthcare dataset
@@ -154,21 +154,15 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
        --enable-update-create \
        --disable-referential-integrity
    
-   # Enable Pub/Sub notifications for FHIR store changes
+   # Create Pub/Sub topic for FHIR store notifications
    TOPIC_NAME="fhir-changes-${RANDOM_SUFFIX}"
    gcloud pubsub topics create ${TOPIC_NAME}
    
-   gcloud healthcare fhir-stores set-iam-policy ${FHIR_STORE_ID} \
+   # Update FHIR store to enable Pub/Sub notifications
+   gcloud healthcare fhir-stores update ${FHIR_STORE_ID} \
        --dataset=${DATASET_ID} \
        --location=${LOCATION} \
-       --policy-file=<(echo '{
-         "bindings": [
-           {
-             "role": "roles/pubsub.publisher",
-             "members": ["serviceAccount:service-'$(gcloud config get-value project --quiet)'@gcp-sa-healthcare.iam.gserviceaccount.com"]
-           }
-         ]
-       }')
+       --pubsub-topic=projects/${PROJECT_ID}/topics/${TOPIC_NAME}
    
    echo "✅ Healthcare dataset and FHIR store created with compliance configurations"
    ```
@@ -211,6 +205,8 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
    echo "✅ Compliance storage bucket created with lifecycle policies"
    ```
 
+   The storage bucket is configured with automated lifecycle management to optimize costs while maintaining compliance data retention requirements. Uniform bucket-level access ensures consistent IAM policies across all objects, simplifying security management for healthcare data.
+
 3. **Create Cloud Tasks Queue for Compliance Processing**:
 
    Cloud Tasks provides reliable, asynchronous processing for compliance workflows that must execute reliably even during high-volume periods. The queue configuration ensures that compliance validation tasks are processed in order and can handle retry logic for failed operations, which is critical for maintaining audit trail integrity.
@@ -230,7 +226,7 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
 
    The task queue is configured with conservative rate limits and retry policies to ensure reliable processing of sensitive healthcare data. This configuration prevents overwhelming downstream systems while maintaining the reliability required for compliance operations.
 
-4. **Create Pub/Sub Topic and Subscription for FHIR Events**:
+4. **Create Pub/Sub Subscription for FHIR Events**:
 
    Pub/Sub enables real-time event-driven processing of FHIR resource changes, ensuring that compliance validation occurs immediately when PHI is accessed or modified. This event-driven architecture provides the responsiveness required for modern healthcare compliance monitoring.
 
@@ -241,14 +237,10 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
        --message-retention-duration=604800s \
        --ack-deadline=600s
    
-   # Configure Pub/Sub notification for FHIR store
-   gcloud healthcare fhir-stores update ${FHIR_STORE_ID} \
-       --dataset=${DATASET_ID} \
-       --location=${LOCATION} \
-       --pubsub-topic=projects/${PROJECT_ID}/topics/${TOPIC_NAME}
-   
-   echo "✅ Pub/Sub configured for real-time FHIR event processing"
+   echo "✅ Pub/Sub subscription configured for real-time FHIR event processing"
    ```
+
+   The subscription is configured with appropriate message retention and acknowledgment settings to ensure reliable event processing while handling potential downstream processing delays.
 
 5. **Deploy Cloud Function for Compliance Processing**:
 
@@ -259,14 +251,14 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
    mkdir -p compliance-function
    cd compliance-function
    
-   # Create requirements.txt
+   # Create requirements.txt with latest stable versions
    cat > requirements.txt << 'EOF'
-   google-cloud-healthcare==2.15.0
-   google-cloud-tasks==2.16.0
-   google-cloud-storage==2.10.0
-   google-cloud-pubsub==2.18.1
+   google-cloud-healthcare==2.16.0
+   google-cloud-tasks==2.19.3
+   google-cloud-storage==2.18.0
+   google-cloud-pubsub==2.21.0
    google-cloud-logging==3.8.0
-   functions-framework==3.4.0
+   functions-framework==3.8.0
    EOF
    
    # Create main function file
@@ -274,6 +266,7 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
    import json
    import base64
    import logging
+   import os
    from datetime import datetime, timezone
    from google.cloud import healthcare_v1
    from google.cloud import tasks_v2
@@ -372,10 +365,11 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
                queue='compliance-queue-' + os.environ.get('RANDOM_SUFFIX', 'default')
            )
            
+           # Create HTTP task targeting the audit function
            task = {
                'http_request': {
                    'http_method': tasks_v2.HttpMethod.POST,
-                   'url': f"https://{os.environ.get('FUNCTION_REGION')}-{os.environ.get('GCP_PROJECT')}.cloudfunctions.net/compliance-audit",
+                   'url': f"https://{os.environ.get('FUNCTION_REGION')}-{os.environ.get('GCP_PROJECT')}.cloudfunctions.net/compliance-audit-{os.environ.get('RANDOM_SUFFIX')}",
                    'headers': {'Content-Type': 'application/json'},
                    'body': json.dumps(event_data).encode()
                }
@@ -408,25 +402,25 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
            
        except Exception as e:
            logger.error(f"Error storing compliance event: {str(e)}")
-   
-   import os
    EOF
    
-   # Deploy Cloud Function
+   # Deploy Cloud Function with 2nd gen runtime
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime=python39 \
+       --gen2 \
+       --runtime=python312 \
        --trigger-topic=${TOPIC_NAME} \
        --entry-point=process_fhir_event \
        --memory=512MB \
        --timeout=540s \
        --set-env-vars="GCP_PROJECT=${PROJECT_ID},FUNCTION_REGION=${REGION},RANDOM_SUFFIX=${RANDOM_SUFFIX}" \
-       --max-instances=10
+       --max-instances=10 \
+       --region=${REGION}
    
    cd ..
    echo "✅ Compliance processing function deployed and configured"
    ```
 
-   The Cloud Function is now deployed with comprehensive compliance processing capabilities, including PHI access validation, risk scoring, and automated audit trail generation. This serverless approach ensures that compliance processing scales automatically while maintaining the security isolation required for healthcare data.
+   The Cloud Function is deployed using the 2nd generation runtime with Python 3.12 for better performance and security. The function implements comprehensive compliance processing capabilities, including PHI access validation, risk scoring, and automated audit trail generation.
 
 6. **Create BigQuery Dataset for Compliance Analytics**:
 
@@ -452,6 +446,8 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
    echo "✅ BigQuery compliance analytics dataset and tables created"
    ```
 
+   The BigQuery dataset provides structured storage for compliance analytics with proper schema definitions that support regulatory reporting requirements and trend analysis capabilities.
+
 7. **Deploy Compliance Audit Function**:
 
    A dedicated audit function provides detailed compliance processing for high-risk events identified by the primary compliance processor. This function implements enhanced validation logic, generates detailed audit reports, and can trigger compliance workflows for regulatory reporting.
@@ -461,19 +457,20 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
    mkdir -p audit-function
    cd audit-function
    
-   # Create requirements.txt
+   # Create requirements.txt with latest stable versions
    cat > requirements.txt << 'EOF'
-   google-cloud-healthcare==2.15.0
-   google-cloud-bigquery==3.13.0
-   google-cloud-storage==2.10.0
+   google-cloud-healthcare==2.16.0
+   google-cloud-bigquery==3.25.0
+   google-cloud-storage==2.18.0
    google-cloud-logging==3.8.0
-   functions-framework==3.4.0
+   functions-framework==3.8.0
    EOF
    
    # Create audit function
    cat > main.py << 'EOF'
    import json
    import logging
+   import os
    from datetime import datetime, timezone
    from google.cloud import bigquery
    from google.cloud import storage
@@ -605,8 +602,11 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
                'session_id': audit_data['original_event'].get('message_id', 'unknown')
            }
            
-           client.insert_rows_json(table_id, [row])
-           logger.info(f"Stored audit results in BigQuery: {table_id}")
+           errors = client.insert_rows_json(table_id, [row])
+           if errors:
+               logger.error(f"BigQuery insert errors: {errors}")
+           else:
+               logger.info(f"Stored audit results in BigQuery: {table_id}")
            
        except Exception as e:
            logger.error(f"Error storing audit results: {str(e)}")
@@ -656,26 +656,26 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
            
        except Exception as e:
            logger.error(f"Error generating compliance report: {str(e)}")
-   
-   import os
    EOF
    
-   # Deploy audit function
+   # Deploy audit function with 2nd gen runtime
    gcloud functions deploy compliance-audit-${RANDOM_SUFFIX} \
-       --runtime=python39 \
+       --gen2 \
+       --runtime=python312 \
        --trigger-http \
        --allow-unauthenticated \
        --entry-point=compliance_audit \
        --memory=1024MB \
        --timeout=540s \
        --set-env-vars="GCP_PROJECT=${PROJECT_ID},RANDOM_SUFFIX=${RANDOM_SUFFIX}" \
-       --max-instances=5
+       --max-instances=5 \
+       --region=${REGION}
    
    cd ..
    echo "✅ Compliance audit function deployed for detailed analysis"
    ```
 
-   The audit function provides comprehensive compliance analysis capabilities, including detailed PHI exposure assessment, access pattern analysis, and automated report generation. This dedicated processing ensures that high-risk events receive appropriate scrutiny while maintaining system performance.
+   The audit function provides comprehensive compliance analysis capabilities using the latest Python runtime and BigQuery client libraries. This dedicated processing ensures that high-risk events receive appropriate scrutiny while maintaining system performance.
 
 8. **Configure Cloud Monitoring for Compliance Alerting**:
 
@@ -686,7 +686,8 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
    gcloud alpha monitoring channels create \
        --display-name="Compliance Alerts" \
        --type=email \
-       --channel-labels=email_address="compliance@example.com"
+       --channel-labels=email_address="compliance@example.com" \
+       --description="Healthcare compliance monitoring alerts"
    
    # Get the notification channel ID
    CHANNEL_ID=$(gcloud alpha monitoring channels list \
@@ -713,6 +714,8 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
    
    echo "✅ Compliance monitoring and alerting configured"
    ```
+
+   The monitoring configuration creates automated alerts for high-risk compliance events, enabling rapid response to potential security incidents or compliance violations.
 
 ## Validation & Testing
 
@@ -748,7 +751,7 @@ echo "✅ Required APIs enabled for healthcare compliance workflow"
    # Check function deployment status
    gcloud functions describe ${FUNCTION_NAME} \
        --region=${REGION} \
-       --format="value(status)"
+       --format="value(state)"
    
    # Test Pub/Sub message processing
    gcloud pubsub topics publish ${TOPIC_NAME} \
@@ -844,7 +847,7 @@ The integration of Cloud Tasks with Cloud Functions creates a robust processing 
 
 The automated audit trail generation leverages Google Cloud's native logging and monitoring capabilities to provide comprehensive visibility into PHI access patterns. By integrating with BigQuery, the solution enables advanced analytics on compliance data, helping healthcare organizations identify trends, generate regulatory reports, and proactively address potential compliance issues. The [Google Cloud Security Best Practices](https://cloud.google.com/security/best-practices) framework ensures that the entire workflow maintains appropriate security controls throughout the data processing lifecycle.
 
-Event-driven architecture proves particularly effective for healthcare compliance because it enables real-time response to data access events while maintaining loose coupling between system components. This approach allows healthcare organizations to evolve their compliance requirements without restructuring the entire system, while the use of managed services reduces the operational overhead of maintaining compliance infrastructure.
+Event-driven architecture proves particularly effective for healthcare compliance because it enables real-time response to data access events while maintaining loose coupling between system components. This approach allows healthcare organizations to evolve their compliance requirements without restructuring the entire system, while the use of managed services reduces the operational overhead of maintaining compliance infrastructure. The solution follows Google Cloud's [Architecture Framework](https://cloud.google.com/architecture/framework) principles for operational excellence, security, reliability, performance efficiency, and cost optimization.
 
 > **Warning**: Always ensure proper Business Associate Agreement (BAA) execution with Google Cloud before processing real PHI data. Review [HIPAA compliance requirements](https://cloud.google.com/security/compliance/hipaa) and implement additional security controls as required by your organization's risk assessment and regulatory requirements.
 

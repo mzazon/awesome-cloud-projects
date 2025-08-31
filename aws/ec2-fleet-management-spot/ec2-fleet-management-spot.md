@@ -4,12 +4,12 @@ id: 4f2a8e6d
 category: compute
 difficulty: 300
 subject: aws
-services: ec2,spot,fleet,auto-scaling
+services: EC2, Spot Fleet, CloudWatch, IAM
 estimated-time: 60 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: compute,ec2,spot-instances,fleet-management,cost-optimization,auto-scaling
 recipe-generator-version: 1.3
@@ -154,9 +154,9 @@ echo "Subnet IDs: ${SUBNET_IDS}"
        --cidr 0.0.0.0/0
    
    echo "✅ Created security group: ${SECURITY_GROUP_ID}"
-   
-   The security group is now active and ready to secure your fleet instances with stateful firewall rules. This configuration enables essential management access through SSH and web traffic through HTTP, while maintaining security by restricting access to only required ports. The security group will be automatically applied to all instances launched by your fleet, ensuring consistent security posture across your distributed infrastructure.
    ```
+
+   The security group is now active and ready to secure your fleet instances with stateful firewall rules. This configuration enables essential management access through SSH and web traffic through HTTP, while maintaining security by restricting access to only required ports. The security group will be automatically applied to all instances launched by your fleet, ensuring consistent security posture across your distributed infrastructure.
 
 2. **Create key pair for EC2 instances**:
 
@@ -172,26 +172,27 @@ echo "Subnet IDs: ${SUBNET_IDS}"
    chmod 400 "${KEY_PAIR_NAME}.pem"
    
    echo "✅ Created key pair: ${KEY_PAIR_NAME}"
-   
-   The key pair is now ready for secure instance authentication, with the public key stored in AWS and the private key saved locally. This cryptographic foundation enables secure SSH access to any instance in your fleet without requiring password authentication. The private key file has been configured with restrictive permissions (400) to prevent unauthorized access, following security best practices for credential management.
    ```
 
-3. **Get latest Amazon Linux 2 AMI ID**:
+   The key pair is now ready for secure instance authentication, with the public key stored in AWS and the private key saved locally. This cryptographic foundation enables secure SSH access to any instance in your fleet without requiring password authentication. The private key file has been configured with restrictive permissions (400) to prevent unauthorized access, following security best practices for credential management.
 
-   Amazon Machine Images (AMIs) serve as the foundational templates that define the operating system, initial software configuration, and system settings for your EC2 instances. By selecting the latest Amazon Linux 2 AMI, you ensure your fleet instances launch with the most recent security patches, AWS CLI tools, and optimized configurations. This approach provides consistency across your fleet while leveraging AWS-optimized performance and security features built into Amazon Linux 2.
+3. **Get latest Amazon Linux 2023 AMI ID**:
+
+   Amazon Machine Images (AMIs) serve as the foundational templates that define the operating system, initial software configuration, and system settings for your EC2 instances. By selecting the latest Amazon Linux 2023 AMI, you ensure your fleet instances launch with the most recent security patches, AWS CLI tools, and optimized configurations. This approach provides consistency across your fleet while leveraging AWS-optimized performance and security features built into Amazon Linux 2023.
 
    ```bash
-   # Get latest Amazon Linux 2 AMI
+   # Get latest Amazon Linux 2023 AMI
    export AMI_ID=$(aws ec2 describe-images \
        --owners amazon \
-       --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" \
+       --filters "Name=name,Values=al2023-ami-*-x86_64" \
+             "Name=state,Values=available" \
        --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
        --output text)
    
    echo "✅ Using AMI: ${AMI_ID}"
-   
-   The AMI selection is now complete, providing your fleet with a standardized, secure operating system foundation. This latest Amazon Linux 2 AMI includes pre-installed AWS CLI tools, CloudWatch monitoring agents, and security-optimized configurations that reduce operational overhead. All instances launched in your fleet will use this consistent base image, ensuring predictable behavior and simplified management across your distributed infrastructure.
    ```
+
+   The AMI selection is now complete, providing your fleet with a standardized, secure operating system foundation. This latest Amazon Linux 2023 AMI includes pre-installed AWS CLI tools, CloudWatch monitoring agents, and security-optimized configurations that reduce operational overhead. All instances launched in your fleet will use this consistent base image, ensuring predictable behavior and simplified management across your distributed infrastructure.
 
 4. **Create launch template for fleet instances**:
 
@@ -201,8 +202,8 @@ echo "Subnet IDs: ${SUBNET_IDS}"
    # Create launch template with user data
    cat > fleet-user-data.sh << 'EOF'
 #!/bin/bash
-yum update -y
-yum install -y httpd
+dnf update -y
+dnf install -y httpd
 systemctl start httpd
 systemctl enable httpd
 echo "<h1>EC2 Fleet Instance</h1>" > /var/www/html/index.html
@@ -231,11 +232,11 @@ EOF
        --query 'LaunchTemplate.LaunchTemplateId' --output text)
    
    echo "✅ Created launch template: ${LAUNCH_TEMPLATE_ID}"
-   
-   The launch template is now ready to serve as the deployment blueprint for your fleet instances. This configuration template enables EC2 Fleet to launch instances with consistent settings while supporting advanced features like mixed instance types and capacity rebalancing. The user data script will automatically configure each instance with a simple web server, allowing you to easily verify fleet functionality and monitor instance distribution across Availability Zones.
-   
-   > **Tip**: Launch templates support mixed instance types and can include multiple network interfaces, making them more flexible than launch configurations. See [Launch Template Documentation](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/launch-instances-from-launch-template.html) for advanced configurations.
    ```
+
+   The launch template is now ready to serve as the deployment blueprint for your fleet instances. This configuration template enables EC2 Fleet to launch instances with consistent settings while supporting advanced features like mixed instance types and capacity rebalancing. The user data script will automatically configure each instance with a simple web server, allowing you to easily verify fleet functionality and monitor instance distribution across Availability Zones.
+
+   > **Tip**: Launch templates support mixed instance types and can include multiple network interfaces, making them more flexible than launch configurations. See [Launch Template Documentation](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/launch-instances-from-launch-template.html) for advanced configurations.
 
 5. **Create IAM role for Spot Fleet**:
 
@@ -270,15 +271,23 @@ EOF
        --policy-arn "arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetRequestRole"
    
    echo "✅ Created Spot Fleet IAM role: ${SPOT_FLEET_ROLE_ARN}"
-   
-   The IAM role is now configured and ready to enable Spot Fleet operations with appropriate permissions. This role allows the Spot Fleet service to launch, tag, and terminate instances while maintaining security through controlled access. The role operates independently of any instance-level permissions, creating a clear separation between service management and application functionality. For more details, see [Spot Fleet Permissions](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-fleet-prerequisites.html).
    ```
+
+   The IAM role is now configured and ready to enable Spot Fleet operations with appropriate permissions. This role allows the Spot Fleet service to launch, tag, and terminate instances while maintaining security through controlled access. The role operates independently of any instance-level permissions, creating a clear separation between service management and application functionality. For more details, see [Spot Fleet Permissions](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-fleet-prerequisites.html).
 
 6. **Create EC2 Fleet configuration**:
 
    EC2 Fleet configuration defines the intelligent orchestration strategy that balances cost optimization with availability requirements through mixed instance types and purchasing options. This configuration enables sophisticated allocation strategies like capacity-optimized for Spot instances and diversified for On-Demand instances, maximizing both cost savings and fault tolerance. The fleet automatically handles capacity rebalancing, instance type diversification, and seamless fallback between Spot and On-Demand instances to maintain your desired capacity while minimizing costs.
 
    ```bash
+   # Get availability zones for subnets
+   SUBNET_1=$(echo ${SUBNET_IDS} | cut -d' ' -f1)
+   SUBNET_2=$(echo ${SUBNET_IDS} | cut -d' ' -f2)
+   AZ_1=$(aws ec2 describe-subnets --subnet-ids ${SUBNET_1} \
+       --query 'Subnets[0].AvailabilityZone' --output text)
+   AZ_2=$(aws ec2 describe-subnets --subnet-ids ${SUBNET_2} \
+       --query 'Subnets[0].AvailabilityZone' --output text)
+   
    # Create fleet configuration file
    cat > ec2-fleet-config.json << EOF
 {
@@ -291,15 +300,15 @@ EOF
             "Overrides": [
                 {
                     "InstanceType": "t3.micro",
-                    "AvailabilityZone": "$(echo ${SUBNET_IDS} | cut -d' ' -f1 | xargs aws ec2 describe-subnets --subnet-ids | jq -r '.Subnets[0].AvailabilityZone')"
+                    "SubnetId": "${SUBNET_1}"
                 },
                 {
                     "InstanceType": "t3.small",
-                    "AvailabilityZone": "$(echo ${SUBNET_IDS} | cut -d' ' -f2 | xargs aws ec2 describe-subnets --subnet-ids | jq -r '.Subnets[0].AvailabilityZone')"
+                    "SubnetId": "${SUBNET_2}"
                 },
                 {
                     "InstanceType": "t3.nano",
-                    "AvailabilityZone": "$(echo ${SUBNET_IDS} | cut -d' ' -f1 | xargs aws ec2 describe-subnets --subnet-ids | jq -r '.Subnets[0].AvailabilityZone')"
+                    "SubnetId": "${SUBNET_1}"
                 }
             ]
         }
@@ -334,11 +343,11 @@ EOF
 EOF
    
    echo "✅ Created EC2 Fleet configuration"
-   
-   The fleet configuration is now ready to orchestrate your mixed-instance deployment with intelligent allocation strategies. This configuration combines capacity-optimized Spot allocation to minimize interruptions with diversified On-Demand allocation to maximize fault tolerance. The maintain fleet type ensures continuous capacity management, automatically replacing terminated instances and rebalancing across Availability Zones for optimal availability and cost efficiency. Learn more about configuration options in the [EC2 Fleet Documentation](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/create-ec2-fleet.html).
-   
-   > **Warning**: Setting excessive target capacity can result in unexpected costs. Always monitor your fleet's actual capacity and adjust limits as needed. Use AWS Budgets to set spending alerts for EC2 resources.
    ```
+
+   The fleet configuration is now ready to orchestrate your mixed-instance deployment with intelligent allocation strategies. This configuration combines capacity-optimized Spot allocation to minimize interruptions with diversified On-Demand allocation to maximize fault tolerance. The maintain fleet type ensures continuous capacity management, automatically replacing terminated instances and rebalancing across Availability Zones for optimal availability and cost efficiency. Learn more about configuration options in the [EC2 Fleet Documentation](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/create-ec2-fleet.html).
+
+   > **Warning**: Setting excessive target capacity can result in unexpected costs. Always monitor your fleet's actual capacity and adjust limits as needed. Use AWS Budgets to set spending alerts for EC2 resources.
 
 7. **Launch EC2 Fleet**:
 
@@ -354,12 +363,12 @@ EOF
    
    # Wait for fleet to be active
    echo "Waiting for fleet to become active..."
-   aws ec2 wait fleet-active --fleet-ids "${FLEET_ID}"
+   sleep 30
    
-   echo "✅ EC2 Fleet is now active"
-   
-   Your EC2 Fleet is now operational and actively managing instance capacity across multiple Availability Zones and instance types. The fleet transitions through states (submitted → modifying → active) as it evaluates capacity requirements and launches instances according to your configuration. With the fleet active, AWS automatically monitors Spot pricing, handles instance interruptions, and maintains your desired capacity through intelligent rebalancing and replacement strategies.
+   echo "✅ EC2 Fleet is now operational"
    ```
+
+   Your EC2 Fleet is now operational and actively managing instance capacity across multiple Availability Zones and instance types. The fleet transitions through states (submitted → modifying → active) as it evaluates capacity requirements and launches instances according to your configuration. With the fleet active, AWS automatically monitors Spot pricing, handles instance interruptions, and maintains your desired capacity through intelligent rebalancing and replacement strategies.
 
 8. **Create Spot Fleet for comparison**:
 
@@ -383,6 +392,7 @@ EOF
                     "GroupId": "${SECURITY_GROUP_ID}"
                 }
             ],
+            "SubnetId": "${SUBNET_1}",
             "UserData": "$(base64 -w 0 fleet-user-data.sh)"
         },
         {
@@ -394,6 +404,7 @@ EOF
                     "GroupId": "${SECURITY_GROUP_ID}"
                 }
             ],
+            "SubnetId": "${SUBNET_2}",
             "UserData": "$(base64 -w 0 fleet-user-data.sh)"
         }
     ],
@@ -408,9 +419,9 @@ EOF
        --query 'SpotFleetRequestId' --output text)
    
    echo "✅ Created Spot Fleet: ${SPOT_FLEET_ID}"
-   
-   The Spot Fleet is now operational, providing a comparison point to understand the differences between legacy and modern fleet management approaches. While Spot Fleet focuses on Spot-only deployments with simpler configuration, EC2 Fleet offers enhanced capabilities including mixed purchasing options, advanced allocation strategies, and better integration with AWS services. This side-by-side deployment demonstrates the evolution of AWS fleet management and the benefits of adopting newer services for production workloads.
    ```
+
+   The Spot Fleet is now operational, providing a comparison point to understand the differences between legacy and modern fleet management approaches. While Spot Fleet focuses on Spot-only deployments with simpler configuration, EC2 Fleet offers enhanced capabilities including mixed purchasing options, advanced allocation strategies, and better integration with AWS services. This side-by-side deployment demonstrates the evolution of AWS fleet management and the benefits of adopting newer services for production workloads.
 
 9. **Monitor fleet status and instances**:
 
@@ -425,7 +436,7 @@ EOF
    # Get fleet instances
    aws ec2 describe-fleet-instances \
        --fleet-id "${FLEET_ID}" \
-       --query 'ActiveInstances[*].[InstanceId,InstanceType,AvailabilityZone,Lifecycle]' \
+       --query 'ActiveInstances[*].[InstanceId,InstanceType,SubnetId,Lifecycle]' \
        --output table
    
    # Check Spot Fleet status
@@ -435,9 +446,9 @@ EOF
        --output text
    
    echo "✅ Fleet monitoring commands executed"
-   
-   Your fleet monitoring is now active, providing real-time visibility into instance distribution, lifecycle states, and operational health. These commands reveal how your fleet intelligently distributes instances across multiple Availability Zones and instance types, optimizing both cost and availability. Regular monitoring enables you to identify capacity trends, cost optimization opportunities, and potential performance issues before they impact your applications.
    ```
+
+   Your fleet monitoring is now active, providing real-time visibility into instance distribution, lifecycle states, and operational health. These commands reveal how your fleet intelligently distributes instances across multiple Availability Zones and instance types, optimizing both cost and availability. Regular monitoring enables you to identify capacity trends, cost optimization opportunities, and potential performance issues before they impact your applications.
 
 10. **Set up CloudWatch monitoring**:
 
@@ -482,9 +493,9 @@ EOF
         --dashboard-body file://dashboard-config.json
     
     echo "✅ Created CloudWatch dashboard for fleet monitoring"
-    
-    Your CloudWatch dashboard is now operational, providing real-time visibility into fleet performance and cost metrics. This centralized monitoring enables you to track CPU utilization across instance types, monitor Spot instance availability, and identify optimization opportunities. The dashboard serves as the foundation for automated alerting, capacity planning, and performance optimization, ensuring your fleet operates efficiently while maintaining cost-effectiveness.
     ```
+
+    Your CloudWatch dashboard is now operational, providing real-time visibility into fleet performance and cost metrics. This centralized monitoring enables you to track CPU utilization across instance types, monitor Spot instance availability, and identify optimization opportunities. The dashboard serves as the foundation for automated alerting, capacity planning, and performance optimization, ensuring your fleet operates efficiently while maintaining cost-effectiveness.
 
 ## Validation & Testing
 
@@ -494,11 +505,11 @@ EOF
    # Check EC2 Fleet instances
    aws ec2 describe-fleet-instances \
        --fleet-id "${FLEET_ID}" \
-       --query 'ActiveInstances[*].[InstanceId,InstanceType,AvailabilityZone,Lifecycle]' \
+       --query 'ActiveInstances[*].[InstanceId,InstanceType,SubnetId,Lifecycle]' \
        --output table
    ```
 
-   Expected output: Table showing 6 instances with mix of spot and on-demand lifecycles across different AZs.
+   Expected output: Table showing 6 instances with mix of spot and on-demand lifecycles across different subnets.
 
 2. **Test web application on fleet instances**:
 
@@ -507,8 +518,11 @@ EOF
    INSTANCE_IPS=$(aws ec2 describe-fleet-instances \
        --fleet-id "${FLEET_ID}" \
        --query 'ActiveInstances[*].InstanceId' \
-       --output text | xargs aws ec2 describe-instances \
-       --instance-ids | jq -r '.Reservations[].Instances[].PublicIpAddress')
+       --output text | tr '\t' '\n' | \
+       xargs -I {} aws ec2 describe-instances \
+       --instance-ids {} \
+       --query 'Reservations[].Instances[].PublicIpAddress' \
+       --output text)
    
    # Test HTTP connectivity
    for IP in ${INSTANCE_IPS}; do
@@ -545,7 +559,8 @@ EOF
    sleep 60
    aws ec2 describe-fleet-instances \
        --fleet-id "${FLEET_ID}" \
-       --query 'length(ActiveInstances)'
+       --query 'length(ActiveInstances)' \
+       --output text
    ```
 
 ## Cleanup
@@ -632,11 +647,13 @@ EOF
 
 EC2 Fleet management provides significant advantages over traditional single-instance deployment models by intelligently balancing cost optimization with availability requirements. The solution leverages both EC2 Fleet and Spot Fleet capabilities to achieve up to 90% cost savings compared to On-Demand only deployments while maintaining application resilience through diversified instance types and Availability Zone distribution. For detailed information on when and how to use Spot instances effectively, see the [AWS Spot Instance Best Practices Guide](https://docs.aws.amazon.com/whitepapers/latest/cost-optimization-leveraging-ec2-spot-instances/when-to-use-spot-instances.html).
 
-The key architectural decision involves choosing between EC2 Fleet and Spot Fleet based on specific use case requirements. EC2 Fleet offers more advanced features like capacity rebalancing, attribute-based instance type selection, and better integration with On-Demand Capacity Reservations. Spot Fleet provides simpler configuration for pure Spot workloads but lacks some advanced fleet management capabilities. For production workloads requiring high availability, EC2 Fleet's mixed instance approach provides better fault tolerance.
+The key architectural decision involves choosing between EC2 Fleet and Spot Fleet based on specific use case requirements. EC2 Fleet offers more advanced features like capacity rebalancing, attribute-based instance type selection, and better integration with On-Demand Capacity Reservations. Spot Fleet provides simpler configuration for pure Spot workloads but lacks some advanced fleet management capabilities. For production workloads requiring high availability, EC2 Fleet's mixed instance approach provides better fault tolerance through diversified allocation strategies and seamless fallback to On-Demand instances.
 
 Cost optimization occurs through multiple mechanisms: Spot instances can reduce costs by up to 90% compared to On-Demand pricing, diversified allocation strategies maximize access to available Spot capacity across multiple instance types and AZs, and intelligent capacity rebalancing minimizes interruption impact. The capacity-optimized allocation strategy selects instances from pools with the lowest probability of interruption, while the diversified strategy for On-Demand instances spreads capacity across multiple instance types to reduce single-point-of-failure risks. Learn more about Spot instance pricing and allocation strategies in the [Spot Instance Cost Optimization Guide](https://docs.aws.amazon.com/whitepapers/latest/cost-optimization-leveraging-ec2-spot-instances/how-spot-instances-work.html).
 
-Performance and scalability considerations include instance type selection based on workload requirements, proper health check configuration to enable automatic replacement of failed instances, and monitoring setup to track fleet performance and cost metrics. The solution scales automatically based on target capacity specifications and can be integrated with Application Load Balancers for seamless traffic distribution across fleet instances.
+Performance and scalability considerations include instance type selection based on workload requirements, proper health check configuration to enable automatic replacement of failed instances, and monitoring setup to track fleet performance and cost metrics. The solution scales automatically based on target capacity specifications and can be integrated with Application Load Balancers for seamless traffic distribution across fleet instances. Following AWS Well-Architected Framework principles ensures operational excellence, security, reliability, performance efficiency, and cost optimization throughout the fleet lifecycle.
+
+> **Tip**: Use AWS Compute Optimizer to analyze your instance usage patterns and receive recommendations for optimal instance types and sizes, further enhancing cost optimization and performance.
 
 ## Challenge
 

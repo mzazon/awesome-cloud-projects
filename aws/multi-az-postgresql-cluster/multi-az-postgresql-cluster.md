@@ -6,16 +6,16 @@ difficulty: 300
 subject: aws
 services: rds,cloudwatch,sns,iam
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database,rds,high-availability,postgresql,multi-az
 recipe-generator-version: 1.3
 ---
 
-# Multi-AZ PostgreSQL Cluster
+# Multi-AZ PostgreSQL Cluster with RDS
 
 ## Problem
 
@@ -34,6 +34,7 @@ graph TB
             subgraph "Private Subnets"
                 PRIM[Primary PostgreSQL<br/>Multi-AZ]
                 STANDBY[Standby Instance<br/>us-east-1b]
+                PROXY[RDS Proxy<br/>Connection Pooling]
             end
             subgraph "Public Subnets"
                 APP[Application Tier]
@@ -63,7 +64,8 @@ graph TB
         end
     end
     
-    APP-->PRIM
+    APP-->PROXY
+    PROXY-->PRIM
     APP-->READ1
     APP-->READ2
     PRIM-.->STANDBY
@@ -77,17 +79,18 @@ graph TB
     style PRIM fill:#FF9900
     style STANDBY fill:#FFA500
     style CROSS fill:#87CEEB
+    style PROXY fill:#4CAF50
     style CW fill:#FF4B4B
     style SNS fill:#FF4B4B
 ```
 
 ## Prerequisites
 
-1. AWS account with appropriate IAM permissions for RDS, CloudWatch, SNS, and IAM
+1. AWS account with appropriate IAM permissions for RDS, CloudWatch, SNS, IAM, and Secrets Manager
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Advanced understanding of PostgreSQL administration and high availability concepts
 4. Knowledge of AWS networking, security groups, and VPC configuration
-5. Estimated cost: $200-500/month for production-grade cluster (depends on instance types and storage)
+5. Estimated cost: $300-600/month for production-grade cluster (depends on instance types and storage)
 
 > **Note**: This recipe creates production-grade resources that incur significant costs. Monitor your usage and clean up resources when testing is complete.
 
@@ -111,7 +114,6 @@ export MASTER_USERNAME="dbadmin"
 export MASTER_PASSWORD="SecurePassword123!"
 export SUBNET_GROUP_NAME="postgresql-subnet-group-${RANDOM_SUFFIX}"
 export PARAMETER_GROUP_NAME="postgresql-params-${RANDOM_SUFFIX}"
-export OPTION_GROUP_NAME="postgresql-options-${RANDOM_SUFFIX}"
 export SECURITY_GROUP_NAME="postgresql-sg-${RANDOM_SUFFIX}"
 export SNS_TOPIC_NAME="postgresql-alerts-${RANDOM_SUFFIX}"
 
@@ -124,6 +126,27 @@ export VPC_ID=$(aws ec2 describe-vpcs \
 export SUBNET_IDS=$(aws ec2 describe-subnets \
     --filters "Name=vpc-id,Values=${VPC_ID}" \
     --query 'Subnets[0:3].SubnetId' --output text)
+
+# Create RDS monitoring role if it doesn't exist
+aws iam create-role --role-name rds-monitoring-role \
+    --assume-role-policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "",
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": "monitoring.rds.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+            }
+        ]
+    }' 2>/dev/null || echo "Role already exists"
+
+aws iam attach-role-policy \
+    --role-name rds-monitoring-role \
+    --policy-arn arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole \
+    2>/dev/null || echo "Policy already attached"
 
 echo "✅ Environment variables configured successfully"
 echo "VPC ID: ${VPC_ID}"
@@ -167,7 +190,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
        --port 5432 \
        --source-group "${SG_ID}"
    
-   # Allow access from application subnets
+   # Allow access from application subnets (adjust CIDR as needed)
    aws ec2 authorize-security-group-ingress \
        --group-id "${SG_ID}" \
        --protocol tcp \
@@ -188,7 +211,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
    # Create parameter group for PostgreSQL optimization
    aws rds create-db-parameter-group \
        --db-parameter-group-name "${PARAMETER_GROUP_NAME}" \
-       --db-parameter-group-family "postgres15" \
+       --db-parameter-group-family "postgres16" \
        --description "Optimized PostgreSQL parameters for HA"
    
    # Configure performance and logging parameters
@@ -238,7 +261,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
        --db-instance-identifier "${CLUSTER_NAME}-primary" \
        --db-instance-class "db.r6g.large" \
        --engine "postgres" \
-       --engine-version "15.4" \
+       --engine-version "16.1" \
        --master-username "${MASTER_USERNAME}" \
        --master-user-password "${MASTER_PASSWORD}" \
        --allocated-storage 200 \
@@ -257,7 +280,8 @@ echo "Subnet IDs: ${SUBNET_IDS}"
        --monitoring-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/rds-monitoring-role" \
        --enable-cloudwatch-logs-exports postgresql \
        --deletion-protection \
-       --copy-tags-to-snapshot
+       --copy-tags-to-snapshot \
+       --db-name "${DB_NAME}"
    
    echo "✅ Primary PostgreSQL instance creation initiated"
    
@@ -400,16 +424,18 @@ echo "Subnet IDs: ${SUBNET_IDS}"
 
     ```bash
     # Create manual snapshot for additional backup
+    SNAPSHOT_ID="${CLUSTER_NAME}-initial-snapshot-$(date +%Y%m%d)"
     aws rds create-db-snapshot \
         --db-instance-identifier "${CLUSTER_NAME}-primary" \
-        --db-snapshot-identifier "${CLUSTER_NAME}-initial-snapshot-$(date +%Y%m%d)"
+        --db-snapshot-identifier "${SNAPSHOT_ID}"
     
     echo "✅ Manual snapshot creation initiated"
     
     # Wait for snapshot to complete
     aws rds wait db-snapshot-completed \
-        --db-snapshot-identifier "${CLUSTER_NAME}-initial-snapshot-$(date +%Y%m%d)"
+        --db-snapshot-identifier "${SNAPSHOT_ID}"
     
+    export SNAPSHOT_ID
     echo "✅ Manual snapshot completed successfully"
     ```
 
@@ -482,6 +508,12 @@ echo "Subnet IDs: ${SUBNET_IDS}"
         --max-connections-percent 100 \
         --max-idle-connections-percent 50
     
+    # Register primary instance with proxy
+    aws rds register-db-proxy-targets \
+        --db-proxy-name "${CLUSTER_NAME}-proxy" \
+        --db-instance-identifiers "${CLUSTER_NAME}-primary"
+    
+    export SECRET_ARN
     echo "✅ RDS Proxy created for connection pooling"
     ```
 
@@ -508,11 +540,14 @@ echo "Subnet IDs: ${SUBNET_IDS}"
        --db-instance-identifier "${CLUSTER_NAME}-primary" \
        --query 'DBInstances[0].Endpoint.Address' --output text)
    
-   # Test connection (requires postgresql-client)
-   # psql -h ${PRIMARY_ENDPOINT} -U ${MASTER_USERNAME} -d ${DB_NAME} -c "SELECT version();"
+   # Get RDS Proxy endpoint
+   PROXY_ENDPOINT=$(aws rds describe-db-proxies \
+       --db-proxy-name "${CLUSTER_NAME}-proxy" \
+       --query 'DBProxies[0].Endpoint' --output text)
    
    echo "Primary endpoint: ${PRIMARY_ENDPOINT}"
-   echo "Test connection using: psql -h ${PRIMARY_ENDPOINT} -U ${MASTER_USERNAME} -d ${DB_NAME}"
+   echo "Proxy endpoint: ${PROXY_ENDPOINT}"
+   echo "Test connection using: psql -h ${PROXY_ENDPOINT} -U ${MASTER_USERNAME} -d ${DB_NAME}"
    ```
 
 3. **Verify Read Replica Status**:
@@ -544,7 +579,8 @@ echo "Subnet IDs: ${SUBNET_IDS}"
    aws rds describe-events \
        --source-identifier "${CLUSTER_NAME}-primary" \
        --source-type db-instance \
-       --start-time "$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S)"
+       --start-time "$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S)" \
+       --query 'Events[*].{Date:Date,Message:Message}'
    
    echo "✅ Failover test initiated - monitor CloudWatch and SNS notifications"
    ```
@@ -568,6 +604,11 @@ echo "Subnet IDs: ${SUBNET_IDS}"
 1. **Delete RDS Proxy and Associated Resources**:
 
    ```bash
+   # Deregister targets from proxy
+   aws rds deregister-db-proxy-targets \
+       --db-proxy-name "${CLUSTER_NAME}-proxy" \
+       --db-instance-identifiers "${CLUSTER_NAME}-primary"
+   
    # Delete RDS Proxy
    aws rds delete-db-proxy \
        --db-proxy-name "${CLUSTER_NAME}-proxy"
@@ -681,7 +722,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
    
    # Delete manual snapshots
    aws rds delete-db-snapshot \
-       --db-snapshot-identifier "${CLUSTER_NAME}-initial-snapshot-$(date +%Y%m%d)"
+       --db-snapshot-identifier "${SNAPSHOT_ID}"
    
    echo "✅ All supporting resources deleted"
    ```
@@ -690,24 +731,26 @@ echo "Subnet IDs: ${SUBNET_IDS}"
 
 This recipe demonstrates a comprehensive approach to building highly available PostgreSQL clusters using Amazon RDS. The architecture incorporates multiple layers of redundancy and disaster recovery capabilities that are essential for production database workloads.
 
-The Multi-AZ deployment provides automatic failover capabilities with synchronous replication to a standby instance in a different Availability Zone. This ensures that database operations can continue with minimal interruption during planned maintenance or unexpected failures. The failover process is transparent to applications, typically completing within 1-2 minutes.
+The Multi-AZ deployment provides automatic failover capabilities with synchronous replication to a standby instance in a different Availability Zone. This ensures that database operations can continue with minimal interruption during planned maintenance or unexpected failures. The failover process is transparent to applications, typically completing within 60-120 seconds according to the [Amazon RDS Multi-AZ Documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.html).
 
-Read replicas serve dual purposes in this architecture: scaling read workloads and providing additional disaster recovery options. The cross-region read replica in us-west-2 ensures that critical data remains accessible even during regional outages. With proper application design, this replica can be promoted to a standalone instance for complete disaster recovery scenarios.
+Read replicas serve dual purposes in this architecture: scaling read workloads and providing additional disaster recovery options. The cross-region read replica in us-west-2 ensures that critical data remains accessible even during regional outages. With proper application design, this replica can be promoted to a standalone instance for complete disaster recovery scenarios as detailed in the [RDS Cross-Region Read Replicas guide](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReadRepl.XRgn.html).
 
-The automated backup strategy includes both point-in-time recovery with 35-day retention and cross-region backup replication. This comprehensive backup approach ensures that data can be recovered from various failure scenarios, including accidental data deletion, corruption, or complete regional failures. The combination of automated and manual snapshots provides flexibility for different recovery requirements.
+The automated backup strategy includes both point-in-time recovery with 35-day retention and cross-region backup replication. This comprehensive backup approach ensures that data can be recovered from various failure scenarios, including accidental data deletion, corruption, or complete regional failures. The combination of automated and manual snapshots provides flexibility for different recovery requirements as outlined in the [RDS Backup Documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReplicateBackups.html).
+
+RDS Proxy adds an intelligent connection pooling layer that dramatically improves connection efficiency and provides enhanced failover capabilities. This is particularly valuable for serverless applications and high-concurrency workloads where connection management can become a bottleneck. Enhanced Monitoring provides real-time OS-level metrics that complement CloudWatch metrics for comprehensive observability.
 
 > **Note**: RDS Multi-AZ deployments provide synchronous replication with automatic failover typically completing within 60-120 seconds. For more details on failover mechanics, see the [Amazon RDS Multi-AZ Documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.html).
 
-> **Tip**: Use RDS Proxy to implement connection pooling and reduce database connection overhead, especially important for serverless and highly concurrent applications.
+> **Tip**: Use RDS Proxy to implement connection pooling and reduce database connection overhead, especially important for serverless and highly concurrent applications. See the [RDS Proxy Documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.html) for implementation details.
 
-Performance monitoring through CloudWatch metrics and Performance Insights provides visibility into database performance, query patterns, and resource utilization. The configured alarms proactively notify administrators of potential issues before they impact application performance.
+Performance monitoring through CloudWatch metrics and Performance Insights provides visibility into database performance, query patterns, and resource utilization. The configured alarms proactively notify administrators of potential issues before they impact application performance, following AWS Well-Architected Framework operational excellence principles.
 
 ## Challenge
 
 Extend this high-availability PostgreSQL solution by implementing these enhancements:
 
 1. **Implement Blue-Green Deployments**: Create a blue-green deployment strategy for zero-downtime PostgreSQL upgrades using RDS Blue/Green deployments feature
-2. **Add Connection Pooling**: Implement PgBouncer or connection pooling at the application level to optimize database connection management
+2. **Add Connection Pooling**: Implement PgBouncer or connection pooling at the application level to optimize database connection management beyond RDS Proxy
 3. **Implement Advanced Monitoring**: Set up custom CloudWatch dashboards and integrate with third-party monitoring tools like Datadog or New Relic for comprehensive observability
 4. **Add Automated Disaster Recovery Testing**: Create Lambda functions that periodically test disaster recovery procedures by promoting read replicas and validating application connectivity
 5. **Implement Database-Level Security**: Configure SSL/TLS encryption, IAM database authentication, and fine-grained access controls using PostgreSQL role-based security

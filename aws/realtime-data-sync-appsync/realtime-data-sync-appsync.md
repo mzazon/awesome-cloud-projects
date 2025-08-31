@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: AppSync, DynamoDB, Lambda, CloudWatch
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: real-time, graphql, data-sync, serverless, websockets
 recipe-generator-version: 1.3
@@ -167,6 +167,9 @@ echo "✅ Environment configured with unique resource names"
        --role-name ${LAMBDA_FUNCTION_NAME}-Role \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaDynamoDBExecutionRole
    
+   # Wait for role propagation
+   sleep 10
+   
    # Get role ARN for Lambda function creation
    export LAMBDA_ROLE_ARN=$(aws iam get-role \
        --role-name ${LAMBDA_FUNCTION_NAME}-Role \
@@ -236,7 +239,7 @@ EOF
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.11 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda_function.zip \
@@ -304,7 +307,8 @@ EOF
    # Create API key for authentication
    aws appsync create-api-key \
        --api-id ${APPSYNC_API_ID} \
-       --description "Development API key for real-time sync"
+       --description "Development API key for real-time sync" \
+       --expires $(date -d "+1 month" +%s)
    
    export APPSYNC_API_KEY=$(aws appsync list-api-keys \
        --api-id ${APPSYNC_API_ID} \
@@ -433,6 +437,9 @@ EOF
          ]
        }'
    
+   # Wait for role propagation
+   sleep 10
+   
    # Get role ARN for data source creation
    export APPSYNC_ROLE_ARN=$(aws iam get-role \
        --role-name AppSyncDynamoDBRole-${RANDOM_SUFFIX} \
@@ -508,6 +515,26 @@ EOF
        --data-source-name DynamoDBDataSource \
        --request-mapping-template file://get-resolver-request.vtl \
        --response-mapping-template file://get-resolver-response.vtl
+   
+   # Create list query resolver
+   cat > list-resolver-request.vtl << 'EOF'
+{
+    "version": "2017-02-28",
+    "operation": "Scan"
+}
+EOF
+   
+   cat > list-resolver-response.vtl << 'EOF'
+$util.toJson($ctx.result.items)
+EOF
+   
+   aws appsync create-resolver \
+       --api-id ${APPSYNC_API_ID} \
+       --type-name Query \
+       --field-name listDataItems \
+       --data-source-name DynamoDBDataSource \
+       --request-mapping-template file://list-resolver-request.vtl \
+       --response-mapping-template file://list-resolver-response.vtl
    
    echo "✅ GraphQL resolvers created for CRUD operations"
    ```
@@ -587,6 +614,11 @@ EOF
 4. **Test GraphQL mutation and real-time subscription**:
 
    ```bash
+   # Get API key for authentication
+   export APPSYNC_API_KEY=$(aws appsync list-api-keys \
+       --api-id ${APPSYNC_API_ID} \
+       --query 'apiKeys[0].id' --output text)
+   
    # Create sample GraphQL mutation
    cat > mutation.json << 'EOF'
 {
@@ -603,12 +635,32 @@ EOF
    # Execute mutation via AppSync
    curl -X POST \
        -H "Content-Type: application/json" \
-       -H "x-api-key: $(aws appsync list-api-keys --api-id ${APPSYNC_API_ID} --query 'apiKeys[0].id' --output text)" \
+       -H "x-api-key: ${APPSYNC_API_KEY}" \
        -d @mutation.json \
        ${APPSYNC_API_URL}
    ```
 
    Expected output: Successful mutation response with generated item data.
+
+5. **Test data listing functionality**:
+
+   ```bash
+   # Create GraphQL query to list all items
+   cat > list-query.json << 'EOF'
+{
+  "query": "query ListItems { listDataItems { id title content timestamp version } }"
+}
+EOF
+   
+   # Execute list query
+   curl -X POST \
+       -H "Content-Type: application/json" \
+       -H "x-api-key: ${APPSYNC_API_KEY}" \
+       -d @list-query.json \
+       ${APPSYNC_API_URL}
+   ```
+
+   Expected output: Array of data items including the previously created test item.
 
 ## Cleanup
 
@@ -671,7 +723,7 @@ EOF
    rm -f lambda_function.py lambda_function.zip
    rm -f schema.graphql
    rm -f *-resolver-*.vtl
-   rm -f test-event.json mutation.json response.json
+   rm -f test-event.json mutation.json list-query.json response.json
    
    echo "✅ Local files cleaned up"
    ```

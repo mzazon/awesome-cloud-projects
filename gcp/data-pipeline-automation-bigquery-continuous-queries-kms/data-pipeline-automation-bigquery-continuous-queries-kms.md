@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: BigQuery, Cloud KMS, Cloud Scheduler, Cloud Logging
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-pipeline, encryption, automation, streaming, analytics, security
 recipe-generator-version: 1.3
@@ -123,6 +123,7 @@ gcloud services enable cloudscheduler.googleapis.com
 gcloud services enable logging.googleapis.com
 gcloud services enable pubsub.googleapis.com
 gcloud services enable storage.googleapis.com
+gcloud services enable cloudfunctions.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ All required APIs enabled"
@@ -248,51 +249,51 @@ echo "✅ All required APIs enabled"
    BigQuery Continuous Queries enable real-time data processing by continuously monitoring for new data and automatically executing SQL transformations. This creates an always-on analytics engine that can enrich data, detect anomalies, and trigger downstream actions without manual intervention.
 
    ```bash
-   # Create the continuous query SQL
+   # Create the continuous query SQL with APPENDS function
    cat > continuous_query.sql << 'EOF'
    EXPORT DATA
    OPTIONS (
-     uri = 'gs://BUCKET_NAME/exports/processed_events_*.json',
-     format = 'JSON',
-     overwrite = false
-   ) AS
+     format = 'CLOUD_PUBSUB',
+     uri = 'https://pubsub.googleapis.com/projects/PROJECT_ID/topics/TOPIC_NAME'
+   ) AS (
    SELECT 
      event_id,
      CURRENT_TIMESTAMP() as processed_timestamp,
      user_id,
      event_type,
-     JSON_OBJECT(
-       'original_metadata', metadata,
-       'processing_time', CURRENT_TIMESTAMP(),
-       'data_source', 'continuous_query'
-     ) as enriched_data,
+     TO_JSON_STRING(STRUCT(
+       JSON_EXTRACT_SCALAR(metadata, '$.original_metadata') AS original_metadata,
+       CURRENT_TIMESTAMP() AS processing_time,
+       'continuous_query' AS data_source
+     )) as message,
      CASE 
        WHEN event_type = 'login_failure' THEN 0.8
        WHEN event_type = 'unusual_activity' THEN 0.9
        WHEN event_type = 'data_access' THEN 0.3
        ELSE 0.1
      END as risk_score
-   FROM `PROJECT_ID.DATASET_ID.raw_events`
+   FROM APPENDS(TABLE `PROJECT_ID.DATASET_ID.raw_events`,
+                CURRENT_TIMESTAMP() - INTERVAL 1 HOUR)
    WHERE timestamp >= CURRENT_TIMESTAMP() - INTERVAL 1 HOUR
-   EOF
+   )
+EOF
    
    # Replace placeholders in the query
-   sed -i "s/BUCKET_NAME/${BUCKET_NAME}/g" continuous_query.sql
    sed -i "s/PROJECT_ID/${PROJECT_ID}/g" continuous_query.sql
    sed -i "s/DATASET_ID/${DATASET_ID}/g" continuous_query.sql
+   sed -i "s/TOPIC_NAME/${PUBSUB_TOPIC}/g" continuous_query.sql
    
-   # Create and start the continuous query
+   # Create and start the continuous query using correct syntax
    bq query \
        --use_legacy_sql=false \
-       --destination_table=${PROJECT_ID}:${DATASET_ID}.processed_events \
-       --job_id=${CONTINUOUS_QUERY_JOB} \
        --continuous=true \
+       --job_id=${CONTINUOUS_QUERY_JOB} \
        "$(cat continuous_query.sql)"
    
    echo "✅ Continuous query deployed and processing real-time data"
    ```
 
-   The continuous query is now actively monitoring for new data and automatically processing it in real-time. This creates an intelligent data pipeline that enriches events with risk scores, timestamps processing metadata, and exports results for downstream consumption while maintaining sub-second latency.
+   The continuous query is now actively monitoring for new data and automatically processing it in real-time using the APPENDS function. This creates an intelligent data pipeline that enriches events with risk scores, exports results to Pub/Sub for downstream consumption, while maintaining sub-second latency.
 
 6. **Configure Cloud Scheduler for Automated Security Operations**:
 
@@ -317,15 +318,20 @@ def security_audit(request):
     logger = logging_client.logger("security-audit")
     
     try:
+        # Get request data
+        request_json = request.get_json(silent=True)
+        if not request_json:
+            return json.dumps({'error': 'No JSON payload provided'}), 400
+        
         # Audit KMS key status
         key_ring_path = kms_client.key_ring_path(
-            request.json.get('project_id'),
-            request.json.get('location'),
-            request.json.get('keyring_name')
+            request_json.get('project_id'),
+            request_json.get('location'),
+            request_json.get('keyring_name')
         )
         
         audit_results = {
-            'timestamp': request.json.get('timestamp'),
+            'timestamp': request_json.get('timestamp'),
             'audit_type': 'automated_security_check',
             'key_ring_status': 'active',
             'encryption_status': 'enabled',
@@ -346,9 +352,10 @@ google-cloud-kms==2.*
 google-cloud-logging==3.*
 EOF
    
-   # Deploy the Cloud Function
+   # Deploy the Cloud Function using 2nd generation syntax
    cd security-audit-function
    gcloud functions deploy security-audit \
+       --region=${REGION} \
        --runtime=python311 \
        --trigger=http \
        --entry-point=security_audit \
@@ -359,6 +366,7 @@ EOF
    
    # Create scheduled job for daily security audits
    gcloud scheduler jobs create http security-audit-daily \
+       --location=${REGION} \
        --schedule="0 2 * * *" \
        --uri="https://${REGION}-${PROJECT_ID}.cloudfunctions.net/security-audit" \
        --http-method=POST \
@@ -391,12 +399,20 @@ def encrypt_sensitive_data(request):
     
     try:
         data = request.get_json()
+        if not data:
+            return json.dumps({'error': 'No JSON payload provided'}), 400
+            
         key_name = data.get('key_name')
-        plaintext = data.get('plaintext').encode('utf-8')
+        plaintext = data.get('plaintext')
+        
+        if not key_name or not plaintext:
+            return json.dumps({'error': 'Missing key_name or plaintext'}), 400
+            
+        plaintext_bytes = plaintext.encode('utf-8')
         
         # Encrypt the data
         response = client.encrypt(
-            request={'name': key_name, 'plaintext': plaintext}
+            request={'name': key_name, 'plaintext': plaintext_bytes}
         )
         
         encrypted_data = base64.b64encode(response.ciphertext).decode('utf-8')
@@ -418,6 +434,7 @@ EOF
    # Deploy the encryption function
    cd encryption-function
    gcloud functions deploy encrypt-sensitive-data \
+       --region=${REGION} \
        --runtime=python311 \
        --trigger=http \
        --entry-point=encrypt_sensitive_data \
@@ -427,17 +444,6 @@ EOF
    cd ..
    
    # Create table with encrypted columns using SQL
-   bq query --use_legacy_sql=false << 'EOF'
-   CREATE OR REPLACE TABLE `PROJECT_ID.DATASET_ID.encrypted_user_data` (
-     user_id STRING NOT NULL,
-     email_encrypted BYTES,
-     phone_encrypted BYTES,
-     created_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
-     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
-   );
-EOF
-   
-   # Replace PROJECT_ID and DATASET_ID placeholders
    bq query --use_legacy_sql=false \
        "CREATE OR REPLACE TABLE \`${PROJECT_ID}.${DATASET_ID}.encrypted_user_data\` (
          user_id STRING NOT NULL,
@@ -522,7 +528,8 @@ EOF
 
    ```bash
    # Verify dataset encryption configuration
-   bq show --format=prettyjson ${PROJECT_ID}:${DATASET_ID} | grep -A 5 "defaultEncryptionConfiguration"
+   bq show --format=prettyjson ${PROJECT_ID}:${DATASET_ID} | \
+       grep -A 5 "defaultEncryptionConfiguration"
    
    # Check continuous query status
    bq show -j ${CONTINUOUS_QUERY_JOB}
@@ -540,14 +547,16 @@ EOF
 
    ```bash
    # Check Pub/Sub topic encryption
-   gcloud pubsub topics describe ${PUBSUB_TOPIC} --format="value(kmsKeyName)"
+   gcloud pubsub topics describe ${PUBSUB_TOPIC} \
+       --format="value(kmsKeyName)"
    
    # Test message publishing
    gcloud pubsub topics publish ${PUBSUB_TOPIC} \
        --message='{"event_id":"test-003","user_id":"user789","event_type":"unusual_activity","metadata":{"location":"unknown"}}'
    
    # Verify subscription
-   gcloud pubsub subscriptions pull "${PUBSUB_TOPIC}-bq-sub" --limit=1 --auto-ack
+   gcloud pubsub subscriptions pull "${PUBSUB_TOPIC}-bq-sub" \
+       --limit=1 --auto-ack
    ```
 
    Expected output: Topic should show KMS key configuration, message should be successfully published and received.
@@ -590,11 +599,12 @@ EOF
 
    ```bash
    # Delete Cloud Functions
-   gcloud functions delete security-audit --quiet
-   gcloud functions delete encrypt-sensitive-data --quiet
+   gcloud functions delete security-audit --region=${REGION} --quiet
+   gcloud functions delete encrypt-sensitive-data --region=${REGION} --quiet
    
    # Delete Cloud Scheduler jobs
-   gcloud scheduler jobs delete security-audit-daily --quiet
+   gcloud scheduler jobs delete security-audit-daily \
+       --location=${REGION} --quiet
    
    echo "✅ Cloud Functions and Scheduler jobs removed"
    ```
@@ -646,7 +656,7 @@ EOF
 
 This intelligent data pipeline demonstrates the power of combining BigQuery Continuous Queries with Cloud KMS to create an enterprise-grade, automated data processing system. The architecture showcases several key Google Cloud Platform capabilities working in harmony to address real-world business challenges around real-time analytics and data security.
 
-BigQuery Continuous Queries represent a paradigm shift from traditional batch processing to always-on analytics. Unlike conventional ETL pipelines that process data in scheduled intervals, continuous queries monitor data sources in real-time and automatically execute transformations as new data arrives. This approach significantly reduces latency for time-sensitive business decisions, enabling organizations to respond to events within seconds rather than hours. The SQL-based interface makes this powerful capability accessible to data analysts and engineers without requiring complex stream processing frameworks.
+BigQuery Continuous Queries represent a paradigm shift from traditional batch processing to always-on analytics. Unlike conventional ETL pipelines that process data in scheduled intervals, continuous queries monitor data sources in real-time and automatically execute transformations as new data arrives using the APPENDS table-valued function. This approach significantly reduces latency for time-sensitive business decisions, enabling organizations to respond to events within seconds rather than hours. The SQL-based interface makes this powerful capability accessible to data analysts and engineers without requiring complex stream processing frameworks.
 
 The integration with Cloud KMS provides multiple layers of security that go beyond basic encryption. Customer-managed encryption keys (CMEK) give organizations complete control over their encryption keys, meeting the most stringent compliance requirements while maintaining the operational benefits of a fully managed service. The automatic key rotation policies and hardware security module (HSM) protection ensure that cryptographic keys remain secure throughout their lifecycle. Column-level encryption adds granular protection for sensitive fields, enabling organizations to implement privacy-preserving analytics that comply with regulations like GDPR and CCPA.
 

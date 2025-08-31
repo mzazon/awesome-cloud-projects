@@ -1,0 +1,392 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  AWS Health Notifications System - Automated notification system using AWS Personal Health Dashboard,
+  EventBridge, and SNS to receive real-time alerts about AWS service health events.
+  
+  This template creates:
+  - SNS Topic for health notifications
+  - EventBridge Rule to capture AWS Health events
+  - IAM Role for EventBridge to publish to SNS
+  - Email subscription to the SNS topic
+  - Topic policy to allow EventBridge access
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableEmailSubscription
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+      - Label:
+          default: "Event Configuration"
+        Parameters:
+          - IncludeSecurityEvents
+          - IncludeMaintenanceEvents
+          - IncludeServiceEvents
+    ParameterLabels:
+      NotificationEmail:
+        default: "Email address for notifications"
+      EnableEmailSubscription:
+        default: "Create email subscription"
+      ResourcePrefix:
+        default: "Resource prefix for naming"
+      Environment:
+        default: "Environment name"
+      IncludeSecurityEvents:
+        default: "Include security events"
+      IncludeMaintenanceEvents:
+        default: "Include maintenance events"
+      IncludeServiceEvents:
+        default: "Include service events"
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive AWS Health notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address format
+    Default: your-email@example.com
+
+  EnableEmailSubscription:
+    Type: String
+    Description: Whether to create email subscription to SNS topic
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  ResourcePrefix:
+    Type: String
+    Description: Prefix for resource names to ensure uniqueness
+    Default: aws-health
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Description: Environment name for resource tagging
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+      - testing
+
+  IncludeSecurityEvents:
+    Type: String
+    Description: Include security-related health events
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  IncludeMaintenanceEvents:
+    Type: String
+    Description: Include scheduled maintenance events
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  IncludeServiceEvents:
+    Type: String
+    Description: Include service disruption events
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  CreateEmailSubscription: !Equals [!Ref EnableEmailSubscription, 'true']
+  FilterSecurityEvents: !Equals [!Ref IncludeSecurityEvents, 'true']
+  FilterMaintenanceEvents: !Equals [!Ref IncludeMaintenanceEvents, 'true']
+  FilterServiceEvents: !Equals [!Ref IncludeServiceEvents, 'true']
+  
+  # Condition to determine if we need custom event filtering
+  UseCustomEventPattern: !Or
+    - !Not [!Condition FilterSecurityEvents]
+    - !Not [!Condition FilterMaintenanceEvents]
+    - !Not [!Condition FilterServiceEvents]
+
+Resources:
+  # SNS Topic for AWS Health Notifications
+  HealthNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-notifications-${AWS::AccountId}'
+      DisplayName: AWS Health Notifications
+      FifoTopic: false
+      ContentBasedDeduplication: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-health-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: AWS Health Event Notifications
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Email subscription to SNS topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailSubscription
+    Properties:
+      TopicArn: !Ref HealthNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for EventBridge to publish to SNS
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-eventbridge-role-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref HealthNotificationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-eventbridge-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: EventBridge SNS Publishing
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # SNS Topic Policy to allow EventBridge access
+  HealthNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref HealthNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref HealthNotificationTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: AllowAccountOwnerFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - sns:Subscribe
+              - sns:Unsubscribe
+              - sns:Publish
+              - sns:GetTopicAttributes
+              - sns:SetTopicAttributes
+              - sns:AddPermission
+              - sns:RemovePermission
+              - sns:DeleteTopic
+            Resource: !Ref HealthNotificationTopic
+
+  # EventBridge Rule for AWS Health Events
+  HealthEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-health-events-rule'
+      Description: Monitor AWS Health events and send SNS notifications
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.health
+        detail-type:
+          - AWS Health Event
+      Targets:
+        - Id: '1'
+          Arn: !Ref HealthNotificationTopic
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              account: '$.account'
+              region: '$.region'
+              time: '$.time'
+              source: '$.source'
+              detail-type: '$.detail-type'
+              service: '$.detail.service'
+              eventTypeCode: '$.detail.eventTypeCode'
+              eventTypeCategory: '$.detail.eventTypeCategory'
+              startTime: '$.detail.startTime'
+              endTime: '$.detail.endTime'
+              eventDescription: '$.detail.eventDescription[0].latestDescription'
+              affectedResources: '$.detail.affectedEntities'
+            InputTemplate: |
+              {
+                "version": "1.0",
+                "timestamp": "<time>",
+                "account": "<account>",
+                "region": "<region>",
+                "source": "<source>",
+                "detail-type": "<detail-type>",
+                "alert-type": "AWS Health Event",
+                "severity": "<eventTypeCategory>",
+                "service": "<service>",
+                "event-code": "<eventTypeCode>",
+                "start-time": "<startTime>",
+                "end-time": "<endTime>",
+                "description": "<eventDescription>",
+                "affected-resources": "<affectedResources>",
+                "message": "AWS Health Event Detected: <eventTypeCode> for service <service>. Category: <eventTypeCategory>. Description: <eventDescription>"
+              }
+
+  # Optional: Additional EventBridge Rule with custom filtering (when conditions are not all true)
+  CustomFilteredHealthEventsRule:
+    Type: AWS::Events::Rule
+    Condition: UseCustomEventPattern
+    Properties:
+      Name: !Sub '${ResourcePrefix}-filtered-health-events-rule'
+      Description: Monitor specific AWS Health events based on filtering preferences
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.health
+        detail-type:
+          - AWS Health Event
+        detail:
+          eventTypeCategory: !If
+            - FilterSecurityEvents
+            - !If
+              - FilterMaintenanceEvents
+              - !If
+                - FilterServiceEvents
+                - [issue, accountNotification, scheduledChange]
+                - [issue, accountNotification]
+              - !If
+                - FilterServiceEvents
+                - [issue, scheduledChange]
+                - [issue]
+            - !If
+              - FilterMaintenanceEvents
+              - !If
+                - FilterServiceEvents
+                - [accountNotification, scheduledChange]
+                - [accountNotification]
+              - !If
+                - FilterServiceEvents
+                - [scheduledChange]
+                - []
+      Targets:
+        - Id: '1'
+          Arn: !Ref HealthNotificationTopic
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+
+  # CloudWatch Log Group for EventBridge Rule (optional monitoring)
+  HealthEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/events/${ResourcePrefix}-health-events'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-health-events-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: EventBridge Health Events Logging
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  SNSTopicArn:
+    Description: ARN of the SNS topic for AWS Health notifications
+    Value: !Ref HealthNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  SNSTopicName:
+    Description: Name of the SNS topic for AWS Health notifications
+    Value: !GetAtt HealthNotificationTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicName'
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule monitoring AWS Health events
+    Value: !GetAtt HealthEventsRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleArn'
+
+  EventBridgeRuleName:
+    Description: Name of the EventBridge rule monitoring AWS Health events
+    Value: !Ref HealthEventsRule
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleName'
+
+  IAMRoleArn:
+    Description: ARN of the IAM role used by EventBridge to publish to SNS
+    Value: !GetAtt EventBridgeExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  EmailSubscriptionArn:
+    Condition: CreateEmailSubscription
+    Description: ARN of the email subscription (if created)
+    Value: !Ref EmailSubscription
+    Export:
+      Name: !Sub '${AWS::StackName}-EmailSubscriptionArn'
+
+  NotificationEmail:
+    Condition: CreateEmailSubscription
+    Description: Email address configured for notifications
+    Value: !Ref NotificationEmail
+
+  LogGroupName:
+    Description: CloudWatch Log Group for EventBridge events
+    Value: !Ref HealthEventsLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  StackInfo:
+    Description: Information about this CloudFormation stack
+    Value: !Sub |
+      Stack: ${AWS::StackName}
+      Region: ${AWS::Region}
+      Account: ${AWS::AccountId}
+      Environment: ${Environment}
+      Created: Complete AWS Health notification system
+
+  NextSteps:
+    Condition: CreateEmailSubscription
+    Description: Next steps after stack creation
+    Value: !Sub |
+      1. Check your email (${NotificationEmail}) for SNS subscription confirmation
+      2. Click the confirmation link to activate notifications
+      3. Test the system by sending a test message to the SNS topic
+      4. Monitor the CloudWatch Log Group for EventBridge activity: ${HealthEventsLogGroup}
+
+  TestCommand:
+    Description: AWS CLI command to test the notification system
+    Value: !Sub |
+      aws sns publish \
+        --topic-arn ${HealthNotificationTopic} \
+        --subject "Test: AWS Health Notification System" \
+        --message "This is a test message to verify your AWS Health notification system is working correctly."

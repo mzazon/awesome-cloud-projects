@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: s3,cloudwatch,iam
 estimated-time: 60 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: s3,cloudwatch,iam
 recipe-generator-version: 1.3
@@ -694,13 +694,13 @@ echo "✅ Enabled versioning on bucket"
 
 S3 Lifecycle Policies provide automated data archiving that significantly reduces storage costs while maintaining data accessibility. The solution demonstrates how different data types require different archiving strategies - log files might transition to cheaper storage classes faster than business documents, while media files benefit from intelligent tiering that adapts to access patterns.
 
-> **Warning**: Be aware of minimum storage duration requirements for each storage class. For example, objects moved to Standard-IA must remain for at least 30 days, while Glacier Deep Archive requires 180 days minimum. Review the [S3 storage classes documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html) for complete details.
-
 The key to effective lifecycle management is understanding your data access patterns and business requirements. Documents might need immediate access for 30 days, then infrequent access for compliance purposes. Log files typically follow a pattern where recent logs are accessed frequently for troubleshooting, but older logs are rarely accessed except for auditing. Backup files represent another pattern where immediate verification is important, but long-term storage in the cheapest tier is preferred.
 
 S3 Intelligent Tiering automatically monitors access patterns and moves objects between storage tiers without operational overhead. This is particularly valuable for unpredictable access patterns or when you want to optimize costs without manual intervention. The Archive Access and Deep Archive Access tiers within Intelligent Tiering provide automatic optimization for rarely accessed data. Learn more about [how S3 Intelligent-Tiering works](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intelligent-tiering-overview.html).
 
 Monitoring and analytics capabilities ensure you understand the cost impact of your lifecycle policies. S3 Analytics provides insights into storage access patterns, helping you optimize transition timing. CloudWatch alarms notify you of unexpected cost increases, while S3 Inventory provides detailed reports on storage usage across different classes. The [S3 Inventory documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html) provides comprehensive guidance on cataloging and analyzing your data for cost optimization.
+
+> **Warning**: Be aware of minimum storage duration requirements for each storage class. For example, objects moved to Standard-IA must remain for at least 30 days, while Glacier Deep Archive requires 180 days minimum. Review the [S3 storage classes documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html) for complete details.
 
 > **Tip**: Use S3 Storage Class Analysis to understand your data access patterns before implementing lifecycle policies. This 30-day analysis helps determine optimal transition timings for your specific use case. Learn more about [S3 lifecycle management](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html) best practices.
 

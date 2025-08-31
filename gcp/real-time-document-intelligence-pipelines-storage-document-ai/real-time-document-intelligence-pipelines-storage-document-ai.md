@@ -4,12 +4,12 @@ id: d7f2a9c4
 category: analytics
 difficulty: 200
 subject: gcp
-services: Cloud Storage, Document AI, Cloud Pub/Sub
+services: Cloud Storage, Document AI, Cloud Pub/Sub, Firestore
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: document-processing, real-time-analytics, machine-learning, event-driven-architecture
 recipe-generator-version: 1.3
@@ -88,7 +88,7 @@ graph TB
 export PROJECT_ID="doc-intelligence-$(date +%s)"
 export REGION="us-central1"
 export LOCATION="us"
-export PROCESSOR_DISPLAY_NAME="invoice-processor"
+export PROCESSOR_DISPLAY_NAME="invoice-processor-$(date +%s)"
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
@@ -102,11 +102,12 @@ export RESULTS_SUBSCRIPTION="consume-results-${RANDOM_SUFFIX}"
 gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
 
-# Enable required APIs for Document AI, Pub/Sub, and Cloud Storage
+# Enable required APIs for Document AI, Pub/Sub, Cloud Storage, and Firestore
 gcloud services enable documentai.googleapis.com
 gcloud services enable pubsub.googleapis.com
 gcloud services enable storage.googleapis.com
 gcloud services enable cloudfunctions.googleapis.com
+gcloud services enable firestore.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled and environment variables set"
@@ -170,7 +171,7 @@ echo "✅ APIs enabled and environment variables set"
    # Create topic for processing results distribution
    gcloud pubsub topics create ${RESULTS_TOPIC}
    
-   # Create subscription for document processing
+   # Create subscription for document processing with extended ack deadline
    gcloud pubsub subscriptions create ${SUBSCRIPTION_NAME} \
        --topic=${TOPIC_NAME} \
        --ack-deadline=600
@@ -252,18 +253,25 @@ def process_document(cloud_event):
         # Configure Document AI request
         processor_name = f"projects/{os.environ['PROJECT_ID']}/locations/{os.environ['LOCATION']}/processors/{os.environ['PROCESSOR_ID']}"
         
-        # Determine document MIME type
-        mime_type = "application/pdf" if file_name.lower().endswith('.pdf') else "image/png"
+        # Determine document MIME type based on file extension
+        mime_type_map = {
+            '.pdf': 'application/pdf',
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.tiff': 'image/tiff'
+        }
+        
+        file_extension = os.path.splitext(file_name.lower())[1]
+        mime_type = mime_type_map.get(file_extension, 'application/pdf')
         
         # Process document with Document AI
-        document = documentai.Document(
-            content=document_content,
-            mime_type=mime_type
-        )
-        
         request = documentai.ProcessRequest(
             name=processor_name,
-            document=document
+            raw_document=documentai.RawDocument(
+                content=document_content,
+                mime_type=mime_type
+            )
         )
         
         result = document_client.process_document(request=request)
@@ -284,10 +292,16 @@ def process_document(cloud_event):
                 field_name = ""
                 field_value = ""
                 
-                if form_field.field_name:
-                    field_name = form_field.field_name.text_anchor.content
-                if form_field.field_value:
-                    field_value = form_field.field_value.text_anchor.content
+                if form_field.field_name and form_field.field_name.text_anchor:
+                    field_name = result.document.text[
+                        form_field.field_name.text_anchor.text_segments[0].start_index:
+                        form_field.field_name.text_anchor.text_segments[0].end_index
+                    ]
+                if form_field.field_value and form_field.field_value.text_anchor:
+                    field_value = result.document.text[
+                        form_field.field_value.text_anchor.text_segments[0].start_index:
+                        form_field.field_value.text_anchor.text_segments[0].end_index
+                    ]
                 
                 extracted_data["form_fields"].append({
                     "name": field_name.strip(),
@@ -307,12 +321,12 @@ def process_document(cloud_event):
         raise
 EOF
    
-   # Create requirements file
+   # Create requirements file with updated versions
    cat << 'EOF' > requirements.txt
-google-cloud-documentai==2.25.0
-google-cloud-pubsub==2.21.1
-google-cloud-storage==2.14.0
-functions-framework==3.5.0
+google-cloud-documentai==2.26.0
+google-cloud-pubsub==2.24.0
+google-cloud-storage==2.17.0
+functions-framework==3.8.1
 EOF
    
    echo "✅ Cloud Function code created"
@@ -328,7 +342,7 @@ EOF
    # Deploy the Cloud Function with appropriate settings
    gcloud functions deploy process-document \
        --gen2 \
-       --runtime=python311 \
+       --runtime=python312 \
        --region=${REGION} \
        --source=. \
        --entry-point=process_document \
@@ -361,7 +375,6 @@ EOF
 import base64
 import json
 import functions_framework
-from google.cloud import bigquery
 from google.cloud import firestore
 
 # Initialize clients
@@ -408,15 +421,14 @@ EOF
    
    # Create requirements for consumer function
    cat << 'EOF' > requirements.txt
-google-cloud-firestore==2.14.0
-google-cloud-bigquery==3.17.2
-functions-framework==3.5.0
+google-cloud-firestore==2.19.0
+functions-framework==3.8.1
 EOF
    
    # Deploy the results consumer function
    gcloud functions deploy consume-results \
        --gen2 \
-       --runtime=python311 \
+       --runtime=python312 \
        --region=${REGION} \
        --source=. \
        --entry-point=consume_results \
@@ -435,14 +447,16 @@ EOF
 
    ```bash
    # Create a test document for processing
-   echo "Invoice Number: INV-12345
-   Date: 2025-07-12
+   cat << 'EOF' > test-invoice.txt
+   Invoice Number: INV-12345
+   Date: 2025-07-23
    Amount: $1,250.00
    Customer: ABC Corporation
    
    Description: Professional Services
    Tax: $125.00
-   Total: $1,375.00" > test-invoice.txt
+   Total: $1,375.00
+   EOF
    
    # Upload test document to trigger processing
    gsutil cp test-invoice.txt gs://${BUCKET_NAME}/invoices/
@@ -478,6 +492,18 @@ EOF
    ```
 
    Expected output: JSON messages containing extracted document data with form fields, text content, and metadata from the processed documents.
+
+4. **Verify Firestore data storage**:
+
+   ```bash
+   # Check that processed documents are stored in Firestore
+   gcloud firestore collections list
+   
+   # View recent processed documents
+   gcloud firestore documents list \
+       --collection-ids=processed_documents \
+       --limit=5
+   ```
 
 ## Cleanup
 
@@ -524,11 +550,11 @@ EOF
    echo "✅ Storage and Document AI resources deleted"
    ```
 
-4. **Clean up environment variables**:
+4. **Clean up environment variables and temporary files**:
 
    ```bash
    # Remove temporary directories
-   rm -rf /tmp/doc-processor /tmp/results-consumer
+   rm -rf /tmp/doc-processor /tmp/results-consumer test-invoice.txt
    
    # Unset environment variables
    unset PROJECT_ID REGION LOCATION PROCESSOR_ID BUCKET_NAME
@@ -543,9 +569,9 @@ This real-time document intelligence pipeline demonstrates the power of Google C
 
 The serverless architecture provides significant advantages for document processing workloads, including automatic scaling based on demand, pay-per-use pricing that optimizes costs, and built-in fault tolerance for mission-critical operations. Document AI's form parser processor can extract text, tables, and key-value pairs from various document types with accuracy rates exceeding 95% for high-quality documents. The event-driven design ensures low latency processing while supporting multiple downstream consumers for analytics, compliance, and business intelligence applications.
 
-Security and compliance considerations are paramount for document processing systems handling sensitive business data. Google Cloud provides enterprise-grade security features including Identity and Access Management (IAM) for fine-grained permissions, Cloud KMS for encryption key management, and audit logging for compliance tracking. Organizations should implement additional security measures such as VPC Service Controls for network isolation and Data Loss Prevention (DLP) for sensitive data detection and protection.
+Security and compliance considerations are paramount for document processing systems handling sensitive business data. Google Cloud provides enterprise-grade security features including Identity and Access Management (IAM) for fine-grained permissions, Cloud KMS for encryption key management, and audit logging for compliance tracking. Organizations should implement additional security measures such as VPC Service Controls for network isolation and Data Loss Prevention (DLP) for sensitive data detection and protection. The pipeline also integrates with Firestore to provide real-time data storage with ACID guarantees and automatic scaling capabilities.
 
-The pipeline's modular design enables easy extension and customization for specific business requirements. Organizations can integrate additional services such as BigQuery for analytics, Cloud Workflows for complex business logic, or third-party systems through Cloud Functions and API Gateway. Performance optimization can be achieved through batch processing for high-volume scenarios, custom Document AI processors for specialized document types, and Pub/Sub message filtering for targeted processing workflows.
+The pipeline's modular design enables easy extension and customization for specific business requirements. Organizations can integrate additional services such as BigQuery for analytics, Cloud Workflows for complex business logic, or third-party systems through Cloud Functions and API Gateway. Performance optimization can be achieved through batch processing for high-volume scenarios, custom Document AI processors for specialized document types, and Pub/Sub message filtering for targeted processing workflows. The updated implementation uses Python 3.12 runtime for improved performance and the latest client library versions for enhanced functionality.
 
 > **Tip**: Monitor Document AI usage and costs through [Cloud Monitoring](https://cloud.google.com/monitoring/docs) and implement intelligent routing to different processors based on document type detection to optimize accuracy and cost efficiency for your specific document processing requirements.
 

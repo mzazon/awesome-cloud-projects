@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: Step Functions, Lambda, EventBridge
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: serverless, step-functions, lambda, eventbridge, microservices, orchestration, workflows, error-handling, parallel-processing
 recipe-generator-version: 1.3
@@ -119,6 +119,28 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
 
 export PROJECT_NAME="microservices-stepfn-${RANDOM_SUFFIX}"
 export ROLE_NAME="${PROJECT_NAME}-execution-role"
+export LAMBDA_ROLE_NAME="${PROJECT_NAME}-lambda-role"
+
+# Create IAM role for Lambda functions
+aws iam create-role \
+    --role-name $LAMBDA_ROLE_NAME \
+    --assume-role-policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": "lambda.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+            }
+        ]
+    }'
+
+# Attach basic Lambda execution policy
+aws iam attach-role-policy \
+    --role-name $LAMBDA_ROLE_NAME \
+    --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
 # Create IAM role for Step Functions execution
 aws iam create-role \
@@ -136,10 +158,40 @@ aws iam create-role \
         ]
     }'
 
-# Attach policy for Lambda invocation
+# Create custom IAM policy for Step Functions execution
+cat > stepfunctions-execution-policy.json << 'EOF'
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "lambda:InvokeFunction"
+            ],
+            "Resource": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${PROJECT_NAME}-*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "xray:PutTraceSegments",
+                "xray:PutTelemetryRecords",
+                "xray:GetSamplingRules",
+                "xray:GetSamplingTargets"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+EOF
+
+# Create and attach the policy
+aws iam create-policy \
+    --policy-name "${PROJECT_NAME}-stepfunctions-policy" \
+    --policy-document file://stepfunctions-execution-policy.json
+
 aws iam attach-role-policy \
     --role-name $ROLE_NAME \
-    --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+    --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PROJECT_NAME}-stepfunctions-policy
 
 echo "✅ IAM role created: $ROLE_NAME"
 ```
@@ -183,8 +235,8 @@ EOF
    
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-user-service" \
-       --runtime python3.9 \
-       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role \
+       --runtime python3.12 \
+       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler user-service.lambda_handler \
        --zip-file fileb://user-service.zip \
        --timeout 30
@@ -233,8 +285,8 @@ EOF
    
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-order-service" \
-       --runtime python3.9 \
-       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role \
+       --runtime python3.12 \
+       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler order-service.lambda_handler \
        --zip-file fileb://order-service.zip \
        --timeout 30
@@ -286,8 +338,8 @@ EOF
    
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-payment-service" \
-       --runtime python3.9 \
-       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role \
+       --runtime python3.12 \
+       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler payment-service.lambda_handler \
        --zip-file fileb://payment-service.zip \
        --timeout 30
@@ -340,8 +392,8 @@ EOF
    
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-inventory-service" \
-       --runtime python3.9 \
-       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role \
+       --runtime python3.12 \
+       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler inventory-service.lambda_handler \
        --zip-file fileb://inventory-service.zip \
        --timeout 30
@@ -386,8 +438,8 @@ EOF
    
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-notification-service" \
-       --runtime python3.9 \
-       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role \
+       --runtime python3.12 \
+       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME} \
        --handler notification-service.lambda_handler \
        --zip-file fileb://notification-service.zip \
        --timeout 30
@@ -654,19 +706,30 @@ EOF
    echo "✅ Lambda functions deleted"
    ```
 
-4. **Remove IAM Role**:
+4. **Remove IAM Roles and Policies**:
 
    ```bash
+   # Detach and delete Step Functions execution role
    aws iam detach-role-policy \
        --role-name $ROLE_NAME \
-       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PROJECT_NAME}-stepfunctions-policy
+   
+   aws iam delete-policy \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PROJECT_NAME}-stepfunctions-policy
    
    aws iam delete-role --role-name $ROLE_NAME
    
-   # Clean up local files
-   rm -f *.py *.zip *.json user-response.json
+   # Detach and delete Lambda execution role
+   aws iam detach-role-policy \
+       --role-name $LAMBDA_ROLE_NAME \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
    
-   echo "✅ IAM role and local files cleaned up"
+   aws iam delete-role --role-name $LAMBDA_ROLE_NAME
+   
+   # Clean up local files
+   rm -f *.py *.zip *.json user-response.json stepfunctions-execution-policy.json
+   
+   echo "✅ IAM roles, policies, and local files cleaned up"
    ```
 
 ## Discussion
@@ -677,9 +740,9 @@ The parallel processing capabilities demonstrated in this recipe show how Step F
 
 Step Functions integrates seamlessly with EventBridge to create event-driven architectures that respond automatically to business events. This integration enables reactive systems that scale based on demand and maintain responsiveness to changing business conditions. The combination of these services provides the foundation for modern, cloud-native applications that can adapt to varying workloads while maintaining operational excellence.
 
-Error handling and observability are critical considerations for production microservices orchestration. Step Functions provides comprehensive logging through CloudWatch and detailed execution history that enables rapid troubleshooting. The built-in retry mechanisms with exponential backoff help handle transient failures automatically, while custom error states can implement sophisticated compensation patterns for distributed transaction management.
+Error handling and observability are critical considerations for production microservices orchestration. Step Functions provides comprehensive logging through CloudWatch and detailed execution history that enables rapid troubleshooting. The built-in retry mechanisms with exponential backoff help handle transient failures automatically, while custom error states can implement sophisticated compensation patterns for distributed transaction management. For detailed guidance on error handling patterns, see the [AWS Step Functions Error Handling documentation](https://docs.aws.amazon.com/step-functions/latest/dg/concepts-error-handling.html).
 
-> **Note**: Consider implementing Step Functions Express Workflows for high-volume, short-duration workloads to reduce costs and improve performance. Express Workflows can handle over 100,000 executions per second with lower per-execution costs than Standard Workflows.
+> **Note**: Consider implementing Step Functions Express Workflows for high-volume, short-duration workloads to reduce costs and improve performance. Express Workflows can handle over 100,000 executions per second with lower per-execution costs than Standard Workflows. See the [Express Workflows documentation](https://docs.aws.amazon.com/step-functions/latest/dg/concepts-express-workflows.html) for implementation guidance.
 
 ## Challenge
 

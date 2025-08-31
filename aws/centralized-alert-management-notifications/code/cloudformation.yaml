@@ -1,0 +1,458 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Centralized Alert Management with User Notifications and CloudWatch
+  Creates S3 bucket with CloudWatch monitoring, alarms, and AWS User Notifications
+  for centralized alert management and notification delivery.
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  BucketNamePrefix:
+    Type: String
+    Description: Prefix for the S3 bucket name (will be suffixed with random string)
+    Default: monitoring-demo
+    MinLength: 3
+    MaxLength: 40
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Must be 3-40 characters, lowercase letters, numbers, and hyphens only
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for receiving notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  AlarmThreshold:
+    Type: Number
+    Description: CloudWatch alarm threshold for S3 bucket size in bytes
+    Default: 5000000
+    MinValue: 1000000
+    MaxValue: 1000000000
+    ConstraintDescription: Must be between 1MB and 1GB
+
+  NotificationAggregationDuration:
+    Type: String
+    Description: Duration for notification aggregation (ISO 8601 format)
+    Default: PT5M
+    AllowedValues:
+      - PT1M
+      - PT5M
+      - PT10M
+      - PT15M
+      - PT30M
+    ConstraintDescription: Must be a valid ISO 8601 duration (PT1M, PT5M, PT10M, PT15M, or PT30M)
+
+  EnableRequestMetrics:
+    Type: String
+    Description: Enable S3 request metrics (additional charges apply)
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  EnableRequestMetricsCondition: !Equals [!Ref EnableRequestMetrics, 'true']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+  # ------------------------------------------------------------------------------
+  # S3 Bucket with Monitoring Configuration
+  # ------------------------------------------------------------------------------
+  MonitoringS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketNamePrefix}-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Project
+          Value: CentralizedAlertManagement
+        - Key: Purpose
+          Value: Monitoring
+        - Key: Environment
+          Value: Demo
+
+  # S3 Bucket Metrics Configuration (conditional)
+  S3BucketMetricsConfiguration:
+    Type: AWS::S3::Bucket
+    Condition: EnableRequestMetricsCondition
+    Properties:
+      BucketName: !Ref MonitoringS3Bucket
+      MetricsConfigurations:
+        - Id: EntireBucket
+          Status: Enabled
+
+  # ------------------------------------------------------------------------------
+  # CloudWatch Resources
+  # ------------------------------------------------------------------------------
+  # Log Group for S3 Access Logs
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${BucketNamePrefix}-access-logs'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: CentralizedAlertManagement
+        - Key: Purpose
+          Value: S3AccessLogging
+
+  # CloudWatch Alarm for S3 Bucket Size
+  S3BucketSizeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-s3-bucket-size-alarm'
+      AlarmDescription: Monitor S3 bucket size growth for centralized alerting
+      MetricName: BucketSizeBytes
+      Namespace: AWS/S3
+      Statistic: Average
+      Period: 86400  # 24 hours
+      EvaluationPeriods: 1
+      Threshold: !Ref AlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref MonitoringS3Bucket
+        - Name: StorageType
+          Value: StandardStorage
+      Tags:
+        - Key: Project
+          Value: CentralizedAlertManagement
+        - Key: AlertType
+          Value: Storage
+
+  # Additional CloudWatch Alarm for Request Errors (if request metrics enabled)
+  S3RequestErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableRequestMetricsCondition
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-s3-request-error-alarm'
+      AlarmDescription: Monitor S3 request errors for operational alerting
+      MetricName: 4xxErrors
+      Namespace: AWS/S3
+      Statistic: Sum
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref MonitoringS3Bucket
+      Tags:
+        - Key: Project
+          Value: CentralizedAlertManagement
+        - Key: AlertType
+          Value: RequestErrors
+
+  # ------------------------------------------------------------------------------
+  # User Notifications Resources
+  # ------------------------------------------------------------------------------
+  # IAM Role for User Notifications Service
+  NotificationsServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-notifications-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - notifications.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/NotificationsServiceRolePolicy
+      Tags:
+        - Key: Project
+          Value: CentralizedAlertManagement
+        - Key: Purpose
+          Value: NotificationsService
+
+  # EventBridge Rule for CloudWatch Alarm State Changes
+  AlarmStateChangeEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-alarm-state-change-rule'
+      Description: Capture CloudWatch alarm state changes for User Notifications
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          alarmName:
+            - !Ref S3BucketSizeAlarm
+            - !If
+              - EnableRequestMetricsCondition
+              - !Ref S3RequestErrorAlarm
+              - !Ref AWS::NoValue
+          state:
+            value:
+              - ALARM
+              - OK
+              - INSUFFICIENT_DATA
+      State: ENABLED
+      Targets:
+        - Arn: !Sub 'arn:aws:notifications:${AWS::Region}:${AWS::AccountId}:configuration/${NotificationConfiguration}'
+          Id: NotificationConfigurationTarget
+          RoleArn: !GetAtt NotificationsServiceRole.Arn
+
+  # ------------------------------------------------------------------------------
+  # User Notifications Configuration
+  # ------------------------------------------------------------------------------
+  # Note: AWS User Notifications resources are not yet fully supported in CloudFormation
+  # The following are custom resources to manage User Notifications via Lambda
+  
+  # Lambda Execution Role for Custom Resources
+  NotificationsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-notifications-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: NotificationsManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - notifications:*
+                  - notificationscontacts:*
+                Resource: '*'
+
+  # Lambda Function for Managing User Notifications
+  NotificationsManagementFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-notifications-manager'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt NotificationsLambdaRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import cfnresponse
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          notifications_client = boto3.client('notifications')
+          contacts_client = boto3.client('notificationscontacts')
+
+          def lambda_handler(event, context):
+              try:
+                  request_type = event['RequestType']
+                  properties = event['ResourceProperties']
+                  
+                  if request_type == 'Create':
+                      response_data = create_notification_resources(properties)
+                  elif request_type == 'Update':
+                      response_data = update_notification_resources(properties)
+                  elif request_type == 'Delete':
+                      response_data = delete_notification_resources(properties)
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+          def create_notification_resources(properties):
+              region = properties['Region']
+              email = properties['NotificationEmail']
+              aggregation_duration = properties['AggregationDuration']
+              
+              # Register notification hub
+              try:
+                  notifications_client.register_notification_hub(
+                      notificationHubRegion=region
+                  )
+                  logger.info(f"Notification hub registered in {region}")
+              except ClientError as e:
+                  if 'AlreadyExistsException' not in str(e):
+                      raise e
+              
+              # Create email contact
+              email_response = contacts_client.create_email_contact(
+                  name=f"monitoring-alerts-contact-{region}",
+                  emailAddress=email
+              )
+              email_arn = email_response['arn']
+              
+              # Create notification configuration
+              config_response = notifications_client.create_notification_configuration(
+                  name=f"s3-monitoring-config-{region}",
+                  description="S3 monitoring notification configuration",
+                  aggregationDuration=aggregation_duration
+              )
+              config_arn = config_response['arn']
+              
+              # Associate email contact with configuration
+              notifications_client.associate_channel(
+                  arn=email_arn,
+                  notificationConfigurationArn=config_arn
+              )
+              
+              return {
+                  'EmailContactArn': email_arn,
+                  'NotificationConfigArn': config_arn
+              }
+
+          def update_notification_resources(properties):
+              # For updates, recreate resources
+              return create_notification_resources(properties)
+
+          def delete_notification_resources(properties):
+              region = properties['Region']
+              
+              try:
+                  # List and clean up resources
+                  configs = notifications_client.list_notification_configurations()
+                  for config in configs.get('notificationConfigurations', []):
+                      if 's3-monitoring-config' in config['name']:
+                          notifications_client.delete_notification_configuration(
+                              arn=config['arn']
+                          )
+                  
+                  contacts = contacts_client.list_email_contacts()
+                  for contact in contacts.get('emailContacts', []):
+                      if 'monitoring-alerts-contact' in contact['name']:
+                          contacts_client.delete_email_contact(
+                              arn=contact['arn']
+                          )
+                  
+                  # Deregister notification hub
+                  notifications_client.deregister_notification_hub(
+                      notificationHubRegion=region
+                  )
+                  
+              except Exception as e:
+                  logger.warning(f"Error during cleanup: {str(e)}")
+              
+              return {}
+
+  # Custom Resource for User Notifications Setup
+  NotificationConfiguration:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt NotificationsManagementFunction.Arn
+      Region: !Ref AWS::Region
+      NotificationEmail: !Ref NotificationEmail
+      AggregationDuration: !Ref NotificationAggregationDuration
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  S3BucketName:
+    Description: Name of the created S3 bucket for monitoring
+    Value: !Ref MonitoringS3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  S3BucketArn:
+    Description: ARN of the created S3 bucket
+    Value: !GetAtt MonitoringS3Bucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'
+
+  CloudWatchAlarmName:
+    Description: Name of the CloudWatch alarm monitoring bucket size
+    Value: !Ref S3BucketSizeAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchAlarmName'
+
+  CloudWatchAlarmArn:
+    Description: ARN of the CloudWatch alarm
+    Value: !Sub 
+      - arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AlarmName}
+      - AlarmName: !Ref S3BucketSizeAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchAlarmArn'
+
+  EventBridgeRuleName:
+    Description: Name of the EventBridge rule capturing alarm state changes
+    Value: !Ref AlarmStateChangeEventRule
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleName'
+
+  NotificationEmail:
+    Description: Email address configured for notifications
+    Value: !Ref NotificationEmail
+
+  NotificationConfigurationArn:
+    Description: ARN of the User Notifications configuration
+    Value: !GetAtt NotificationConfiguration.NotificationConfigArn
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationConfigArn'
+
+  EmailContactArn:
+    Description: ARN of the email contact for notifications
+    Value: !GetAtt NotificationConfiguration.EmailContactArn
+    Export:
+      Name: !Sub '${AWS::StackName}-EmailContactArn'
+
+  ConsoleUrl:
+    Description: URL to access the User Notifications console
+    Value: !Sub 'https://console.aws.amazon.com/notifications/home?region=${AWS::Region}'
+
+  ValidationCommands:
+    Description: Commands to validate the deployment
+    Value: !Sub |
+      # Verify S3 bucket and upload test files
+      aws s3 ls s3://${MonitoringS3Bucket}
+      echo "Test file" | aws s3 cp - s3://${MonitoringS3Bucket}/test.txt
+      
+      # Check CloudWatch alarm status
+      aws cloudwatch describe-alarms --alarm-names ${S3BucketSizeAlarm}
+      
+      # List notification configurations
+      aws notifications list-notification-configurations
+      
+      # Test alarm state change
+      aws cloudwatch set-alarm-state --alarm-name ${S3BucketSizeAlarm} --state-value ALARM --state-reason "Manual test"
+
+  CleanupInstructions:
+    Description: Instructions for cleaning up resources
+    Value: !Sub |
+      # Delete the CloudFormation stack to clean up all resources
+      aws cloudformation delete-stack --stack-name ${AWS::StackName}
+      
+      # Wait for stack deletion to complete
+      aws cloudformation wait stack-delete-complete --stack-name ${AWS::StackName}
+      
+      # Verify S3 bucket is deleted (should return an error)
+      aws s3 ls s3://${MonitoringS3Bucket}

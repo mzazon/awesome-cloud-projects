@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: s3, lambda, sqs, sns
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: s3
+tags: s3, event-driven, serverless, automation
 recipe-generator-version: 1.3
 ---
 
 # Automated Processing with S3 Event Triggers
-
 
 ## Problem
 
@@ -121,11 +120,15 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
    Amazon S3 provides highly durable (99.999999999% or 11 9's) object storage that serves as the ideal foundation for event-driven data processing architectures. [S3 event notifications](https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html) automatically detect when objects are created, modified, or deleted, eliminating the need for manual polling or scheduling mechanisms. This creates a reactive system that processes data immediately upon arrival, reducing latency and operational overhead.
 
    ```bash
-   # Create the S3 bucket
-   aws s3api create-bucket \
-       --bucket $BUCKET_NAME \
-       --region $AWS_REGION \
-       --create-bucket-configuration LocationConstraint=$AWS_REGION
+   # Create the S3 bucket (handle region-specific creation)
+   if [ "$AWS_REGION" = "us-east-1" ]; then
+       aws s3api create-bucket --bucket $BUCKET_NAME
+   else
+       aws s3api create-bucket \
+           --bucket $BUCKET_NAME \
+           --region $AWS_REGION \
+           --create-bucket-configuration LocationConstraint=$AWS_REGION
+   fi
    
    # Enable versioning for better data management
    aws s3api put-bucket-versioning \
@@ -231,6 +234,7 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
                "Effect": "Allow",
                "Action": [
                    "s3:GetObject",
+                   "s3:GetObjectVersion",
                    "s3:PutObject",
                    "s3:DeleteObject"
                ],
@@ -283,6 +287,11 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
    import boto3
    import urllib.parse
    from datetime import datetime
+   import logging
+   
+   # Configure logging
+   logger = logging.getLogger()
+   logger.setLevel(logging.INFO)
    
    s3 = boto3.client('s3')
    sqs = boto3.client('sqs')
@@ -294,11 +303,12 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
                bucket = record['s3']['bucket']['name']
                key = urllib.parse.unquote_plus(record['s3']['object']['key'])
                
-               print(f"Processing object: {key} from bucket: {bucket}")
+               logger.info(f"Processing object: {key} from bucket: {bucket}")
                
                # Get object metadata
                response = s3.head_object(Bucket=bucket, Key=key)
                file_size = response['ContentLength']
+               last_modified = response['LastModified']
                
                # Example processing logic based on file type
                if key.endswith('.csv'):
@@ -306,11 +316,11 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
                elif key.endswith('.json'):
                    process_json_file(bucket, key, file_size)
                else:
-                   print(f"Unsupported file type: {key}")
+                   logger.info(f"Unsupported file type: {key}")
                    continue
                
                # Create processing report
-               create_processing_report(bucket, key, file_size)
+               create_processing_report(bucket, key, file_size, last_modified)
                
            return {
                'statusCode': 200,
@@ -318,40 +328,48 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
            }
            
        except Exception as e:
-           print(f"Error processing S3 event: {str(e)}")
+           logger.error(f"Error processing S3 event: {str(e)}")
            # Send to DLQ for retry logic
            send_to_dlq(event, str(e))
            raise e
    
    def process_csv_file(bucket, key, file_size):
        """Process CSV files - add your business logic here"""
-       print(f"Processing CSV file: {key} (Size: {file_size} bytes)")
+       logger.info(f"Processing CSV file: {key} (Size: {file_size} bytes)")
+       # Example: You could parse CSV and perform data transformations
+       # csv_obj = s3.get_object(Bucket=bucket, Key=key)
+       # csv_content = csv_obj['Body'].read().decode('utf-8')
        # Add your CSV processing logic here
        
    def process_json_file(bucket, key, file_size):
        """Process JSON files - add your business logic here"""
-       print(f"Processing JSON file: {key} (Size: {file_size} bytes)")
+       logger.info(f"Processing JSON file: {key} (Size: {file_size} bytes)")
+       # Example: You could parse JSON and validate schema
+       # json_obj = s3.get_object(Bucket=bucket, Key=key)
+       # json_content = json.loads(json_obj['Body'].read().decode('utf-8'))
        # Add your JSON processing logic here
    
-   def create_processing_report(bucket, key, file_size):
+   def create_processing_report(bucket, key, file_size, last_modified):
        """Create a processing report and store it in S3"""
-       report_key = f"reports/{key}-report-{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+       report_key = f"reports/{key.replace('/', '_')}-report-{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
        
        report = {
            'file_processed': key,
            'file_size': file_size,
+           'last_modified': last_modified.isoformat(),
            'processing_time': datetime.now().isoformat(),
-           'status': 'completed'
+           'status': 'completed',
+           'processor_version': '1.0'
        }
        
        s3.put_object(
            Bucket=bucket,
            Key=report_key,
-           Body=json.dumps(report),
+           Body=json.dumps(report, indent=2),
            ContentType='application/json'
        )
        
-       print(f"Processing report created: {report_key}")
+       logger.info(f"Processing report created: {report_key}")
    
    def send_to_dlq(event, error_message):
        """Send failed event to DLQ for retry"""
@@ -362,22 +380,30 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
            message = {
                'original_event': event,
                'error_message': error_message,
-               'timestamp': datetime.now().isoformat()
+               'timestamp': datetime.now().isoformat(),
+               'retry_count': 1
            }
            
-           sqs.send_message(
-               QueueUrl=dlq_url,
-               MessageBody=json.dumps(message)
-           )
+           try:
+               sqs.send_message(
+                   QueueUrl=dlq_url,
+                   MessageBody=json.dumps(message)
+               )
+               logger.info("Failed event sent to DLQ")
+           except Exception as dlq_error:
+               logger.error(f"Failed to send message to DLQ: {str(dlq_error)}")
    EOF
    
    # Create deployment package
    cd /tmp && zip data_processor.zip data_processor.py
    
-   # Create Lambda function
+   # Wait for IAM role to propagate
+   sleep 15
+   
+   # Create Lambda function with updated runtime
    LAMBDA_ARN=$(aws lambda create-function \
        --function-name $LAMBDA_FUNCTION_NAME \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::$AWS_ACCOUNT_ID:role/$LAMBDA_ROLE_NAME \
        --handler data_processor.lambda_handler \
        --zip-file fileb://data_processor.zip \
@@ -390,7 +416,7 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
    echo "✅ Data processing Lambda function created: $LAMBDA_ARN"
    ```
 
-   Your automated data processing capability is now deployed and ready to handle incoming files. The function includes error handling, logging, and retry logic for reliable data processing operations.
+   Your automated data processing capability is now deployed and ready to handle incoming files. The function includes enhanced error handling, structured logging, and retry logic for reliable data processing operations. The updated Python 3.12 runtime provides better performance and security compared to older versions.
 
 7. **Create error handler Lambda function**:
 
@@ -402,6 +428,11 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
    import json
    import boto3
    from datetime import datetime
+   import logging
+   
+   # Configure logging
+   logger = logging.getLogger()
+   logger.setLevel(logging.INFO)
    
    sns = boto3.client('sns')
    
@@ -414,15 +445,31 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
                # Extract error details
                error_message = message_body.get('error_message', 'Unknown error')
                timestamp = message_body.get('timestamp', datetime.now().isoformat())
+               original_event = message_body.get('original_event', {})
+               retry_count = message_body.get('retry_count', 1)
+               
+               # Extract S3 object details if available
+               s3_details = ""
+               if original_event and 'Records' in original_event:
+                   try:
+                       s3_record = original_event['Records'][0]['s3']
+                       bucket_name = s3_record['bucket']['name']
+                       object_key = s3_record['object']['key']
+                       s3_details = f"Bucket: {bucket_name}, Object: {object_key}"
+                   except (KeyError, IndexError):
+                       s3_details = "S3 details not available"
                
                # Send alert via SNS
                alert_message = f"""
-               Data Processing Error Alert
-               
-               Error: {error_message}
-               Timestamp: {timestamp}
-               
-               Please investigate the failed processing job.
+   Data Processing Error Alert
+   
+   Error: {error_message}
+   Timestamp: {timestamp}
+   Retry Attempt: {retry_count}
+   {s3_details}
+   
+   Please investigate the failed processing job.
+   Check CloudWatch Logs for detailed error information.
                """
                
                import os
@@ -431,14 +478,14 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
                if sns_topic_arn:
                    sns.publish(
                        TopicArn=sns_topic_arn,
-                       Message=alert_message,
+                       Message=alert_message.strip(),
                        Subject='Data Processing Error Alert'
                    )
                
-               print(f"Error alert sent for: {error_message}")
+               logger.info(f"Error alert sent for: {error_message}")
                
        except Exception as e:
-           print(f"Error in error handler: {str(e)}")
+           logger.error(f"Error in error handler: {str(e)}")
            raise e
        
        return {
@@ -453,7 +500,7 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
    # Create error handler Lambda function
    ERROR_HANDLER_ARN=$(aws lambda create-function \
        --function-name $ERROR_HANDLER_NAME \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::$AWS_ACCOUNT_ID:role/$LAMBDA_ROLE_NAME \
        --handler error_handler.lambda_handler \
        --zip-file fileb://error_handler.zip \
@@ -465,7 +512,7 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
    echo "✅ Error handler Lambda function created: $ERROR_HANDLER_ARN"
    ```
 
-   Your error handling system is now operational, providing automated failure detection and notification capabilities. This ensures processing issues are quickly identified and communicated to operations teams.
+   Your error handling system is now operational, providing automated failure detection and notification capabilities with enhanced error context. This ensures processing issues are quickly identified and communicated to operations teams with sufficient detail for rapid troubleshooting.
 
 8. **Configure SQS trigger for error handler**:
 
@@ -482,7 +529,7 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
    echo "✅ SQS event source mapping created for error handler"
    ```
 
-   Your error processing automation is now complete, ensuring that failed processing attempts are automatically captured and processed through dedicated error handling logic.
+   Your error processing automation is now complete, ensuring that failed processing attempts are automatically captured and processed through dedicated error handling logic with optimized batching for efficient processing.
 
 9. **Grant S3 permission to invoke Lambda**:
 
@@ -500,11 +547,11 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
    echo "✅ S3 permission granted to invoke Lambda"
    ```
 
-   S3 can now trigger your Lambda function automatically, completing the event-driven integration between storage and processing services.
+   S3 can now trigger your Lambda function automatically, completing the event-driven integration between storage and processing services with proper security controls in place.
 
 10. **Configure S3 event notifications**:
 
-     S3 event notifications transform your storage bucket into an active component of your processing pipeline by automatically detecting object lifecycle events and routing them to appropriate targets. The filtering capabilities allow you to process only relevant files (by prefix, suffix, or object size), reducing costs and preventing unnecessary function invocations. This configuration creates a reactive architecture where data processing happens immediately upon data arrival, eliminating polling overhead and reducing processing latency.
+    S3 event notifications transform your storage bucket into an active component of your processing pipeline by automatically detecting object lifecycle events and routing them to appropriate targets. The filtering capabilities allow you to process only relevant files (by prefix, suffix, or object size), reducing costs and preventing unnecessary function invocations. This configuration creates a reactive architecture where data processing happens immediately upon data arrival, eliminating polling overhead and reducing processing latency.
 
     ```bash
     # Create notification configuration
@@ -540,11 +587,11 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
     echo "✅ S3 event notifications configured"
     ```
 
-    Your event-driven data processing pipeline is now fully operational. File uploads will automatically trigger processing functions, providing real-time data processing capabilities.
+    Your event-driven data processing pipeline is now fully operational. File uploads to the "data/" prefix will automatically trigger processing functions, providing real-time data processing capabilities with built-in filtering to reduce unnecessary invocations.
 
 11. **Create CloudWatch alarms for monitoring**:
 
-     Amazon CloudWatch provides comprehensive monitoring and alerting capabilities that transform reactive troubleshooting into proactive system management. These [CloudWatch alarms](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html) monitor key performance indicators (error rates, message queue depths, processing latencies) and automatically trigger notifications when thresholds are breached. This enables your operations team to detect and respond to issues before they impact business processes, implementing the observability practices essential for production-grade serverless applications.
+    Amazon CloudWatch provides comprehensive monitoring and alerting capabilities that transform reactive troubleshooting into proactive system management. These [CloudWatch alarms](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html) monitor key performance indicators (error rates, message queue depths, processing latencies) and automatically trigger notifications when thresholds are breached. This enables your operations team to detect and respond to issues before they impact business processes, implementing the observability practices essential for production-grade serverless applications.
 
     ```bash
     # Create alarm for Lambda errors
@@ -575,10 +622,24 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
         --alarm-actions $SNS_TOPIC_ARN \
         --dimensions Name=QueueName,Value=$DLQ_NAME
     
+    # Create alarm for Lambda duration (performance monitoring)
+    aws cloudwatch put-metric-alarm \
+        --alarm-name "${LAMBDA_FUNCTION_NAME}-duration" \
+        --alarm-description "Monitor Lambda function duration" \
+        --metric-name Duration \
+        --namespace AWS/Lambda \
+        --statistic Average \
+        --period 300 \
+        --threshold 240000 \
+        --comparison-operator GreaterThanThreshold \
+        --evaluation-periods 2 \
+        --alarm-actions $SNS_TOPIC_ARN \
+        --dimensions Name=FunctionName,Value=$LAMBDA_FUNCTION_NAME
+    
     echo "✅ CloudWatch alarms created for monitoring"
     ```
 
-    Your monitoring infrastructure is now active, providing automated alerting on processing failures and performance issues. This completes your production-ready event-driven data processing system.
+    Your monitoring infrastructure is now active, providing automated alerting on processing failures, performance issues, and queue depth anomalies. This completes your production-ready event-driven data processing system with comprehensive observability.
 
 ## Validation & Testing
 
@@ -604,10 +665,12 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
        --log-group-name-prefix /aws/lambda/$LAMBDA_FUNCTION_NAME
    
    # Get recent log events (wait a few seconds after upload)
-   sleep 10
+   sleep 15
    aws logs filter-log-events \
        --log-group-name /aws/lambda/$LAMBDA_FUNCTION_NAME \
-       --start-time $(date -d '5 minutes ago' +%s)000
+       --start-time $(date -d '5 minutes ago' +%s)000 \
+       --query 'events[*].[timestamp,message]' \
+       --output table
    ```
 
 3. **Check processing reports were created**:
@@ -622,22 +685,37 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
    
    if [ ! -z "$REPORT_KEY" ]; then
        aws s3 cp s3://$BUCKET_NAME/$REPORT_KEY /tmp/report.json
-       cat /tmp/report.json
+       echo "Processing report contents:"
+       cat /tmp/report.json | jq '.'
    fi
    ```
 
 4. **Test error handling by uploading an invalid file**:
 
    ```bash
-   # Create a file that will trigger an error
+   # Create a file that will trigger an error (unsupported type)
    echo "invalid content" > /tmp/invalid-test.txt
    aws s3 cp /tmp/invalid-test.txt s3://$BUCKET_NAME/data/invalid-test.txt
    
-   # Check DLQ for messages (wait a few seconds)
-   sleep 15
+   # Wait for processing and check DLQ for messages
+   sleep 20
    aws sqs get-queue-attributes \
        --queue-url $DLQ_URL \
-       --attribute-names ApproximateNumberOfMessages
+       --attribute-names ApproximateNumberOfMessages,ApproximateNumberOfMessagesNotVisible
+   ```
+
+5. **Monitor CloudWatch metrics**:
+
+   ```bash
+   # Check Lambda invocation metrics
+   aws cloudwatch get-metric-statistics \
+       --namespace AWS/Lambda \
+       --metric-name Invocations \
+       --dimensions Name=FunctionName,Value=$LAMBDA_FUNCTION_NAME \
+       --start-time $(date -d '10 minutes ago' --iso-8601) \
+       --end-time $(date --iso-8601) \
+       --period 300 \
+       --statistics Sum
    ```
 
 ## Cleanup
@@ -698,7 +776,9 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
    ```bash
    # Delete CloudWatch alarms
    aws cloudwatch delete-alarms \
-       --alarm-names "${LAMBDA_FUNCTION_NAME}-errors" "${DLQ_NAME}-messages"
+       --alarm-names "${LAMBDA_FUNCTION_NAME}-errors" \
+       "${DLQ_NAME}-messages" \
+       "${LAMBDA_FUNCTION_NAME}-duration"
    
    echo "✅ CloudWatch alarms deleted"
    ```
@@ -726,23 +806,23 @@ echo "Lambda Function: $LAMBDA_FUNCTION_NAME"
 
 This event-driven data processing solution demonstrates the power of AWS's serverless architecture for building scalable, responsive data pipelines. The architecture leverages [S3 event notifications](https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html) as the primary trigger mechanism, which automatically detects when new objects are created and immediately invokes processing functions without the need for polling or manual intervention.
 
-The key architectural decisions include using Lambda for compute-intensive processing, SQS Dead Letter Queues for error handling, and SNS for alert notifications. This design provides several advantages: automatic scaling based on workload, pay-per-use pricing, and built-in fault tolerance. The filtering capabilities allow for fine-grained control over which events trigger processing, enabling efficient resource utilization.
+The key architectural decisions include using Lambda for compute-intensive processing, SQS Dead Letter Queues for error handling, and SNS for alert notifications. This design provides several advantages: automatic scaling based on workload, pay-per-use pricing, and built-in fault tolerance. The filtering capabilities allow for fine-grained control over which events trigger processing, enabling efficient resource utilization and cost optimization by processing only relevant files.
 
-The monitoring and error handling components are crucial for production workloads. [CloudWatch alarms](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html) provide proactive alerting when processing failures occur, while the [Dead Letter Queue](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html) captures failed events for analysis and potential reprocessing. This approach ensures that data processing failures don't go unnoticed and can be addressed systematically.
+The monitoring and error handling components are crucial for production workloads. [CloudWatch alarms](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html) provide proactive alerting when processing failures occur, while the [Dead Letter Queue](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html) captures failed events for analysis and potential reprocessing. This approach ensures that data processing failures don't go unnoticed and can be addressed systematically. The enhanced error handler provides detailed context about failures, making troubleshooting more efficient.
 
-Performance considerations include Lambda cold starts, which can add latency to initial processing, and the eventual consistency model of S3 events. For high-throughput scenarios, consider using provisioned concurrency for Lambda functions and implementing idempotent processing logic to handle potential duplicate events. See [Lambda monitoring best practices](https://docs.aws.amazon.com/lambda/latest/dg/lambda-monitoring.html) for additional guidance.
+Performance considerations include Lambda cold starts, which can add latency to initial processing, and the eventual consistency model of S3 events. For high-throughput scenarios, consider using [provisioned concurrency](https://docs.aws.amazon.com/lambda/latest/dg/provisioned-concurrency.html) for Lambda functions and implementing idempotent processing logic to handle potential duplicate events. The Python 3.12 runtime provides improved performance and security compared to older versions. See [Lambda monitoring best practices](https://docs.aws.amazon.com/lambda/latest/dg/lambda-monitoring.html) for additional guidance.
 
-> **Tip**: Use S3 object prefixes effectively to organize data and reduce unnecessary Lambda invocations. Consider implementing batch processing for small files to optimize costs and performance.
+> **Tip**: Use S3 object prefixes effectively to organize data and reduce unnecessary Lambda invocations. Consider implementing batch processing for small files to optimize costs and performance. The current configuration only processes files in the "data/" prefix, which is a cost-effective approach for selective processing.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Add data validation and schema checking** using AWS Glue Data Catalog to validate incoming data files against predefined schemas before processing
-2. **Implement parallel processing** by partitioning large files and processing chunks concurrently using Step Functions for orchestration
-3. **Add data lineage tracking** by integrating with AWS Lake Formation to track data transformations and maintain audit trails
-4. **Create a processing dashboard** using QuickSight to visualize processing metrics, success rates, and error patterns
-5. **Implement cross-region replication** for disaster recovery by setting up S3 Cross-Region Replication and deploying the processing infrastructure in multiple regions
+1. **Add data validation and schema checking** using AWS Glue Data Catalog to validate incoming data files against predefined schemas before processing, with automatic quarantine of invalid files
+2. **Implement parallel processing** by partitioning large files and processing chunks concurrently using Step Functions for orchestration and Lambda for parallel execution
+3. **Add comprehensive data lineage tracking** by integrating with AWS Lake Formation to track data transformations, maintain audit trails, and enable data governance
+4. **Create an operational dashboard** using Amazon QuickSight to visualize processing metrics, success rates, error patterns, and system performance with real-time updates
+5. **Implement cross-region disaster recovery** by setting up S3 Cross-Region Replication, deploying processing infrastructure in multiple regions, and implementing automatic failover mechanisms
 
 ## Infrastructure Code
 

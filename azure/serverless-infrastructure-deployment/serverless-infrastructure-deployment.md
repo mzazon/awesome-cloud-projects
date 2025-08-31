@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure Container Apps, Azure Resource Manager, Azure Storage, Azure Key Vault
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: devops, automation, infrastructure, containers, cicd, arm-templates
 recipe-generator-version: 1.3
@@ -82,7 +82,7 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with Owner or Contributor permissions for resource creation
-2. Azure CLI v2.50.0 or later installed and configured (or use Azure Cloud Shell)
+2. Azure CLI v2.57.0 or later installed and configured (or use Azure Cloud Shell)
 3. Basic understanding of ARM templates and Azure Resource Manager
 4. Familiarity with containerization and Azure Container Apps concepts
 5. Git repository for storing ARM templates and deployment scripts
@@ -117,8 +117,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 az containerapp env create \
     --name ${CONTAINER_APPS_ENV} \
     --resource-group ${RESOURCE_GROUP} \
-    --location ${LOCATION} \
-    --logs-destination none
+    --location ${LOCATION}
 
 echo "✅ Container Apps environment created: ${CONTAINER_APPS_ENV}"
 ```
@@ -155,7 +154,7 @@ echo "✅ Container Apps environment created: ${CONTAINER_APPS_ENV}"
 
 2. **Create Storage Account for Deployment Artifacts**:
 
-   Azure Storage provides durable, scalable storage for ARM templates, deployment scripts, and execution logs. Using Azure Storage with hierarchical namespace capabilities enables organized artifact management while providing integration with Azure Container Apps for seamless file access during deployment execution.
+   Azure Storage provides durable, scalable storage for ARM templates, deployment scripts, and execution logs. Using Azure Storage with organized container structure enables efficient artifact management while providing integration with Azure Container Apps for seamless file access during deployment execution.
 
    ```bash
    # Create storage account for ARM templates and logs
@@ -166,7 +165,8 @@ echo "✅ Container Apps environment created: ${CONTAINER_APPS_ENV}"
        --sku Standard_LRS \
        --kind StorageV2 \
        --access-tier Hot \
-       --allow-blob-public-access false
+       --allow-blob-public-access false \
+       --min-tls-version TLS1_2
    
    # Create containers for organized artifact storage
    az storage container create \
@@ -187,7 +187,7 @@ echo "✅ Container Apps environment created: ${CONTAINER_APPS_ENV}"
    echo "✅ Storage account created with organized containers: ${STORAGE_ACCOUNT}"
    ```
 
-   The storage account provides secure, organized storage for deployment artifacts with private access controls. This centralized approach enables version control of ARM templates, maintains deployment history, and provides audit trails for compliance requirements.
+   The storage account provides secure, organized storage for deployment artifacts with private access controls and TLS 1.2 encryption. This centralized approach enables version control of ARM templates, maintains deployment history, and provides audit trails for compliance requirements.
 
 3. **Create Managed Identity for Container Apps Job**:
 
@@ -275,7 +275,7 @@ echo "✅ Container Apps environment created: ${CONTAINER_APPS_ENV}"
        "resources": [
            {
                "type": "Microsoft.Storage/storageAccounts",
-               "apiVersion": "2023-01-01",
+               "apiVersion": "2023-04-01",
                "name": "[parameters('storageAccountName')]",
                "location": "[parameters('location')]",
                "sku": {
@@ -284,7 +284,8 @@ echo "✅ Container Apps environment created: ${CONTAINER_APPS_ENV}"
                "kind": "StorageV2",
                "properties": {
                    "accessTier": "Hot",
-                   "allowBlobPublicAccess": false
+                   "allowBlobPublicAccess": false,
+                   "minimumTlsVersion": "TLS1_2"
                }
            }
        ],
@@ -308,7 +309,7 @@ echo "✅ Container Apps environment created: ${CONTAINER_APPS_ENV}"
    echo "✅ Sample ARM template created and uploaded"
    ```
 
-   The sample ARM template demonstrates infrastructure-as-code principles with proper parameterization and resource organization. This template serves as a foundation for testing the deployment workflow and can be extended for complex infrastructure requirements.
+   The sample ARM template demonstrates infrastructure-as-code principles with proper parameterization, security configurations, and the latest API version. This template serves as a foundation for testing the deployment workflow and can be extended for complex infrastructure requirements.
 
 6. **Create Deployment Script for Container Job**:
 
@@ -593,7 +594,7 @@ Azure Container Apps Jobs provides a modern, serverless approach to infrastructu
 
 The combination of Container Apps Jobs with ARM templates creates a powerful deployment platform that can scale from simple single-resource deployments to complex multi-tier applications. The event-driven nature of Container Apps Jobs enables integration with various trigger sources, including Git webhooks, Azure Event Grid, and custom applications, providing flexibility for different deployment scenarios. For comprehensive guidance on Container Apps Jobs, see the [Azure Container Apps Jobs documentation](https://docs.microsoft.com/en-us/azure/container-apps/jobs) and [ARM template best practices](https://docs.microsoft.com/en-us/azure/azure-resource-manager/templates/best-practices).
 
-From a security perspective, this solution implements defense-in-depth strategies by using managed identities for authentication, Azure Key Vault for secret management, and RBAC for authorization. The separation of deployment artifacts in Azure Storage provides audit capabilities and version control, while the serverless execution model reduces the attack surface compared to traditional agent-based deployment systems. For detailed security considerations, review the [Azure Container Apps security documentation](https://docs.microsoft.com/en-us/azure/container-apps/security) and [ARM template security best practices](https://docs.microsoft.com/en-us/azure/azure-resource-manager/templates/security-guidance).
+From a security perspective, this solution implements defense-in-depth strategies by using managed identities for authentication, Azure Key Vault for secret management, and RBAC for authorization. The separation of deployment artifacts in Azure Storage provides audit capabilities and version control, while the serverless execution model reduces the attack surface compared to traditional agent-based deployment systems. For detailed security considerations, review the [Azure Container Apps security documentation](https://docs.microsoft.com/en-us/azure/container-apps/security) and [ARM template security best practices](https://docs.microsoft.com/en-us/azure/azure-resource-manager/templates/template-best-practices).
 
 Cost optimization is achieved through the consumption-based pricing model of Container Apps Jobs, which only charges for actual execution time and resources consumed. This approach is particularly beneficial for organizations with infrequent deployments or varying workload patterns. The solution also supports advanced scaling scenarios through parallel execution and can be integrated with Azure Cost Management for detailed cost tracking and optimization opportunities.
 

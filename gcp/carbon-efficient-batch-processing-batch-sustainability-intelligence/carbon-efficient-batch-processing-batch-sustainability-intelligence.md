@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Batch, Carbon Footprint, Cloud Monitoring, Pub/Sub
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: sustainability, batch-processing, carbon-footprint, green-computing, automation, scheduling
 recipe-generator-version: 1.3
@@ -87,6 +87,8 @@ graph TB
 
 ## Preparation
 
+Google Cloud Batch requires proper project configuration and API enablement to function effectively. The preparation phase establishes the foundational environment variables, enables required services, and configures the project for sustainable batch processing operations.
+
 ```bash
 # Set environment variables for GCP resources
 export PROJECT_ID="carbon-batch-$(date +%s)"
@@ -115,6 +117,8 @@ gcloud services enable storage.googleapis.com
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Region set to: ${REGION} (high CFE% region)"
 ```
+
+The project is now configured with all necessary APIs enabled and environment variables set. The selected region (us-central1) has high carbon-free energy availability, supporting sustainable computing objectives.
 
 ## Steps
 
@@ -183,7 +187,7 @@ echo "✅ Region set to: ${REGION} (high CFE% region)"
    
    def get_regional_carbon_data():
        """Simulate fetching regional carbon intensity data"""
-       # In production, this would fetch real CFE% data
+       # In production, this would fetch real CFE% data from Google Cloud APIs
        regions_data = {
            "us-central1": {"cfe_percent": 85, "carbon_intensity": 120},
            "europe-west1": {"cfe_percent": 92, "carbon_intensity": 95},
@@ -291,7 +295,7 @@ echo "✅ Region set to: ${REGION} (high CFE% region)"
    echo "✅ Carbon-aware job script created and uploaded"
    ```
 
-   The carbon-aware job script now includes intelligent workload modulation based on regional carbon intensity, demonstrating how applications can dynamically adjust their environmental impact.
+   The carbon-aware job script now includes intelligent workload modulation based on regional carbon intensity, demonstrating how applications can dynamically adjust their environmental impact while maintaining operational requirements.
 
 4. **Create Cloud Batch Job Definition**:
 
@@ -321,14 +325,14 @@ echo "✅ Region set to: ${REGION} (high CFE% region)"
            "runnables": [
              {
                "container": {
-                 "imageUri": "python:3.9-slim",
+                 "imageUri": "python:3.12-slim",
                  "commands": [
                    "/bin/bash"
                  ],
                  "options": "--workdir=/workspace"
                },
                "script": {
-                 "text": "pip install google-cloud-pubsub google-cloud-monitoring google-cloud-storage && python /workspace/carbon_aware_job.py"
+                 "text": "pip install google-cloud-pubsub google-cloud-monitoring google-cloud-storage && gsutil cp gs://${BUCKET_NAME}/job-scripts/carbon_aware_job.py /workspace/ && python /workspace/carbon_aware_job.py"
                },
                "environment": {
                  "variables": {
@@ -359,7 +363,7 @@ echo "✅ Region set to: ${REGION} (high CFE% region)"
    echo "✅ Batch job configuration created with sustainability optimizations"
    ```
 
-   The batch job configuration now includes preemptible instances for cost and carbon efficiency, proper resource limits, and comprehensive logging for sustainability tracking.
+   The batch job configuration now includes preemptible instances for cost and carbon efficiency, proper resource limits, and comprehensive logging for sustainability tracking. The updated Python 3.12 runtime provides better performance and security.
 
 5. **Set Up Carbon Footprint Monitoring Dashboard**:
 
@@ -394,7 +398,7 @@ echo "✅ Region set to: ${REGION} (high CFE% region)"
    echo "✅ Carbon monitoring metrics configured"
    ```
 
-   The monitoring system now includes specialized carbon footprint metrics, enabling comprehensive tracking of environmental impact across all batch processing operations.
+   The monitoring system now includes specialized carbon footprint metrics, enabling comprehensive tracking of environmental impact across all batch processing operations with Google Cloud's enterprise-grade monitoring capabilities.
 
 6. **Deploy Carbon-Aware Scheduler Function**:
 
@@ -418,7 +422,7 @@ echo "✅ Region set to: ${REGION} (high CFE% region)"
            # Parse request data
            request_json = request.get_json(silent=True)
            
-           # Get regional carbon data
+           # Get regional carbon data (in production, fetch from Carbon Footprint API)
            regions_carbon_data = {
                "us-central1": {"cfe_percent": 85, "carbon_intensity": 120},
                "europe-west1": {"cfe_percent": 92, "carbon_intensity": 95},
@@ -494,9 +498,10 @@ echo "✅ Region set to: ${REGION} (high CFE% region)"
    
    # Deploy the carbon-aware scheduler function
    gcloud functions deploy carbon-scheduler \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-http \
        --allow-unauthenticated \
+       --region=${REGION} \
        --source . \
        --entry-point carbon_aware_scheduler \
        --memory 256MB \
@@ -507,7 +512,7 @@ echo "✅ Region set to: ${REGION} (high CFE% region)"
    echo "✅ Carbon-aware scheduler function deployed"
    ```
 
-   The scheduler function now provides intelligent, sustainability-driven workload orchestration that automatically optimizes job placement and timing based on real-time carbon footprint data.
+   The scheduler function now provides intelligent, sustainability-driven workload orchestration that automatically optimizes job placement and timing based on real-time carbon footprint data using the latest Python 3.12 runtime.
 
 7. **Execute Carbon-Optimized Batch Job**:
 
@@ -538,7 +543,7 @@ echo "✅ Region set to: ${REGION} (high CFE% region)"
    echo "✅ Carbon-aware batch job completed successfully"
    ```
 
-   The batch job is now executing with full carbon intelligence capabilities, automatically adjusting its processing intensity based on regional carbon-free energy availability.
+   The batch job is now executing with full carbon intelligence capabilities, automatically adjusting its processing intensity based on regional carbon-free energy availability and Google Cloud's sustainability infrastructure.
 
 8. **Configure Sustainability Alerting**:
 
@@ -583,7 +588,7 @@ echo "✅ Region set to: ${REGION} (high CFE% region)"
    echo "✅ Carbon impact alerting configured"
    ```
 
-   The alerting system now provides proactive monitoring of carbon efficiency, enabling rapid response to sustainability performance issues and optimization opportunities.
+   The alerting system now provides proactive monitoring of carbon efficiency, enabling rapid response to sustainability performance issues and optimization opportunities through Google Cloud's comprehensive monitoring ecosystem.
 
 ## Validation & Testing
 
@@ -624,6 +629,7 @@ echo "✅ Region set to: ${REGION} (high CFE% region)"
    # Test scheduler function with sample request
    curl -X POST \
        $(gcloud functions describe carbon-scheduler \
+         --region=${REGION} \
          --format="value(httpsTrigger.url)") \
        -H "Content-Type: application/json" \
        -d '{
@@ -718,11 +724,11 @@ echo "✅ Region set to: ${REGION} (high CFE% region)"
 
 This recipe demonstrates a comprehensive approach to carbon-efficient batch processing that integrates Google Cloud's sustainability intelligence capabilities with modern batch orchestration patterns. The solution leverages Google Cloud's commitment to carbon-free energy (CFE) and regional carbon intensity data to make intelligent scheduling decisions that reduce environmental impact without sacrificing operational requirements.
 
-The carbon-aware scheduling system represents a shift from traditional resource optimization toward sustainable computing practices. By incorporating real-time regional carbon-free energy percentages into batch job scheduling decisions, organizations can significantly reduce their carbon footprint while often achieving cost savings through efficient resource utilization. Google Cloud's regional CFE data shows substantial variation - for example, Europe-West1 achieving 92% CFE while some regions operate at lower percentages, making intelligent regional selection crucial for sustainability goals.
+The carbon-aware scheduling system represents a shift from traditional resource optimization toward sustainable computing practices. By incorporating real-time regional carbon-free energy percentages into batch job scheduling decisions, organizations can significantly reduce their carbon footprint while often achieving cost savings through efficient resource utilization. Google Cloud's regional CFE data shows substantial variation - for example, Europe-West1 achieving 92% CFE while some regions operate at lower percentages, making intelligent regional selection crucial for sustainability goals. According to Google's [Carbon-free energy for Google Cloud regions](https://cloud.google.com/sustainability/region-carbon), regional variations in carbon-free energy can differ by 40% or more.
 
-The architectural pattern demonstrated here combines several key sustainability principles: temporal optimization (scheduling during low carbon intensity periods), spatial optimization (selecting regions with high CFE percentages), and adaptive processing (modulating workload intensity based on current carbon conditions). The Pub/Sub-based event system enables real-time responsiveness to changing carbon conditions, while Cloud Monitoring provides comprehensive visibility into sustainability metrics alongside traditional performance indicators.
+The architectural pattern demonstrated here combines several key sustainability principles: temporal optimization (scheduling during low carbon intensity periods), spatial optimization (selecting regions with high CFE percentages), and adaptive processing (modulating workload intensity based on current carbon conditions). The Pub/Sub-based event system enables real-time responsiveness to changing carbon conditions, while Cloud Monitoring provides comprehensive visibility into sustainability metrics alongside traditional performance indicators. This approach aligns with Google's commitment to achieving [24/7 carbon-free energy by 2030](https://sustainability.google/progress/energy/).
 
-Integration with Google Cloud's Carbon Footprint reporting enables organizations to track and report on their cloud sustainability performance with enterprise-grade accuracy. The system automatically generates detailed carbon accounting data that supports corporate sustainability reporting requirements and helps organizations meet their net-zero commitments. This approach aligns with Google Cloud's 24/7 carbon-free energy goals and provides customers with actionable sustainability intelligence.
+Integration with Google Cloud's Carbon Footprint reporting enables organizations to track and report on their cloud sustainability performance with enterprise-grade accuracy. The system automatically generates detailed carbon accounting data that supports corporate sustainability reporting requirements and helps organizations meet their net-zero commitments. This approach aligns with Google Cloud's 24/7 carbon-free energy goals and provides customers with actionable sustainability intelligence through the [Google Cloud Carbon Footprint](https://cloud.google.com/carbon-footprint) tooling.
 
 > **Tip**: Monitor regional CFE percentages during different times of day and seasons to identify optimal scheduling windows. Google Cloud's renewable energy investments create predictable patterns that can be leveraged for even greater carbon efficiency.
 

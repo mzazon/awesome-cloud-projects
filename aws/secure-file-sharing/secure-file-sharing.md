@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: s3,iam
 estimated-time: 30 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-25
 passed-qa: null
 tags: file-sharing,presigned-urls,s3,security
 recipe-generator-version: 1.3
@@ -61,11 +61,12 @@ graph TB
 1. AWS account with permissions to create S3 buckets and generate presigned URLs
 2. AWS CLI v2 installed and configured with appropriate credentials
 3. IAM user or role with S3 permissions (s3:GetObject, s3:PutObject)
-4. Files ready to share or test upload scenarios
-5. Basic understanding of S3 bucket policies and IAM permissions
-6. Estimated cost: S3 storage (~$0.023/GB), requests (~$0.0004/1000 requests)
+4. Python 3.x installed for upload presigned URL generation
+5. Files ready to share or test upload scenarios
+6. Basic understanding of S3 bucket policies and IAM permissions
+7. Estimated cost: S3 storage (~$0.023/GB), requests (~$0.0004/1000 requests)
 
-> **Note**: Presigned URLs inherit the permissions of the user who generates them, so ensure proper IAM policies are in place.
+> **Note**: Presigned URLs inherit the permissions of the user who generates them, so ensure proper IAM policies are in place. The AWS CLI `s3 presign` command only supports GET operations; upload URLs require AWS SDK tools.
 
 ## Preparation
 
@@ -165,17 +166,86 @@ echo "✅ Created private S3 bucket: ${BUCKET_NAME}"
 
    The successful download confirms that the presigned URL mechanism is working properly. S3 validated the embedded signature, verified the expiration time, and granted temporary access to the private object. This demonstrates the seamless user experience that presigned URLs provide.
 
-4. **Generate presigned URL for file upload**:
+4. **Create Python script for upload presigned URLs**:
 
-   Upload presigned URLs enable secure file submission workflows where external users can contribute content to your S3 bucket without requiring write permissions. This capability is essential for use cases like document submission portals, user-generated content, or collaborative file sharing. The HTTP PUT method ensures atomic uploads and prevents partial file corruption.
+   Upload presigned URLs enable secure file submission workflows where external users can contribute content to your S3 bucket without requiring write permissions. The AWS CLI `s3 presign` command only supports GET operations, so we need to use the AWS SDK (boto3) to generate PUT presigned URLs as recommended in the [AWS documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/PresignedUrlUploadObject.html).
 
    ```bash
-   # Generate a presigned URL for uploading a new file
+   # Create Python script for generating upload presigned URLs
+   cat > generate_upload_url.py << 'EOF'
+   #!/usr/bin/env python3
+   import boto3
+   import sys
+   from botocore.exceptions import ClientError
+   
+   def generate_presigned_url(s3_client, client_method, method_parameters, expires_in):
+       """
+       Generate a presigned Amazon S3 URL that can be used to perform an action.
+       
+       :param s3_client: A Boto3 Amazon S3 client.
+       :param client_method: The name of the client method that the URL performs.
+       :param method_parameters: The parameters of the specified client method.
+       :param expires_in: The number of seconds the presigned URL is valid for.
+       :return: The presigned URL.
+       """
+       try:
+           url = s3_client.generate_presigned_url(
+               ClientMethod=client_method,
+               Params=method_parameters,
+               ExpiresIn=expires_in
+           )
+       except ClientError:
+           print(f"Couldn't get a presigned URL for client method '{client_method}'.")
+           raise
+       return url
+   
+   def main():
+       if len(sys.argv) != 4:
+           print("Usage: python3 generate_upload_url.py <bucket-name> <object-key> <expiry-seconds>")
+           sys.exit(1)
+       
+       bucket_name = sys.argv[1]
+       object_key = sys.argv[2]
+       expires_in = int(sys.argv[3])
+       
+       # Create S3 client
+       s3_client = boto3.client('s3')
+       
+       # Generate presigned URL for PUT operation
+       url = generate_presigned_url(
+           s3_client, 
+           "put_object", 
+           {"Bucket": bucket_name, "Key": object_key}, 
+           expires_in
+       )
+       
+       print(url)
+   
+   if __name__ == "__main__":
+       main()
+   EOF
+   
+   chmod +x generate_upload_url.py
+   
+   echo "✅ Created upload URL generator script"
+   ```
+
+   This Python script uses the AWS SDK (boto3) to generate presigned URLs for PUT operations, which is the recommended approach according to AWS documentation. The script provides the same functionality as the AWS CLI but supports upload operations.
+
+5. **Generate presigned URL for file upload**:
+
+   Using our Python script, we can now generate secure upload URLs that allow external users to contribute content to specific paths in our S3 bucket. The HTTP PUT method ensures atomic uploads and prevents partial file corruption.
+
+   ```bash
+   # Install boto3 if not already available
+   pip3 install boto3 2>/dev/null || echo "boto3 already installed or using system package"
+   
+   # Generate a presigned URL for uploading a new file (30 minutes = 1800 seconds)
    UPLOAD_FILE="upload-test.txt"
-   UPLOAD_URL=$(aws s3 presign \
-       s3://${BUCKET_NAME}/uploads/${UPLOAD_FILE} \
-       --expires-in 1800 \
-       --http-method PUT)
+   UPLOAD_URL=$(python3 generate_upload_url.py \
+       "${BUCKET_NAME}" \
+       "uploads/${UPLOAD_FILE}" \
+       1800)
    
    echo "Upload URL (valid for 30 minutes):"
    echo "${UPLOAD_URL}"
@@ -189,9 +259,9 @@ echo "✅ Created private S3 bucket: ${BUCKET_NAME}"
 
    The upload URL grants time-limited PUT permissions to a specific object path, enabling controlled content submission. The shorter 30-minute expiration for uploads provides enhanced security for write operations while still allowing reasonable time for file transfers.
 
-> **Warning**: Upload presigned URLs should use shorter expiration times than download URLs to minimize the risk window for unauthorized uploads.
+> **Warning**: Upload presigned URLs should use shorter expiration times than download URLs to minimize the risk window for unauthorized uploads. Always validate uploaded content before making it available to other users.
 
-5. **Test the upload URL**:
+6. **Test the upload URL**:
 
    Testing the upload functionality validates bidirectional file sharing capabilities. This simulates scenarios where external partners submit documents, reports, or other content to your organization. The successful upload demonstrates how presigned URLs can replace complex FTP servers or user account management systems.
 
@@ -210,7 +280,7 @@ echo "✅ Created private S3 bucket: ${BUCKET_NAME}"
 
    The successful upload confirms that external users can contribute content securely without compromising bucket permissions. S3 automatically applies your bucket's default encryption and access policies to uploaded objects, maintaining consistent security controls.
 
-6. **Create a batch presigned URL generator script**:
+7. **Create a batch presigned URL generator script**:
 
    Batch URL generation enables efficient distribution of multiple files simultaneously, which is essential for scenarios like quarterly reports, project documentation bundles, or media asset sharing. This automation reduces manual effort and ensures consistent expiration policies across all shared content.
 
@@ -254,7 +324,7 @@ echo "✅ Created private S3 bucket: ${BUCKET_NAME}"
 
    This script provides operational scalability by automating URL generation for entire buckets or prefixes. Organizations can integrate this into notification systems, content management workflows, or scheduled distribution processes.
 
-7. **Set up URL expiration monitoring**:
+8. **Set up URL expiration monitoring**:
 
    URL expiration monitoring provides operational visibility and prevents user frustration from expired links. Understanding expiration mechanics helps administrators plan distribution timing and implement proactive renewal processes. This monitoring capability is crucial for maintaining reliable file sharing services.
 
@@ -314,7 +384,7 @@ echo "✅ Created private S3 bucket: ${BUCKET_NAME}"
 
    This monitoring script decodes the AWS signature parameters to extract creation and expiration timestamps. Organizations can integrate this into monitoring dashboards, alerting systems, or automated renewal workflows to maintain seamless file sharing operations.
 
-> **Tip**: Integrate this expiration checker into your CI/CD pipelines or monitoring systems to proactively alert users before URLs expire. Consider implementing automated re-generation for frequently accessed files.
+> **Tip**: Integrate this expiration checker into your CI/CD pipelines or monitoring systems to proactively alert users before URLs expire. Consider implementing automated re-generation for frequently accessed files using AWS Lambda and EventBridge.
 
 ## Validation & Testing
 
@@ -391,7 +461,7 @@ echo "✅ Created private S3 bucket: ${BUCKET_NAME}"
    # Remove local test files and scripts
    rm -f ${SAMPLE_FILE} downloaded_${SAMPLE_FILE} test-upload.txt
    rm -f downloaded-upload.txt download_url.txt upload_url.txt
-   rm -f generate_presigned_urls.sh check_url_expiry.py
+   rm -f generate_presigned_urls.sh check_url_expiry.py generate_upload_url.py
    
    # Clear environment variables
    unset BUCKET_NAME SAMPLE_FILE UPLOAD_FILE
@@ -402,21 +472,23 @@ echo "✅ Created private S3 bucket: ${BUCKET_NAME}"
 
 ## Discussion
 
-S3 presigned URLs provide a powerful mechanism for secure, temporary file sharing without the complexity of user management or the security risks of public buckets. The solution leverages AWS's built-in authentication and authorization systems while providing fine-grained control over access duration and permissions.
+S3 presigned URLs provide a powerful mechanism for secure, temporary file sharing without the complexity of user management or the security risks of public buckets. The solution leverages AWS's built-in authentication and authorization systems while providing fine-grained control over access duration and permissions. This approach follows the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) security pillar by implementing the principle of least privilege and defense in depth.
 
-The key advantage of presigned URLs is that they inherit the permissions of the user who generates them, ensuring that access is limited to what the URL creator is authorized to do. This creates a secure delegation model where administrators can grant temporary access without sharing credentials or modifying bucket policies.
+The key advantage of presigned URLs is that they inherit the permissions of the user who generates them, ensuring that access is limited to what the URL creator is authorized to do. This creates a secure delegation model where administrators can grant temporary access without sharing credentials or modifying bucket policies. According to the [AWS S3 User Guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html), presigned URLs can be valid for up to 7 days, providing flexibility for various use cases while maintaining security boundaries.
 
-For enterprise use cases, consider implementing additional security measures such as IP address restrictions through bucket policies, integration with AWS CloudTrail for comprehensive audit logging, and automated URL generation through Lambda functions triggered by business workflows. The solution scales naturally with S3's global infrastructure and can handle everything from occasional file sharing to high-volume document distribution systems.
+For enterprise use cases, consider implementing additional security measures such as IP address restrictions through bucket policies, integration with AWS CloudTrail for comprehensive audit logging, and automated URL generation through Lambda functions triggered by business workflows. The solution scales naturally with S3's global infrastructure and can handle everything from occasional file sharing to high-volume document distribution systems. For enhanced security monitoring, integrate with [AWS Security Hub](https://docs.aws.amazon.com/securityhub/latest/userguide/what-is-securityhub.html) to detect and respond to suspicious access patterns.
+
+> **Note**: This implementation follows AWS security best practices by using private buckets, time-limited access, and comprehensive audit logging. For production deployments, consider implementing additional controls such as content scanning and approval workflows.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Build a web interface** using Lambda and API Gateway that allows users to request presigned URLs through a simple form with approval workflows
-2. **Implement IP-based restrictions** by adding bucket policies that limit presigned URL access to specific IP ranges or VPC endpoints
-3. **Create automated expiration notifications** using EventBridge and SNS to alert users when shared URLs are about to expire
-4. **Add virus scanning integration** using Lambda to scan uploaded files before they become available for download
-5. **Build a file sharing dashboard** with CloudWatch metrics to track usage patterns, popular files, and security events
+1. **Build a web interface** using Lambda and API Gateway that allows users to request presigned URLs through a simple form with approval workflows and email notifications
+2. **Implement IP-based restrictions** by adding bucket policies that limit presigned URL access to specific IP ranges or VPC endpoints for enhanced security
+3. **Create automated expiration notifications** using EventBridge and SNS to alert users when shared URLs are about to expire, with automatic renewal options
+4. **Add virus scanning integration** using Lambda to scan uploaded files with ClamAV or third-party services before they become available for download
+5. **Build a file sharing dashboard** with CloudWatch metrics and QuickSight to track usage patterns, popular files, security events, and cost optimization opportunities
 
 ## Infrastructure Code
 

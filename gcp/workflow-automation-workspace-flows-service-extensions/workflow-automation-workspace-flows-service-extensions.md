@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Google Workspace Flows, Service Extensions, Cloud Functions, Pub/Sub
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: workflow-automation, document-processing, intelligent-automation, workspace-integration
 recipe-generator-version: 1.3
@@ -19,7 +19,7 @@ recipe-generator-version: 1.3
 
 ## Problem
 
-Organizations struggle with manual document processing workflows that involve multiple stakeholders and complex approval chains. Teams waste valuable time manually routing documents, extracting metadata, applying business rules, and coordinating approvals across different departments. Traditional automation solutions require extensive coding knowledge and fail to integrate seamlessly with existing Google Workspace environments, creating bottlenecks that slow down critical business processes.
+Organizations struggle with manual document processing workflows that involve multiple stakeholders, complex approval chains, and inconsistent business rule application. Teams waste valuable time manually routing documents, extracting metadata, coordinating approvals across departments, and tracking workflow status. Traditional automation solutions require extensive coding knowledge, lack AI-powered decision-making capabilities, and fail to integrate seamlessly with existing Google Workspace environments, creating operational bottlenecks that impact business productivity.
 
 ## Solution
 
@@ -85,7 +85,7 @@ graph TB
 5. Basic understanding of workflow automation and document processing concepts
 6. Estimated cost: $50-150/month depending on usage volume (includes Workspace licenses, Cloud Functions, Pub/Sub, and storage)
 
-> **Note**: Google Workspace Flows is currently in alpha and requires specific domain eligibility criteria including Gemini for Google Workspace licenses purchased before January 15, 2025.
+> **Note**: Google Workspace Flows is currently in limited preview and requires specific domain eligibility. Organizations must have Gemini for Google Workspace licenses and be part of the early access program. Contact your Google Workspace administrator for access requirements.
 
 ## Preparation
 
@@ -976,13 +976,13 @@ This intelligent workflow automation solution demonstrates the power of combinin
 
 **AI-Powered Decision Making**: By integrating Gemini AI within Google Workspace Flows, the system makes intelligent routing decisions based on document content analysis rather than simple rule-based logic. This approach reduces manual configuration overhead and adapts to varying document types and business contexts. The AI analysis extracts metadata like document type, priority, and estimated value, enabling sophisticated approval workflows that would be difficult to implement with traditional automation tools.
 
-**Custom Business Logic with WebAssembly**: Service Extensions with WebAssembly plugins provide high-performance business rule execution without the latency and complexity of external service calls. This approach is particularly valuable for organizations with complex approval hierarchies or regulatory requirements that demand consistent rule application. The WebAssembly runtime ensures security isolation while enabling custom logic written in multiple programming languages.
+**Custom Business Logic with WebAssembly**: Service Extensions with WebAssembly plugins provide high-performance, secure business rule execution without the latency of external service calls. This approach is ideal for organizations with complex approval hierarchies or regulatory requirements demanding consistent rule application. The WebAssembly sandbox runtime ensures security isolation while supporting custom logic in multiple programming languages, enabling sophisticated business rules that adapt to document content and organizational policies.
 
 The monitoring and analytics capabilities provide essential visibility into workflow performance, enabling continuous optimization based on actual usage patterns. Organizations can identify bottlenecks, track approval times, and optimize routing rules based on empirical data rather than assumptions.
 
 For additional guidance on implementing enterprise workflow automation, refer to the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework), [Google Workspace Flows documentation](https://workspace.google.com/products/flows/), [Service Extensions best practices](https://cloud.google.com/service-extensions/docs/best-practices), [Cloud Functions patterns](https://cloud.google.com/functions/docs/concepts/overview), and [Pub/Sub message flow design](https://cloud.google.com/pubsub/docs/overview).
 
-> **Tip**: Monitor workflow performance metrics regularly and use Cloud Monitoring alerts to proactively identify processing delays or error spikes. Consider implementing progressive rollout strategies when updating WebAssembly business rules to minimize disruption to active workflows.
+> **Tip**: Monitor workflow performance using Cloud Monitoring dashboards to track document processing volumes, approval response times, and error rates. Set up alerts for processing delays exceeding SLA thresholds and implement canary deployments when updating WebAssembly business rules to minimize workflow disruption.
 
 ## Challenge
 

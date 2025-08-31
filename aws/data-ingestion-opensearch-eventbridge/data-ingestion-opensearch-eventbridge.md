@@ -6,16 +6,16 @@ difficulty: 200
 subject: aws
 services: OpenSearch Ingestion, EventBridge Scheduler, S3, IAM
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-ingestion, analytics, automation, scheduling, real-time, monitoring
 recipe-generator-version: 1.3
 ---
 
-# OpenSearch Data Ingestion Pipelines
+# OpenSearch Data Ingestion Pipelines with EventBridge Scheduler
 
 ## Problem
 
@@ -137,7 +137,7 @@ echo "✅ AWS environment configured with S3 bucket: ${BUCKET_NAME}"
    cat > domain-config.json << EOF
    {
      "DomainName": "${OPENSEARCH_DOMAIN}",
-     "EngineVersion": "OpenSearch_2.3",
+     "EngineVersion": "OpenSearch_2.13",
      "ClusterConfig": {
        "InstanceType": "t3.small.search",
        "InstanceCount": 1,
@@ -402,20 +402,25 @@ echo "✅ AWS environment configured with S3 bucket: ${BUCKET_NAME}"
    EventBridge Scheduler enables precise timing control for pipeline operations, allowing data processing to occur during optimal time windows. This schedule automatically starts the pipeline during business hours to ensure fresh data is available for analytics and reporting activities while managing operational costs through automated control.
 
    ```bash
+   # Create target configuration for pipeline start
+   cat > start-target.json << EOF
+   {
+     "Arn": "arn:aws:scheduler:::aws-sdk:osis:startPipeline",
+     "RoleArn": "${SCHEDULER_ROLE_ARN}",
+     "Input": "{\"PipelineName\": \"${PIPELINE_NAME}\"}",
+     "RetryPolicy": {
+       "MaximumRetryAttempts": 3,
+       "MaximumEventAge": 3600
+     }
+   }
+   EOF
+   
    # Create schedule to start pipeline daily at 8 AM UTC
    aws scheduler create-schedule \
        --name "start-ingestion-pipeline" \
        --group-name ${SCHEDULE_GROUP_NAME} \
        --schedule-expression "cron(0 8 * * ? *)" \
-       --target '{
-         "Arn": "arn:aws:osis:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':pipeline/'${PIPELINE_NAME}'",
-         "RoleArn": "'${SCHEDULER_ROLE_ARN}'",
-         "Input": "{\"action\": \"start\"}",
-         "RetryPolicy": {
-           "MaximumRetryAttempts": 3,
-           "MaximumEventAge": 3600
-         }
-       }' \
+       --target file://start-target.json \
        --flexible-time-window '{"Mode": "FLEXIBLE", "MaximumWindowInMinutes": 15}' \
        --description "Daily start of data ingestion pipeline"
    
@@ -429,20 +434,25 @@ echo "✅ AWS environment configured with S3 bucket: ${BUCKET_NAME}"
    Cost optimization is achieved through automated pipeline shutdown during non-business hours. This schedule stops the pipeline when data processing is not required, reducing operational costs while maintaining data availability during peak usage periods. The flexible time window ensures graceful shutdown without interrupting active processing tasks.
 
    ```bash
+   # Create target configuration for pipeline stop
+   cat > stop-target.json << EOF
+   {
+     "Arn": "arn:aws:scheduler:::aws-sdk:osis:stopPipeline",
+     "RoleArn": "${SCHEDULER_ROLE_ARN}",
+     "Input": "{\"PipelineName\": \"${PIPELINE_NAME}\"}",
+     "RetryPolicy": {
+       "MaximumRetryAttempts": 3,
+       "MaximumEventAge": 3600
+     }
+   }
+   EOF
+   
    # Create schedule to stop pipeline daily at 6 PM UTC
    aws scheduler create-schedule \
        --name "stop-ingestion-pipeline" \
        --group-name ${SCHEDULE_GROUP_NAME} \
        --schedule-expression "cron(0 18 * * ? *)" \
-       --target '{
-         "Arn": "arn:aws:osis:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':pipeline/'${PIPELINE_NAME}'",
-         "RoleArn": "'${SCHEDULER_ROLE_ARN}'",
-         "Input": "{\"action\": \"stop\"}",
-         "RetryPolicy": {
-           "MaximumRetryAttempts": 3,
-           "MaximumEventAge": 3600
-         }
-       }' \
+       --target file://stop-target.json \
        --flexible-time-window '{"Mode": "FLEXIBLE", "MaximumWindowInMinutes": 15}' \
        --description "Daily stop of data ingestion pipeline"
    
@@ -522,11 +532,13 @@ echo "✅ AWS environment configured with S3 bucket: ${BUCKET_NAME}"
    ```bash
    # Check if data was processed (may take a few minutes)
    curl -X GET "https://${OPENSEARCH_ENDPOINT}/_cat/indices?v" \
-       -H "Content-Type: application/json"
+       -H "Content-Type: application/json" \
+       --aws-sigv4 "aws:amz:${AWS_REGION}:es"
    
    # Query processed data
    curl -X GET "https://${OPENSEARCH_ENDPOINT}/application-logs-*/_search" \
        -H "Content-Type: application/json" \
+       --aws-sigv4 "aws:amz:${AWS_REGION}:es" \
        -d '{"query": {"match_all": {}}, "size": 10}'
    ```
 
@@ -620,7 +632,7 @@ echo "✅ AWS environment configured with S3 bucket: ${BUCKET_NAME}"
    # Remove local files
    rm -f domain-config.json trust-policy.json permissions-policy.json
    rm -f pipeline-config.yaml scheduler-trust-policy.json scheduler-permissions-policy.json
-   rm -f sample-logs.log sample-metrics.json
+   rm -f sample-logs.log sample-metrics.json start-target.json stop-target.json
    
    echo "✅ All resources cleaned up"
    ```
@@ -631,11 +643,11 @@ This solution demonstrates a modern approach to automated data ingestion that co
 
 The integration with EventBridge Scheduler represents a significant advancement in workload automation, offering more precise control and reliability compared to traditional cron-based scheduling. The service's flexible time windows, automatic retry mechanisms, and centralized management capabilities make it ideal for production data processing workflows. This approach ensures that data ingestion operations occur during optimal time windows while maintaining cost efficiency through automated resource management.
 
-The architectural pattern demonstrated here aligns with AWS Well-Architected Framework principles by implementing operational excellence through automation, reliability through managed services, and cost optimization through scheduled resource management. The solution provides a foundation for building sophisticated data analytics platforms that can scale with organizational needs while maintaining security and operational best practices. Organizations can extend this pattern to support multiple data sources, complex transformation logic, and advanced analytics use cases.
+The architectural pattern demonstrated here aligns with [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles by implementing operational excellence through automation, reliability through managed services, and cost optimization through scheduled resource management. The solution provides a foundation for building sophisticated data analytics platforms that can scale with organizational needs while maintaining security and operational best practices. Organizations can extend this pattern to support multiple data sources, complex transformation logic, and advanced analytics use cases.
 
 Security considerations are paramount in this implementation, with IAM roles configured using least privilege principles and all data encrypted both at rest and in transit. The OpenSearch domain includes comprehensive security features including access policies, encryption, and HTTPS enforcement. This security-first approach ensures that sensitive data is protected throughout the ingestion and processing pipeline while maintaining compliance with enterprise security requirements.
 
-> **Tip**: Monitor pipeline performance using CloudWatch metrics and set up alerts for processing failures to ensure reliable data ingestion operations.
+> **Tip**: Monitor pipeline performance using CloudWatch metrics and set up alerts for processing failures to ensure reliable data ingestion operations. Use [OpenSearch Service monitoring](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/monitoring.html) to track domain health and performance.
 
 For detailed implementation guidance, refer to the [Amazon OpenSearch Ingestion User Guide](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/ingestion.html), [EventBridge Scheduler User Guide](https://docs.aws.amazon.com/scheduler/latest/UserGuide/), [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html), and [Amazon S3 Best Practices](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html).
 

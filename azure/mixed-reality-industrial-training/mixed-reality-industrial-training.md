@@ -6,10 +6,10 @@ difficulty: 400
 subject: azure
 services: Azure Remote Rendering, Azure Object Anchors, Azure Spatial Anchors, Azure Storage
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: mixed-reality, hololens, industrial-training, 3d-rendering, spatial-computing, object-anchoring
 recipe-generator-version: 1.3
@@ -83,11 +83,14 @@ graph TB
 6. Understanding of 3D modeling and industrial equipment visualization
 7. Estimated cost: $200-500 for testing (Remote Rendering sessions, storage, and compute resources)
 
-> **Note**: Azure Remote Rendering will be retired on September 30, 2025. Consider this timeline when planning production deployments and explore alternative solutions such as Unity Cloud Build or custom GPU-based rendering solutions.
+> **Warning**: Azure Remote Rendering will be retired on September 30, 2025. Consider this timeline when planning production deployments and explore alternative solutions such as Unity Cloud Build or custom GPU-based rendering solutions.
 
 ## Preparation
 
 ```bash
+# Generate unique suffix for resource names first
+RANDOM_SUFFIX=$(openssl rand -hex 3)
+
 # Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-industrial-training-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
@@ -95,9 +98,6 @@ export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 export ARR_ACCOUNT_NAME="arr-training-${RANDOM_SUFFIX}"
 export STORAGE_ACCOUNT_NAME="sttraining${RANDOM_SUFFIX}"
 export SPATIAL_ANCHORS_ACCOUNT="sa-training-${RANDOM_SUFFIX}"
-
-# Generate unique suffix for resource names
-RANDOM_SUFFIX=$(openssl rand -hex 3)
 
 # Create resource group for industrial training platform
 az group create \
@@ -164,25 +164,25 @@ echo "✅ Azure providers registered for Mixed Reality services"
 
    ```bash
    # Create Azure Remote Rendering account
-   az mixed-reality remote-rendering-account create \
+   az remote-rendering-account create \
        --name ${ARR_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --tags purpose=industrial-training environment=demo
    
    # Get account details for application configuration
-   ARR_ACCOUNT_ID=$(az mixed-reality remote-rendering-account show \
+   ARR_ACCOUNT_ID=$(az remote-rendering-account show \
        --name ${ARR_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query accountId --output tsv)
    
-   ARR_ACCOUNT_DOMAIN=$(az mixed-reality remote-rendering-account show \
+   ARR_ACCOUNT_DOMAIN=$(az remote-rendering-account show \
        --name ${ARR_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query accountDomain --output tsv)
    
    # Get access key for authentication
-   ARR_ACCESS_KEY=$(az mixed-reality remote-rendering-account key show \
+   ARR_ACCESS_KEY=$(az remote-rendering-account key show \
        --name ${ARR_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query primaryKey --output tsv)
@@ -200,25 +200,25 @@ echo "✅ Azure providers registered for Mixed Reality services"
 
    ```bash
    # Create Azure Spatial Anchors account
-   az mixed-reality spatial-anchors-account create \
+   az spatial-anchors-account create \
        --name ${SPATIAL_ANCHORS_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --tags purpose=spatial-anchoring environment=industrial-training
    
    # Get account details for Unity integration
-   SPATIAL_ANCHORS_ID=$(az mixed-reality spatial-anchors-account show \
+   SPATIAL_ANCHORS_ID=$(az spatial-anchors-account show \
        --name ${SPATIAL_ANCHORS_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
        --query accountId --output tsv)
    
-   SPATIAL_ANCHORS_DOMAIN=$(az mixed-reality spatial-anchors-account show \
+   SPATIAL_ANCHORS_DOMAIN=$(az spatial-anchors-account show \
        --name ${SPATIAL_ANCHORS_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
        --query accountDomain --output tsv)
    
    # Get access key for authentication
-   SPATIAL_ANCHORS_KEY=$(az mixed-reality spatial-anchors-account key show \
+   SPATIAL_ANCHORS_KEY=$(az spatial-anchors-account key show \
        --name ${SPATIAL_ANCHORS_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
        --query primaryKey --output tsv)
@@ -441,6 +441,9 @@ echo "✅ Azure providers registered for Mixed Reality services"
    # Create Unity project configuration
    mkdir -p ./unity-project-config
    
+   # Get tenant ID for configuration
+   TENANT_ID=$(az account show --query tenantId --output tsv)
+   
    cat > ./unity-project-config/azure-services-config.json << EOF
    {
      "azureServices": {
@@ -463,9 +466,9 @@ echo "✅ Azure providers registered for Mixed Reality services"
          "trainingContainer": "training-content"
        },
        "azureAD": {
-         "tenantId": "$(az account show --query tenantId --output tsv)",
+         "tenantId": "${TENANT_ID}",
          "clientId": "${APP_ID}",
-         "redirectUri": "ms-appx-web://microsoft.aad.brokerplugin/{APP_ID}"
+         "redirectUri": "ms-appx-web://microsoft.aad.brokerplugin/${APP_ID}"
        }
      },
      "trainingPlatform": {
@@ -549,7 +552,7 @@ echo "✅ Azure providers registered for Mixed Reality services"
    
    # Validate Azure service connectivity
    echo "Validating Azure Remote Rendering service..."
-   ARR_STATUS=$(az mixed-reality remote-rendering-account show \
+   ARR_STATUS=$(az remote-rendering-account show \
        --name ${ARR_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query provisioningState --output tsv 2>/dev/null)
@@ -562,7 +565,7 @@ echo "✅ Azure providers registered for Mixed Reality services"
    fi
    
    echo "Validating Azure Spatial Anchors service..."
-   SPATIAL_STATUS=$(az mixed-reality spatial-anchors-account show \
+   SPATIAL_STATUS=$(az spatial-anchors-account show \
        --name ${SPATIAL_ANCHORS_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
        --query provisioningState --output tsv 2>/dev/null)
@@ -626,35 +629,26 @@ echo "✅ Azure providers registered for Mixed Reality services"
 
    ```bash
    # Check Remote Rendering account status
-   az mixed-reality remote-rendering-account show \
+   az remote-rendering-account show \
        --name ${ARR_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --output table
-   
-   # Test rendering session creation capability
-   echo "Testing rendering session creation..."
-   az mixed-reality remote-rendering session create \
-       --account-name ${ARR_ACCOUNT_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --session-id "test-session-001" \
-       --size "standard" \
-       --lease-time 60
    ```
 
-   Expected output: Remote Rendering account shows "Succeeded" status with valid session creation capability.
+   Expected output: Remote Rendering account shows "Succeeded" status with valid configuration.
 
 2. **Validate Spatial Anchors Service Integration**:
 
    ```bash
    # Verify Spatial Anchors account configuration
-   az mixed-reality spatial-anchors-account show \
+   az spatial-anchors-account show \
        --name ${SPATIAL_ANCHORS_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
        --query '{name:name, status:provisioningState, id:accountId}' \
        --output table
    
    # Test spatial anchors key access
-   az mixed-reality spatial-anchors-account key show \
+   az spatial-anchors-account key show \
        --name ${SPATIAL_ANCHORS_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
        --query primaryKey --output tsv
@@ -710,25 +704,7 @@ echo "✅ Azure providers registered for Mixed Reality services"
 
 ## Cleanup
 
-1. **Stop and Remove Azure Remote Rendering Sessions**:
-
-   ```bash
-   # List active rendering sessions
-   az mixed-reality remote-rendering session list \
-       --account-name ${ARR_ACCOUNT_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --output table
-   
-   # Stop test session if running
-   az mixed-reality remote-rendering session stop \
-       --account-name ${ARR_ACCOUNT_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --session-id "test-session-001" || echo "No active sessions found"
-   
-   echo "✅ Remote rendering sessions stopped"
-   ```
-
-2. **Delete Azure AD Application Registration**:
+1. **Delete Azure AD Application Registration**:
 
    ```bash
    # Remove application registration
@@ -737,7 +713,7 @@ echo "✅ Azure providers registered for Mixed Reality services"
    echo "✅ Azure AD application registration deleted"
    ```
 
-3. **Remove Local Development Files**:
+2. **Remove Local Development Files**:
 
    ```bash
    # Clean up local files
@@ -751,7 +727,7 @@ echo "✅ Azure providers registered for Mixed Reality services"
    echo "✅ Local development files cleaned up"
    ```
 
-4. **Delete Azure Resource Group**:
+3. **Delete Azure Resource Group**:
 
    ```bash
    # Delete resource group and all contained resources

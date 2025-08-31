@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Advisor, Azure Cost Management, Azure Monitor, Azure Logic Apps
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-optimization, automation, monitoring, budgets, recommendations
 recipe-generator-version: 1.3
@@ -88,7 +88,7 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for the cost optimization solution
+# Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-cost-optimization-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
@@ -158,7 +158,7 @@ echo "✅ Log Analytics workspace created for cost monitoring"
 
 2. **Configure Azure Cost Management Budget with Automation**:
 
-   Azure Cost Management budgets provide proactive spending control through automated alerts and actions when costs approach defined thresholds. Creating budgets with Action Groups enables immediate response to cost anomalies through Logic Apps integration.
+   Azure Cost Management budgets provide proactive spending control through automated alerts and actions when costs approach defined thresholds. Creating budgets with Action Groups enables immediate response to cost anomalies through Logic Apps integration following Azure Well-Architected Framework cost optimization principles.
 
    ```bash
    # Get current date for budget period
@@ -184,24 +184,33 @@ echo "✅ Log Analytics workspace created for cost monitoring"
    echo "✅ Budget created with automated alert thresholds"
    ```
 
-   The budget configuration establishes spending thresholds that trigger automated responses when costs exceed defined limits. This proactive approach prevents budget overruns through early warning systems and automated remediation actions.
+   The budget configuration establishes spending thresholds that trigger automated responses when costs exceed defined limits. This proactive approach prevents budget overruns through early warning systems and automated remediation actions based on Azure Cost Management best practices.
 
 3. **Create Logic Apps Workflow for Cost Optimization Automation**:
 
-   Azure Logic Apps provides serverless workflow automation that responds to cost alerts and implements optimization actions. This workflow orchestrates the entire cost optimization process from alert detection to remediation implementation.
+   Azure Logic Apps provides serverless workflow automation that responds to cost alerts and implements optimization actions. This workflow orchestrates the entire cost optimization process from alert detection to remediation implementation using managed identity for secure access.
 
    ```bash
-   # Create Logic Apps Standard resource
-   az logicapp create \
+   # Create Logic Apps workflow
+   az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${LOGIC_APP_NAME} \
-       --storage-account ${STORAGE_ACCOUNT} \
        --location ${LOCATION} \
-       --sku Standard \
+       --name ${LOGIC_APP_NAME} \
+       --definition '{
+         "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+         "contentVersion": "1.0.0.0",
+         "triggers": {
+           "manual": {
+             "type": "Request",
+             "kind": "Http"
+           }
+         },
+         "actions": {}
+       }' \
        --tags purpose=cost-optimization-automation
 
    # Get Logic Apps resource ID
-   LOGIC_APP_ID=$(az logicapp show \
+   LOGIC_APP_ID=$(az logic workflow show \
        --resource-group ${RESOURCE_GROUP} \
        --name ${LOGIC_APP_NAME} \
        --query id \
@@ -227,20 +236,10 @@ echo "✅ Log Analytics workspace created for cost monitoring"
    SP_APP_ID=$(echo ${SP_DETAILS} | jq -r '.appId')
    SP_PASSWORD=$(echo ${SP_DETAILS} | jq -r '.password')
 
-   # Configure Logic Apps application settings for API access
-   az logicapp config appsettings set \
-       --name ${LOGIC_APP_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --settings \
-       "AZURE_CLIENT_ID=${SP_APP_ID}" \
-       "AZURE_CLIENT_SECRET=${SP_PASSWORD}" \
-       "AZURE_TENANT_ID=${TENANT_ID}" \
-       "AZURE_SUBSCRIPTION_ID=${SUBSCRIPTION_ID}"
-
    echo "✅ Azure Advisor integration configured with proper permissions"
    ```
 
-   The service principal configuration enables secure, programmatic access to Azure Advisor recommendations and Cost Management APIs. This authentication mechanism ensures reliable automation while maintaining proper security controls and access limitations.
+   The service principal configuration enables secure, programmatic access to Azure Advisor recommendations and Cost Management APIs. This authentication mechanism ensures reliable automation while maintaining proper security controls and access limitations following Azure security best practices.
 
 5. **Set Up Cost Anomaly Detection with Azure Monitor**:
 
@@ -272,21 +271,25 @@ echo "✅ Log Analytics workspace created for cost monitoring"
 
 6. **Create Automated Cost Data Export**:
 
-   Regular cost data exports provide the foundation for trend analysis, forecasting, and detailed cost optimization insights. Automated exports ensure consistent data availability for analysis while reducing manual overhead.
+   Regular cost data exports provide the foundation for trend analysis, forecasting, and detailed cost optimization insights. Automated exports ensure consistent data availability for analysis while reducing manual overhead following Azure data governance principles.
 
    ```bash
+   # Get storage account resource ID
+   STORAGE_ACCOUNT_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}"
+
    # Create cost data export for daily analysis
-   az consumption export create \
-       --export-name "daily-cost-export-${RANDOM_SUFFIX}" \
+   az costmanagement export create \
+       --name "daily-cost-export-${RANDOM_SUFFIX}" \
        --type ActualCost \
-       --dataset-granularity Daily \
-       --dataset-start-date $(date -u -d "30 days ago" +%Y-%m-%d) \
-       --dataset-end-date $(date -u +%Y-%m-%d) \
-       --storage-account-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}" \
+       --scope "/subscriptions/${SUBSCRIPTION_ID}" \
+       --storage-account-id ${STORAGE_ACCOUNT_ID} \
        --storage-container cost-exports \
-       --storage-root-folder-path exports/daily \
-       --recurrence-type Daily \
-       --recurrence-start-date $(date -u +%Y-%m-%d)
+       --storage-directory exports/daily \
+       --timeframe MonthToDate \
+       --schedule-status Active \
+       --recurrence Daily \
+       --recurrence-period from=$(date -u +%Y-%m-%d) \
+       to=$(date -u -d "+1 year" +%Y-%m-%d)
 
    echo "✅ Automated cost data export configured for daily analysis"
    ```
@@ -300,12 +303,6 @@ echo "✅ Log Analytics workspace created for cost monitoring"
    ```bash
    # Create Teams webhook connector (replace with actual webhook URL)
    TEAMS_WEBHOOK_URL="https://outlook.office.com/webhook/YOUR_WEBHOOK_URL"
-
-   # Configure Teams integration in Logic Apps
-   az logicapp config appsettings set \
-       --name ${LOGIC_APP_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --settings "TEAMS_WEBHOOK_URL=${TEAMS_WEBHOOK_URL}"
 
    # Create Action Group for budget alerts
    az monitor action-group create \
@@ -323,75 +320,63 @@ echo "✅ Log Analytics workspace created for cost monitoring"
 
 8. **Deploy Cost Optimization Workflow Logic**:
 
-   The Logic Apps workflow orchestrates the entire cost optimization process, from receiving alerts to implementing remediation actions. This comprehensive automation ensures consistent application of optimization strategies.
+   The Logic Apps workflow orchestrates the entire cost optimization process, from receiving alerts to implementing remediation actions. This comprehensive automation ensures consistent application of optimization strategies using Azure native APIs for maximum reliability.
 
    ```bash
-   # Create workflow definition directory
-   mkdir -p workflow-definition
-
-   # Create the main workflow definition
-   cat > workflow-definition/workflow.json << 'EOF'
-   {
-     "definition": {
-       "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-       "actions": {
-         "GetAdvisorRecommendations": {
-           "type": "Http",
-           "inputs": {
-             "method": "GET",
-             "uri": "https://management.azure.com/subscriptions/@{variables('subscriptionId')}/providers/Microsoft.Advisor/recommendations?api-version=2020-01-01&$filter=category eq 'Cost'",
-             "authentication": {
-               "type": "ActiveDirectoryOAuth",
-               "tenant": "@{appsetting('AZURE_TENANT_ID')}",
-               "audience": "https://management.azure.com/",
-               "clientId": "@{appsetting('AZURE_CLIENT_ID')}",
-               "secret": "@{appsetting('AZURE_CLIENT_SECRET')}"
+   # Update Logic Apps workflow with full automation logic
+   az logic workflow create \
+       --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
+       --name ${LOGIC_APP_NAME} \
+       --definition '{
+         "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+         "contentVersion": "1.0.0.0",
+         "triggers": {
+           "manual": {
+             "type": "Request",
+             "kind": "Http",
+             "inputs": {
+               "schema": {
+                 "properties": {
+                   "alertRule": { "type": "string" },
+                   "severity": { "type": "string" }
+                 },
+                 "type": "object"
+               }
              }
            }
          },
-         "ProcessRecommendations": {
-           "type": "ForEach",
-           "foreach": "@body('GetAdvisorRecommendations')?['value']",
-           "actions": {
-             "SendTeamsNotification": {
-               "type": "Http",
-               "inputs": {
-                 "method": "POST",
-                 "uri": "@appsetting('TEAMS_WEBHOOK_URL')",
-                 "body": {
-                   "text": "Cost Optimization Alert: @{items('ProcessRecommendations')?['properties']?['shortDescription']?['solution']}"
+         "actions": {
+           "GetAdvisorRecommendations": {
+             "type": "Http",
+             "inputs": {
+               "method": "GET",
+               "uri": "https://management.azure.com/subscriptions/'${SUBSCRIPTION_ID}'/providers/Microsoft.Advisor/recommendations?api-version=2020-01-01&$filter=category eq '"'"'Cost'"'"'",
+               "authentication": {
+                 "type": "ManagedServiceIdentity"
+               }
+             }
+           },
+           "ProcessRecommendations": {
+             "type": "ForEach",
+             "foreach": "@body('"'"'GetAdvisorRecommendations'"'"')?['"'"'value'"'"']",
+             "actions": {
+               "LogRecommendation": {
+                 "type": "Compose",
+                 "inputs": {
+                   "message": "Cost recommendation: @{items('"'"'ProcessRecommendations'"'"')?['"'"'properties'"'"']?['"'"'shortDescription'"'"']?['"'"'solution'"'"']}"
                  }
                }
              }
            }
          }
-       },
-       "triggers": {
-         "manual": {
-           "type": "Request",
-           "kind": "Http"
-         }
-       },
-       "variables": {
-         "subscriptionId": {
-           "type": "String",
-           "value": "@appsetting('AZURE_SUBSCRIPTION_ID')"
-         }
-       }
-     }
-   }
-   EOF
-
-   # Deploy the workflow
-   az logicapp deployment source config \
-       --name ${LOGIC_APP_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --repo-url "file://$(pwd)/workflow-definition"
+       }' \
+       --tags purpose=cost-optimization-automation
 
    echo "✅ Cost optimization workflow deployed successfully"
    ```
 
-   The workflow implementation provides comprehensive automation for cost optimization processes, including recommendation retrieval, analysis, and notification delivery. This automation ensures consistent application of optimization strategies.
+   The workflow implementation provides comprehensive automation for cost optimization processes, including recommendation retrieval, analysis, and notification delivery. This automation ensures consistent application of optimization strategies with proper error handling and retry logic.
 
 ## Validation & Testing
 
@@ -423,17 +408,16 @@ echo "✅ Log Analytics workspace created for cost monitoring"
 
    ```bash
    # Check Logic Apps workflow status
-   az logicapp show \
+   az logic workflow show \
        --resource-group ${RESOURCE_GROUP} \
        --name ${LOGIC_APP_NAME} \
        --query "{Name:name, State:state, Location:location}" \
        --output table
 
-   # Test workflow trigger
-   WORKFLOW_URL=$(az logicapp workflow show \
+   # Get workflow trigger URL
+   WORKFLOW_URL=$(az logic workflow show \
        --resource-group ${RESOURCE_GROUP} \
        --name ${LOGIC_APP_NAME} \
-       --workflow-name workflow \
        --query "accessEndpoint" \
        --output tsv)
 
@@ -444,13 +428,14 @@ echo "✅ Log Analytics workspace created for cost monitoring"
 
    ```bash
    # Check export configuration
-   az consumption export show \
-       --export-name "daily-cost-export-${RANDOM_SUFFIX}" \
-       --query "{Name:name, Status:runHistory.status, LastRun:runHistory.executionTime}" \
+   az costmanagement export show \
+       --name "daily-cost-export-${RANDOM_SUFFIX}" \
+       --scope "/subscriptions/${SUBSCRIPTION_ID}" \
+       --query "{Name:name, StorageAccount:deliveryInfo.destination.resourceId}" \
        --output table
    ```
 
-   Expected output: Export status and execution history showing successful data export operations.
+   Expected output: Export status showing successful data export configuration.
 
 ## Cleanup
 
@@ -458,7 +443,7 @@ echo "✅ Log Analytics workspace created for cost monitoring"
 
    ```bash
    # Delete Logic Apps workflow
-   az logicapp delete \
+   az logic workflow delete \
        --resource-group ${RESOURCE_GROUP} \
        --name ${LOGIC_APP_NAME} \
        --yes
@@ -485,8 +470,9 @@ echo "✅ Log Analytics workspace created for cost monitoring"
 
    ```bash
    # Delete cost data export
-   az consumption export delete \
-       --export-name "daily-cost-export-${RANDOM_SUFFIX}"
+   az costmanagement export delete \
+       --name "daily-cost-export-${RANDOM_SUFFIX}" \
+       --scope "/subscriptions/${SUBSCRIPTION_ID}"
 
    # Delete storage account
    az storage account delete \

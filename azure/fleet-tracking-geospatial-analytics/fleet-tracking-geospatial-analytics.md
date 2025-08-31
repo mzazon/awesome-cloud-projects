@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Maps, Azure Stream Analytics, Azure Event Hubs, Azure Monitor
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: geospatial, real-time-analytics, fleet-management, location-tracking, streaming
 recipe-generator-version: 1.3
@@ -86,10 +86,13 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables
-export RESOURCE_GROUP="rg-geospatial-analytics"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-geospatial-analytics-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
-export RANDOM_SUFFIX=$(openssl rand -hex 3)
+export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
+
+# Generate unique suffix for resource names
+RANDOM_SUFFIX=$(openssl rand -hex 3)
 
 # Set service-specific names
 export EVENTHUB_NAMESPACE="ehns-fleet-${RANDOM_SUFFIX}"
@@ -116,6 +119,14 @@ az storage account create \
     --kind StorageV2
 
 echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
+
+# Create container for telemetry archive
+az storage container create \
+    --name telemetry-archive \
+    --account-name ${STORAGE_ACCOUNT} \
+    --public-access off
+
+echo "✅ Storage container created for archival"
 ```
 
 ## Steps
@@ -139,9 +150,9 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --namespace-name ${EVENTHUB_NAMESPACE} \
        --resource-group ${RESOURCE_GROUP} \
        --partition-count 4 \
-       --retention-time 24
+       --message-retention 1
    
-   # Get connection string
+   # Get connection string for Stream Analytics
    EVENTHUB_CONNECTION=$(az eventhubs namespace \
        authorization-rule keys list \
        --resource-group ${RESOURCE_GROUP} \
@@ -153,7 +164,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Event Hub created for location streaming"
    ```
 
-   The Event Hub is now configured with 4 partitions for parallel processing and 24-hour retention for replay scenarios. This setup can handle thousands of vehicles sending location updates every few seconds while maintaining low latency.
+   The Event Hub is now configured with 4 partitions for parallel processing and 1-day retention for replay scenarios. This setup can handle thousands of vehicles sending location updates every few seconds while maintaining low latency.
 
 2. **Deploy Azure Cosmos DB for Real-Time Data Storage**:
 
@@ -193,6 +204,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Cosmos DB deployed with geospatial support"
    ```
 
+   The Cosmos DB container is partitioned by vehicleId for optimal query performance and uses 400 RU/s provisioned throughput. This configuration provides predictable performance for real-time dashboard queries while supporting geospatial indexing for location-based operations.
+
 3. **Configure Azure Maps Account**:
 
    Azure Maps provides comprehensive mapping and location services including geocoding, routing, and traffic data. The service enables rich visualization of fleet movements, geofence boundaries, and real-time traffic conditions, essential for operational dashboards and customer-facing tracking applications.
@@ -202,8 +215,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    az maps account create \
        --name ${MAPS_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
-       --sku G2 \
-       --kind Gen2
+       --sku S0
    
    # Get Maps primary key
    MAPS_KEY=$(az maps account keys list \
@@ -221,6 +233,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Azure Maps configured for visualization"
    ```
 
+   The Maps account uses S0 pricing tier which includes 250,000 free transactions per month, suitable for development and testing. The geofence container stores polygon definitions that can be referenced by the Stream Analytics query for spatial operations.
+
 4. **Create Stream Analytics Job with Geospatial Query**:
 
    Azure Stream Analytics provides real-time analytics on streaming data with built-in geospatial functions. These functions enable complex spatial operations like point-in-polygon checks for geofencing, distance calculations for proximity alerts, and route deviation detection—all executed in real-time on streaming data.
@@ -228,42 +242,54 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    ```bash
    # Create Stream Analytics job
    az stream-analytics job create \
-       --name ${ASA_JOB} \
-       --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --sku Standard \
-       --output-error-policy Drop \
-       --events-outoforder-policy Adjust \
-       --events-late-arrival-max-delay 5
-   
-   # Configure Event Hub input
-   az stream-analytics input create \
        --job-name ${ASA_JOB} \
        --resource-group ${RESOURCE_GROUP} \
-       --name VehicleInput \
-       --type Stream \
-       --datasource @- <<EOF
+       --location ${LOCATION} \
+       --output-error-policy Drop \
+       --out-of-order-policy Adjust \
+       --order-max-delay 5 \
+       --arrival-max-delay 16
+   
+   # Configure Event Hub input using properties
+   cat > input-properties.json << EOF
    {
-       "type": "Microsoft.EventHub/EventHub",
-       "properties": {
-           "serviceBusNamespace": "${EVENTHUB_NAMESPACE}",
-           "eventHubName": "${EVENTHUB_NAME}",
-           "consumerGroupName": "\$Default",
-           "sharedAccessPolicyName": "RootManageSharedAccessKey",
-           "sharedAccessPolicyKey": "${EVENTHUB_CONNECTION##*SharedAccessKey=}"
+       "type": "Stream",
+       "datasource": {
+           "type": "Microsoft.ServiceBus/EventHub",
+           "properties": {
+               "serviceBusNamespace": "${EVENTHUB_NAMESPACE}",
+               "eventHubName": "${EVENTHUB_NAME}",
+               "consumerGroupName": "\$Default",
+               "sharedAccessPolicyName": "RootManageSharedAccessKey",
+               "sharedAccessPolicyKey": "${EVENTHUB_CONNECTION##*SharedAccessKey=}"
+           }
+       },
+       "serialization": {
+           "type": "Json",
+           "properties": {
+               "encoding": "UTF8"
+           }
        }
    }
    EOF
    
-   echo "✅ Stream Analytics job created"
+   az stream-analytics input create \
+       --job-name ${ASA_JOB} \
+       --resource-group ${RESOURCE_GROUP} \
+       --input-name VehicleInput \
+       --properties @input-properties.json
+   
+   echo "✅ Stream Analytics job created with input configured"
    ```
+
+   The Stream Analytics job is configured with robust error handling policies that drop malformed events and adjust out-of-order events within a 5-second window. This ensures continuous processing even with irregular data arrival patterns common in mobile IoT scenarios.
 
 5. **Define Geospatial Analytics Query**:
 
    The Stream Analytics query language extends SQL with temporal and geospatial functions specifically designed for streaming scenarios. This query demonstrates geofence monitoring, speed analysis, and anomaly detection—processing thousands of location updates per second with millisecond latency.
 
    ```bash
-   # Create query with geospatial functions
+   # Create transformation with geospatial query
    cat > query.sql << 'EOF'
    WITH GeofencedData AS (
        SELECT
@@ -305,13 +331,15 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    FROM GeofencedData
    EOF
    
-   # Update job with query
-   az stream-analytics job update \
-       --name ${ASA_JOB} \
+   # Create transformation using the query
+   az stream-analytics transformation create \
+       --job-name ${ASA_JOB} \
        --resource-group ${RESOURCE_GROUP} \
-       --transformation-query @query.sql
+       --transformation-name Transformation \
+       --streaming-units 6 \
+       --saql @query.sql
    
-   echo "✅ Geospatial query configured"
+   echo "✅ Geospatial query configured with transformation"
    ```
 
    This query performs real-time geofence monitoring and distance calculations for every incoming location update. The spatial functions process complex polygon intersections and distance computations at scale, enabling immediate detection of zone violations and proximity-based alerts.
@@ -322,21 +350,33 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
    ```bash
    # Configure Cosmos DB output
-   az stream-analytics output create \
-       --job-name ${ASA_JOB} \
-       --resource-group ${RESOURCE_GROUP} \
-       --name VehicleOutput \
-       --datasource @- <<EOF
+   cat > cosmos-output.json << EOF
    {
-       "type": "Microsoft.Storage/DocumentDB",
-       "properties": {
-           "accountId": "${COSMOS_ACCOUNT}",
-           "accountKey": "${COSMOS_KEY}",
-           "database": "FleetAnalytics",
-           "collectionNamePattern": "LocationEvents"
+       "datasource": {
+           "type": "Microsoft.Storage/DocumentDB",
+           "properties": {
+               "accountId": "${COSMOS_ACCOUNT}",
+               "accountKey": "${COSMOS_KEY}",
+               "database": "FleetAnalytics",
+               "collectionNamePattern": "LocationEvents"
+           }
+       },
+       "serialization": {
+           "type": "Json",
+           "properties": {
+               "encoding": "UTF8",
+               "format": "LineSeparated"
+           }
        }
    }
    EOF
+   
+   az stream-analytics output create \
+       --job-name ${ASA_JOB} \
+       --resource-group ${RESOURCE_GROUP} \
+       --output-name VehicleOutput \
+       --datasource @cosmos-output.json \
+       --serialization @cosmos-output.json
    
    # Configure blob storage output for archival
    STORAGE_KEY=$(az storage account keys list \
@@ -345,28 +385,42 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --query "[0].value" \
        --output tsv)
    
-   az stream-analytics output create \
-       --job-name ${ASA_JOB} \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ArchiveOutput \
-       --datasource @- <<EOF
+   cat > blob-output.json << EOF
    {
-       "type": "Microsoft.Storage/Blob",
-       "properties": {
-           "storageAccounts": [{
-               "accountName": "${STORAGE_ACCOUNT}",
-               "accountKey": "${STORAGE_KEY}"
-           }],
-           "container": "telemetry-archive",
-           "pathPattern": "vehicles/{date}/{time}",
-           "dateFormat": "yyyy/MM/dd",
-           "timeFormat": "HH"
+       "datasource": {
+           "type": "Microsoft.Storage/Blob",
+           "properties": {
+               "storageAccounts": [{
+                   "accountName": "${STORAGE_ACCOUNT}",
+                   "accountKey": "${STORAGE_KEY}"
+               }],
+               "container": "telemetry-archive",
+               "pathPattern": "vehicles/{date}/{time}",
+               "dateFormat": "yyyy/MM/dd",
+               "timeFormat": "HH"
+           }
+       },
+       "serialization": {
+           "type": "Json",
+           "properties": {
+               "encoding": "UTF8",
+               "format": "LineSeparated"
+           }
        }
    }
    EOF
    
+   az stream-analytics output create \
+       --job-name ${ASA_JOB} \
+       --resource-group ${RESOURCE_GROUP} \
+       --output-name ArchiveOutput \
+       --datasource @blob-output.json \
+       --serialization @blob-output.json
+   
    echo "✅ Outputs configured for real-time and archival storage"
    ```
+
+   The dual output configuration ensures both real-time access through Cosmos DB and long-term retention in blob storage. The partitioned blob path pattern organizes data by date and hour for efficient querying and cost-effective lifecycle management.
 
 7. **Start Stream Analytics Job**:
 
@@ -375,11 +429,12 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    ```bash
    # Start the Stream Analytics job
    az stream-analytics job start \
-       --name ${ASA_JOB} \
+       --job-name ${ASA_JOB} \
        --resource-group ${RESOURCE_GROUP} \
        --output-start-mode JobStartTime
    
-   # Monitor job status
+   # Wait for job to start and check status
+   sleep 30
    JOB_STATUS=$(az stream-analytics job show \
        --name ${ASA_JOB} \
        --resource-group ${RESOURCE_GROUP} \
@@ -388,6 +443,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    
    echo "✅ Stream Analytics job status: ${JOB_STATUS}"
    ```
+
+   The job starts with JobStartTime mode, processing events from the moment it begins running. With 6 streaming units configured, the job can handle high-throughput scenarios while maintaining low processing latency.
 
 8. **Configure Monitoring and Alerts**:
 
@@ -400,16 +457,18 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --resource-group ${RESOURCE_GROUP} \
        --short-name FleetOps
    
-   # Create metric alert for high latency
+   # Create metric alert for high latency using new syntax
+   ASA_RESOURCE_ID=$(az stream-analytics job show \
+       --name ${ASA_JOB} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query id --output tsv)
+   
    az monitor metrics alert create \
        --name high-processing-latency \
        --resource-group ${RESOURCE_GROUP} \
-       --scopes $(az stream-analytics job show \
-           --name ${ASA_JOB} \
-           --resource-group ${RESOURCE_GROUP} \
-           --query id --output tsv) \
-       --condition "avg OutputWatermarkDelaySeconds > 10" \
-       --description "Alert when processing latency exceeds 10 seconds" \
+       --scopes ${ASA_RESOURCE_ID} \
+       --condition "avg SU.Memory.Utilization > 80" \
+       --description "Alert when Stream Analytics memory usage exceeds 80%" \
        --evaluation-frequency 1m \
        --window-size 5m \
        --severity 2
@@ -417,16 +476,15 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    # Enable diagnostic logging
    az monitor diagnostic-settings create \
        --name asa-diagnostics \
-       --resource $(az stream-analytics job show \
-           --name ${ASA_JOB} \
-           --resource-group ${RESOURCE_GROUP} \
-           --query id --output tsv) \
+       --resource ${ASA_RESOURCE_ID} \
        --logs '[{"category": "Execution", "enabled": true}]' \
        --metrics '[{"category": "AllMetrics", "enabled": true}]' \
        --storage-account ${STORAGE_ACCOUNT}
    
    echo "✅ Monitoring and alerts configured"
    ```
+
+   The monitoring configuration includes both metric alerts for real-time notifications and diagnostic logging for troubleshooting. Memory utilization alerts help prevent processing delays during peak traffic periods.
 
 ## Validation & Testing
 
@@ -446,8 +504,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    }
    EOF
    
-   # Send test event (requires Event Hub SDK or REST API)
    echo "Sample event created: sample-event.json"
+   echo "Use Event Hub REST API or SDK to send test events"
    ```
 
 2. Verify Stream Analytics processing:
@@ -455,10 +513,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    ```bash
    # Check job metrics
    az monitor metrics list \
-       --resource $(az stream-analytics job show \
-           --name ${ASA_JOB} \
-           --resource-group ${RESOURCE_GROUP} \
-           --query id --output tsv) \
+       --resource ${ASA_RESOURCE_ID} \
        --metric "IncomingEvents" \
        --interval PT1M \
        --output table
@@ -469,13 +524,14 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 3. Query processed data in Cosmos DB:
 
    ```bash
-   # Check if data is flowing to Cosmos DB
-   az cosmosdb sql container list \
+   # Check if container exists and has data
+   az cosmosdb sql container show \
        --account-name ${COSMOS_ACCOUNT} \
        --database-name FleetAnalytics \
+       --name LocationEvents \
        --resource-group ${RESOURCE_GROUP} \
-       --query "[].id" \
-       --output table
+       --query "resource.id" \
+       --output tsv
    ```
 
 4. Verify Azure Maps configuration:
@@ -494,7 +550,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    ```bash
    # Stop the job to prevent charges
    az stream-analytics job stop \
-       --name ${ASA_JOB} \
+       --job-name ${ASA_JOB} \
        --resource-group ${RESOURCE_GROUP}
    
    echo "✅ Stream Analytics job stopped"
@@ -527,6 +583,8 @@ Real-time geospatial analytics combines the power of streaming data processing w
 The architecture leverages Azure's managed services to minimize operational overhead while maximizing scalability. Event Hubs' partition-based design enables linear scaling—simply increase partitions to handle more vehicles or higher update frequencies. Stream Analytics automatically distributes processing across available compute resources, maintaining consistent performance even as data volumes grow. This serverless approach aligns with the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of operational excellence and performance efficiency.
 
 From a cost optimization perspective, the consumption-based pricing model ensures costs scale with actual usage. During low-activity periods (nights, weekends), the system automatically scales down, reducing costs. The use of Cosmos DB's serverless tier for development environments can further reduce costs by up to 90% compared to provisioned throughput. For production workloads, review the [Azure Maps pricing guide](https://docs.microsoft.com/en-us/azure/azure-maps/azure-maps-pricing) and [Stream Analytics pricing documentation](https://docs.microsoft.com/en-us/azure/stream-analytics/stream-analytics-pricing) to optimize configuration based on your specific requirements.
+
+Security considerations include using Azure Active Directory for authentication, enabling encryption at rest for all storage services, and implementing network security groups to restrict access. The solution follows Azure security best practices by using managed identities where possible and storing sensitive connection strings in Azure Key Vault for production deployments.
 
 > **Warning**: Geospatial calculations in Stream Analytics use planar geometry, which may introduce errors for long distances. For global fleet management requiring high precision over continental distances, consider using Azure Maps Route API for accurate distance calculations.
 

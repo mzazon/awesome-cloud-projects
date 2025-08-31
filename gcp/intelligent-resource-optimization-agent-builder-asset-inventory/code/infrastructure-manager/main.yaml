@@ -1,0 +1,556 @@
+# Infrastructure Manager Configuration for Intelligent Resource Optimization
+# This configuration deploys a complete AI-powered resource optimization system
+# using Vertex AI Agent Builder, Cloud Asset Inventory, BigQuery, and Cloud Scheduler
+
+# Define input variables for customization
+variables:
+  # Project and Location Configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for deployment"
+    validation:
+      condition: "length(var.project_id) > 0"
+      error_message: "Project ID cannot be empty"
+  
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    validation:
+      condition: "contains(['us-central1', 'us-east1', 'us-west1', 'europe-west1'], var.region)"
+      error_message: "Region must be a supported location for Vertex AI"
+  
+  # Resource Naming Configuration
+  resource_prefix:
+    type: string
+    description: "Prefix for resource names to ensure uniqueness"
+    default: "resource-optimizer"
+    validation:
+      condition: "can(regex('^[a-z][a-z0-9-]{0,20}[a-z0-9]$', var.resource_prefix))"
+      error_message: "Resource prefix must be lowercase alphanumeric with hyphens, 1-22 characters"
+  
+  # BigQuery Configuration
+  dataset_location:
+    type: string
+    description: "Location for BigQuery dataset (should match region for performance)"
+    default: "US"
+  
+  # Asset Inventory Configuration
+  organization_id:
+    type: string
+    description: "Google Cloud Organization ID for asset inventory"
+    validation:
+      condition: "length(var.organization_id) > 0"
+      error_message: "Organization ID is required for asset inventory access"
+  
+  # Monitoring Configuration
+  notification_email:
+    type: string
+    description: "Email address for optimization alerts and notifications"
+    default: ""
+    validation:
+      condition: "var.notification_email == '' || can(regex('^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$', var.notification_email))"
+      error_message: "Must be a valid email address or empty string"
+
+# Local values for computed configurations
+locals:
+  # Generate unique suffix for resource names
+  random_suffix: "${substr(md5(var.project_id), 0, 6)}"
+  
+  # Computed resource names
+  dataset_name: "${var.resource_prefix}-dataset-${local.random_suffix}"
+  bucket_name: "${var.resource_prefix}-staging-${local.random_suffix}"
+  scheduler_job_name: "${var.resource_prefix}-export-${local.random_suffix}"
+  service_account_name: "${var.resource_prefix}-sa-${local.random_suffix}"
+  agent_display_name: "${var.resource_prefix}-agent-${local.random_suffix}"
+  
+  # Asset types to monitor for optimization
+  monitored_asset_types: [
+    "compute.googleapis.com/Instance",
+    "compute.googleapis.com/Disk",
+    "storage.googleapis.com/Bucket",
+    "container.googleapis.com/Cluster",
+    "sqladmin.googleapis.com/Instance"
+  ]
+
+# Enable required Google Cloud APIs
+resources:
+  # API Services Enablement
+  cloudasset_api:
+    type: "gcp-types/serviceusage-v1:services"
+    properties:
+      name: "projects/${var.project_id}/services/cloudasset.googleapis.com"
+      disableDependentServices: false
+  
+  bigquery_api:
+    type: "gcp-types/serviceusage-v1:services"
+    properties:
+      name: "projects/${var.project_id}/services/bigquery.googleapis.com"
+      disableDependentServices: false
+  
+  aiplatform_api:
+    type: "gcp-types/serviceusage-v1:services"
+    properties:
+      name: "projects/${var.project_id}/services/aiplatform.googleapis.com"
+      disableDependentServices: false
+  
+  cloudscheduler_api:
+    type: "gcp-types/serviceusage-v1:services"
+    properties:
+      name: "projects/${var.project_id}/services/cloudscheduler.googleapis.com"
+      disableDependentServices: false
+  
+  storage_api:
+    type: "gcp-types/serviceusage-v1:services"
+    properties:
+      name: "projects/${var.project_id}/services/storage.googleapis.com"
+      disableDependentServices: false
+  
+  cloudfunctions_api:
+    type: "gcp-types/serviceusage-v1:services"
+    properties:
+      name: "projects/${var.project_id}/services/cloudfunctions.googleapis.com"
+      disableDependentServices: false
+
+  # Service Account for Automation
+  asset_export_service_account:
+    type: "gcp-types/iam-v1:projects.serviceAccounts"
+    properties:
+      accountId: "${local.service_account_name}"
+      serviceAccount:
+        displayName: "Asset Export Scheduler Service Account"
+        description: "Service account for automated asset inventory exports and optimization analysis"
+    depends_on:
+      - cloudasset_api
+      - bigquery_api
+
+  # IAM Bindings for Service Account
+  asset_viewer_binding:
+    type: "gcp-types/cloudresourcemanager-v1:projects.setIamPolicy"
+    properties:
+      resource: "${var.project_id}"
+      policy:
+        bindings:
+          - role: "roles/cloudasset.viewer"
+            members:
+              - "serviceAccount:${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com"
+          - role: "roles/bigquery.dataEditor"
+            members:
+              - "serviceAccount:${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com"
+          - role: "roles/storage.objectAdmin"
+            members:
+              - "serviceAccount:${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com"
+    depends_on:
+      - asset_export_service_account
+
+  # Cloud Storage Bucket for Vertex AI Staging
+  staging_bucket:
+    type: "gcp-types/storage-v1:buckets"
+    properties:
+      name: "${local.bucket_name}"
+      location: "${var.region}"
+      storageClass: "STANDARD"
+      lifecycle:
+        rule:
+          - action:
+              type: "Delete"
+            condition:
+              age: 30
+              matchesStorageClass: ["STANDARD"]
+      versioning:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: ""
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        purpose: "vertex-ai-staging"
+        component: "resource-optimization"
+        managed-by: "infrastructure-manager"
+    depends_on:
+      - storage_api
+
+  # BigQuery Dataset for Asset Analytics
+  asset_optimization_dataset:
+    type: "gcp-types/bigquery-v2:datasets"
+    properties:
+      datasetId: "${local.dataset_name}"
+      location: "${var.dataset_location}"
+      description: "Dataset for storing asset inventory data and optimization analytics"
+      access:
+        - role: "OWNER"
+          userByEmail: "$(ref.asset_export_service_account.email)"
+        - role: "READER"
+          specialGroup: "projectReaders"
+      labels:
+        purpose: "asset-optimization"
+        component: "analytics"
+        managed-by: "infrastructure-manager"
+      defaultTableExpirationMs: "7776000000"  # 90 days
+      defaultPartitionExpirationMs: "2592000000"  # 30 days
+    depends_on:
+      - bigquery_api
+      - asset_export_service_account
+
+  # BigQuery Table for Asset Inventory
+  asset_inventory_table:
+    type: "gcp-types/bigquery-v2:tables"
+    properties:
+      datasetId: "$(ref.asset_optimization_dataset.datasetId)"
+      tableId: "asset_inventory"
+      description: "Table storing Cloud Asset Inventory exports for optimization analysis"
+      schema:
+        fields:
+          - name: "name"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Full resource name"
+          - name: "asset_type"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Asset type identifier"
+          - name: "resource"
+            type: "RECORD"
+            mode: "NULLABLE"
+            description: "Resource metadata"
+            fields:
+              - name: "version"
+                type: "STRING"
+                mode: "NULLABLE"
+              - name: "discovery_document_uri"
+                type: "STRING"
+                mode: "NULLABLE"
+              - name: "discovery_name"
+                type: "STRING"
+                mode: "NULLABLE"
+              - name: "parent"
+                type: "STRING"
+                mode: "NULLABLE"
+              - name: "data"
+                type: "JSON"
+                mode: "NULLABLE"
+          - name: "update_time"
+            type: "TIMESTAMP"
+            mode: "NULLABLE"
+            description: "Last update timestamp"
+      timePartitioning:
+        type: "DAY"
+        field: "update_time"
+      clustering:
+        fields: ["asset_type", "name"]
+      labels:
+        purpose: "asset-inventory"
+        component: "storage"
+        managed-by: "infrastructure-manager"
+    depends_on:
+      - asset_optimization_dataset
+
+  # BigQuery View for Resource Optimization Analysis
+  resource_optimization_view:
+    type: "gcp-types/bigquery-v2:tables"
+    properties:
+      datasetId: "$(ref.asset_optimization_dataset.datasetId)"
+      tableId: "resource_optimization_analysis"
+      description: "View providing optimized resource analysis with scoring"
+      view:
+        query: |
+          SELECT 
+            name,
+            asset_type,
+            JSON_EXTRACT_SCALAR(resource.data, '$.location') as location,
+            JSON_EXTRACT_SCALAR(resource.data, '$.project') as project,
+            DATE_DIFF(CURRENT_DATE(), DATE(update_time), DAY) as age_days,
+            JSON_EXTRACT_SCALAR(resource.data, '$.status') as status,
+            JSON_EXTRACT_SCALAR(resource.data, '$.machineType') as machine_type,
+            JSON_EXTRACT_SCALAR(resource.data, '$.zone') as zone,
+            CASE 
+              WHEN asset_type LIKE '%Instance%' AND JSON_EXTRACT_SCALAR(resource.data, '$.status') = 'TERMINATED' THEN 'Idle Compute'
+              WHEN asset_type LIKE '%Disk%' AND JSON_EXTRACT_SCALAR(resource.data, '$.status') = 'READY' AND JSON_EXTRACT_SCALAR(resource.data, '$.users') IS NULL THEN 'Unattached Storage'
+              WHEN asset_type LIKE '%Bucket%' AND JSON_EXTRACT_SCALAR(resource.data, '$.storageClass') = 'STANDARD' THEN 'Storage Class Optimization'
+              WHEN asset_type LIKE '%Instance%' AND JSON_EXTRACT_SCALAR(resource.data, '$.machineType') LIKE '%n1-%' THEN 'Instance Type Upgrade'
+              ELSE 'Active Resource'
+            END as optimization_category,
+            CASE
+              WHEN DATE_DIFF(CURRENT_DATE(), DATE(update_time), DAY) > 30 AND JSON_EXTRACT_SCALAR(resource.data, '$.status') != 'RUNNING' THEN 90
+              WHEN DATE_DIFF(CURRENT_DATE(), DATE(update_time), DAY) > 7 AND JSON_EXTRACT_SCALAR(resource.data, '$.status') = 'TERMINATED' THEN 70
+              WHEN JSON_EXTRACT_SCALAR(resource.data, '$.machineType') LIKE '%n1-%' THEN 60
+              WHEN asset_type LIKE '%Bucket%' AND JSON_EXTRACT_SCALAR(resource.data, '$.storageClass') = 'STANDARD' THEN 40
+              ELSE 20
+            END as optimization_score,
+            update_time
+          FROM `${var.project_id}.$(ref.asset_optimization_dataset.datasetId).asset_inventory`
+          WHERE update_time IS NOT NULL
+        useLegacySql: false
+    depends_on:
+      - asset_inventory_table
+
+  # BigQuery View for Cost Impact Summary
+  cost_impact_summary_view:
+    type: "gcp-types/bigquery-v2:tables"
+    properties:
+      datasetId: "$(ref.asset_optimization_dataset.datasetId)"
+      tableId: "cost_impact_summary"
+      description: "Aggregated view of optimization opportunities by category"
+      view:
+        query: |
+          SELECT 
+            optimization_category,
+            COUNT(*) as resource_count,
+            AVG(optimization_score) as avg_optimization_score,
+            MAX(optimization_score) as max_optimization_score,
+            COUNT(*) * AVG(optimization_score) as total_impact_score,
+            COUNT(CASE WHEN optimization_score > 70 THEN 1 END) as high_priority_count,
+            COUNT(CASE WHEN optimization_score BETWEEN 40 AND 70 THEN 1 END) as medium_priority_count
+          FROM `${var.project_id}.$(ref.asset_optimization_dataset.datasetId).resource_optimization_analysis`
+          GROUP BY optimization_category
+          ORDER BY total_impact_score DESC
+        useLegacySql: false
+    depends_on:
+      - resource_optimization_view
+
+  # Cloud Function for Asset Export Automation
+  asset_export_function:
+    type: "gcp-types/cloudfunctions-v1:projects.locations.functions"
+    properties:
+      location: "${var.region}"
+      function: "trigger-asset-export-${local.random_suffix}"
+      sourceArchiveUrl: "gs://$(ref.staging_bucket.name)/function-source.zip"
+      entryPoint: "trigger_asset_export"
+      runtime: "python311"
+      timeout: "540s"
+      availableMemoryMb: 256
+      serviceAccountEmail: "$(ref.asset_export_service_account.email)"
+      environmentVariables:
+        PROJECT_ID: "${var.project_id}"
+        DATASET_NAME: "$(ref.asset_optimization_dataset.datasetId)"
+        ORGANIZATION_ID: "${var.organization_id}"
+      httpsTrigger: {}
+      labels:
+        purpose: "asset-export-automation"
+        component: "automation"
+        managed-by: "infrastructure-manager"
+    depends_on:
+      - cloudfunctions_api
+      - staging_bucket
+      - asset_export_service_account
+      - asset_optimization_dataset
+
+  # Cloud Scheduler Job for Daily Asset Exports
+  daily_asset_export_job:
+    type: "gcp-types/cloudscheduler-v1:projects.locations.jobs"
+    properties:
+      name: "projects/${var.project_id}/locations/${var.region}/jobs/${local.scheduler_job_name}"
+      description: "Daily automated export of Cloud Asset Inventory to BigQuery for optimization analysis"
+      schedule: "0 2 * * *"  # Daily at 2 AM
+      timeZone: "America/New_York"
+      httpTarget:
+        uri: "$(ref.asset_export_function.httpsTrigger.url)"
+        httpMethod: "POST"
+        headers:
+          Content-Type: "application/json"
+        body: |
+          {
+            "organization_id": "${var.organization_id}",
+            "project_id": "${var.project_id}",
+            "dataset_name": "$(ref.asset_optimization_dataset.datasetId)",
+            "asset_types": ${jsonencode(local.monitored_asset_types)}
+          }
+        oidcToken:
+          serviceAccountEmail: "$(ref.asset_export_service_account.email)"
+    depends_on:
+      - cloudscheduler_api
+      - asset_export_function
+
+  # BigQuery Table for Optimization Metrics Tracking
+  optimization_metrics_table:
+    type: "gcp-types/bigquery-v2:tables"
+    properties:
+      datasetId: "$(ref.asset_optimization_dataset.datasetId)"
+      tableId: "optimization_metrics"
+      description: "Historical tracking of optimization metrics and trends"
+      schema:
+        fields:
+          - name: "analysis_time"
+            type: "TIMESTAMP"
+            mode: "REQUIRED"
+            description: "When the analysis was performed"
+          - name: "total_resources"
+            type: "INTEGER"
+            mode: "NULLABLE"
+            description: "Total number of resources analyzed"
+          - name: "high_priority_optimizations"
+            type: "INTEGER"
+            mode: "NULLABLE"
+            description: "Number of high-priority optimization opportunities"
+          - name: "medium_priority_optimizations"
+            type: "INTEGER"
+            mode: "NULLABLE"
+            description: "Number of medium-priority optimization opportunities"
+          - name: "avg_optimization_score"
+            type: "FLOAT"
+            mode: "NULLABLE"
+            description: "Average optimization score across all resources"
+          - name: "idle_compute_count"
+            type: "INTEGER"
+            mode: "NULLABLE"
+            description: "Number of idle compute instances"
+          - name: "unattached_storage_count"
+            type: "INTEGER"
+            mode: "NULLABLE"
+            description: "Number of unattached storage volumes"
+          - name: "potential_savings_estimate"
+            type: "FLOAT"
+            mode: "NULLABLE"
+            description: "Estimated potential monthly savings in USD"
+      timePartitioning:
+        type: "DAY"
+        field: "analysis_time"
+      clustering:
+        fields: ["analysis_time"]
+      labels:
+        purpose: "optimization-metrics"
+        component: "analytics"
+        managed-by: "infrastructure-manager"
+    depends_on:
+      - asset_optimization_dataset
+
+  # Notification Channel for Optimization Alerts (if email provided)
+  optimization_notification_channel:
+    type: "gcp-types/monitoring-v1:projects.notificationChannels"
+    properties:
+      type: "email"
+      displayName: "Resource Optimization Alerts"
+      description: "Email notifications for high-impact optimization opportunities"
+      labels:
+        email_address: "${var.notification_email}"
+      enabled: true
+    condition: "var.notification_email != ''"
+
+  # Monitoring Policy for High-Impact Optimizations
+  high_impact_optimization_policy:
+    type: "gcp-types/monitoring-v1:projects.alertPolicies"
+    properties:
+      displayName: "High-Impact Resource Optimization Detected"
+      documentation:
+        content: |
+          This alert triggers when more than 10 high-priority optimization opportunities
+          are detected in the asset inventory analysis. Review the BigQuery dataset
+          for specific recommendations and potential cost savings.
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "High Optimization Score Count"
+          conditionThreshold:
+            filter: |
+              resource.type="bigquery_table"
+              resource.labels.table_id="resource_optimization_analysis"
+            comparison: "COMPARISON_GREATER_THAN"
+            thresholdValue: 10.0
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "300s"
+                perSeriesAligner: "ALIGN_COUNT"
+                crossSeriesReducer: "REDUCE_SUM"
+      alertStrategy:
+        autoClose: "604800s"  # 7 days
+      enabled: true
+      notificationChannels: 
+        - "$(ref.optimization_notification_channel.name)"
+    condition: "var.notification_email != ''"
+    depends_on:
+      - optimization_notification_channel
+
+# Define output values for verification and integration
+outputs:
+  # Project Configuration
+  project_id:
+    description: "Google Cloud Project ID"
+    value: "${var.project_id}"
+  
+  deployment_region:
+    description: "Deployment region for resources"
+    value: "${var.region}"
+
+  # BigQuery Resources
+  bigquery_dataset_id:
+    description: "BigQuery dataset ID for asset optimization analytics"
+    value: "$(ref.asset_optimization_dataset.datasetId)"
+  
+  bigquery_dataset_location:
+    description: "BigQuery dataset location"
+    value: "$(ref.asset_optimization_dataset.location)"
+  
+  asset_inventory_table_id:
+    description: "BigQuery table ID for asset inventory data"
+    value: "$(ref.asset_inventory_table.tableId)"
+  
+  optimization_analysis_view_id:
+    description: "BigQuery view ID for optimization analysis"
+    value: "$(ref.resource_optimization_view.tableId)"
+
+  # Storage Resources
+  staging_bucket_name:
+    description: "Cloud Storage bucket name for Vertex AI staging"
+    value: "$(ref.staging_bucket.name)"
+  
+  staging_bucket_url:
+    description: "Cloud Storage bucket URL for Vertex AI staging"
+    value: "gs://$(ref.staging_bucket.name)"
+
+  # Automation Resources
+  service_account_email:
+    description: "Service account email for asset export automation"
+    value: "$(ref.asset_export_service_account.email)"
+  
+  cloud_function_name:
+    description: "Cloud Function name for asset export trigger"
+    value: "$(ref.asset_export_function.name)"
+  
+  cloud_function_url:
+    description: "Cloud Function trigger URL"
+    value: "$(ref.asset_export_function.httpsTrigger.url)"
+  
+  scheduler_job_name:
+    description: "Cloud Scheduler job name for daily exports"
+    value: "${local.scheduler_job_name}"
+
+  # Monitoring Resources
+  notification_channel_name:
+    description: "Monitoring notification channel name"
+    value: "$(ref.optimization_notification_channel.name)"
+    condition: "var.notification_email != ''"
+  
+  alert_policy_name:
+    description: "Monitoring alert policy name"
+    value: "$(ref.high_impact_optimization_policy.name)"
+    condition: "var.notification_email != ''"
+
+  # Next Steps
+  bigquery_console_url:
+    description: "URL to access BigQuery dataset in console"
+    value: "https://console.cloud.google.com/bigquery?project=${var.project_id}&ws=!1m4!1m3!3m2!1s${var.project_id}!2s$(ref.asset_optimization_dataset.datasetId)"
+  
+  vertex_ai_console_url:
+    description: "URL to access Vertex AI in console for agent deployment"
+    value: "https://console.cloud.google.com/vertex-ai?project=${var.project_id}"
+  
+  cloud_scheduler_console_url:
+    description: "URL to view Cloud Scheduler jobs"
+    value: "https://console.cloud.google.com/cloudscheduler?project=${var.project_id}"
+
+# Deployment metadata
+metadata:
+  version: "1.0"
+  description: "Infrastructure Manager configuration for AI-powered resource optimization using Vertex AI Agent Builder and Cloud Asset Inventory"
+  author: "Cloud Recipe Generator"
+  created: "2025-07-12"
+  components:
+    - "Vertex AI Agent Builder"
+    - "Cloud Asset Inventory" 
+    - "BigQuery Analytics"
+    - "Cloud Scheduler"
+    - "Cloud Functions"
+    - "Cloud Storage"
+    - "Cloud Monitoring"
+  estimated_deployment_time: "15-20 minutes"
+  estimated_monthly_cost: "$25-50 USD"

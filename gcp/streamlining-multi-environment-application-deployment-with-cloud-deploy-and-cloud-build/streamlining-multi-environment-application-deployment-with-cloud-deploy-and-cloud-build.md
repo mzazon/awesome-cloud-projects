@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Deploy, Cloud Build, Google Kubernetes Engine, Cloud Storage
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: devops, cloud-deploy, cloud-build, gke, gitops, cicd, multi-environment, deployment-pipeline
 recipe-generator-version: 1.3
@@ -163,6 +163,9 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
        --enable-autoupgrade \
        --labels=environment=development
    
+   # Wait for cluster to be ready
+   gcloud container clusters get-credentials ${CLUSTER_DEV} --zone=${ZONE}
+   
    # Create staging GKE cluster
    gcloud container clusters create ${CLUSTER_STAGE} \
        --zone=${ZONE} \
@@ -172,6 +175,9 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
        --enable-autoupgrade \
        --labels=environment=staging
    
+   # Wait for cluster to be ready
+   gcloud container clusters get-credentials ${CLUSTER_STAGE} --zone=${ZONE}
+   
    # Create production GKE cluster
    gcloud container clusters create ${CLUSTER_PROD} \
        --zone=${ZONE} \
@@ -180,6 +186,9 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
        --enable-autorepair \
        --enable-autoupgrade \
        --labels=environment=production
+   
+   # Wait for cluster to be ready
+   gcloud container clusters get-credentials ${CLUSTER_PROD} --zone=${ZONE}
    
    echo "✅ Created GKE clusters: ${CLUSTER_DEV}, ${CLUSTER_STAGE}, ${CLUSTER_PROD}"
    ```
@@ -201,8 +210,9 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
    gsutil versioning set on gs://${BUCKET_NAME}
    
    # Set appropriate IAM permissions for Cloud Deploy
-   gsutil iam ch serviceAccount:$(gcloud projects describe ${PROJECT_ID} \
-       --format="value(projectNumber)")-compute@developer.gserviceaccount.com:objectAdmin \
+   PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} \
+       --format="value(projectNumber)")
+   gsutil iam ch serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com:objectAdmin \
        gs://${BUCKET_NAME}
    
    echo "✅ Cloud Storage bucket created: ${BUCKET_NAME}"
@@ -221,41 +231,45 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
    
    # Create simple web application
    cat > app.py << 'EOF'
-   from flask import Flask
-   import os
-   
-   app = Flask(__name__)
-   
-   @app.route('/')
-   def hello():
-       env = os.environ.get('ENVIRONMENT', 'unknown')
-       version = os.environ.get('VERSION', '1.0.0')
-       return f'Hello from {env} environment! Version: {version}'
-   
-   @app.route('/health')
-   def health():
-       return {'status': 'healthy', 'environment': os.environ.get('ENVIRONMENT', 'unknown')}
-   
-   if __name__ == '__main__':
-       app.run(host='0.0.0.0', port=8080)
-   EOF
+from flask import Flask, jsonify
+import os
+
+app = Flask(__name__)
+
+@app.route('/')
+def hello():
+    env = os.environ.get('ENVIRONMENT', 'unknown')
+    version = os.environ.get('VERSION', '1.0.0')
+    return f'Hello from {env} environment! Version: {version}'
+
+@app.route('/health')
+def health():
+    return jsonify({
+        'status': 'healthy',
+        'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+        'version': os.environ.get('VERSION', '1.0.0')
+    })
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
+EOF
    
    # Create Dockerfile
    cat > Dockerfile << 'EOF'
-   FROM python:3.9-slim
-   WORKDIR /app
-   COPY requirements.txt .
-   RUN pip install -r requirements.txt
-   COPY app.py .
-   EXPOSE 8080
-   CMD ["python", "app.py"]
-   EOF
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+EXPOSE 8080
+CMD ["python", "app.py"]
+EOF
    
    # Create requirements.txt
    cat > requirements.txt << 'EOF'
-   Flask==2.3.3
-   gunicorn==21.2.0
-   EOF
+Flask==3.0.0
+gunicorn==21.2.0
+EOF
    
    echo "✅ Application source code created"
    ```
@@ -272,162 +286,198 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
    
    # Development environment manifest
    cat > k8s/dev/deployment.yaml << EOF
-   apiVersion: apps/v1
-   kind: Deployment
-   metadata:
-     name: sample-app
-     labels:
-       app: sample-app
-       environment: dev
-   spec:
-     replicas: 1
-     selector:
-       matchLabels:
-         app: sample-app
-     template:
-       metadata:
-         labels:
-           app: sample-app
-           environment: dev
-       spec:
-         containers:
-         - name: app
-           image: sample-app
-           ports:
-           - containerPort: 8080
-           env:
-           - name: ENVIRONMENT
-             value: "development"
-           - name: VERSION
-             value: "1.0.0"
-           resources:
-             requests:
-               memory: "128Mi"
-               cpu: "100m"
-             limits:
-               memory: "256Mi"
-               cpu: "200m"
-   ---
-   apiVersion: v1
-   kind: Service
-   metadata:
-     name: sample-app-service
-     labels:
-       app: sample-app
-   spec:
-     ports:
-     - port: 80
-       targetPort: 8080
-     selector:
-       app: sample-app
-     type: LoadBalancer
-   EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+  labels:
+    app: sample-app
+    environment: dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sample-app
+  template:
+    metadata:
+      labels:
+        app: sample-app
+        environment: dev
+    spec:
+      containers:
+      - name: app
+        image: sample-app
+        ports:
+        - containerPort: 8080
+        env:
+        - name: ENVIRONMENT
+          value: "development"
+        - name: VERSION
+          value: "1.0.0"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app-service
+  labels:
+    app: sample-app
+spec:
+  ports:
+  - port: 80
+    targetPort: 8080
+  selector:
+    app: sample-app
+  type: LoadBalancer
+EOF
    
    # Staging environment manifest (higher resources)
    cat > k8s/staging/deployment.yaml << EOF
-   apiVersion: apps/v1
-   kind: Deployment
-   metadata:
-     name: sample-app
-     labels:
-       app: sample-app
-       environment: staging
-   spec:
-     replicas: 2
-     selector:
-       matchLabels:
-         app: sample-app
-     template:
-       metadata:
-         labels:
-           app: sample-app
-           environment: staging
-       spec:
-         containers:
-         - name: app
-           image: sample-app
-           ports:
-           - containerPort: 8080
-           env:
-           - name: ENVIRONMENT
-             value: "staging"
-           - name: VERSION
-             value: "1.0.0"
-           resources:
-             requests:
-               memory: "256Mi"
-               cpu: "200m"
-             limits:
-               memory: "512Mi"
-               cpu: "400m"
-   ---
-   apiVersion: v1
-   kind: Service
-   metadata:
-     name: sample-app-service
-     labels:
-       app: sample-app
-   spec:
-     ports:
-     - port: 80
-       targetPort: 8080
-     selector:
-       app: sample-app
-     type: LoadBalancer
-   EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+  labels:
+    app: sample-app
+    environment: staging
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sample-app
+  template:
+    metadata:
+      labels:
+        app: sample-app
+        environment: staging
+    spec:
+      containers:
+      - name: app
+        image: sample-app
+        ports:
+        - containerPort: 8080
+        env:
+        - name: ENVIRONMENT
+          value: "staging"
+        - name: VERSION
+          value: "1.0.0"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "400m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app-service
+  labels:
+    app: sample-app
+spec:
+  ports:
+  - port: 80
+    targetPort: 8080
+  selector:
+    app: sample-app
+  type: LoadBalancer
+EOF
    
    # Production environment manifest (highest resources)
    cat > k8s/prod/deployment.yaml << EOF
-   apiVersion: apps/v1
-   kind: Deployment
-   metadata:
-     name: sample-app
-     labels:
-       app: sample-app
-       environment: production
-   spec:
-     replicas: 3
-     selector:
-       matchLabels:
-         app: sample-app
-     template:
-       metadata:
-         labels:
-           app: sample-app
-           environment: production
-       spec:
-         containers:
-         - name: app
-           image: sample-app
-           ports:
-           - containerPort: 8080
-           env:
-           - name: ENVIRONMENT
-             value: "production"
-           - name: VERSION
-             value: "1.0.0"
-           resources:
-             requests:
-               memory: "512Mi"
-               cpu: "400m"
-             limits:
-               memory: "1Gi"
-               cpu: "800m"
-   ---
-   apiVersion: v1
-   kind: Service
-   metadata:
-     name: sample-app-service
-     labels:
-       app: sample-app
-   spec:
-     ports:
-     - port: 80
-       targetPort: 8080
-     selector:
-       app: sample-app
-     type: LoadBalancer
-   EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+  labels:
+    app: sample-app
+    environment: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sample-app
+  template:
+    metadata:
+      labels:
+        app: sample-app
+        environment: production
+    spec:
+      containers:
+      - name: app
+        image: sample-app
+        ports:
+        - containerPort: 8080
+        env:
+        - name: ENVIRONMENT
+          value: "production"
+        - name: VERSION
+          value: "1.0.0"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "400m"
+          limits:
+            memory: "1Gi"
+            cpu: "800m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app-service
+  labels:
+    app: sample-app
+spec:
+  ports:
+  - port: 80
+    targetPort: 8080
+  selector:
+    app: sample-app
+  type: LoadBalancer
+EOF
    
    echo "✅ Kubernetes manifests created for all environments"
    ```
@@ -441,34 +491,34 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
    ```bash
    # Create Skaffold configuration for Cloud Deploy
    cat > skaffold.yaml << EOF
-   apiVersion: skaffold/v4beta7
-   kind: Config
-   metadata:
-     name: sample-app
-   build:
-     artifacts:
-     - image: sample-app
-       docker:
-         dockerfile: Dockerfile
-     googleCloudBuild:
-       projectId: ${PROJECT_ID}
-   profiles:
-   - name: dev
-     deploy:
-       kubectl:
-         manifests:
-         - k8s/dev/*.yaml
-   - name: staging
-     deploy:
-       kubectl:
-         manifests:
-         - k8s/staging/*.yaml
-   - name: prod
-     deploy:
-       kubectl:
-         manifests:
-         - k8s/prod/*.yaml
-   EOF
+apiVersion: skaffold/v4beta7
+kind: Config
+metadata:
+  name: sample-app
+build:
+  artifacts:
+  - image: sample-app
+    docker:
+      dockerfile: Dockerfile
+  googleCloudBuild:
+    projectId: ${PROJECT_ID}
+profiles:
+- name: dev
+  deploy:
+    kubectl:
+      manifests:
+      - k8s/dev/*.yaml
+- name: staging
+  deploy:
+    kubectl:
+      manifests:
+      - k8s/staging/*.yaml
+- name: prod
+  deploy:
+    kubectl:
+      manifests:
+      - k8s/prod/*.yaml
+EOF
    
    echo "✅ Skaffold configuration created"
    ```
@@ -482,46 +532,46 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
    ```bash
    # Create Cloud Deploy pipeline configuration
    cat > clouddeploy.yaml << EOF
-   apiVersion: deploy.cloud.google.com/v1
-   kind: DeliveryPipeline
-   metadata:
-     name: ${PIPELINE_NAME}
-   description: Multi-environment deployment pipeline for sample application
-   serialPipeline:
-     stages:
-     - targetId: dev-target
-       profiles: [dev]
-     - targetId: staging-target
-       profiles: [staging]
-     - targetId: prod-target
-       profiles: [prod]
-   ---
-   apiVersion: deploy.cloud.google.com/v1
-   kind: Target
-   metadata:
-     name: dev-target
-   description: Development environment
-   gke:
-     cluster: projects/${PROJECT_ID}/locations/${ZONE}/clusters/${CLUSTER_DEV}
-   ---
-   apiVersion: deploy.cloud.google.com/v1
-   kind: Target
-   metadata:
-     name: staging-target
-   description: Staging environment
-   gke:
-     cluster: projects/${PROJECT_ID}/locations/${ZONE}/clusters/${CLUSTER_STAGE}
-   requireApproval: false
-   ---
-   apiVersion: deploy.cloud.google.com/v1
-   kind: Target
-   metadata:
-     name: prod-target
-   description: Production environment
-   gke:
-     cluster: projects/${PROJECT_ID}/locations/${ZONE}/clusters/${CLUSTER_PROD}
-   requireApproval: true
-   EOF
+apiVersion: deploy.cloud.google.com/v1
+kind: DeliveryPipeline
+metadata:
+  name: ${PIPELINE_NAME}
+description: Multi-environment deployment pipeline for sample application
+serialPipeline:
+  stages:
+  - targetId: dev-target
+    profiles: [dev]
+  - targetId: staging-target
+    profiles: [staging]
+  - targetId: prod-target
+    profiles: [prod]
+---
+apiVersion: deploy.cloud.google.com/v1
+kind: Target
+metadata:
+  name: dev-target
+description: Development environment
+gke:
+  cluster: projects/${PROJECT_ID}/locations/${ZONE}/clusters/${CLUSTER_DEV}
+---
+apiVersion: deploy.cloud.google.com/v1
+kind: Target
+metadata:
+  name: staging-target
+description: Staging environment
+gke:
+  cluster: projects/${PROJECT_ID}/locations/${ZONE}/clusters/${CLUSTER_STAGE}
+requireApproval: false
+---
+apiVersion: deploy.cloud.google.com/v1
+kind: Target
+metadata:
+  name: prod-target
+description: Production environment
+gke:
+  cluster: projects/${PROJECT_ID}/locations/${ZONE}/clusters/${CLUSTER_PROD}
+requireApproval: true
+EOF
    
    echo "✅ Cloud Deploy pipeline configuration created"
    ```
@@ -534,54 +584,54 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
 
    ```bash
    # Create Cloud Build configuration
-   cat > cloudbuild.yaml << 'EOF'
-   steps:
-   # Build and push container image
-   - name: 'gcr.io/cloud-builders/docker'
-     args:
-     - 'build'
-     - '-t'
-     - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/sample-app:${SHORT_SHA}'
-     - '-t'
-     - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/sample-app:latest'
-     - '.'
-   
-   # Push images to Artifact Registry
-   - name: 'gcr.io/cloud-builders/docker'
-     args:
-     - 'push'
-     - '--all-tags'
-     - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/sample-app'
-   
-   # Create Cloud Deploy release
-   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-     entrypoint: 'gcloud'
-     args:
-     - 'deploy'
-     - 'releases'
-     - 'create'
-     - 'release-${SHORT_SHA}'
-     - '--delivery-pipeline=${_PIPELINE_NAME}'
-     - '--region=${_REGION}'
-     - '--images=sample-app=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO_NAME}/sample-app:${SHORT_SHA}'
-   
-   # Store build artifacts in Cloud Storage
-   artifacts:
-     objects:
-       location: 'gs://${_BUCKET_NAME}/builds/${SHORT_SHA}'
-       paths:
-       - 'skaffold.yaml'
-       - 'clouddeploy.yaml'
-   
-   substitutions:
-     _REGION: 'us-central1'
-     _REPO_NAME: '${REPO_NAME}'
-     _PIPELINE_NAME: '${PIPELINE_NAME}'
-     _BUCKET_NAME: '${BUCKET_NAME}'
-   
-   options:
-     logging: CLOUD_LOGGING_ONLY
-   EOF
+   cat > cloudbuild.yaml << EOF
+steps:
+# Build and push container image
+- name: 'gcr.io/cloud-builders/docker'
+  args:
+  - 'build'
+  - '-t'
+  - '${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/sample-app:\${SHORT_SHA}'
+  - '-t'
+  - '${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/sample-app:latest'
+  - '.'
+
+# Push images to Artifact Registry
+- name: 'gcr.io/cloud-builders/docker'
+  args:
+  - 'push'
+  - '--all-tags'
+  - '${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/sample-app'
+
+# Create Cloud Deploy release
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  entrypoint: 'gcloud'
+  args:
+  - 'deploy'
+  - 'releases'
+  - 'create'
+  - 'release-\${SHORT_SHA}'
+  - '--delivery-pipeline=${PIPELINE_NAME}'
+  - '--region=${REGION}'
+  - '--images=sample-app=${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/sample-app:\${SHORT_SHA}'
+
+# Store build artifacts in Cloud Storage
+artifacts:
+  objects:
+    location: 'gs://${BUCKET_NAME}/builds/\${SHORT_SHA}'
+    paths:
+    - 'skaffold.yaml'
+    - 'clouddeploy.yaml'
+
+substitutions:
+  _REGION: '${REGION}'
+  _REPO_NAME: '${REPO_NAME}'
+  _PIPELINE_NAME: '${PIPELINE_NAME}'
+  _BUCKET_NAME: '${BUCKET_NAME}'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+EOF
    
    echo "✅ Cloud Build configuration created"
    ```
@@ -598,6 +648,9 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
        --file=clouddeploy.yaml \
        --region=${REGION} \
        --project=${PROJECT_ID}
+   
+   # Wait for pipeline registration to complete
+   sleep 30
    
    # Verify pipeline registration
    gcloud deploy delivery-pipelines list \
@@ -623,6 +676,9 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
         --delivery-pipeline=${PIPELINE_NAME} \
         --region=${REGION} \
         --images=sample-app=${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/sample-app:v1.0.0
+    
+    # Wait for deployment to complete
+    sleep 60
     
     # Monitor deployment to development environment
     gcloud deploy rollouts list \
@@ -662,7 +718,15 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
    # Get development environment service URL
    DEV_IP=$(kubectl get service sample-app-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
    
+   # Wait for external IP to be assigned
+   echo "Waiting for external IP to be assigned..."
+   while [ -z "$DEV_IP" ] || [ "$DEV_IP" == "null" ]; do
+     sleep 10
+     DEV_IP=$(kubectl get service sample-app-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+   done
+   
    # Test application endpoint
+   echo "Testing application at: http://${DEV_IP}/"
    curl -s http://${DEV_IP}/ || echo "Service still starting..."
    
    # Test health check endpoint
@@ -683,7 +747,7 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
    gcloud deploy releases list \
        --delivery-pipeline=${PIPELINE_NAME} \
        --region=${REGION} \
-       --format="table(name,createTime,condition.state)"
+       --format="table(name,createTime,renderState)"
    ```
 
    Expected output: Pipeline shows healthy state with successful release and rollout.
@@ -697,9 +761,12 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
        --delivery-pipeline=${PIPELINE_NAME} \
        --region=${REGION}
    
+   # Wait for promotion to complete
+   sleep 90
+   
    # Monitor staging deployment
    kubectl config use-context gke_${PROJECT_ID}_${ZONE}_${CLUSTER_STAGE}
-   kubectl get deployments,services -w
+   kubectl get deployments,services -w --timeout=60s
    ```
 
    Expected output: Application successfully deploys to staging with appropriate resource allocations.
@@ -723,15 +790,18 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
    # Delete all GKE clusters
    gcloud container clusters delete ${CLUSTER_DEV} \
        --zone=${ZONE} \
-       --quiet
+       --quiet &
    
    gcloud container clusters delete ${CLUSTER_STAGE} \
        --zone=${ZONE} \
-       --quiet
+       --quiet &
    
    gcloud container clusters delete ${CLUSTER_PROD} \
        --zone=${ZONE} \
-       --quiet
+       --quiet &
+   
+   # Wait for all cluster deletions to complete
+   wait
    
    echo "✅ GKE clusters deleted"
    ```
@@ -759,7 +829,7 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
    
    # Clear environment variables
    unset PROJECT_ID REGION ZONE CLUSTER_DEV CLUSTER_STAGE CLUSTER_PROD
-   unset REPO_NAME PIPELINE_NAME BUCKET_NAME RANDOM_SUFFIX
+   unset REPO_NAME PIPELINE_NAME BUCKET_NAME RANDOM_SUFFIX PROJECT_NUMBER
    
    echo "✅ Local environment cleaned up"
    ```
@@ -768,11 +838,11 @@ echo "✅ APIs enabled for Cloud Deploy and Cloud Build"
 
 This implementation demonstrates Google Cloud's modern approach to multi-environment application deployment through the integration of Cloud Deploy and Cloud Build services. Cloud Deploy provides a managed delivery pipeline service that automates the promotion of applications through a defined sequence of environments, eliminating the need for custom scripts and reducing the complexity of multi-environment deployments. The service integrates seamlessly with Google Kubernetes Engine clusters, providing native support for Kubernetes deployments while maintaining environment isolation and security boundaries.
 
-The GitOps-style approach implemented here enables declarative infrastructure and application management through version-controlled configuration files. By storing Skaffold configurations, Kubernetes manifests, and Cloud Deploy pipeline definitions in source control, teams can implement infrastructure as code practices that provide audit trails, rollback capabilities, and collaborative development workflows. This approach aligns with modern DevOps practices and provides the foundation for compliance and governance requirements in enterprise environments.
+The GitOps-style approach implemented here enables declarative infrastructure and application management through version-controlled configuration files. By storing Skaffold configurations, Kubernetes manifests, and Cloud Deploy pipeline definitions in source control, teams can implement infrastructure as code practices that provide audit trails, rollback capabilities, and collaborative development workflows. This approach aligns with modern DevOps practices and provides the foundation for compliance and governance requirements in enterprise environments, as outlined in the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework).
 
 Cloud Build's integration with Cloud Deploy creates a seamless CI/CD pipeline that responds automatically to source code changes while providing flexibility for different deployment strategies. The build service handles container image creation, vulnerability scanning through Artifact Registry, and automatic release creation in Cloud Deploy. This integration eliminates the need for custom CI/CD infrastructure while providing enterprise-grade security and compliance features. The pipeline supports various deployment patterns including blue-green deployments, canary releases, and automated rollbacks, making it suitable for production environments with strict availability requirements.
 
-The architecture also demonstrates Google Cloud's approach to cost optimization and resource management across multiple environments. Development environments use minimal resources for rapid iteration, staging environments provide realistic testing conditions, and production environments receive optimal resource allocations for performance and reliability. This graduated approach to resource allocation, combined with Google Cloud's automatic scaling and management features, provides cost-effective operations while maintaining the performance characteristics required for each deployment stage.
+The architecture also demonstrates Google Cloud's approach to cost optimization and resource management across multiple environments. Development environments use minimal resources for rapid iteration, staging environments provide realistic testing conditions, and production environments receive optimal resource allocations for performance and reliability. This graduated approach to resource allocation, combined with Google Cloud's automatic scaling and management features, provides cost-effective operations while maintaining the performance characteristics required for each deployment stage. For additional cost optimization strategies, refer to the [Google Cloud cost optimization best practices](https://cloud.google.com/architecture/framework/cost-optimization).
 
 > **Tip**: Use Cloud Deploy's approval workflows and Pub/Sub integration to implement custom approval processes that align with your organization's governance requirements and change management procedures.
 

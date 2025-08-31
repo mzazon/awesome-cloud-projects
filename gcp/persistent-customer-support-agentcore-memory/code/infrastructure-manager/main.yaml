@@ -1,0 +1,730 @@
+# Infrastructure Manager Configuration for Persistent AI Customer Support with Agent Engine Memory
+# This template deploys a complete serverless AI customer support system with conversation memory
+# 
+# Resources deployed:
+# - Firestore database for conversation memory storage
+# - Cloud Functions for memory retrieval and AI chat processing
+# - Required APIs and IAM permissions
+# - Service accounts with appropriate roles
+#
+# Prerequisites:
+# - Google Cloud project with billing enabled
+# - Infrastructure Manager API enabled
+# - Terraform provider credentials configured
+
+terraform:
+  required_version: ">= 1.5"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    archive:
+      source: "hashicorp/archive"
+      version: "~> 2.4"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.6"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID where resources will be deployed"
+    validation:
+      condition: "length(var.project_id) > 0"
+      error_message: "Project ID cannot be empty."
+
+  region:
+    type: string
+    description: "Google Cloud region for deploying resources"
+    default: "us-central1"
+    validation:
+      condition: "contains(['us-central1', 'us-east1', 'us-west1', 'europe-west1', 'asia-southeast1'], var.region)"
+      error_message: "Region must be one of: us-central1, us-east1, us-west1, europe-west1, asia-southeast1."
+
+  environment:
+    type: string
+    description: "Environment name for resource naming (dev, staging, prod)"
+    default: "dev"
+    validation:
+      condition: "contains(['dev', 'staging', 'prod'], var.environment)"
+      error_message: "Environment must be one of: dev, staging, prod."
+
+  function_memory_mb:
+    type: number
+    description: "Memory allocation for Cloud Functions in MB"
+    default: 512
+    validation:
+      condition: "var.function_memory_mb >= 256 && var.function_memory_mb <= 8192"
+      error_message: "Function memory must be between 256 and 8192 MB."
+
+  function_timeout_seconds:
+    type: number
+    description: "Timeout for Cloud Functions in seconds"
+    default: 300
+    validation:
+      condition: "var.function_timeout_seconds >= 60 && var.function_timeout_seconds <= 540"
+      error_message: "Function timeout must be between 60 and 540 seconds."
+
+  firestore_location:
+    type: string
+    description: "Firestore database location"
+    default: "us-central1"
+
+  enable_public_access:
+    type: bool
+    description: "Allow unauthenticated access to Cloud Functions (for testing only)"
+    default: false
+
+# Local values for resource naming and configuration
+locals:
+  # Generate unique suffix for resource names to avoid conflicts
+  resource_suffix = "${var.environment}-${random_string.suffix.result}"
+  
+  # Resource naming convention
+  memory_function_name = "retrieve-memory-${local.resource_suffix}"
+  chat_function_name = "support-chat-${local.resource_suffix}"
+  service_account_name = "ai-support-agent-${local.resource_suffix}"
+  
+  # API services required for the solution
+  required_apis = [
+    "cloudfunctions.googleapis.com",
+    "firestore.googleapis.com",
+    "aiplatform.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+    "iam.googleapis.com"
+  ]
+
+  # Common labels for all resources
+  common_labels = {
+    environment = var.environment
+    project     = "ai-customer-support"
+    managed-by  = "infrastructure-manager"
+    recipe-id   = "a7c3f9e2"
+  }
+}
+
+# Generate random suffix for unique resource naming
+resource "random_string" "suffix" {
+  length  = 6
+  special = false
+  upper   = false
+}
+
+# Data source to get current project information
+data "google_project" "current" {
+  project_id = var.project_id
+}
+
+# Enable required Google Cloud APIs
+resource "google_project_service" "apis" {
+  for_each = toset(local.required_apis)
+  
+  project = var.project_id
+  service = each.value
+  
+  # Disable dependent services when this resource is destroyed
+  disable_dependent_services = true
+  
+  # Don't disable the service when the resource is destroyed
+  disable_on_destroy = false
+
+  timeouts {
+    create = "20m"
+    update = "20m"
+  }
+}
+
+# Create service account for Cloud Functions
+resource "google_service_account" "ai_support_service_account" {
+  account_id   = local.service_account_name
+  display_name = "AI Customer Support Service Account"
+  description  = "Service account for AI customer support Cloud Functions"
+  project      = var.project_id
+
+  depends_on = [google_project_service.apis]
+}
+
+# IAM roles for the service account
+resource "google_project_iam_member" "service_account_roles" {
+  for_each = toset([
+    "roles/firestore.user",           # Access Firestore database
+    "roles/aiplatform.user",          # Access Vertex AI services
+    "roles/cloudfunctions.invoker",   # Invoke other Cloud Functions
+    "roles/logging.logWriter",        # Write logs
+    "roles/monitoring.metricWriter"   # Write metrics
+  ])
+  
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.ai_support_service_account.email}"
+  
+  depends_on = [google_service_account.ai_support_service_account]
+}
+
+# Create Firestore database for conversation memory
+resource "google_firestore_database" "conversation_memory" {
+  project                           = var.project_id
+  name                             = "(default)"
+  location_id                      = var.firestore_location
+  type                             = "FIRESTORE_NATIVE"
+  concurrency_mode                 = "OPTIMISTIC"
+  app_engine_integration_mode      = "DISABLED"
+  point_in_time_recovery_enablement = "POINT_IN_TIME_RECOVERY_ENABLED"
+  
+  # Enable delete protection for production environments
+  delete_protection_state = var.environment == "prod" ? "DELETE_PROTECTION_ENABLED" : "DELETE_PROTECTION_DISABLED"
+
+  depends_on = [
+    google_project_service.apis
+  ]
+}
+
+# Create Firestore index for efficient conversation queries
+resource "google_firestore_field" "conversation_index" {
+  project    = var.project_id
+  database   = google_firestore_database.conversation_memory.name
+  collection = "conversations"
+  field      = "customer_id"
+
+  index_config {
+    indexes {
+      fields {
+        field_path = "customer_id"
+        order      = "ASCENDING"
+      }
+      fields {
+        field_path = "timestamp"
+        order      = "DESCENDING"
+      }
+      query_scope = "COLLECTION"
+    }
+  }
+
+  depends_on = [google_firestore_database.conversation_memory]
+}
+
+# Create Cloud Storage bucket for function source code
+resource "google_storage_bucket" "function_source" {
+  name     = "${var.project_id}-ai-support-functions-${local.resource_suffix}"
+  location = var.region
+  project  = var.project_id
+
+  uniform_bucket_level_access = true
+  force_destroy              = true
+
+  labels = local.common_labels
+
+  lifecycle_rule {
+    condition {
+      age = 30
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+# Create memory retrieval function source code
+data "archive_file" "memory_function_source" {
+  type        = "zip"
+  output_path = "/tmp/memory-function-${local.resource_suffix}.zip"
+  
+  source {
+    content = <<-EOT
+import functions_framework
+from google.cloud import firestore
+import json
+from flask import Request
+from datetime import datetime, timedelta
+
+@functions_framework.http
+def retrieve_memory(request: Request):
+    """Retrieve conversation memory for customer context."""
+    
+    if request.method == 'OPTIONS':
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST',
+            'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Max-Age': '3600'
+        }
+        return ('', 204, headers)
+    
+    try:
+        request_json = request.get_json()
+        customer_id = request_json.get('customer_id')
+        
+        if not customer_id:
+            return {'error': 'customer_id required'}, 400
+        
+        # Initialize Firestore client
+        db = firestore.Client()
+        
+        # Retrieve recent conversations (last 30 days)
+        thirty_days_ago = datetime.now() - timedelta(days=30)
+        
+        conversations_ref = db.collection('conversations')
+        query = conversations_ref.where('customer_id', '==', customer_id) \
+                               .where('timestamp', '>=', thirty_days_ago) \
+                               .order_by('timestamp', direction=firestore.Query.DESCENDING) \
+                               .limit(10)
+        
+        conversations = []
+        for doc in query.stream():
+            conversation = doc.to_dict()
+            conversations.append({
+                'id': doc.id,
+                'message': conversation.get('message', ''),
+                'response': conversation.get('response', ''),
+                'timestamp': conversation.get('timestamp'),
+                'sentiment': conversation.get('sentiment', 'neutral'),
+                'resolved': conversation.get('resolved', False)
+            })
+        
+        # Extract customer context
+        customer_context = {
+            'total_conversations': len(conversations),
+            'recent_topics': [],
+            'satisfaction_trend': 'neutral',
+            'common_issues': []
+        }
+        
+        if conversations:
+            # Analyze conversation patterns
+            unresolved_count = sum(1 for c in conversations if not c['resolved'])
+            customer_context['unresolved_issues'] = unresolved_count
+            
+            # Extract recent topics (simplified)
+            recent_messages = [c['message'][:100] for c in conversations[:3]]
+            customer_context['recent_topics'] = recent_messages
+        
+        response = {
+            'customer_id': customer_id,
+            'conversations': conversations,
+            'context': customer_context,
+            'retrieved_at': datetime.now().isoformat()
+        }
+        
+        headers = {'Access-Control-Allow-Origin': '*'}
+        return (response, 200, headers)
+        
+    except Exception as e:
+        return {'error': str(e)}, 500
+EOT
+    filename = "main.py"
+  }
+  
+  source {
+    content = <<-EOT
+functions-framework==3.*
+google-cloud-firestore==2.*
+google-cloud-aiplatform==1.*
+flask==2.*
+EOT
+    filename = "requirements.txt"
+  }
+}
+
+# Upload memory function source to Cloud Storage
+resource "google_storage_bucket_object" "memory_function_source" {
+  name   = "memory-function-${local.resource_suffix}.zip"
+  bucket = google_storage_bucket.function_source.name
+  source = data.archive_file.memory_function_source.output_path
+
+  depends_on = [google_storage_bucket.function_source]
+}
+
+# Deploy memory retrieval Cloud Function
+resource "google_cloudfunctions2_function" "memory_retrieval" {
+  name        = local.memory_function_name
+  location    = var.region
+  project     = var.project_id
+  description = "Retrieve conversation memory for customer context"
+
+  build_config {
+    runtime     = "python311"
+    entry_point = "retrieve_memory"
+    
+    source {
+      storage_source {
+        bucket = google_storage_bucket.function_source.name
+        object = google_storage_bucket_object.memory_function_source.name
+      }
+    }
+  }
+
+  service_config {
+    max_instance_count             = 100
+    min_instance_count             = 0
+    available_memory               = "256Mi"
+    timeout_seconds                = 60
+    max_instance_request_concurrency = 80
+    available_cpu                  = "1"
+    
+    environment_variables = {
+      GOOGLE_CLOUD_PROJECT = var.project_id
+    }
+
+    ingress_settings               = "ALLOW_ALL"
+    all_traffic_on_latest_revision = true
+    service_account_email          = google_service_account.ai_support_service_account.email
+  }
+
+  labels = local.common_labels
+
+  depends_on = [
+    google_project_service.apis,
+    google_storage_bucket_object.memory_function_source,
+    google_service_account.ai_support_service_account,
+    google_firestore_database.conversation_memory
+  ]
+}
+
+# Create IAM binding for memory function invocation
+resource "google_cloudfunctions2_function_iam_binding" "memory_function_invoker" {
+  count = var.enable_public_access ? 1 : 0
+  
+  project        = var.project_id
+  location       = var.region
+  cloud_function = google_cloudfunctions2_function.memory_retrieval.name
+  role           = "roles/cloudfunctions.invoker"
+  members = [
+    "allUsers"
+  ]
+}
+
+# Create chat function source code
+data "archive_file" "chat_function_source" {
+  type        = "zip"
+  output_path = "/tmp/chat-function-${local.resource_suffix}.zip"
+  
+  source {
+    content = <<-EOT
+import functions_framework
+from google.cloud import firestore
+import vertexai
+from vertexai.generative_models import GenerativeModel
+import json
+import requests
+from flask import Request
+from datetime import datetime
+import os
+
+# Initialize Vertex AI
+PROJECT_ID = os.environ.get('GOOGLE_CLOUD_PROJECT')
+REGION = os.environ.get('FUNCTION_REGION', 'us-central1')
+
+vertexai.init(project=PROJECT_ID, location=REGION)
+
+@functions_framework.http
+def support_chat(request: Request):
+    """Main support chat function with memory integration."""
+    
+    if request.method == 'OPTIONS':
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST',
+            'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Max-Age': '3600'
+        }
+        return ('', 204, headers)
+    
+    try:
+        request_json = request.get_json()
+        customer_id = request_json.get('customer_id')
+        message = request_json.get('message')
+        
+        if not customer_id or not message:
+            return {'error': 'customer_id and message required'}, 400
+        
+        # Retrieve conversation memory
+        memory_response = requests.post(
+            os.environ.get('RETRIEVE_MEMORY_URL'),
+            json={'customer_id': customer_id},
+            timeout=30
+        )
+        
+        memory_data = {}
+        if memory_response.status_code == 200:
+            memory_data = memory_response.json()
+        
+        # Build context-aware prompt
+        system_prompt = build_system_prompt(memory_data)
+        user_prompt = f"Customer message: {message}"
+        
+        # Generate AI response using Vertex AI
+        ai_response = generate_ai_response(system_prompt, user_prompt)
+        
+        # Store conversation in Firestore
+        conversation_id = store_conversation(
+            customer_id, message, ai_response, memory_data.get('context', {})
+        )
+        
+        response = {
+            'conversation_id': conversation_id,
+            'customer_id': customer_id,
+            'message': message,
+            'ai_response': ai_response,
+            'memory_context_used': bool(memory_data),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        headers = {'Access-Control-Allow-Origin': '*'}
+        return (response, 200, headers)
+        
+    except Exception as e:
+        return {'error': str(e)}, 500
+
+def build_system_prompt(memory_data):
+    """Build context-aware system prompt using memory data."""
+    base_prompt = """You are a helpful customer support agent. You provide professional, empathetic, and solution-focused responses to customer inquiries."""
+    
+    if memory_data and memory_data.get('conversations'):
+        context = memory_data.get('context', {})
+        conversations = memory_data.get('conversations', [])
+        
+        base_prompt += f"""
+
+Customer Context:
+- Total previous conversations: {context.get('total_conversations', 0)}
+- Unresolved issues: {context.get('unresolved_issues', 0)}
+- Recent topics: {', '.join(context.get('recent_topics', [])[:2])}
+
+Recent conversation history:
+"""
+        
+        for conv in conversations[:3]:
+            base_prompt += f"- Customer: {conv.get('message', '')[:100]}...\n"
+            base_prompt += f"  Agent: {conv.get('response', '')[:100]}...\n"
+        
+        base_prompt += "\nUse this context to provide personalized, relevant responses."
+    
+    return base_prompt
+
+def generate_ai_response(system_prompt, user_prompt):
+    """Generate AI response using Vertex AI Gemini."""
+    try:
+        model = GenerativeModel("gemini-1.5-flash")
+        
+        full_prompt = f"{system_prompt}\n\n{user_prompt}"
+        
+        response = model.generate_content(
+            full_prompt,
+            generation_config={
+                "max_output_tokens": 1024,
+                "temperature": 0.7,
+                "top_p": 0.8
+            }
+        )
+        return response.text
+        
+    except Exception as e:
+        return f"I apologize, but I'm experiencing technical difficulties. Please try again or contact our support team directly. Error: {str(e)}"
+
+def store_conversation(customer_id, message, response, context):
+    """Store conversation in Firestore."""
+    try:
+        db = firestore.Client()
+        
+        conversation_data = {
+            'customer_id': customer_id,
+            'message': message,
+            'response': response,
+            'timestamp': datetime.now(),
+            'context_used': context,
+            'resolved': False,  # Can be updated later
+            'sentiment': 'neutral'  # Can be enhanced with sentiment analysis
+        }
+        
+        doc_ref = db.collection('conversations').add(conversation_data)
+        return doc_ref[1].id
+        
+    except Exception as e:
+        print(f"Error storing conversation: {e}")
+        return None
+EOT
+    filename = "main.py"
+  }
+  
+  source {
+    content = <<-EOT
+functions-framework==3.*
+google-cloud-firestore==2.*
+google-cloud-aiplatform==1.*
+flask==2.*
+requests==2.*
+EOT
+    filename = "requirements.txt"
+  }
+}
+
+# Upload chat function source to Cloud Storage
+resource "google_storage_bucket_object" "chat_function_source" {
+  name   = "chat-function-${local.resource_suffix}.zip"
+  bucket = google_storage_bucket.function_source.name
+  source = data.archive_file.chat_function_source.output_path
+
+  depends_on = [google_storage_bucket.function_source]
+}
+
+# Deploy AI support chat Cloud Function
+resource "google_cloudfunctions2_function" "ai_support_chat" {
+  name        = local.chat_function_name
+  location    = var.region
+  project     = var.project_id
+  description = "AI customer support chat with memory integration"
+
+  build_config {
+    runtime     = "python311"
+    entry_point = "support_chat"
+    
+    source {
+      storage_source {
+        bucket = google_storage_bucket.function_source.name
+        object = google_storage_bucket_object.chat_function_source.name
+      }
+    }
+  }
+
+  service_config {
+    max_instance_count             = 100
+    min_instance_count             = 0
+    available_memory               = "${var.function_memory_mb}Mi"
+    timeout_seconds                = var.function_timeout_seconds
+    max_instance_request_concurrency = 80
+    available_cpu                  = "1"
+    
+    environment_variables = {
+      GOOGLE_CLOUD_PROJECT   = var.project_id
+      FUNCTION_REGION        = var.region
+      RETRIEVE_MEMORY_URL    = google_cloudfunctions2_function.memory_retrieval.service_config[0].uri
+    }
+
+    ingress_settings               = "ALLOW_ALL"
+    all_traffic_on_latest_revision = true
+    service_account_email          = google_service_account.ai_support_service_account.email
+  }
+
+  labels = local.common_labels
+
+  depends_on = [
+    google_project_service.apis,
+    google_storage_bucket_object.chat_function_source,
+    google_service_account.ai_support_service_account,
+    google_cloudfunctions2_function.memory_retrieval,
+    google_firestore_database.conversation_memory
+  ]
+}
+
+# Create IAM binding for chat function invocation
+resource "google_cloudfunctions2_function_iam_binding" "chat_function_invoker" {
+  count = var.enable_public_access ? 1 : 0
+  
+  project        = var.project_id
+  location       = var.region
+  cloud_function = google_cloudfunctions2_function.ai_support_chat.name
+  role           = "roles/cloudfunctions.invoker"
+  members = [
+    "allUsers"
+  ]
+}
+
+# Create IAM binding for chat function to invoke memory function
+resource "google_cloudfunctions2_function_iam_binding" "memory_function_internal_invoker" {
+  project        = var.project_id
+  location       = var.region
+  cloud_function = google_cloudfunctions2_function.memory_retrieval.name
+  role           = "roles/cloudfunctions.invoker"
+  members = [
+    "serviceAccount:${google_service_account.ai_support_service_account.email}"
+  ]
+}
+
+# Output values for reference and testing
+outputs:
+  project_id:
+    description = "Google Cloud Project ID"
+    value       = var.project_id
+
+  region:
+    description = "Deployment region"
+    value       = var.region
+
+  firestore_database_name:
+    description = "Firestore database name for conversation memory"
+    value       = google_firestore_database.conversation_memory.name
+
+  memory_function_name:
+    description = "Memory retrieval Cloud Function name"
+    value       = google_cloudfunctions2_function.memory_retrieval.name
+
+  memory_function_url:
+    description = "Memory retrieval Cloud Function URL"
+    value       = google_cloudfunctions2_function.memory_retrieval.service_config[0].uri
+
+  chat_function_name:
+    description = "AI support chat Cloud Function name"
+    value       = google_cloudfunctions2_function.ai_support_chat.name
+
+  chat_function_url:
+    description = "AI support chat Cloud Function URL"
+    value       = google_cloudfunctions2_function.ai_support_chat.service_config[0].uri
+
+  service_account_email:
+    description = "Service account email for Cloud Functions"
+    value       = google_service_account.ai_support_service_account.email
+
+  storage_bucket_name:
+    description = "Cloud Storage bucket for function source code"
+    value       = google_storage_bucket.function_source.name
+
+  resource_suffix:
+    description = "Unique suffix used for resource naming"
+    value       = local.resource_suffix
+
+  # Testing endpoints (only when public access is enabled)
+  test_memory_curl_command:
+    description = "Example curl command to test memory retrieval function"
+    value = var.enable_public_access ? "curl -X POST ${google_cloudfunctions2_function.memory_retrieval.service_config[0].uri} -H 'Content-Type: application/json' -d '{\"customer_id\": \"test-customer-001\"}'" : "Public access disabled - enable_public_access variable must be true"
+
+  test_chat_curl_command:
+    description = "Example curl command to test AI chat function"
+    value = var.enable_public_access ? "curl -X POST ${google_cloudfunctions2_function.ai_support_chat.service_config[0].uri} -H 'Content-Type: application/json' -d '{\"customer_id\": \"test-customer-001\", \"message\": \"I need help with my order\"}'" : "Public access disabled - enable_public_access variable must be true"
+
+  deployment_notes:
+    description = "Important deployment notes and next steps"
+    value = <<-EOT
+Deployment Complete! 
+
+Your AI Customer Support system has been deployed with the following components:
+- Firestore database for conversation memory
+- Memory retrieval Cloud Function: ${google_cloudfunctions2_function.memory_retrieval.name}
+- AI support chat Cloud Function: ${google_cloudfunctions2_function.ai_support_chat.name}
+
+${var.enable_public_access ? 
+  "⚠️  PUBLIC ACCESS ENABLED: Functions are accessible without authentication. This is suitable for testing only." :
+  "🔒 PRIVATE ACCESS: Functions require authentication. Use Cloud IAM to grant access to specific users or services."
+}
+
+Next Steps:
+1. Test the memory retrieval function using the provided curl command
+2. Test the AI chat function to verify end-to-end functionality
+3. Monitor function logs in Cloud Logging for troubleshooting
+4. Scale memory and timeout settings based on usage patterns
+5. Implement additional security measures for production use
+
+For production deployments:
+- Set enable_public_access = false
+- Configure proper authentication and authorization
+- Enable monitoring and alerting
+- Implement rate limiting and abuse protection
+- Add conversation encryption for sensitive data
+EOT
+}

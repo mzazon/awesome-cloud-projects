@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: MediaConvert, S3, CloudFront, Lambda
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: video, streaming, adaptive-bitrate, media-processing
 recipe-generator-version: 1.3
@@ -81,6 +81,8 @@ graph TB
 5. Basic familiarity with AWS Lambda and S3 events
 6. Estimated cost: $10-30 for testing (varies by video duration and output formats)
 
+> **Note**: This recipe creates MediaConvert jobs that incur charges based on processing time. Monitor your usage and clean up resources when testing is complete.
+
 ## Preparation
 
 ```bash
@@ -130,7 +132,7 @@ echo "✅ Created S3 buckets and configured CORS for streaming"
 
 1. **Create IAM Role for MediaConvert**:
 
-   MediaConvert requires an IAM role to access your S3 buckets for reading source videos and writing transcoded outputs. This role implements least privilege access, granting only the specific S3 permissions needed for video processing while maintaining security boundaries.
+   MediaConvert requires an IAM role to access your S3 buckets for reading source videos and writing transcoded outputs. This role implements least privilege access, granting only the specific S3 permissions needed for video processing while maintaining security boundaries following [AWS IAM best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html).
 
    ```bash
    # Create trust policy for MediaConvert
@@ -218,7 +220,7 @@ echo "✅ Created S3 buckets and configured CORS for streaming"
 
 3. **Create Comprehensive ABR Job Template**:
 
-   Adaptive bitrate streaming enables seamless video playback by providing multiple quality variants that automatically adjust based on network conditions and device capabilities. This MediaConvert job template creates a comprehensive ABR ladder with QVBR (Quality-defined Variable Bitrate) encoding, which optimizes visual quality while maintaining target bitrates. The template generates both HLS and DASH outputs for maximum device compatibility across all streaming platforms.
+   Adaptive bitrate streaming enables seamless video playback by providing multiple quality variants that automatically adjust based on network conditions and device capabilities. This MediaConvert job template creates a comprehensive ABR ladder with [QVBR (Quality-defined Variable Bitrate) encoding](https://docs.aws.amazon.com/mediaconvert/latest/ug/qvbr-guidelines.html), which optimizes visual quality while maintaining target bitrates. The template generates both HLS and DASH outputs for maximum device compatibility across all streaming platforms.
 
    ```bash
    # Create job template with multiple bitrate outputs
@@ -616,10 +618,6 @@ echo "✅ Created S3 buckets and configured CORS for streaming"
        --cli-input-json file://abr-job-template.json
    
    echo "✅ Created comprehensive ABR job template: ${JOB_TEMPLATE}"
-   
-   # The job template defines multiple quality variants for adaptive streaming
-   # QVBR encoding optimizes quality while maintaining target bitrates
-   # Template supports both HLS and DASH output formats for maximum compatibility
    ```
 
    The ABR template creates four quality levels (360p to 1080p) with optimized bitrates that follow industry best practices. Each variant uses H.264 encoding with progressive quality settings and appropriate audio bitrates, ensuring smooth switching between quality levels during playback.
@@ -627,6 +625,8 @@ echo "✅ Created S3 buckets and configured CORS for streaming"
    > **Tip**: Adjust quality levels and bitrates based on your content type. Sports content may need higher bitrates, while talking-head videos can use lower settings. Learn more about [MediaConvert encoding optimization](https://docs.aws.amazon.com/mediaconvert/latest/ug/working-with-job-templates.html).
 
 4. **Create Lambda Function for Video Processing**:
+
+   AWS Lambda provides serverless compute that automatically scales based on incoming S3 events. The Lambda function triggers MediaConvert jobs when videos are uploaded, implementing event-driven architecture that eliminates idle infrastructure costs while providing enterprise-scale processing capabilities when needed.
 
    ```bash
    # Create Lambda function code for ABR processing
@@ -805,10 +805,10 @@ echo "✅ Created S3 buckets and configured CORS for streaming"
    # Wait for role propagation
    sleep 10
    
-   # Create Lambda function
+   # Create Lambda function with current runtime
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda-abr-function.zip \
@@ -816,13 +816,13 @@ echo "✅ Created S3 buckets and configured CORS for streaming"
        --environment Variables="{MEDIACONVERT_ENDPOINT=${MEDIACONVERT_ENDPOINT},JOB_TEMPLATE=${JOB_TEMPLATE},MEDIACONVERT_ROLE_ARN=${MEDIACONVERT_ROLE_ARN},OUTPUT_BUCKET=${OUTPUT_BUCKET}}"
    
    echo "✅ Created Lambda function for ABR processing: ${LAMBDA_FUNCTION}"
-   
-   # Lambda automatically triggers MediaConvert jobs when videos are uploaded
-   # The function extracts metadata and configures output paths dynamically
-   # Environment variables store MediaConvert configuration for reusability
    ```
 
+   The Lambda function automatically triggers MediaConvert jobs when videos are uploaded to S3. It extracts metadata, configures output paths dynamically, and implements error handling for robust video processing workflows. Environment variables store MediaConvert configuration for reusability and maintainability.
+
 5. **Configure S3 Event Notification**:
+
+   S3 event notifications enable real-time processing by triggering Lambda functions when objects are created. The configuration includes filters for video file types to prevent unnecessary Lambda invocations and ensure cost-effective operation.
 
    ```bash
    # Add permission for S3 to invoke Lambda
@@ -877,15 +877,15 @@ echo "✅ Created S3 buckets and configured CORS for streaming"
        --notification-configuration file://s3-video-notification.json
    
    echo "✅ Configured S3 event notifications for video processing"
-   
-   # S3 events trigger Lambda immediately when video files are uploaded
-   # Multiple file format triggers ensure compatibility with various video types
-   # Event filtering prevents processing of non-video files
    ```
+
+   S3 events trigger Lambda immediately when video files are uploaded. Multiple file format triggers ensure compatibility with various video types, while event filtering prevents processing of non-video files and reduces operational costs.
 
    > **Warning**: Ensure your source bucket receives only video files to prevent unnecessary Lambda invocations and MediaConvert charges.
 
 6. **Create CloudFront Distribution for Streaming**:
+
+   CloudFront provides global content distribution with [intelligent caching strategies optimized for streaming workloads](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/live-streaming.html). The distribution uses separate cache behaviors for manifests and segments to balance performance and accuracy in adaptive streaming delivery.
 
    ```bash
    # Create CloudFront distribution for ABR streaming
@@ -1025,13 +1025,13 @@ echo "✅ Created S3 buckets and configured CORS for streaming"
    
    echo "✅ Created CloudFront distribution: ${DISTRIBUTION_ID}"
    echo "Distribution domain: ${DISTRIBUTION_DOMAIN}"
-   
-   # CloudFront provides global content delivery with optimized caching
-   # Different cache behaviors for manifests (short TTL) and segments (long TTL)
-   # HTTPS redirection ensures secure video delivery
    ```
 
+   CloudFront provides global content delivery with optimized caching. Different cache behaviors for manifests (short TTL) and segments (long TTL) ensure rapid quality switching while reducing origin requests. HTTPS redirection ensures secure video delivery across all devices.
+
 7. **Create Test Video Player**:
+
+   The HTML5 video player uses Video.js with native HLS and DASH support to demonstrate adaptive bitrate streaming capabilities. Real-time statistics show quality switching behavior and streaming performance metrics for validation and optimization.
 
    ```bash
    # Create HTML5 video player with ABR support
@@ -1326,11 +1326,9 @@ echo "✅ Created S3 buckets and configured CORS for streaming"
    
    echo "✅ Created ABR test player"
    echo "Test player URL: http://${OUTPUT_BUCKET}.s3-website.${AWS_REGION}.amazonaws.com/test-player.html"
-   
-   # The test player uses Video.js with HLS and DASH support
-   # Real-time statistics show adaptive bitrate switching behavior
-   # Quality metrics help validate optimal streaming performance
    ```
+
+   The test player uses Video.js with HLS and DASH support for comprehensive streaming format testing. Real-time statistics show adaptive bitrate switching behavior and quality metrics to help validate optimal streaming performance across different network conditions.
 
 8. **Display Setup Information**:
 

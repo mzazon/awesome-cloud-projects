@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: Systems Manager, CloudFormation, EventBridge, CloudWatch
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: business-continuity, disaster-recovery, testing, automation
 recipe-generator-version: 1.3
@@ -390,7 +390,7 @@ echo "Results Bucket: ${TEST_RESULTS_BUCKET}"
      - name: TestDatabaseConnectivity
        action: 'aws:executeScript'
        inputs:
-         Runtime: python3.8
+         Runtime: python3.12
          Handler: test_db_connection
          Script: |
            import boto3
@@ -487,7 +487,7 @@ echo "Results Bucket: ${TEST_RESULTS_BUCKET}"
      - name: CheckPrimaryApplicationHealth
        action: 'aws:executeScript'
        inputs:
-         Runtime: python3.8
+         Runtime: python3.12
          Handler: check_application_health
          Script: |
            import requests
@@ -541,7 +541,7 @@ echo "Results Bucket: ${TEST_RESULTS_BUCKET}"
      - name: ValidateSecondaryApplication
        action: 'aws:executeScript'
        inputs:
-         Runtime: python3.8
+         Runtime: python3.12
          Handler: check_application_health
          Script: |
            import requests
@@ -617,6 +617,7 @@ echo "Results Bucket: ${TEST_RESULTS_BUCKET}"
    import boto3
    import datetime
    import uuid
+   import os
    from typing import Dict, List
    
    def lambda_handler(event, context):
@@ -760,7 +761,7 @@ echo "Results Bucket: ${TEST_RESULTS_BUCKET}"
    
    ORCHESTRATOR_LAMBDA=$(aws lambda create-function \
        --function-name "bc-test-orchestrator-${BC_PROJECT_ID}" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${AUTOMATION_ROLE_NAME} \
        --handler bc-test-orchestrator.lambda_handler \
        --zip-file fileb://bc-test-orchestrator.zip \
@@ -1027,7 +1028,7 @@ echo "Results Bucket: ${TEST_RESULTS_BUCKET}"
    
    COMPLIANCE_LAMBDA=$(aws lambda create-function \
        --function-name "bc-compliance-reporter-${BC_PROJECT_ID}" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${AUTOMATION_ROLE_NAME} \
        --handler compliance-reporter.lambda_handler \
        --zip-file fileb://compliance-reporter.zip \
@@ -1067,6 +1068,7 @@ echo "Results Bucket: ${TEST_RESULTS_BUCKET}"
     import json
     import boto3
     import uuid
+    import os
     
     def lambda_handler(event, context):
         ssm = boto3.client('ssm')
@@ -1138,7 +1140,7 @@ echo "Results Bucket: ${TEST_RESULTS_BUCKET}"
     
     MANUAL_TEST_LAMBDA=$(aws lambda create-function \
         --function-name "bc-manual-test-executor-${BC_PROJECT_ID}" \
-        --runtime python3.9 \
+        --runtime python3.12 \
         --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${AUTOMATION_ROLE_NAME} \
         --handler manual-test-executor.lambda_handler \
         --zip-file fileb://manual-test-executor.zip \

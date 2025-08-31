@@ -1,0 +1,880 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Standardized Service Deployment with VPC Lattice and Service Catalog - Complete Infrastructure Stack'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - TemplateBucketName
+      - Label:
+          default: "Service Catalog Configuration"
+        Parameters:
+          - PortfolioDisplayName
+          - ServiceNetworkProductName
+          - LatticeServiceProductName
+      - Label:
+          default: "VPC Lattice Configuration"
+        Parameters:
+          - DefaultVpcId
+          - ServiceNetworkName
+          - AuthType
+      - Label:
+          default: "IAM Configuration"
+        Parameters:
+          - LaunchRoleName
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      TemplateBucketName:
+        default: "CloudFormation Templates S3 Bucket Name"
+      PortfolioDisplayName:
+        default: "Service Catalog Portfolio Display Name"
+      ServiceNetworkProductName:
+        default: "Service Network Product Name"
+      LatticeServiceProductName:
+        default: "Lattice Service Product Name"
+      DefaultVpcId:
+        default: "Default VPC ID"
+      ServiceNetworkName:
+        default: "VPC Lattice Service Network Name"
+      AuthType:
+        default: "VPC Lattice Authentication Type"
+      LaunchRoleName:
+        default: "Service Catalog Launch Role Name"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and naming'
+
+  ProjectName:
+    Type: String
+    Default: 'vpc-lattice-service-catalog'
+    Description: 'Project name used for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: 'Must begin with a letter, contain only alphanumeric characters and hyphens, and end with an alphanumeric character'
+
+  TemplateBucketName:
+    Type: String
+    Description: 'S3 bucket name for storing CloudFormation templates (will be created if it does not exist)'
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name (lowercase letters, numbers, and hyphens only)'
+    MinLength: 3
+    MaxLength: 63
+
+  PortfolioDisplayName:
+    Type: String
+    Default: 'VPC Lattice Services'
+    Description: 'Display name for the Service Catalog portfolio'
+    MinLength: 1
+    MaxLength: 100
+
+  ServiceNetworkProductName:
+    Type: String
+    Default: 'Standardized VPC Lattice Service Network'
+    Description: 'Name for the Service Network product in Service Catalog'
+    MinLength: 1
+    MaxLength: 100
+
+  LatticeServiceProductName:
+    Type: String
+    Default: 'Standardized VPC Lattice Service'
+    Description: 'Name for the Lattice Service product in Service Catalog'
+    MinLength: 1
+    MaxLength: 100
+
+  DefaultVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where target groups will be created (required for service templates)'
+
+  ServiceNetworkName:
+    Type: String
+    Default: 'standard-service-network'
+    Description: 'Default name for VPC Lattice service networks created from templates'
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+
+  AuthType:
+    Type: String
+    Default: 'AWS_IAM'
+    AllowedValues: ['AWS_IAM', 'NONE']
+    Description: 'Default authentication type for VPC Lattice service networks'
+
+  LaunchRoleName:
+    Type: String
+    Default: 'ServiceCatalogVpcLatticeRole'
+    Description: 'Name for the IAM role used by Service Catalog to launch products'
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+
+Conditions:
+  CreateS3Bucket: !Not [!Equals [!Ref TemplateBucketName, '']]
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # ==================== S3 BUCKET FOR CLOUDFORMATION TEMPLATES ====================
+  
+  TemplatesBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3Bucket
+    Properties:
+      BucketName: !Ref TemplateBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref TemplatesBucketLogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'CloudFormation Templates Storage'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  TemplatesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateS3Bucket
+    Properties:
+      Bucket: !Ref TemplatesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${TemplatesBucket}/*'
+              - !Ref TemplatesBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          - Sid: AllowServiceCatalogAccess
+            Effect: Allow
+            Principal:
+              Service: servicecatalog.amazonaws.com
+            Action:
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+            Resource: !Sub '${TemplatesBucket}/*'
+
+  TemplatesBucketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-templates-bucket'
+      RetentionInDays: !If [IsProductionEnvironment, 90, 30]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==================== VPC LATTICE SERVICE NETWORK TEMPLATE ====================
+  
+  ServiceNetworkTemplate:
+    Type: AWS::S3::Object
+    Condition: CreateS3Bucket
+    Properties:
+      Bucket: !Ref TemplatesBucket
+      Key: 'service-network-template.yaml'
+      Body: !Sub |
+        AWSTemplateFormatVersion: '2010-09-09'
+        Description: 'Standardized VPC Lattice Service Network Template'
+        
+        Parameters:
+          NetworkName:
+            Type: String
+            Default: '${ServiceNetworkName}'
+            Description: 'Name for the VPC Lattice service network'
+            MinLength: 1
+            MaxLength: 63
+            AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+          
+          AuthType:
+            Type: String
+            Default: '${AuthType}'
+            AllowedValues: ['AWS_IAM', 'NONE']
+            Description: 'Authentication type for the service network'
+          
+          Environment:
+            Type: String
+            Default: '${Environment}'
+            Description: 'Environment for resource tagging'
+        
+        Resources:
+          ServiceNetwork:
+            Type: AWS::VpcLattice::ServiceNetwork
+            Properties:
+              Name: !Ref NetworkName
+              AuthType: !Ref AuthType
+              Tags:
+                - Key: 'Environment'
+                  Value: !Ref Environment
+                - Key: 'Purpose'
+                  Value: 'StandardizedDeployment'
+                - Key: 'ManagedBy'
+                  Value: 'ServiceCatalog'
+                - Key: 'Project'
+                  Value: '${ProjectName}'
+        
+          ServiceNetworkPolicy:
+            Type: AWS::VpcLattice::AuthPolicy
+            Properties:
+              ResourceIdentifier: !Ref ServiceNetwork
+              Policy:
+                Version: '2012-10-17'
+                Statement:
+                  - Sid: 'AllowSameAccountAccess'
+                    Effect: Allow
+                    Principal: '*'
+                    Action: 'vpc-lattice-svcs:Invoke'
+                    Resource: '*'
+                    Condition:
+                      StringEquals:
+                        'aws:PrincipalAccount': !Ref 'AWS::AccountId'
+                  - Sid: 'DenyUnauthorizedAccess'
+                    Effect: Deny
+                    Principal: '*'
+                    Action: 'vpc-lattice-svcs:*'
+                    Resource: '*'
+                    Condition:
+                      Bool:
+                        'aws:SecureTransport': false
+        
+          ServiceNetworkLogGroup:
+            Type: AWS::Logs::LogGroup
+            Properties:
+              LogGroupName: !Sub '/aws/vpclattice/servicenetwork/${!Ref ServiceNetwork}'
+              RetentionInDays: 30
+        
+        Outputs:
+          ServiceNetworkId:
+            Description: 'VPC Lattice Service Network ID'
+            Value: !Ref ServiceNetwork
+            Export:
+              Name: !Sub '$${AWS::StackName}-ServiceNetworkId'
+          
+          ServiceNetworkArn:
+            Description: 'VPC Lattice Service Network ARN'
+            Value: !GetAtt ServiceNetwork.Arn
+            Export:
+              Name: !Sub '$${AWS::StackName}-ServiceNetworkArn'
+          
+          ServiceNetworkName:
+            Description: 'VPC Lattice Service Network Name'
+            Value: !Ref NetworkName
+            Export:
+              Name: !Sub '$${AWS::StackName}-ServiceNetworkName'
+      ContentType: 'text/plain'
+
+  # ==================== VPC LATTICE SERVICE TEMPLATE ====================
+  
+  LatticeServiceTemplate:
+    Type: AWS::S3::Object
+    Condition: CreateS3Bucket
+    Properties:
+      Bucket: !Ref TemplatesBucket
+      Key: 'lattice-service-template.yaml'
+      Body: !Sub |
+        AWSTemplateFormatVersion: '2010-09-09'
+        Description: 'Standardized VPC Lattice Service with Target Group Template'
+        
+        Parameters:
+          ServiceName:
+            Type: String
+            Description: 'Name for the VPC Lattice service'
+            MinLength: 1
+            MaxLength: 63
+            AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+          
+          ServiceNetworkId:
+            Type: String
+            Description: 'Service Network ID to associate with'
+            AllowedPattern: '^sn-[a-zA-Z0-9]+$'
+          
+          TargetType:
+            Type: String
+            Default: 'IP'
+            AllowedValues: ['IP', 'LAMBDA', 'ALB']
+            Description: 'Type of targets for the target group'
+          
+          VpcId:
+            Type: AWS::EC2::VPC::Id
+            Description: 'VPC ID for the target group'
+          
+          Port:
+            Type: Number
+            Default: 80
+            MinValue: 1
+            MaxValue: 65535
+            Description: 'Port for the service listener'
+          
+          Protocol:
+            Type: String
+            Default: 'HTTP'
+            AllowedValues: ['HTTP', 'HTTPS']
+            Description: 'Protocol for the service listener'
+          
+          HealthCheckPath:
+            Type: String
+            Default: '/health'
+            Description: 'Health check path for target group'
+            MinLength: 1
+            MaxLength: 1024
+          
+          Environment:
+            Type: String
+            Default: '${Environment}'
+            Description: 'Environment for resource tagging'
+        
+        Conditions:
+          IsHttps: !Equals [!Ref Protocol, 'HTTPS']
+          IsLambdaTarget: !Equals [!Ref TargetType, 'LAMBDA']
+          IsAlbTarget: !Equals [!Ref TargetType, 'ALB']
+        
+        Resources:
+          TargetGroup:
+            Type: AWS::VpcLattice::TargetGroup
+            Properties:
+              Name: !Sub '$${ServiceName}-targets'
+              Type: !Ref TargetType
+              Port: !If [IsLambdaTarget, !Ref 'AWS::NoValue', !Ref Port]
+              Protocol: !If [IsLambdaTarget, !Ref 'AWS::NoValue', !Ref Protocol]
+              VpcIdentifier: !If [IsLambdaTarget, !Ref 'AWS::NoValue', !Ref VpcId]
+              HealthCheck:
+                Enabled: true
+                HealthCheckIntervalSeconds: 30
+                HealthCheckTimeoutSeconds: 5
+                HealthyThresholdCount: 2
+                UnhealthyThresholdCount: 3
+                Matcher:
+                  HttpCode: '200'
+                Path: !If [IsLambdaTarget, !Ref 'AWS::NoValue', !Ref HealthCheckPath]
+                Port: !If [IsLambdaTarget, !Ref 'AWS::NoValue', !Ref Port]
+                Protocol: !If [IsLambdaTarget, !Ref 'AWS::NoValue', !Ref Protocol]
+              Tags:
+                - Key: 'Environment'
+                  Value: !Ref Environment
+                - Key: 'Purpose'
+                  Value: 'StandardizedDeployment'
+                - Key: 'ManagedBy'
+                  Value: 'ServiceCatalog'
+                - Key: 'Project'
+                  Value: '${ProjectName}'
+        
+          Service:
+            Type: AWS::VpcLattice::Service
+            Properties:
+              Name: !Ref ServiceName
+              AuthType: 'AWS_IAM'
+              Tags:
+                - Key: 'Environment'
+                  Value: !Ref Environment
+                - Key: 'Purpose'
+                  Value: 'StandardizedDeployment'
+                - Key: 'ManagedBy'
+                  Value: 'ServiceCatalog'
+                - Key: 'Project'
+                  Value: '${ProjectName}'
+        
+          Listener:
+            Type: AWS::VpcLattice::Listener
+            Properties:
+              ServiceIdentifier: !Ref Service
+              Name: 'default-listener'
+              Port: !Ref Port
+              Protocol: !Ref Protocol
+              DefaultAction:
+                Forward:
+                  TargetGroups:
+                    - TargetGroupIdentifier: !Ref TargetGroup
+                      Weight: 100
+        
+          ServiceNetworkAssociation:
+            Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+            Properties:
+              ServiceIdentifier: !Ref Service
+              ServiceNetworkIdentifier: !Ref ServiceNetworkId
+        
+          ServiceAuthPolicy:
+            Type: AWS::VpcLattice::AuthPolicy
+            Properties:
+              ResourceIdentifier: !Ref Service
+              Policy:
+                Version: '2012-10-17'
+                Statement:
+                  - Sid: 'AllowSameAccountAccess'
+                    Effect: Allow
+                    Principal: '*'
+                    Action: 'vpc-lattice-svcs:Invoke'
+                    Resource: '*'
+                    Condition:
+                      StringEquals:
+                        'aws:PrincipalAccount': !Ref 'AWS::AccountId'
+        
+          ServiceLogGroup:
+            Type: AWS::Logs::LogGroup
+            Properties:
+              LogGroupName: !Sub '/aws/vpclattice/service/$${ServiceName}'
+              RetentionInDays: 30
+        
+        Outputs:
+          ServiceId:
+            Description: 'VPC Lattice Service ID'
+            Value: !Ref Service
+          
+          ServiceArn:
+            Description: 'VPC Lattice Service ARN'
+            Value: !GetAtt Service.Arn
+          
+          ServiceDnsEntry:
+            Description: 'VPC Lattice Service DNS Entry'
+            Value: !GetAtt Service.DnsEntry
+          
+          TargetGroupId:
+            Description: 'Target Group ID'
+            Value: !Ref TargetGroup
+          
+          TargetGroupArn:
+            Description: 'Target Group ARN'
+            Value: !GetAtt TargetGroup.Arn
+          
+          ListenerId:
+            Description: 'Listener ID'
+            Value: !Ref Listener
+      ContentType: 'text/plain'
+
+  # ==================== IAM ROLE FOR SERVICE CATALOG ====================
+  
+  ServiceCatalogLaunchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${LaunchRoleName}-${Environment}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: servicecatalog.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCloudFormationFullAccess
+      Policies:
+        - PolicyName: VpcLatticeServiceCatalogPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: VpcLatticePermissions
+                Effect: Allow
+                Action:
+                  - vpc-lattice:*
+                Resource: '*'
+              - Sid: EC2ReadPermissions
+                Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeInstances
+                Resource: '*'
+              - Sid: LogsPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: 
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vpclattice/*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vpclattice/*:*'
+              - Sid: IAMPassRolePermissions
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${LaunchRoleName}-*'
+              - Sid: TaggingPermissions
+                Effect: Allow
+                Action:
+                  - tag:GetResources
+                  - tag:TagResources
+                  - tag:UntagResources
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'ServiceCatalogLaunchRole'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ==================== SERVICE CATALOG PORTFOLIO ====================
+  
+  ServiceCatalogPortfolio:
+    Type: AWS::ServiceCatalog::Portfolio
+    Properties:
+      DisplayName: !Sub '${PortfolioDisplayName} (${Environment})'
+      Description: !Sub 'Standardized VPC Lattice service deployment templates for ${Environment} environment'
+      ProviderName: 'Platform Engineering Team'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'VPCLatticeStandardization'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ==================== SERVICE CATALOG PRODUCTS ====================
+  
+  ServiceNetworkProduct:
+    Type: AWS::ServiceCatalog::CloudFormationProduct
+    Properties:
+      Name: !Sub '${ServiceNetworkProductName} (${Environment})'
+      Description: 'Standardized VPC Lattice Service Network with security policies and logging'
+      Owner: 'Platform Engineering Team'
+      SupportDescription: 'Contact Platform Engineering team for support'
+      SupportEmail: 'platform-engineering@company.com'
+      SupportUrl: 'https://wiki.company.com/platform/vpc-lattice'
+      ProvisioningArtifactParameters:
+        - Name: 'v1.0'
+          Description: 'Initial version with basic service network, auth policy, and logging'
+          Info:
+            LoadTemplateFromURL: !If 
+              - CreateS3Bucket
+              - !Sub 'https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/service-network-template.yaml'
+              - !Sub 'https://${TemplateBucketName}.s3.${AWS::Region}.amazonaws.com/service-network-template.yaml'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ProductType
+          Value: 'ServiceNetwork'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  LatticeServiceProduct:
+    Type: AWS::ServiceCatalog::CloudFormationProduct
+    Properties:
+      Name: !Sub '${LatticeServiceProductName} (${Environment})'
+      Description: 'Standardized VPC Lattice Service with target group, listener, and health checks'
+      Owner: 'Platform Engineering Team'
+      SupportDescription: 'Contact Platform Engineering team for support'
+      SupportEmail: 'platform-engineering@company.com'
+      SupportUrl: 'https://wiki.company.com/platform/vpc-lattice'
+      ProvisioningArtifactParameters:
+        - Name: 'v1.0'
+          Description: 'Initial version with service, target group, listener, and auth policy'
+          Info:
+            LoadTemplateFromURL: !If 
+              - CreateS3Bucket
+              - !Sub 'https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/lattice-service-template.yaml'
+              - !Sub 'https://${TemplateBucketName}.s3.${AWS::Region}.amazonaws.com/lattice-service-template.yaml'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ProductType
+          Value: 'LatticeService'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ==================== PRODUCT-PORTFOLIO ASSOCIATIONS ====================
+  
+  ServiceNetworkProductAssociation:
+    Type: AWS::ServiceCatalog::PortfolioProductAssociation
+    Properties:
+      PortfolioId: !Ref ServiceCatalogPortfolio
+      ProductId: !Ref ServiceNetworkProduct
+
+  LatticeServiceProductAssociation:
+    Type: AWS::ServiceCatalog::PortfolioProductAssociation
+    Properties:
+      PortfolioId: !Ref ServiceCatalogPortfolio
+      ProductId: !Ref LatticeServiceProduct
+
+  # ==================== LAUNCH CONSTRAINTS ====================
+  
+  ServiceNetworkLaunchConstraint:
+    Type: AWS::ServiceCatalog::LaunchRoleConstraint
+    Properties:
+      PortfolioId: !Ref ServiceCatalogPortfolio
+      ProductId: !Ref ServiceNetworkProduct
+      RoleArn: !GetAtt ServiceCatalogLaunchRole.Arn
+      Description: 'IAM role for VPC Lattice service network deployment'
+
+  LatticeServiceLaunchConstraint:
+    Type: AWS::ServiceCatalog::LaunchRoleConstraint
+    Properties:
+      PortfolioId: !Ref ServiceCatalogPortfolio
+      ProductId: !Ref LatticeServiceProduct
+      RoleArn: !GetAtt ServiceCatalogLaunchRole.Arn
+      Description: 'IAM role for VPC Lattice service deployment'
+
+  # ==================== TAG OPTIONS ====================
+  
+  EnvironmentTagOption:
+    Type: AWS::ServiceCatalog::TagOption
+    Properties:
+      Key: 'Environment'
+      Value: !Ref Environment
+
+  ProjectTagOption:
+    Type: AWS::ServiceCatalog::TagOption
+    Properties:
+      Key: 'Project'
+      Value: !Ref ProjectName
+
+  ManagedByTagOption:
+    Type: AWS::ServiceCatalog::TagOption
+    Properties:
+      Key: 'ManagedBy'
+      Value: 'ServiceCatalog'
+
+  # ==================== TAG OPTION ASSOCIATIONS ====================
+  
+  PortfolioEnvironmentTagAssociation:
+    Type: AWS::ServiceCatalog::TagOptionAssociation
+    Properties:
+      ResourceId: !Ref ServiceCatalogPortfolio
+      TagOptionId: !Ref EnvironmentTagOption
+
+  PortfolioProjectTagAssociation:
+    Type: AWS::ServiceCatalog::TagOptionAssociation
+    Properties:
+      ResourceId: !Ref ServiceCatalogPortfolio
+      TagOptionId: !Ref ProjectTagOption
+
+  PortfolioManagedByTagAssociation:
+    Type: AWS::ServiceCatalog::TagOptionAssociation
+    Properties:
+      ResourceId: !Ref ServiceCatalogPortfolio
+      TagOptionId: !Ref ManagedByTagOption
+
+  # ==================== CLOUDWATCH DASHBOARD ====================
+  
+  VpcLatticeDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-vpc-lattice-overview'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 2,
+              "properties": {
+                "markdown": "# VPC Lattice Service Catalog Dashboard\n\nThis dashboard provides an overview of VPC Lattice services deployed through Service Catalog in the **${Environment}** environment."
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 2,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/VpcLattice", "RequestCount", "ServiceNetwork", { "stat": "Sum" } ],
+                  [ ".", "ErrorCount", ".", { "stat": "Sum" } ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "VPC Lattice Request Metrics",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 2,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/VpcLattice", "TargetResponseTime", "ServiceNetwork", { "stat": "Average" } ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "VPC Lattice Response Time",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+  # ==================== CLOUDWATCH ALARMS ====================
+  
+  ServiceCatalogFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-service-catalog-failures'
+      AlarmDescription: 'Alarm for Service Catalog provisioning failures'
+      MetricName: 'ProvisionProductFailures'
+      Namespace: 'AWS/ServiceCatalog'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ServiceCatalogFailuresSnsTopic
+
+  ServiceCatalogFailuresSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-service-catalog-failures'
+      DisplayName: 'Service Catalog Failures Notifications'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  # ==================== S3 OUTPUTS ====================
+  
+  TemplatesBucketName:
+    Description: 'S3 bucket name for CloudFormation templates'
+    Value: !If [CreateS3Bucket, !Ref TemplatesBucket, !Ref TemplateBucketName]
+    Export:
+      Name: !Sub '${AWS::StackName}-TemplatesBucket'
+
+  TemplatesBucketArn:
+    Condition: CreateS3Bucket
+    Description: 'S3 bucket ARN for CloudFormation templates'
+    Value: !GetAtt TemplatesBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TemplatesBucketArn'
+
+  # ==================== SERVICE CATALOG OUTPUTS ====================
+  
+  PortfolioId:
+    Description: 'Service Catalog Portfolio ID'
+    Value: !Ref ServiceCatalogPortfolio
+    Export:
+      Name: !Sub '${AWS::StackName}-PortfolioId'
+
+  ServiceNetworkProductId:
+    Description: 'Service Network Product ID'
+    Value: !Ref ServiceNetworkProduct
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetworkProductId'
+
+  LatticeServiceProductId:
+    Description: 'Lattice Service Product ID'
+    Value: !Ref LatticeServiceProduct
+    Export:
+      Name: !Sub '${AWS::StackName}-LatticeServiceProductId'
+
+  # ==================== IAM OUTPUTS ====================
+  
+  ServiceCatalogLaunchRoleArn:
+    Description: 'Service Catalog Launch Role ARN'
+    Value: !GetAtt ServiceCatalogLaunchRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LaunchRoleArn'
+
+  ServiceCatalogLaunchRoleName:
+    Description: 'Service Catalog Launch Role Name'
+    Value: !Ref ServiceCatalogLaunchRole
+    Export:
+      Name: !Sub '${AWS::StackName}-LaunchRoleName'
+
+  # ==================== MONITORING OUTPUTS ====================
+  
+  DashboardUrl:
+    Description: 'CloudWatch Dashboard URL'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-vpc-lattice-overview'
+
+  ServiceCatalogConsoleUrl:
+    Description: 'Service Catalog Console URL'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/servicecatalog/home?region=${AWS::Region}#/portfolios/${ServiceCatalogPortfolio}'
+
+  # ==================== TEMPLATE URLS ====================
+  
+  ServiceNetworkTemplateUrl:
+    Description: 'Service Network CloudFormation Template URL'
+    Value: !If 
+      - CreateS3Bucket
+      - !Sub 'https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/service-network-template.yaml'
+      - !Sub 'https://${TemplateBucketName}.s3.${AWS::Region}.amazonaws.com/service-network-template.yaml'
+
+  LatticeServiceTemplateUrl:
+    Description: 'Lattice Service CloudFormation Template URL'
+    Value: !If 
+      - CreateS3Bucket
+      - !Sub 'https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/lattice-service-template.yaml'
+      - !Sub 'https://${TemplateBucketName}.s3.${AWS::Region}.amazonaws.com/lattice-service-template.yaml'
+
+  # ==================== DEPLOYMENT INSTRUCTIONS ====================
+  
+  NextSteps:
+    Description: 'Next steps for using this Service Catalog setup'
+    Value: !Sub |
+      1. Grant portfolio access: aws servicecatalog associate-principal-with-portfolio --portfolio-id ${ServiceCatalogPortfolio} --principal-arn <USER_OR_ROLE_ARN> --principal-type IAM
+      2. View portfolio: ${ServiceCatalogConsoleUrl}
+      3. Deploy service network: Use Service Catalog console or CLI to provision the Service Network product
+      4. Deploy services: Use the Lattice Service product to deploy individual services
+      5. Monitor: View the CloudWatch dashboard at ${DashboardUrl}
+
+  # ==================== COST INFORMATION ====================
+  
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for this infrastructure (USD)'
+    Value: !Sub |
+      Base Infrastructure: $5-10/month
+      - S3 Storage: ~$1/month for templates
+      - CloudWatch Logs: ~$2-5/month depending on log volume
+      - VPC Lattice: $0.025 per processing unit + $0.25 per service network per day
+      Additional costs depend on actual VPC Lattice usage and deployed services.

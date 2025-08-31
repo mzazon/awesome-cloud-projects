@@ -1,0 +1,729 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Website Monitoring with CloudWatch Synthetics
+  Creates a comprehensive monitoring solution using CloudWatch Synthetics canaries,
+  S3 artifacts storage, CloudWatch alarms, SNS notifications, and monitoring dashboard.
+  This template implements proactive website monitoring with automated alerting.
+
+# ==============================================================================
+# METADATA
+# ==============================================================================
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Website Configuration"
+        Parameters:
+          - WebsiteUrl
+          - CanaryFrequency
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - SuccessThreshold
+          - ResponseTimeThreshold
+          - NotificationEmail
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - ArtifactRetentionDays
+          - FailureRetentionDays
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+
+    ParameterLabels:
+      WebsiteUrl:
+        default: "Website URL to Monitor"
+      CanaryFrequency:
+        default: "Monitoring Frequency"
+      SuccessThreshold:
+        default: "Success Rate Threshold (%)"
+      ResponseTimeThreshold:
+        default: "Response Time Threshold (ms)"
+      NotificationEmail:
+        default: "Alert Email Address"
+      ArtifactRetentionDays:
+        default: "Artifact Retention Days"
+      FailureRetentionDays:
+        default: "Failure Log Retention Days"
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+      Environment:
+        default: "Environment Tag"
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+
+Parameters:
+  WebsiteUrl:
+    Type: String
+    Description: The URL of the website to monitor (must include https://)
+    Default: https://example.com
+    AllowedPattern: ^https?://[^\s/$.?#].[^\s]*$
+    ConstraintDescription: Must be a valid HTTP or HTTPS URL
+
+  CanaryFrequency:
+    Type: String
+    Description: How often to run the synthetic monitoring tests
+    Default: rate(5 minutes)
+    AllowedValues:
+      - rate(1 minute)
+      - rate(5 minutes)
+      - rate(10 minutes)
+      - rate(15 minutes)
+      - rate(30 minutes)
+      - rate(1 hour)
+
+  SuccessThreshold:
+    Type: Number
+    Description: Minimum success percentage before triggering alerts (0-100)
+    Default: 90
+    MinValue: 0
+    MaxValue: 100
+
+  ResponseTimeThreshold:
+    Type: Number
+    Description: Maximum acceptable response time in milliseconds
+    Default: 10000
+    MinValue: 1000
+    MaxValue: 60000
+
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive monitoring alerts
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+    ConstraintDescription: Must be a valid email address
+
+  ArtifactRetentionDays:
+    Type: Number
+    Description: Number of days to retain canary artifacts in S3
+    Default: 31
+    MinValue: 1
+    MaxValue: 365
+
+  FailureRetentionDays:
+    Type: Number
+    Description: Number of days to retain failure logs
+    Default: 31
+    MinValue: 1
+    MaxValue: 365
+
+  ResourcePrefix:
+    Type: String
+    Description: Prefix for resource names to ensure uniqueness
+    Default: website-monitor
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    MinLength: 3
+    MaxLength: 20
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  Environment:
+    Type: String
+    Description: Environment designation for resource tagging
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+      - testing
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+
+Conditions:
+  IsProductionEnvironment: !Equals [!Ref Environment, production]
+  EnableDetailedMonitoring: !Or
+    - !Equals [!Ref Environment, production]
+    - !Equals [!Ref Environment, staging]
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+
+Resources:
+
+  # ------------------------------------------------------------------------------
+  # S3 BUCKET FOR CANARY ARTIFACTS
+  # ------------------------------------------------------------------------------
+
+  SyntheticsArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ResourcePrefix}-synthetics-artifacts-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: SyntheticsArtifactRetention
+            Status: Enabled
+            ExpirationInDays: !Ref ArtifactRetentionDays
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            NoncurrentVersionExpirationInDays: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref CanaryLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-synthetics-artifacts"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SyntheticsArtifacts
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ------------------------------------------------------------------------------
+  # IAM ROLE FOR SYNTHETICS CANARY
+  # ------------------------------------------------------------------------------
+
+  SyntheticsCanaryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-synthetics-canary-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchSyntheticsExecutionRolePolicy
+      Policies:
+        - PolicyName: SyntheticsS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObjectAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "${SyntheticsArtifactsBucket}/*"
+                  - !GetAtt SyntheticsArtifactsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/cwsyn-${ResourcePrefix}-*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: CloudWatchSynthetics
+        - PolicyName: XRayTracing
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-synthetics-canary-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ------------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUP FOR CANARY LOGS
+  # ------------------------------------------------------------------------------
+
+  CanaryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/cwsyn-${ResourcePrefix}-canary"
+      RetentionInDays: !Ref FailureRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-canary-logs"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ------------------------------------------------------------------------------
+  # CLOUDWATCH SYNTHETICS CANARY
+  # ------------------------------------------------------------------------------
+
+  WebsiteMonitoringCanary:
+    Type: AWS::Synthetics::Canary
+    Properties:
+      Name: !Sub "${ResourcePrefix}-canary"
+      RuntimeVersion: syn-nodejs-puppeteer-10.0
+      ExecutionRoleArn: !GetAtt SyntheticsCanaryRole.Arn
+      Schedule:
+        Expression: !Ref CanaryFrequency
+        DurationInSeconds: 0
+      Code:
+        Handler: pageLoadBlueprint.handler
+        Script: !Sub |
+          const synthetics = require('Synthetics');
+          const log = require('SyntheticsLogger');
+          
+          const checkWebsite = async function () {
+              let page = await synthetics.getPage();
+              
+              // Configure page for enhanced monitoring
+              await page.setViewport({ width: 1920, height: 1080 });
+              await page.setUserAgent('CloudWatch-Synthetics/1.0');
+              
+              // Navigate to website with performance monitoring
+              const response = await synthetics.executeStepFunction('loadHomepage', async function () {
+                  const startTime = Date.now();
+                  const response = await page.goto('${WebsiteUrl}', {
+                      waitUntil: 'networkidle0',
+                      timeout: 30000
+                  });
+                  const loadTime = Date.now() - startTime;
+                  
+                  // Log custom metric for load time
+                  await synthetics.addUserAgentMetric('LoadTime', loadTime, 'Milliseconds');
+                  log.info(`Page load time: ${!loadTime}ms`);
+                  
+                  return response;
+              });
+              
+              // Verify successful response
+              if (response.status() < 200 || response.status() > 299) {
+                  throw new Error(`HTTP ${!response.status()}: Failed to load page`);
+              }
+              
+              // Check for critical page elements
+              await synthetics.executeStepFunction('verifyPageElements', async function () {
+                  // Wait for body element
+                  await page.waitForSelector('body', { timeout: 10000 });
+                  
+                  // Verify page title exists and is not empty
+                  const title = await page.title();
+                  if (!title || title.length === 0) {
+                      throw new Error('Page title is missing or empty');
+                  }
+                  log.info(`Page title: ${!title}`);
+                  
+                  // Check for common error indicators
+                  const errorIndicators = await page.evaluate(() => {
+                      const indicators = [];
+                      
+                      // Check for error text content
+                      const errorTexts = ['404', 'Not Found', 'Error', 'Server Error', 'Unavailable'];
+                      const bodyText = document.body.textContent || '';
+                      
+                      errorTexts.forEach(errorText => {
+                          if (bodyText.toLowerCase().includes(errorText.toLowerCase())) {
+                              indicators.push(`Error text found: ${!errorText}`);
+                          }
+                      });
+                      
+                      // Check for JavaScript errors
+                      if (window.console && window.console.errors) {
+                          indicators.push(`JavaScript errors: ${!window.console.errors.length}`);
+                      }
+                      
+                      return indicators;
+                  });
+                  
+                  if (errorIndicators.length > 0) {
+                      log.warn(`Warning indicators detected: ${!errorIndicators.join(', ')}`);
+                  }
+              });
+              
+              // Capture performance metrics
+              await synthetics.executeStepFunction('captureMetrics', async function () {
+                  const performanceMetrics = await page.evaluate(() => {
+                      const navigation = performance.getEntriesByType('navigation')[0];
+                      if (!navigation) return null;
+                      
+                      return {
+                          domContentLoaded: navigation.domContentLoadedEventEnd - navigation.domContentLoadedEventStart,
+                          responseTime: navigation.responseEnd - navigation.requestStart,
+                          firstPaint: performance.getEntriesByType('paint').find(entry => entry.name === 'first-paint')?.startTime || 0,
+                          firstContentfulPaint: performance.getEntriesByType('paint').find(entry => entry.name === 'first-contentful-paint')?.startTime || 0
+                      };
+                  });
+                  
+                  if (performanceMetrics) {
+                      // Publish custom CloudWatch metrics
+                      await synthetics.addUserAgentMetric('DOMContentLoaded', performanceMetrics.domContentLoaded, 'Milliseconds');
+                      await synthetics.addUserAgentMetric('ResponseTime', performanceMetrics.responseTime, 'Milliseconds');
+                      await synthetics.addUserAgentMetric('FirstPaint', performanceMetrics.firstPaint, 'Milliseconds');
+                      await synthetics.addUserAgentMetric('FirstContentfulPaint', performanceMetrics.firstContentfulPaint, 'Milliseconds');
+                      
+                      log.info(`Performance metrics captured:
+                          DOM Content Loaded: ${!performanceMetrics.domContentLoaded}ms
+                          Response Time: ${!performanceMetrics.responseTime}ms
+                          First Paint: ${!performanceMetrics.firstPaint}ms
+                          First Contentful Paint: ${!performanceMetrics.firstContentfulPaint}ms`);
+                  }
+              });
+              
+              // Take screenshot for visual validation
+              await synthetics.takeScreenshot('homepage', 'loaded');
+          };
+          
+          exports.handler = async () => {
+              return await synthetics.executeStep('checkWebsite', checkWebsite);
+          };
+      ArtifactS3Location: !Sub "${SyntheticsArtifactsBucket}/canary-artifacts"
+      RunConfig:
+        TimeoutInSeconds: 60
+        MemoryInMB: 960
+        ActiveTracing: !If [EnableDetailedMonitoring, true, false]
+        EnvironmentVariables:
+          WEBSITE_URL: !Ref WebsiteUrl
+          ENVIRONMENT: !Ref Environment
+      SuccessRetentionPeriodInDays: !Ref ArtifactRetentionDays
+      FailureRetentionPeriodInDays: !Ref FailureRetentionDays
+      StartCanaryAfterCreation: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-website-monitor"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Website
+          Value: !Ref WebsiteUrl
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ------------------------------------------------------------------------------
+  # SNS TOPIC FOR ALERTS
+  # ------------------------------------------------------------------------------
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ResourcePrefix}-synthetics-alerts"
+      DisplayName: !Sub "${ResourcePrefix} Website Monitoring Alerts"
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-alerts"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref AlertsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ------------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS
+  # ------------------------------------------------------------------------------
+
+  CanaryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-CanaryFailure"
+      AlarmDescription: !Sub "Alert when ${ResourcePrefix} canary success rate falls below threshold"
+      MetricName: SuccessPercent
+      Namespace: CloudWatchSynthetics
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref SuccessThreshold
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+      Dimensions:
+        - Name: CanaryName
+          Value: !Sub "${ResourcePrefix}-canary"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-failure-alarm"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-HighResponseTime"
+      AlarmDescription: !Sub "Alert when ${ResourcePrefix} canary response time exceeds threshold"
+      MetricName: Duration
+      Namespace: CloudWatchSynthetics
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref ResponseTimeThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+      Dimensions:
+        - Name: CanaryName
+          Value: !Sub "${ResourcePrefix}-canary"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-response-time-alarm"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Conditional alarm for production environments
+  UptimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProductionEnvironment
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-UptimeMonitoring"
+      AlarmDescription: !Sub "Monitor overall uptime for ${ResourcePrefix} canary"
+      MetricName: Failed
+      Namespace: CloudWatchSynthetics
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      Dimensions:
+        - Name: CanaryName
+          Value: !Sub "${ResourcePrefix}-canary"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-uptime-alarm"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ------------------------------------------------------------------------------
+  # CLOUDWATCH DASHBOARD
+  # ------------------------------------------------------------------------------
+
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ResourcePrefix}-Website-Monitoring"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["CloudWatchSynthetics", "SuccessPercent", "CanaryName", "${ResourcePrefix}-canary", {"stat": "Average"}],
+                  [".", "Duration", ".", ".", {"stat": "Average", "yAxis": "right"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Website Monitoring Overview",
+                "period": 300,
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                },
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "Success Threshold",
+                      "value": ${SuccessThreshold}
+                    },
+                    {
+                      "label": "Response Time Threshold",
+                      "value": ${ResponseTimeThreshold},
+                      "yAxis": "right"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["CloudWatchSynthetics", "Failed", "CanaryName", "${ResourcePrefix}-canary", {"stat": "Sum"}],
+                  [".", "Passed", ".", ".", {"stat": "Sum"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Test Results",
+                "period": 300,
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["CWAgent", "LoadTime", "CanaryName", "${ResourcePrefix}-canary"],
+                  [".", "ResponseTime", ".", "."],
+                  [".", "FirstPaint", ".", "."],
+                  [".", "FirstContentfulPaint", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Performance Metrics",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "log",
+              "x": 8,
+              "y": 6,
+              "width": 16,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/cwsyn-${ResourcePrefix}-canary'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+
+Outputs:
+  CanaryName:
+    Description: Name of the created CloudWatch Synthetics canary
+    Value: !Sub "${ResourcePrefix}-canary"
+    Export:
+      Name: !Sub "${AWS::StackName}-CanaryName"
+
+  CanaryArn:
+    Description: ARN of the CloudWatch Synthetics canary
+    Value: !Sub "arn:aws:synthetics:${AWS::Region}:${AWS::AccountId}:canary:${ResourcePrefix}-canary"
+    Export:
+      Name: !Sub "${AWS::StackName}-CanaryArn"
+
+  ArtifactsBucketName:
+    Description: Name of the S3 bucket storing canary artifacts
+    Value: !Ref SyntheticsArtifactsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ArtifactsBucket"
+
+  ArtifactsBucketArn:
+    Description: ARN of the S3 bucket storing canary artifacts
+    Value: !GetAtt SyntheticsArtifactsBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ArtifactsBucketArn"
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for monitoring alerts
+    Value: !Ref AlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-AlertsTopic"
+
+  DashboardURL:
+    Description: URL to the CloudWatch monitoring dashboard
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-Website-Monitoring"
+
+  CanaryExecutionRole:
+    Description: ARN of the IAM role used by the canary
+    Value: !GetAtt SyntheticsCanaryRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CanaryRole"
+
+  MonitoredWebsite:
+    Description: The website URL being monitored
+    Value: !Ref WebsiteUrl
+
+  MonitoringFrequency:
+    Description: Frequency of synthetic monitoring tests
+    Value: !Ref CanaryFrequency
+
+  FailureAlarmName:
+    Description: Name of the CloudWatch alarm for canary failures
+    Value: !Ref CanaryFailureAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-FailureAlarm"
+
+  ResponseTimeAlarmName:
+    Description: Name of the CloudWatch alarm for high response times
+    Value: !Ref ResponseTimeAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-ResponseTimeAlarm"
+
+  LogGroupName:
+    Description: Name of the CloudWatch log group for canary logs
+    Value: !Ref CanaryLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroup"

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Asset Inventory, Pub/Sub, Cloud Functions, BigQuery
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: monitoring, compliance, audit, real-time, infrastructure
 recipe-generator-version: 1.3
@@ -160,6 +160,7 @@ echo "✅ Required APIs enabled"
 import base64
 import json
 import logging
+import os
 from datetime import datetime
 from google.cloud import bigquery
 from google.cloud import monitoring_v3
@@ -200,7 +201,7 @@ def process_asset_change(event, context):
             'change_type': change_type,
             'prior_state': json.dumps(prior_asset.get('resource', {}).get('data', {})),
             'current_state': json.dumps(asset.get('resource', {}).get('data', {})),
-            'project_id': context.resource.split('/')[-1] if hasattr(context, 'resource') else '',
+            'project_id': os.environ.get('PROJECT_ID', ''),
             'location': asset.get('resource', {}).get('location', '') if asset else '',
             'change_time': change_data.get('window', {}).get('startTime', ''),
             'ancestors': ','.join(asset.get('ancestors', [])) if asset else ''
@@ -243,14 +244,12 @@ def process_asset_change(event, context):
     except Exception as e:
         logging.error(f'Error processing asset change: {str(e)}')
         raise
-
-import os
 EOF
    
-   # Create requirements.txt
+   # Create requirements.txt with latest stable versions
    cat > requirements.txt << 'EOF'
-google-cloud-bigquery==3.13.0
-google-cloud-monitoring==2.16.0
+google-cloud-bigquery==3.28.0
+google-cloud-monitoring==2.23.1
 EOF
    
    echo "✅ Cloud Function code created"
@@ -263,9 +262,9 @@ EOF
    Deploying the Cloud Function with appropriate IAM roles ensures secure access to BigQuery and Cloud Monitoring while maintaining the principle of least privilege. The function runtime configuration optimizes for reliability and performance under varying event loads.
 
    ```bash
-   # Deploy the Cloud Function
+   # Deploy the Cloud Function with latest Python runtime
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-topic ${TOPIC_NAME} \
        --entry-point process_asset_change \
        --memory 256MB \
@@ -434,16 +433,18 @@ EOF
    echo "✅ BigQuery dataset deleted"
    ```
 
-4. **Clean up Alert Policies**:
+4. **Clean up Alert Policies and Temporary Files**:
 
    ```bash
    # List and delete alert policies (manual cleanup)
    gcloud alpha monitoring policies list \
        --filter="displayName:'Critical Infrastructure Changes'"
    
-   # Note: Delete specific policies manually using their IDs
+   # Clean up temporary files
+   rm -rf /tmp/asset-processor
    
-   echo "✅ Alert policies require manual cleanup"
+   echo "✅ Alert policies require manual cleanup using policy IDs"
+   echo "✅ Temporary files cleaned up"
    ```
 
 ## Discussion

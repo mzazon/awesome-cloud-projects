@@ -1,0 +1,428 @@
+# Infrastructure Manager Configuration for Real-Time Voice Support Agent
+# This configuration deploys a complete voice support agent solution using
+# Google's Agent Development Kit (ADK) integrated with Gemini Live API
+
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: Blueprint
+metadata:
+  name: real-time-voice-support-agent
+  annotations:
+    config.kubernetes.io/local-config: "true"
+    source: "Google Cloud Recipe - Real-Time Voice Support Agent with ADK and Live API"
+    description: "Voice-enabled customer support agent with function calling capabilities"
+    estimated-cost: "$3-8 per hour for development and testing"
+
+spec:
+  # Global configuration and variables
+  info:
+    title: Real-Time Voice Support Agent Infrastructure
+    author: GCP Recipes
+    version: 1.0
+    description: |
+      Complete infrastructure for deploying a voice-enabled customer support agent
+      using Google's Agent Development Kit (ADK) with Gemini Live API integration.
+      Includes Cloud Functions, IAM roles, and monitoring configuration.
+
+  # Input variables for customization
+  content:
+    imports:
+      # Project configuration
+      - name: project-id
+        type: gcp-types/v1:resourcemanager.v1.project
+
+      # Enable required APIs
+      - name: enable-apis
+        type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+        properties:
+          serviceName: aiplatform.googleapis.com
+          consumerId: projects/$(ref.project-id.projectId)
+        
+      - name: enable-functions-api
+        type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+        properties:
+          serviceName: cloudfunctions.googleapis.com
+          consumerId: projects/$(ref.project-id.projectId)
+          
+      - name: enable-build-api
+        type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+        properties:
+          serviceName: cloudbuild.googleapis.com
+          consumerId: projects/$(ref.project-id.projectId)
+          
+      - name: enable-logging-api
+        type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+        properties:
+          serviceName: logging.googleapis.com
+          consumerId: projects/$(ref.project-id.projectId)
+
+    resources:
+      # Random suffix for unique resource naming
+      - name: random-suffix
+        type: gcp-types/random:random.string
+        properties:
+          length: 6
+          special: false
+          upper: false
+
+      # Service Account for Voice Agent
+      - name: voice-agent-service-account
+        type: gcp-types/iam-v1:projects.serviceAccounts
+        properties:
+          project: $(ref.project-id.projectId)
+          accountId: voice-agent-sa-$(ref.random-suffix.result)
+          serviceAccount:
+            displayName: "Voice Support Agent Service Account"
+            description: "Service account for ADK voice agent with AI Platform access"
+        depends_on:
+          - enable-apis
+
+      # IAM Policy Binding for AI Platform User Role
+      - name: voice-agent-ai-platform-binding
+        type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+        properties:
+          resource: $(ref.project-id.projectId)
+          policy:
+            bindings:
+              - role: roles/aiplatform.user
+                members:
+                  - serviceAccount:$(ref.voice-agent-service-account.email)
+              - role: roles/cloudfunctions.invoker
+                members:
+                  - serviceAccount:$(ref.voice-agent-service-account.email)
+              - role: roles/logging.logWriter
+                members:
+                  - serviceAccount:$(ref.voice-agent-service-account.email)
+        depends_on:
+          - voice-agent-service-account
+
+      # Cloud Storage Bucket for Function Source Code
+      - name: function-source-bucket
+        type: gcp-types/storage-v1:buckets
+        properties:
+          name: voice-agent-source-$(ref.random-suffix.result)-$(ref.project-id.projectId)
+          project: $(ref.project-id.projectId)
+          location: US-CENTRAL1
+          storageClass: STANDARD
+          lifecycle:
+            rule:
+              - action:
+                  type: Delete
+                condition:
+                  age: 30
+          versioning:
+            enabled: true
+        depends_on:
+          - project-id
+
+      # Cloud Function for Voice Support Agent
+      - name: voice-support-function
+        type: gcp-types/cloudfunctions-v1:projects.locations.functions
+        properties:
+          location: projects/$(ref.project-id.projectId)/locations/us-central1
+          function:
+            name: voice-agent-$(ref.random-suffix.result)
+            description: "Real-time voice support agent using ADK and Gemini Live API"
+            
+            # Function configuration
+            runtime: python312
+            availableMemoryMb: 1024
+            timeout: 300s
+            maxInstances: 100
+            
+            # Source code configuration (placeholder - would be uploaded separately)
+            sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/voice-agent-source.zip
+            
+            # Entry point and environment
+            entryPoint: voice_support_endpoint
+            environmentVariables:
+              PROJECT_ID: $(ref.project-id.projectId)
+              REGION: us-central1
+              GEMINI_MODEL: models/gemini-2.0-flash-exp
+              ADK_VERSION: "1.8.0"
+            
+            # Service account and security
+            serviceAccountEmail: $(ref.voice-agent-service-account.email)
+            
+            # HTTP trigger configuration
+            httpsTrigger:
+              securityLevel: SECURE_ALWAYS
+              
+            # Labels for resource management
+            labels:
+              component: voice-agent
+              environment: production
+              recipe: real-time-voice-support
+              ai-framework: adk
+              api: gemini-live
+        depends_on:
+          - voice-agent-service-account
+          - function-source-bucket
+          - enable-functions-api
+
+      # IAM Policy for Function Invocation (Allow unauthenticated for demo)
+      - name: function-invoker-policy
+        type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+        properties:
+          resource: $(ref.voice-support-function.name)
+          policy:
+            bindings:
+              - role: roles/cloudfunctions.invoker
+                members:
+                  - allUsers
+        depends_on:
+          - voice-support-function
+
+      # Cloud Logging Log Sink for Voice Agent Monitoring
+      - name: voice-agent-log-sink
+        type: gcp-types/logging-v2:projects.sinks
+        properties:
+          parent: projects/$(ref.project-id.projectId)
+          sink:
+            name: voice-agent-monitoring-sink
+            description: "Log sink for voice support agent monitoring and analytics"
+            destination: storage.googleapis.com/$(ref.function-source-bucket.name)
+            filter: |
+              resource.type="cloud_function"
+              resource.labels.function_name="voice-agent-$(ref.random-suffix.result)"
+              (severity>=WARNING OR jsonPayload.event_type="customer_interaction")
+            includeChildren: true
+        depends_on:
+          - voice-support-function
+          - function-source-bucket
+
+      # Cloud Monitoring Alert Policy for Function Errors
+      - name: function-error-alert-policy
+        type: gcp-types/monitoring-v1:projects.alertPolicies
+        properties:
+          parent: projects/$(ref.project-id.projectId)
+          alertPolicy:
+            displayName: "Voice Agent Function Errors"
+            documentation:
+              content: |
+                Alert triggered when the voice support agent function experiences errors.
+                This may indicate issues with ADK integration or Gemini Live API connectivity.
+              mimeType: text/markdown
+            
+            # Alert conditions
+            conditions:
+              - displayName: "Function Error Rate"
+                conditionThreshold:
+                  filter: |
+                    resource.type="cloud_function"
+                    resource.label.function_name="voice-agent-$(ref.random-suffix.result)"
+                    metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                    metric.label.status!="ok"
+                  comparison: COMPARISON_GREATER_THAN
+                  thresholdValue: 5
+                  duration: 300s
+                  aggregations:
+                    - alignmentPeriod: 60s
+                      perSeriesAligner: ALIGN_RATE
+                      crossSeriesReducer: REDUCE_SUM
+            
+            # Notification configuration
+            enabled: true
+            combiner: OR
+            
+            # Alert metadata
+            alertStrategy:
+              autoClose: 604800s  # 7 days
+        depends_on:
+          - voice-support-function
+
+      # Cloud Monitoring Dashboard for Voice Agent Metrics
+      - name: voice-agent-dashboard
+        type: gcp-types/monitoring-v1:projects.dashboards
+        properties:
+          parent: projects/$(ref.project-id.projectId)
+          dashboard:
+            displayName: "Voice Support Agent Monitoring"
+            
+            # Dashboard layout and widgets
+            gridLayout:
+              columns: 2
+              widgets:
+                # Function execution metrics
+                - title: "Function Executions"
+                  xyChart:
+                    dataSets:
+                      - timeSeriesQuery:
+                          timeSeriesFilter:
+                            filter: |
+                              resource.type="cloud_function"
+                              resource.label.function_name="voice-agent-$(ref.random-suffix.result)"
+                              metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                            aggregation:
+                              alignmentPeriod: 60s
+                              perSeriesAligner: ALIGN_RATE
+                              crossSeriesReducer: REDUCE_SUM
+                        plotType: LINE
+                
+                # Function duration metrics
+                - title: "Function Duration"
+                  xyChart:
+                    dataSets:
+                      - timeSeriesQuery:
+                          timeSeriesFilter:
+                            filter: |
+                              resource.type="cloud_function"
+                              resource.label.function_name="voice-agent-$(ref.random-suffix.result)"
+                              metric.type="cloudfunctions.googleapis.com/function/execution_times"
+                            aggregation:
+                              alignmentPeriod: 60s
+                              perSeriesAligner: ALIGN_MEAN
+                              crossSeriesReducer: REDUCE_MEAN
+                        plotType: LINE
+                
+                # Memory utilization
+                - title: "Memory Usage"
+                  xyChart:
+                    dataSets:
+                      - timeSeriesQuery:
+                          timeSeriesFilter:
+                            filter: |
+                              resource.type="cloud_function"
+                              resource.label.function_name="voice-agent-$(ref.random-suffix.result)"
+                              metric.type="cloudfunctions.googleapis.com/function/user_memory_bytes"
+                            aggregation:
+                              alignmentPeriod: 60s
+                              perSeriesAligner: ALIGN_MEAN
+                              crossSeriesReducer: REDUCE_MEAN
+                        plotType: LINE
+                
+                # Error rate
+                - title: "Error Rate"
+                  xyChart:
+                    dataSets:
+                      - timeSeriesQuery:
+                          timeSeriesFilter:
+                            filter: |
+                              resource.type="cloud_function"
+                              resource.label.function_name="voice-agent-$(ref.random-suffix.result)"
+                              metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                              metric.label.status!="ok"
+                            aggregation:
+                              alignmentPeriod: 60s
+                              perSeriesAligner: ALIGN_RATE
+                              crossSeriesReducer: REDUCE_SUM
+                        plotType: LINE
+        depends_on:
+          - voice-support-function
+
+      # Firestore Database for Conversation History (Optional)
+      - name: conversation-firestore-database
+        type: gcp-types/firestore-v1:projects.databases
+        properties:
+          parent: projects/$(ref.project-id.projectId)
+          database:
+            name: conversation-history
+            locationId: us-central1
+            type: FIRESTORE_NATIVE
+            concurrencyMode: OPTIMISTIC
+            appEngineIntegrationMode: DISABLED
+        depends_on:
+          - project-id
+
+      # Security: Cloud Armor Security Policy (Optional for production)
+      - name: voice-agent-security-policy
+        type: gcp-types/compute-v1:securityPolicies
+        properties:
+          name: voice-agent-security-policy-$(ref.random-suffix.result)
+          description: "Security policy for voice support agent function"
+          
+          # Default rule to allow traffic
+          rules:
+            - priority: 2147483647
+              action: allow
+              match:
+                versionedExpr: SRC_IPS_V1
+                config:
+                  srcIpRanges:
+                    - "*"
+              description: "Default allow rule"
+            
+            # Rate limiting rule
+            - priority: 1000
+              action: rate_based_ban
+              match:
+                versionedExpr: SRC_IPS_V1
+                config:
+                  srcIpRanges:
+                    - "*"
+              rateLimitOptions:
+                conformAction: allow
+                exceedAction: deny_429
+                enforceOnKey: IP
+                rateLimitThreshold:
+                  count: 100
+                  intervalSec: 60
+                banDurationSec: 300
+              description: "Rate limit: 100 requests per minute per IP"
+        depends_on:
+          - project-id
+
+    # Output values for reference and integration
+    outputs:
+      # Function information
+      - name: voice_function_name
+        value: $(ref.voice-support-function.name)
+        description: "Name of the deployed voice support function"
+        
+      - name: voice_function_url
+        value: $(ref.voice-support-function.httpsTrigger.url)
+        description: "HTTPS URL for the voice support agent function"
+        
+      - name: voice_function_region
+        value: us-central1
+        description: "Region where the function is deployed"
+      
+      # Service account information
+      - name: service_account_email
+        value: $(ref.voice-agent-service-account.email)
+        description: "Service account email for the voice agent"
+      
+      # Storage information
+      - name: source_bucket_name
+        value: $(ref.function-source-bucket.name)
+        description: "Cloud Storage bucket for function source code"
+      
+      # Database information
+      - name: firestore_database_name
+        value: $(ref.conversation-firestore-database.name)
+        description: "Firestore database for conversation history"
+      
+      # Monitoring information
+      - name: dashboard_url
+        value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.voice-agent-dashboard.name)?project=$(ref.project-id.projectId)
+        description: "URL to access the voice agent monitoring dashboard"
+      
+      # Security information
+      - name: security_policy_name
+        value: $(ref.voice-agent-security-policy.name)
+        description: "Cloud Armor security policy name"
+      
+      # Configuration values
+      - name: project_id
+        value: $(ref.project-id.projectId)
+        description: "Google Cloud project ID"
+        
+      - name: random_suffix
+        value: $(ref.random-suffix.result)
+        description: "Random suffix used for resource naming"
+
+      # Quick start information
+      - name: deployment_summary
+        value: |
+          Voice Support Agent Deployment Complete!
+          
+          Function URL: $(ref.voice-support-function.httpsTrigger.url)
+          Test endpoint: $(ref.voice-support-function.httpsTrigger.url)
+          
+          Dashboard: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.voice-agent-dashboard.name)?project=$(ref.project-id.projectId)
+          
+          Next steps:
+          1. Upload your voice agent source code to gs://$(ref.function-source-bucket.name)/
+          2. Test the function using the provided test interface
+          3. Configure additional customer service integrations
+          4. Monitor performance through the created dashboard
+        description: "Deployment summary and next steps"

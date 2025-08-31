@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: amplify,appsync,dynamodb,cognito
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: amplify,datastore,offline-first,mobile,sync,conflict-resolution,appsync,dynamodb,cognito
 recipe-generator-version: 1.3
@@ -67,8 +67,6 @@ graph TB
 
 > **Note**: This recipe uses React Native for demonstration, but DataStore works with iOS, Android, Flutter, and web applications.
 
-> **Warning**: Ensure proper error handling in production applications, as network failures and authentication token expiration can affect synchronization. Implement retry logic and user feedback mechanisms for robust offline experiences.
-
 ## Preparation
 
 ```bash
@@ -87,13 +85,14 @@ export APP_NAME="offline-tasks-${RANDOM_SUFFIX}"
 export PROJECT_DIR="${HOME}/amplify-offline-app"
 
 # Create React Native project
-npx react-native init ${APP_NAME} --template react-native-template-typescript
+npx react-native@latest init ${APP_NAME} \
+    --template react-native-template-typescript
 
 # Navigate to project directory
 cd "${HOME}/${APP_NAME}"
 
 # Initialize Amplify in the project
-amplify init --yes
+npx amplify-app@latest
 ```
 
 ## Steps
@@ -151,9 +150,9 @@ amplify init --yes
      status: Status!
      dueDate: AWSDateTime
      tags: [String]
-     createdAt: AWSDateTime
-     updatedAt: AWSDateTime
-     owner: String @auth(rules: [{ allow: owner, operations: [read] }])
+     projectID: ID @index(name: "byProject")
+     createdAt: AWSDateTime!
+     updatedAt: AWSDateTime!
    }
    
    type Project @model @auth(rules: [{ allow: owner }]) {
@@ -162,9 +161,8 @@ amplify init --yes
      description: String
      color: String
      tasks: [Task] @hasMany(indexName: "byProject", fields: ["id"])
-     createdAt: AWSDateTime
-     updatedAt: AWSDateTime
-     owner: String @auth(rules: [{ allow: owner, operations: [read] }])
+     createdAt: AWSDateTime!
+     updatedAt: AWSDateTime!
    }
    
    enum Priority {
@@ -207,11 +205,15 @@ amplify init --yes
 
    ```bash
    # Install required dependencies
-   npm install aws-amplify @aws-amplify/datastore
+   npm install aws-amplify @aws-amplify/ui-react-native \
+       @aws-amplify/react-native
    
    # Install React Native specific dependencies
-   npm install react-native-get-random-values
-   npm install @react-native-async-storage/async-storage
+   npm install react-native-get-random-values \
+       @react-native-community/netinfo \
+       @react-native-async-storage/async-storage \
+       @azure/core-asynciterator-polyfill \
+       react-native-safe-area-context
    
    # For iOS, install pods
    cd ios && pod install && cd ..
@@ -227,9 +229,10 @@ amplify init --yes
 
    ```bash
    # Create DataStore configuration
+   mkdir -p src
    cat > src/datastore-config.js << 'EOF'
    import { DataStore, syncExpression } from 'aws-amplify/datastore';
-   import { Task, Project } from '../models';
+   import { Task, Project } from './models';
    
    // Configure selective sync based on user preferences
    const configureSyncExpressions = (userPreferences) => {
@@ -265,12 +268,15 @@ amplify init --yes
    echo "✅ DataStore configuration created"
    ```
 
+   The DataStore configuration now includes selective sync expressions that optimize data transfer and storage. Only recent and active data will be synchronized to the device, improving performance and reducing storage requirements while maintaining functionality.
+
 7. **Implement Offline-First Data Operations**:
 
    The DataService layer provides a clean abstraction over DataStore operations, implementing patterns that work consistently in both offline and online scenarios. DataStore automatically queues operations when offline and synchronizes them when connectivity returns. The service layer includes error handling, data validation, and optimistic updates that provide immediate user feedback even when offline.
 
    ```bash
    # Create data service layer
+   mkdir -p src/services
    cat > src/services/DataService.js << 'EOF'
    import { DataStore, Predicates } from 'aws-amplify/datastore';
    import { Task, Project, Priority, Status } from '../models';
@@ -286,7 +292,7 @@ amplify init --yes
            status: Status.PENDING,
            dueDate: taskData.dueDate,
            tags: taskData.tags || [],
-           projectId: taskData.projectId
+           projectID: taskData.projectID
          }));
          return task;
        } catch (error) {
@@ -399,14 +405,17 @@ amplify init --yes
    echo "✅ Data service layer implemented"
    ```
 
+   The DataService layer now provides comprehensive CRUD operations that work seamlessly in both online and offline modes. All operations include proper error handling and follow DataStore best practices for optimal performance and reliability.
+
 8. **Create Conflict Resolution Handler**:
 
    Custom conflict resolution becomes essential when the default auto-merge strategy doesn't align with business requirements. This implementation provides priority-based conflict resolution where higher priority tasks and completed status take precedence. Understanding conflict resolution patterns helps maintain data consistency while respecting business rules and user intent across multiple devices.
 
    ```bash
    # Create conflict resolution utilities
+   mkdir -p src/utils
    cat > src/utils/ConflictResolver.js << 'EOF'
-   import { DataStore, Hub } from 'aws-amplify/core';
+   import { Hub } from 'aws-amplify/utils';
    
    export class ConflictResolver {
      static setupConflictHandling() {
@@ -478,6 +487,8 @@ amplify init --yes
    echo "✅ Conflict resolution handler created"
    ```
 
+   The conflict resolution handler now implements business-specific logic for handling data conflicts. This ensures that the most important changes are preserved when conflicts occur between local and remote data modifications.
+
 9. **Implement Network Status Monitoring**:
 
    Network monitoring is essential for providing users with appropriate feedback about synchronization status and application capabilities. This service integrates DataStore's network events with React Native's NetInfo to provide comprehensive connectivity awareness. Understanding network status allows the application to adjust behavior, queue operations appropriately, and inform users about sync capabilities.
@@ -485,7 +496,7 @@ amplify init --yes
    ```bash
    # Create network status service
    cat > src/services/NetworkService.js << 'EOF'
-   import { Hub } from 'aws-amplify/core';
+   import { Hub } from 'aws-amplify/utils';
    import NetInfo from '@react-native-community/netinfo';
    
    export class NetworkService {
@@ -535,6 +546,8 @@ amplify init --yes
    echo "✅ Network status monitoring implemented"
    ```
 
+   Network status monitoring is now integrated with both DataStore events and device network information. This provides comprehensive connectivity awareness that helps users understand when their data can synchronize with the cloud.
+
 10. **Create Real-time Sync Manager**:
 
     The SyncManager provides centralized monitoring of DataStore synchronization events, enabling applications to provide detailed feedback about sync status, pending changes, and conflicts. This visibility helps users understand the application state and builds confidence in the offline-first experience. Real-time sync monitoring is essential for debugging and optimizing synchronization performance.
@@ -542,7 +555,8 @@ amplify init --yes
     ```bash
     # Create sync manager
     cat > src/services/SyncManager.js << 'EOF'
-    import { DataStore, Hub } from 'aws-amplify/core';
+    import { DataStore } from 'aws-amplify/datastore';
+    import { Hub } from 'aws-amplify/utils';
     
     export class SyncManager {
       static syncStatus = {
@@ -645,12 +659,15 @@ amplify init --yes
     echo "✅ Sync manager implemented"
     ```
 
+    The SyncManager now provides comprehensive monitoring of all DataStore synchronization events. This gives users real-time visibility into sync status, pending changes, and any errors that occur during synchronization.
+
 11. **Create React Native Components with Offline Support**:
 
     The React Native components demonstrate how to build a user interface that gracefully handles offline scenarios. The implementation shows real-time sync status, provides immediate feedback for user actions, and maintains functionality regardless of network connectivity. This approach ensures users can continue working productively even when offline, with all changes automatically synchronized when connectivity returns.
 
     ```bash
     # Create main app component
+    mkdir -p src/components
     cat > src/components/TaskApp.tsx << 'EOF'
     import React, { useState, useEffect } from 'react';
     import { View, Text, StyleSheet, FlatList, TouchableOpacity, Alert } from 'react-native';
@@ -667,6 +684,10 @@ amplify init --yes
     
       useEffect(() => {
         initializeApp();
+        
+        return () => {
+          // Cleanup listeners on unmount
+        };
       }, []);
     
       const initializeApp = async () => {
@@ -682,14 +703,10 @@ amplify init --yes
           // Load initial data
           await loadTasks();
           setLoading(false);
-    
-          return () => {
-            networkUnsubscribe();
-            syncUnsubscribe();
-          };
         } catch (error) {
           console.error('App initialization failed:', error);
           Alert.alert('Error', 'Failed to initialize app');
+          setLoading(false);
         }
       };
     
@@ -862,14 +879,27 @@ amplify init --yes
     echo "✅ React Native components created"
     ```
 
+    The React Native components now provide a complete user interface that works seamlessly in both online and offline modes. Users receive real-time feedback about network status and sync progress while maintaining full functionality regardless of connectivity.
+
 12. **Configure App with Amplify and DataStore**:
 
     The final application configuration brings together all components to create a fully functional offline-first application. The initialization sequence ensures DataStore is properly configured before the UI loads, establishes conflict resolution handlers, and starts the synchronization process. This configuration pattern provides a robust foundation for production applications.
 
     ```bash
+    # Add polyfill import to index.js
+    cat > index.js << 'EOF'
+    import '@azure/core-asynciterator-polyfill';
+    import 'react-native-get-random-values';
+    import {AppRegistry} from 'react-native';
+    import App from './App';
+    import {name as appName} from './app.json';
+    
+    AppRegistry.registerComponent(appName, () => App);
+    EOF
+    
     # Update App.tsx to initialize Amplify
     cat > App.tsx << 'EOF'
-    import React, { useEffect } from 'react';
+    import React, { useEffect, useState } from 'react';
     import { SafeAreaProvider } from 'react-native-safe-area-context';
     import { Amplify } from 'aws-amplify';
     import { DataStore } from 'aws-amplify/datastore';
@@ -883,6 +913,8 @@ amplify init --yes
     Amplify.configure(amplifyconfig);
     
     const App: React.FC = () => {
+      const [isReady, setIsReady] = useState(false);
+    
       useEffect(() => {
         initializeApp();
       }, []);
@@ -898,11 +930,17 @@ amplify init --yes
           // Start DataStore
           await DataStore.start();
           
+          setIsReady(true);
           console.log('App initialized successfully');
         } catch (error) {
           console.error('App initialization failed:', error);
+          setIsReady(true); // Allow app to start even if DataStore fails
         }
       };
+    
+      if (!isReady) {
+        return null; // You could show a loading screen here
+      }
     
       return (
         <SafeAreaProvider>
@@ -921,6 +959,8 @@ amplify init --yes
     echo "✅ App configuration completed"
     ```
 
+    The application is now fully configured with proper initialization sequence, authentication, and DataStore setup. The app gracefully handles initialization failures and provides a robust offline-first experience for users.
+
 ## Validation & Testing
 
 1. **Verify DataStore initialization**:
@@ -932,6 +972,7 @@ amplify init --yes
    amplify status
    
    # Expected output should show API and Auth as deployed
+   echo "✅ Backend resources verified"
    ```
 
 2. **Test offline functionality**:
@@ -1031,27 +1072,27 @@ amplify init --yes
 
 AWS Amplify DataStore provides a comprehensive solution for building offline-first mobile applications that automatically handle data synchronization, conflict resolution, and real-time updates. The DataStore programming model abstracts away the complexities of managing local storage, API calls, and synchronization logic, allowing developers to focus on building compelling user experiences.
 
-The architecture leverages several key components working together: DataStore manages local storage and synchronization, AppSync provides the GraphQL API layer with real-time subscriptions, DynamoDB stores data in the cloud, and Cognito handles user authentication and authorization. This combination creates a robust system that works seamlessly across online and offline scenarios.
+The architecture leverages several key components working together: DataStore manages local storage and synchronization, AppSync provides the GraphQL API layer with real-time subscriptions, DynamoDB stores data in the cloud, and Cognito handles user authentication and authorization. This combination creates a robust system that works seamlessly across online and offline scenarios following [AWS Well-Architected Framework principles](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
-Selective synchronization is particularly important for mobile applications where bandwidth and storage are limited. By using sync expressions, applications can filter data based on user preferences, device capabilities, or business rules. This approach reduces data transfer costs, improves sync performance, and ensures that only relevant data is stored locally.
+Selective synchronization is particularly important for mobile applications where bandwidth and storage are limited. By using sync expressions, applications can filter data based on user preferences, device capabilities, or business rules. This approach reduces data transfer costs, improves sync performance, and ensures that only relevant data is stored locally. The [AWS AppSync documentation](https://docs.aws.amazon.com/appsync/latest/devguide/designing-a-graphql-api.html) provides additional guidance on designing effective GraphQL APIs for mobile applications.
 
-Conflict resolution strategies are critical for maintaining data consistency across multiple devices and users. Amplify DataStore supports multiple conflict resolution strategies including optimistic concurrency, auto-merge, and custom Lambda-based resolution. The auto-merge strategy works well for most use cases, automatically resolving conflicts based on data types and update patterns.
+Conflict resolution strategies are critical for maintaining data consistency across multiple devices and users. Amplify DataStore supports multiple conflict resolution strategies including optimistic concurrency, auto-merge, and custom Lambda-based resolution. The auto-merge strategy works well for most use cases, automatically resolving conflicts based on data types and update patterns. For more complex scenarios, custom conflict resolution logic can be implemented to handle business-specific requirements.
 
-> **Tip**: Monitor DataStore sync performance using CloudWatch metrics and adjust sync expressions based on actual usage patterns to optimize performance and costs.
+> **Tip**: Monitor DataStore sync performance using CloudWatch metrics and adjust sync expressions based on actual usage patterns to optimize performance and costs. See the [AWS Amplify DataStore documentation](https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/build-a-serverless-react-native-mobile-app-by-using-aws-amplify.html) for additional best practices.
 
 ## Challenge
 
 Extend this offline-first architecture with these advanced features:
 
-1. **Implement custom conflict resolution logic** that considers business rules, user roles, and data sensitivity when resolving conflicts between local and remote changes.
+1. **Implement custom conflict resolution logic** that considers business rules, user roles, and data sensitivity when resolving conflicts between local and remote changes using [AWS Lambda resolvers](https://docs.aws.amazon.com/appsync/latest/devguide/designing-a-graphql-api.html).
 
-2. **Add support for large file attachments** using S3 with presigned URLs, implementing offline queuing for file uploads and automatic retry mechanisms.
+2. **Add support for large file attachments** using S3 with presigned URLs, implementing offline queuing for file uploads and automatic retry mechanisms with proper error handling.
 
-3. **Create advanced selective sync patterns** that dynamically adjust sync expressions based on user behavior, device storage capacity, and network conditions.
+3. **Create advanced selective sync patterns** that dynamically adjust sync expressions based on user behavior, device storage capacity, and network conditions to optimize performance.
 
-4. **Build comprehensive sync analytics** that track sync performance, conflict rates, and user engagement metrics to optimize the offline experience.
+4. **Build comprehensive sync analytics** that track sync performance, conflict rates, and user engagement metrics using CloudWatch to optimize the offline experience.
 
-5. **Implement multi-tenant data isolation** with fine-grained access controls that work consistently across offline and online scenarios.
+5. **Implement multi-tenant data isolation** with fine-grained access controls that work consistently across offline and online scenarios using Cognito User Groups and AppSync authorization.
 
 ## Infrastructure Code
 

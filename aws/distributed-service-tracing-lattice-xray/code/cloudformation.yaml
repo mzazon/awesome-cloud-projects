@@ -1,0 +1,653 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Distributed Service Tracing with VPC Lattice and X-Ray - Complete infrastructure for microservices observability'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and naming'
+  
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$'
+    Description: 'CIDR block for the VPC'
+  
+  SubnetCidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$'
+    Description: 'CIDR block for the Lambda subnet'
+  
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.12'
+    AllowedValues: ['python3.9', 'python3.10', 'python3.11', 'python3.12']
+    Description: 'Python runtime version for Lambda functions'
+  
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+    Description: 'Memory size for Lambda functions in MB'
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: 'Timeout for Lambda functions in seconds'
+  
+  EnableXRayTracing:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable X-Ray tracing for Lambda functions'
+  
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'CloudWatch log retention period in days'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableTracing: !Equals [!Ref EnableXRayTracing, 'true']
+
+Resources:
+  # VPC Infrastructure
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'VPC Lattice X-Ray Tracing'
+
+  LambdaSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref SubnetCidr
+      AvailabilityZone: !Sub '${AWS::Region}a'
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-lambda-subnet'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Lambda Functions with X-Ray Permissions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-xray-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If 
+          - EnableTracing
+          - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: 
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Layer for X-Ray SDK
+  XRaySDKLayer:
+    Type: AWS::Lambda::LayerVersion
+    Condition: EnableTracing
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-xray-sdk-layer'
+      Description: 'AWS X-Ray SDK for Python with distributed tracing capabilities'
+      Content:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: 'layers/xray-sdk-layer.zip'
+      CompatibleRuntimes:
+        - !Ref LambdaRuntime
+      CompatibleArchitectures:
+        - x86_64
+
+  # S3 Bucket for Lambda Code
+  LambdaCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-lambda-code-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-lambda-code'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Order Service Lambda Function
+  OrderServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-order-service'
+      Runtime: !Ref LambdaRuntime
+      Handler: 'order-service.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: 'functions/order-service.zip'
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Layers: !If
+        - EnableTracing
+        - [!Ref XRaySDKLayer]
+        - []
+      TracingConfig: !If
+        - EnableTracing
+        - Mode: Active
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          PAYMENT_FUNCTION_NAME: !Sub '${AWS::StackName}-payment-service'
+          INVENTORY_FUNCTION_NAME: !Sub '${AWS::StackName}-inventory-service'
+          ENVIRONMENT: !Ref Environment
+          ENABLE_XRAY: !Ref EnableXRayTracing
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-order-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: 'order-processing'
+
+  # Payment Service Lambda Function
+  PaymentServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-payment-service'
+      Runtime: !Ref LambdaRuntime
+      Handler: 'payment-service.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: 'functions/payment-service.zip'
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Layers: !If
+        - EnableTracing
+        - [!Ref XRaySDKLayer]
+        - []
+      TracingConfig: !If
+        - EnableTracing
+        - Mode: Active
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          ENABLE_XRAY: !Ref EnableXRayTracing
+          PAYMENT_GATEWAY: 'stripe'
+          FAILURE_RATE: '0.1'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-payment-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: 'payment-processing'
+
+  # Inventory Service Lambda Function
+  InventoryServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-inventory-service'
+      Runtime: !Ref LambdaRuntime
+      Handler: 'inventory-service.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: 'functions/inventory-service.zip'
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Layers: !If
+        - EnableTracing
+        - [!Ref XRaySDKLayer]
+        - []
+      TracingConfig: !If
+        - EnableTracing
+        - Mode: Active
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          ENABLE_XRAY: !Ref EnableXRayTracing
+          DATABASE_TYPE: 'dynamodb'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-inventory-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: 'inventory-management'
+
+  # VPC Lattice Service Network
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub '${AWS::StackName}-service-network'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-service-network'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Microservices mesh with observability'
+
+  # VPC Association with Service Network
+  ServiceNetworkVpcAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      VpcIdentifier: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc-association'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Target Group for Order Service
+  OrderServiceTargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-order-tg'
+      Type: LAMBDA
+      Config:
+        HealthCheck:
+          Enabled: true
+          Protocol: HTTPS
+          Path: '/health'
+          HealthCheckIntervalSeconds: 30
+          HealthCheckTimeoutSeconds: 5
+          HealthyThresholdCount: 2
+          UnhealthyThresholdCount: 3
+      Targets:
+        - Id: !GetAtt OrderServiceFunction.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-order-target-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # VPC Lattice Service for Order Processing
+  OrderService:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Sub '${AWS::StackName}-order-service'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-order-service'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Listener for Order Service
+  OrderServiceListener:
+    Type: AWS::VpcLattice::Listener
+    Properties:
+      ServiceIdentifier: !Ref OrderService
+      Name: 'order-listener'
+      Protocol: HTTPS
+      Port: 443
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref OrderServiceTargetGroup
+              Weight: 100
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-order-listener'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Service Network Service Association
+  ServiceNetworkServiceAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      ServiceIdentifier: !Ref OrderService
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-service-association'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Resource-based Policy for VPC Lattice
+  OrderServiceLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderServiceFunction
+      Action: lambda:InvokeFunction
+      Principal: vpc-lattice.amazonaws.com
+      SourceArn: !Sub 'arn:aws:vpc-lattice:${AWS::Region}:${AWS::AccountId}:service/${OrderService}'
+
+  # CloudWatch Log Groups
+  OrderServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-order-service'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-order-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PaymentServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-payment-service'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-payment-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  InventoryServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-inventory-service'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-inventory-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # VPC Lattice Access Logs
+  VpcLatticeAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vpclattice/${AWS::StackName}-access-logs'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-lattice-access-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Access Log Subscription for VPC Lattice
+  AccessLogSubscription:
+    Type: AWS::VpcLattice::AccessLogSubscription
+    Properties:
+      ResourceIdentifier: !Ref ServiceNetwork
+      DestinationArn: !GetAtt VpcLatticeAccessLogGroup.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-access-log-subscription'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard for Observability
+  ObservabilityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-observability'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/VPC-Lattice", "RequestCount", "ServiceNetwork", "${ServiceNetwork}"],
+                  [".", "ResponseTime", ".", "."],
+                  [".", "ActiveConnectionCount", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "VPC Lattice Service Network Metrics",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${OrderServiceFunction}"],
+                  [".", "Invocations", ".", "."],
+                  [".", "Errors", ".", "."],
+                  [".", "Duration", "FunctionName", "${PaymentServiceFunction}"],
+                  [".", "Invocations", ".", "."],
+                  [".", "Errors", ".", "."],
+                  [".", "Duration", "FunctionName", "${InventoryServiceFunction}"],
+                  [".", "Invocations", ".", "."],
+                  [".", "Errors", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Performance",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/X-Ray", "TracesReceived"],
+                  [".", "LatencyHigh", "ServiceName", "${OrderServiceFunction}"],
+                  [".", "ErrorRate", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "X-Ray Distributed Tracing Metrics",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${AWS::StackName}-order-service' | SOURCE '/aws/lambda/${AWS::StackName}-payment-service' | SOURCE '/aws/lambda/${AWS::StackName}-inventory-service'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Errors Across All Services",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for Service Health
+  OrderServiceErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-order-service-errors'
+      AlarmDescription: 'High error rate in Order Service'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OrderServiceFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-order-error-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PaymentServiceErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-payment-service-errors'
+      AlarmDescription: 'High error rate in Payment Service'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PaymentServiceFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-payment-error-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for Alerts (Optional)
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: IsProduction
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alerts'
+      DisplayName: 'Distributed Tracing Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alert-topic'
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  VPCId:
+    Description: 'ID of the created VPC'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  ServiceNetworkId:
+    Description: 'ID of the VPC Lattice Service Network'
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetwork-ID'
+
+  ServiceNetworkArn:
+    Description: 'ARN of the VPC Lattice Service Network'
+    Value: !Sub 'arn:aws:vpc-lattice:${AWS::Region}:${AWS::AccountId}:servicenetwork/${ServiceNetwork}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetwork-ARN'
+
+  OrderServiceArn:
+    Description: 'ARN of the Order Service Lambda function'
+    Value: !GetAtt OrderServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrderService-ARN'
+
+  PaymentServiceArn:
+    Description: 'ARN of the Payment Service Lambda function'
+    Value: !GetAtt PaymentServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PaymentService-ARN'
+
+  InventoryServiceArn:
+    Description: 'ARN of the Inventory Service Lambda function'
+    Value: !GetAtt InventoryServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InventoryService-ARN'
+
+  LatticeServiceId:
+    Description: 'ID of the VPC Lattice Order Service'
+    Value: !Ref OrderService
+    Export:
+      Name: !Sub '${AWS::StackName}-LatticeService-ID'
+
+  ObservabilityDashboardURL:
+    Description: 'URL to the CloudWatch Observability Dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-observability'
+
+  XRayServiceMapURL:
+    Description: 'URL to the X-Ray Service Map'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/xray/home?region=${AWS::Region}#/service-map'
+
+  LambdaCodeBucket:
+    Description: 'S3 Bucket for Lambda deployment packages'
+    Value: !Ref LambdaCodeBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaCode-Bucket'
+
+  XRayLayerArn:
+    Condition: EnableTracing
+    Description: 'ARN of the X-Ray SDK Lambda Layer'
+    Value: !Ref XRaySDKLayer
+    Export:
+      Name: !Sub '${AWS::StackName}-XRayLayer-ARN'
+
+  AlertTopicArn:
+    Condition: IsProduction
+    Description: 'ARN of the SNS Alert Topic'
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopic-ARN'
+
+  DeploymentInstructions:
+    Description: 'Next steps for deployment'
+    Value: !Sub |
+      1. Upload Lambda function code to S3 bucket: ${LambdaCodeBucket}
+      2. Create X-Ray SDK layer package and upload to S3
+      3. Update Lambda function code references
+      4. Test the distributed tracing functionality
+      5. View traces in X-Ray console and metrics in CloudWatch dashboard

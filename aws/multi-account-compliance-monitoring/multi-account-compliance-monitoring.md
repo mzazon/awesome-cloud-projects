@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: Systems Manager, Security Hub, CloudTrail, IAM
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: compliance, security, monitoring, cross-account, systems-manager, security-hub
 recipe-generator-version: 1.3
@@ -98,9 +98,13 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for the security hub administrator account
-export SECURITY_ACCOUNT_ID="123456789012"  # Replace with your security account ID
+# Set environment variables
 export AWS_REGION=$(aws configure get region)
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+    --query Account --output text)
+
+# Replace with your actual account IDs
+export SECURITY_ACCOUNT_ID="123456789012"  # Replace with your security account ID
 export MEMBER_ACCOUNT_1="123456789013"     # Replace with first member account
 export MEMBER_ACCOUNT_2="123456789014"     # Replace with second member account
 
@@ -115,9 +119,9 @@ export COMPLIANCE_LAMBDA_NAME="ComplianceAutomation-${RANDOM_SUFFIX}"
 export CLOUDTRAIL_NAME="ComplianceAuditTrail-${RANDOM_SUFFIX}"
 
 # Verify current account context
-CURRENT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-echo "Current Account: ${CURRENT_ACCOUNT}"
+echo "Current Account: ${AWS_ACCOUNT_ID}"
 echo "Security Hub Admin Account: ${SECURITY_ACCOUNT_ID}"
+echo "Generated suffix: ${RANDOM_SUFFIX}"
 ```
 
 ## Steps
@@ -130,7 +134,7 @@ echo "Security Hub Admin Account: ${SECURITY_ACCOUNT_ID}"
    # Enable Security Hub in the security account (run this in security account)
    aws securityhub enable-security-hub \
        --enable-default-standards \
-       --tags "Purpose=ComplianceMonitoring,Environment=Production"
+       --tags 'Purpose=ComplianceMonitoring,Environment=Production'
    
    # Designate this account as the Security Hub administrator for the organization
    aws securityhub enable-organization-admin-account \
@@ -139,7 +143,7 @@ echo "Security Hub Admin Account: ${SECURITY_ACCOUNT_ID}"
    echo "✅ Security Hub enabled and configured as organization administrator"
    ```
 
-   Security Hub is now configured to receive findings from all organization member accounts. The default security standards (AWS Foundational Security Standard, CIS AWS Foundations Benchmark, and PCI DSS) are automatically enabled, providing immediate compliance checking capabilities across fundamental security controls. This establishes the foundation for enterprise-wide security posture management and regulatory compliance monitoring.
+   Security Hub is now configured to receive findings from all organization member accounts. The default security standards (AWS Foundational Security Standard, CIS AWS Foundations Benchmark) are automatically enabled, providing immediate compliance checking capabilities across fundamental security controls. This establishes the foundation for enterprise-wide security posture management and regulatory compliance monitoring.
 
 2. **Create Cross-Account IAM Role for Compliance Access**:
 
@@ -240,12 +244,12 @@ echo "Security Hub Admin Account: ${SECURITY_ACCOUNT_ID}"
        echo "Configuring Systems Manager Compliance for account: ${ACCOUNT_ID}"
        
        # Create default patch baseline if not exists
-       aws ssm describe-patch-baselines \
+       BASELINE_ID=$(aws ssm describe-patch-baselines \
            --filters "Key=DefaultBaseline,Values=true" \
            --query "BaselineIdentities[0].BaselineId" \
-           --output text > baseline_id.txt
+           --output text)
        
-       if [ "$(cat baseline_id.txt)" = "None" ]; then
+       if [ "${BASELINE_ID}" = "None" ] || [ -z "${BASELINE_ID}" ]; then
            aws ssm create-patch-baseline \
                --name "ComplianceMonitoring-Baseline-${RANDOM_SUFFIX}" \
                --description "Default patch baseline for compliance monitoring" \
@@ -470,7 +474,7 @@ echo "Security Hub Admin Account: ${SECURITY_ACCOUNT_ID}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${COMPLIANCE_LAMBDA_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${SECURITY_ACCOUNT_ID}:role/ComplianceProcessingRole-${RANDOM_SUFFIX} \
        --handler compliance_processor.lambda_handler \
        --zip-file fileb://compliance_processor.zip \
@@ -555,7 +559,7 @@ echo "Security Hub Admin Account: ${SECURITY_ACCOUNT_ID}"
    
    # Configure organization-wide Security Hub settings
    aws securityhub update-organization-configuration \
-       --auto-enable \
+       --no-auto-enable \
        --auto-enable-standards DEFAULT
    
    # Enable Systems Manager integration with Security Hub
@@ -698,7 +702,7 @@ echo "Security Hub Admin Account: ${SECURITY_ACCOUNT_ID}"
    # Verify CloudTrail logging
    aws cloudtrail lookup-events \
        --lookup-attributes AttributeKey=EventName,AttributeValue=PutComplianceItems \
-       --start-time 2025-07-12 \
+       --start-time 2025-07-23 \
        --max-items 5
    ```
 
@@ -789,7 +793,6 @@ echo "Security Hub Admin Account: ${SECURITY_ACCOUNT_ID}"
    rm -f compliance_processor.zip
    rm -f custom-compliance-script.sh
    rm -f response.json
-   rm -f baseline_id.txt
    
    echo "✅ Local files cleaned up"
    ```

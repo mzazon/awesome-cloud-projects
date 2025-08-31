@@ -1,0 +1,313 @@
+# Google Cloud Infrastructure Manager Configuration
+# Text-to-Speech Converter with Cloud Text-to-Speech and Storage
+# 
+# This configuration deploys the complete infrastructure needed for a text-to-speech
+# converter solution using Google Cloud Text-to-Speech API and Cloud Storage.
+#
+# Resources Created:
+# - Cloud Storage bucket for audio file storage
+# - IAM service account for application authentication
+# - Required API enablements
+# - IAM bindings for proper permissions
+
+imports:
+  # Import standard Google Cloud resource types
+  - path: https://www.googleapis.com/compute/v1/
+  - path: https://www.googleapis.com/storage/v1/
+  - path: https://www.googleapis.com/servicemanagement/v1/
+  - path: https://www.googleapis.com/cloudresourcemanager/v1/
+  - path: https://www.googleapis.com/iam/v1/
+
+# Template variables for customization
+properties:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID where resources will be created"
+    default: "tts-demo-project"
+  
+  # Regional configuration
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+  
+  # Storage configuration
+  bucket_name:
+    type: string
+    description: "Name for the Cloud Storage bucket (must be globally unique)"
+    default: "tts-audio-files"
+  
+  storage_class:
+    type: string
+    description: "Cloud Storage class for the bucket"
+    default: "STANDARD"
+    enum:
+      - "STANDARD"
+      - "NEARLINE" 
+      - "COLDLINE"
+      - "ARCHIVE"
+  
+  # Access control configuration
+  public_access:
+    type: boolean
+    description: "Whether to allow public read access to audio files"
+    default: true
+  
+  # Service account configuration
+  service_account_name:
+    type: string
+    description: "Name for the service account used by the application"
+    default: "tts-converter-sa"
+
+resources:
+  # Enable required Google Cloud APIs
+  # Text-to-Speech API is required for speech synthesis functionality
+  - name: enable-texttospeech-api
+    type: gcp-types/servicemanagement-v1:services.enable
+    properties:
+      serviceName: texttospeech.googleapis.com
+      consumerId: "project:{{ properties.project_id }}"
+    metadata:
+      dependsOn: []
+      description: "Enables the Cloud Text-to-Speech API for speech synthesis"
+
+  # Cloud Storage API is required for bucket operations
+  - name: enable-storage-api
+    type: gcp-types/servicemanagement-v1:services.enable
+    properties:
+      serviceName: storage.googleapis.com
+      consumerId: "project:{{ properties.project_id }}"
+    metadata:
+      dependsOn: []
+      description: "Enables the Cloud Storage API for file storage operations"
+
+  # IAM API is required for service account management
+  - name: enable-iam-api
+    type: gcp-types/servicemanagement-v1:services.enable
+    properties:
+      serviceName: iam.googleapis.com
+      consumerId: "project:{{ properties.project_id }}"
+    metadata:
+      dependsOn: []
+      description: "Enables the IAM API for service account operations"
+
+  # Create Cloud Storage bucket for audio file storage
+  # This bucket will store all generated MP3 audio files
+  - name: audio-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      # Bucket configuration
+      name: "{{ properties.bucket_name }}-{{ properties.project_id }}"
+      location: "{{ properties.region }}"
+      storageClass: "{{ properties.storage_class }}"
+      
+      # Enable uniform bucket-level access for simplified IAM
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: "Delete"
+            condition:
+              age: 90  # Delete files older than 90 days
+              
+      # Versioning configuration (disabled for cost efficiency)
+      versioning:
+        enabled: false
+        
+      # CORS configuration for web application integration
+      cors:
+        - origin: ["*"]
+          method: ["GET", "HEAD"]
+          responseHeader: ["Content-Type", "Content-Length"]
+          maxAgeSeconds: 3600
+          
+      # Labels for resource organization
+      labels:
+        purpose: "text-to-speech"
+        environment: "demo"
+        managed-by: "infrastructure-manager"
+        
+    metadata:
+      dependsOn:
+        - enable-storage-api
+      description: "Cloud Storage bucket for storing generated audio files"
+
+  # Create service account for application authentication
+  # This service account will be used by the text-to-speech application
+  - name: tts-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: "{{ properties.service_account_name }}"
+      displayName: "Text-to-Speech Converter Service Account"
+      description: "Service account for text-to-speech converter application with minimal required permissions"
+    metadata:
+      dependsOn:
+        - enable-iam-api
+      description: "Service account for secure application authentication"
+
+  # Grant Text-to-Speech API usage permissions to service account
+  # This allows the application to synthesize speech from text
+  - name: tts-api-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: "{{ properties.project_id }}"
+      policy:
+        bindings:
+          - role: "roles/texttospeech.synthesizer"
+            members:
+              - "serviceAccount:{{ properties.service_account_name }}@{{ properties.project_id }}.iam.gserviceaccount.com"
+    metadata:
+      dependsOn:
+        - tts-service-account
+        - enable-texttospeech-api
+      description: "Grants Text-to-Speech synthesizer permissions to service account"
+
+  # Grant Cloud Storage permissions to service account
+  # This allows the application to upload and manage audio files
+  - name: storage-object-admin-binding
+    type: gcp-types/storage-v1:buckets.setIamPolicy
+    properties:
+      bucket: "{{ properties.bucket_name }}-{{ properties.project_id }}"
+      policy:
+        bindings:
+          - role: "roles/storage.objectAdmin"
+            members:
+              - "serviceAccount:{{ properties.service_account_name }}@{{ properties.project_id }}.iam.gserviceaccount.com"
+    metadata:
+      dependsOn:
+        - audio-storage-bucket
+        - tts-service-account
+      description: "Grants Storage Object Admin permissions for audio file management"
+
+  # Optional: Grant public read access to audio files
+  # This allows generated audio files to be accessed via public URLs
+  - name: public-read-binding
+    type: gcp-types/storage-v1:buckets.setIamPolicy
+    properties:
+      bucket: "{{ properties.bucket_name }}-{{ properties.project_id }}"
+      policy:
+        bindings:
+          - role: "roles/storage.objectViewer"
+            members:
+              - "allUsers"
+    condition: "{{ properties.public_access }}"
+    metadata:
+      dependsOn:
+        - audio-storage-bucket
+      description: "Grants public read access to audio files (optional)"
+
+  # Create service account key for local development
+  # This key can be downloaded and used for Application Default Credentials
+  - name: service-account-key
+    type: gcp-types/iam-v1:projects.serviceAccounts.keys
+    properties:
+      name: "projects/{{ properties.project_id }}/serviceAccounts/{{ properties.service_account_name }}@{{ properties.project_id }}.iam.gserviceaccount.com"
+      privateKeyType: "TYPE_GOOGLE_CREDENTIALS_FILE"
+    metadata:
+      dependsOn:
+        - tts-service-account
+      description: "Service account key for local development and testing"
+
+# Output values for reference and integration
+outputs:
+  # Storage bucket information
+  - name: bucket_name
+    value: "{{ properties.bucket_name }}-{{ properties.project_id }}"
+    description: "Name of the created Cloud Storage bucket"
+    
+  - name: bucket_url
+    value: "gs://{{ properties.bucket_name }}-{{ properties.project_id }}"
+    description: "Cloud Storage URL for the audio files bucket"
+    
+  - name: bucket_web_url
+    value: "https://storage.googleapis.com/{{ properties.bucket_name }}-{{ properties.project_id }}"
+    description: "Public web URL for accessing bucket contents"
+
+  # Service account information
+  - name: service_account_email
+    value: "{{ properties.service_account_name }}@{{ properties.project_id }}.iam.gserviceaccount.com"
+    description: "Email address of the created service account"
+    
+  - name: service_account_key_id
+    value: "$(ref.service-account-key.name)"
+    description: "ID of the created service account key"
+
+  # API endpoints and configuration
+  - name: texttospeech_api_endpoint
+    value: "https://texttospeech.googleapis.com"
+    description: "Text-to-Speech API endpoint URL"
+    
+  - name: project_id
+    value: "{{ properties.project_id }}"
+    description: "Google Cloud Project ID used for deployment"
+    
+  - name: region
+    value: "{{ properties.region }}"
+    description: "Google Cloud region where resources are deployed"
+
+  # Usage instructions
+  - name: usage_instructions
+    value: |
+      To use this Text-to-Speech infrastructure:
+      
+      1. Set up authentication:
+         export GOOGLE_APPLICATION_CREDENTIALS="path/to/service-account-key.json"
+      
+      2. Install required Python packages:
+         pip install google-cloud-texttospeech google-cloud-storage
+      
+      3. Use the following environment variables in your application:
+         PROJECT_ID="{{ properties.project_id }}"
+         BUCKET_NAME="{{ properties.bucket_name }}-{{ properties.project_id }}"
+         REGION="{{ properties.region }}"
+      
+      4. Your audio files will be stored at:
+         https://storage.googleapis.com/{{ properties.bucket_name }}-{{ properties.project_id }}/
+    description: "Instructions for using the deployed infrastructure"
+
+# Metadata and documentation
+metadata:
+  version: "1.0.0"
+  description: "Infrastructure Manager template for Text-to-Speech Converter with Cloud Storage"
+  author: "Google Cloud Recipe Generator"
+  created: "2025-07-12"
+  
+  # Template capabilities and features
+  capabilities:
+    - "Text-to-Speech API integration"
+    - "Cloud Storage for audio files"
+    - "Service account authentication"
+    - "Public access control"
+    - "Lifecycle management"
+    - "CORS configuration"
+  
+  # Cost estimation notes
+  cost_notes: |
+    Estimated costs for this infrastructure:
+    - Text-to-Speech API: $4-$30 per million characters (depending on voice type)
+    - Cloud Storage: ~$0.020 per GB per month (Standard class)
+    - IAM operations: No additional cost
+    - Data transfer: $0.12 per GB egress (if accessing from outside GCP)
+  
+  # Security considerations
+  security_notes: |
+    Security features implemented:
+    - Service account with minimal required permissions
+    - Uniform bucket-level access control
+    - Optional public access (can be disabled)
+    - No long-lived credentials (use ADC when possible)
+    - Lifecycle policies to prevent data accumulation
+  
+  # Maintenance and monitoring
+  maintenance_notes: |
+    Recommended monitoring and maintenance:
+    - Monitor Text-to-Speech API usage and costs
+    - Review storage bucket contents regularly
+    - Rotate service account keys periodically
+    - Monitor bucket access patterns
+    - Consider implementing request quotas for production use

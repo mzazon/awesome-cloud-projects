@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud SQL, Cloud SQL Insights, Cloud Monitoring, Cloud Functions
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: database, monitoring, performance, analytics, alerting, automation
 recipe-generator-version: 1.3
@@ -299,7 +299,7 @@ echo "✅ Foundational resources created successfully"
    EOF
    
    # Create the alerting policy
-   gcloud alpha monitoring policies create --policy-from-file=cpu-alert-policy.json
+   gcloud monitoring policies create --policy-from-file=cpu-alert-policy.json
    
    # Create alerting policy for slow queries
    cat > slow-query-alert-policy.json << EOF
@@ -330,7 +330,7 @@ echo "✅ Foundational resources created successfully"
    }
    EOF
    
-   gcloud alpha monitoring policies create --policy-from-file=slow-query-alert-policy.json
+   gcloud monitoring policies create --policy-from-file=slow-query-alert-policy.json
    
    echo "✅ Intelligent alerting policies configured for proactive monitoring"
    ```
@@ -350,6 +350,7 @@ echo "✅ Foundational resources created successfully"
    cat > main.py << 'EOF'
    import json
    import base64
+   import os
    from google.cloud import storage
    from google.cloud import monitoring_v3
    from datetime import datetime, timezone
@@ -444,14 +445,14 @@ echo "✅ Foundational resources created successfully"
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-   google-cloud-storage==2.10.0
-   google-cloud-monitoring==2.15.1
-   functions-framework==3.4.0
+   google-cloud-storage==2.18.0
+   google-cloud-monitoring==2.22.0
+   functions-framework==3.8.1
    EOF
    
    # Deploy the Cloud Function
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-topic ${TOPIC_NAME} \
        --source . \
        --entry-point process_db_alert \
@@ -472,19 +473,19 @@ echo "✅ Foundational resources created successfully"
 
    ```bash
    # Create Pub/Sub notification channel
-   NOTIFICATION_CHANNEL=$(gcloud alpha monitoring channels create \
+   NOTIFICATION_CHANNEL=$(gcloud monitoring channels create \
        --display-name="Database Alert Processing" \
        --type=pubsub \
        --channel-labels=topic=projects/${PROJECT_ID}/topics/${TOPIC_NAME} \
        --format="value(name)")
    
    # Update existing alerting policies to use the notification channel
-   POLICIES=$(gcloud alpha monitoring policies list \
+   POLICIES=$(gcloud monitoring policies list \
        --filter="displayName:('Cloud SQL High CPU Usage' OR 'Cloud SQL Slow Query Detection')" \
        --format="value(name)")
    
    for policy in $POLICIES; do
-       gcloud alpha monitoring policies update $policy \
+       gcloud monitoring policies update $policy \
            --add-notification-channels=$NOTIFICATION_CHANNEL
    done
    
@@ -528,7 +529,7 @@ echo "✅ Foundational resources created successfully"
 
    ```bash
    # List alerting policies
-   gcloud alpha monitoring policies list \
+   gcloud monitoring policies list \
        --filter="displayName:('Cloud SQL High CPU Usage' OR 'Cloud SQL Slow Query Detection')" \
        --format="table(displayName,enabled,notificationChannels[0])"
    
@@ -584,12 +585,12 @@ echo "✅ Foundational resources created successfully"
 
    ```bash
    # Delete alerting policies
-   POLICIES=$(gcloud alpha monitoring policies list \
+   POLICIES=$(gcloud monitoring policies list \
        --filter="displayName:('Cloud SQL High CPU Usage' OR 'Cloud SQL Slow Query Detection')" \
        --format="value(name)")
    
    for policy in $POLICIES; do
-       gcloud alpha monitoring policies delete $policy --quiet
+       gcloud monitoring policies delete $policy --quiet
    done
    
    # Delete monitoring dashboard
@@ -633,13 +634,13 @@ echo "✅ Foundational resources created successfully"
 
 ## Discussion
 
-Cloud SQL Insights represents a significant advancement in database observability, providing query-level visibility that goes far beyond traditional infrastructure monitoring. By combining this deep analytical capability with Cloud Monitoring's robust alerting system and Cloud Functions' serverless automation, we create an intelligent monitoring platform that not only detects performance issues but provides actionable insights for optimization.
+Cloud SQL Insights represents a significant advancement in database observability, providing query-level visibility that goes far beyond traditional infrastructure monitoring. By combining this deep analytical capability with Cloud Monitoring's robust alerting system and Cloud Functions' serverless automation, we create an intelligent monitoring platform that not only detects performance issues but provides actionable insights for optimization. This comprehensive approach aligns with Google Cloud's [Architecture Framework](https://cloud.google.com/architecture/framework) principles of operational excellence and reliability.
 
-The Enterprise Plus edition's advanced features, including AI-assisted troubleshooting and extended metrics retention, enable sophisticated analysis of database performance patterns. Query Insights captures detailed execution plans, wait events, and resource consumption data, providing the granular visibility needed for intelligent performance optimization. This data becomes the foundation for automated analysis and recommendation systems that can guide database tuning decisions.
+The Enterprise Plus edition's advanced features, including AI-assisted troubleshooting and extended metrics retention, enable sophisticated analysis of database performance patterns. Query Insights captures detailed execution plans, wait events, and resource consumption data, providing the granular visibility needed for intelligent performance optimization. This data becomes the foundation for automated analysis and recommendation systems that can guide database tuning decisions based on Google Cloud's [Cloud SQL best practices](https://cloud.google.com/sql/docs/postgres/best-practices).
 
-The integration of multiple Google Cloud services creates a powerful feedback loop where monitoring data drives automated analysis, which in turn generates actionable recommendations. Cloud Functions serve as the intelligence layer, processing alerts and performance data to provide context-aware insights. This approach transforms reactive monitoring into proactive optimization, enabling database administrators to address performance issues before they impact users.
+The integration of multiple Google Cloud services creates a powerful feedback loop where monitoring data drives automated analysis, which in turn generates actionable recommendations. Cloud Functions serve as the intelligence layer, processing alerts and performance data to provide context-aware insights. This approach transforms reactive monitoring into proactive optimization, enabling database administrators to address performance issues before they impact users, following the principles outlined in the [Google Cloud Operations Suite](https://cloud.google.com/products/operations).
 
-Performance monitoring at this level requires understanding the relationship between infrastructure metrics, query execution patterns, and application behavior. Query Insights provides this correlation by linking individual queries to their resource consumption and performance impact, enabling targeted optimization efforts that deliver measurable improvements.
+Performance monitoring at this level requires understanding the relationship between infrastructure metrics, query execution patterns, and application behavior. Query Insights provides this correlation by linking individual queries to their resource consumption and performance impact, enabling targeted optimization efforts that deliver measurable improvements while maintaining [Google Cloud security best practices](https://cloud.google.com/security/best-practices).
 
 > **Tip**: Regularly review Query Insights data to identify performance trends and optimization opportunities. The AI-assisted troubleshooting feature can provide valuable recommendations for query optimization and index strategies.
 

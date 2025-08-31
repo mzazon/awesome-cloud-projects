@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: fraud-detector, s3, iam, lambda
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: fraud-detection, machine-learning, security, real-time
 recipe-generator-version: 1.3
@@ -422,6 +422,62 @@ echo "✅ S3 bucket created: ${FRAUD_BUCKET}"
     Lambda functions provide serverless integration between your applications and Amazon Fraud Detector, enabling real-time fraud evaluation during transaction processing. This pattern allows applications to seamlessly incorporate fraud detection into their existing workflows without managing infrastructure or handling API complexity.
 
     ```bash
+    # Create IAM trust policy for Lambda execution role
+    cat > lambda-trust-policy.json << EOF
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": "lambda.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+            }
+        ]
+    }
+    EOF
+    
+    # Create IAM role for Lambda execution
+    aws iam create-role \
+        --role-name FraudDetectorLambdaRole \
+        --assume-role-policy-document file://lambda-trust-policy.json
+    
+    # Attach basic Lambda execution policy
+    aws iam attach-role-policy \
+        --role-name FraudDetectorLambdaRole \
+        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+    
+    # Create policy for Fraud Detector access
+    cat > lambda-fraud-detector-policy.json << EOF
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "frauddetector:GetEventPrediction"
+                ],
+                "Resource": "*"
+            }
+        ]
+    }
+    EOF
+    
+    # Create and attach custom policy
+    aws iam create-policy \
+        --policy-name FraudDetectorLambdaPolicy \
+        --policy-document file://lambda-fraud-detector-policy.json
+    
+    aws iam attach-role-policy \
+        --role-name FraudDetectorLambdaRole \
+        --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/FraudDetectorLambdaPolicy
+    
+    # Get Lambda role ARN
+    export LAMBDA_ROLE_ARN=$(aws iam get-role \
+        --role-name FraudDetectorLambdaRole \
+        --query Role.Arn --output text)
+    
     # Create Lambda function code
     cat > fraud-processor.py << 'EOF'
     import json
@@ -505,11 +561,15 @@ echo "✅ S3 bucket created: ${FRAUD_BUCKET}"
     # Create deployment package
     zip fraud-processor.zip fraud-processor.py
     
+    # Wait for IAM role propagation
+    echo "Waiting for IAM role propagation..."
+    sleep 10
+    
     # Create Lambda function
     aws lambda create-function \
         --function-name fraud-prediction-processor \
         --runtime python3.9 \
-        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/service-role/lambda-execution-role \
+        --role ${LAMBDA_ROLE_ARN} \
         --handler fraud-processor.lambda_handler \
         --zip-file fileb://fraud-processor.zip \
         --timeout 30 \
@@ -518,7 +578,7 @@ echo "✅ S3 bucket created: ${FRAUD_BUCKET}"
     echo "✅ Lambda function created: fraud-prediction-processor"
     ```
 
-    The Lambda function now serves as a fraud detection microservice that can be integrated into payment processing workflows, API Gateway endpoints, or event-driven architectures. It abstracts the complexity of fraud detection API calls and provides structured fraud assessment results.
+    The Lambda function now serves as a fraud detection microservice that can be integrated into payment processing workflows, API Gateway endpoints, or event-driven architectures. It abstracts the complexity of fraud detection API calls and provides structured fraud assessment results with proper IAM permissions for security.
 
 12. **Test Real-time Fraud Detection**:
 
@@ -767,7 +827,21 @@ echo "✅ S3 bucket created: ${FRAUD_BUCKET}"
    aws s3 rm s3://${FRAUD_BUCKET} --recursive
    aws s3 rb s3://${FRAUD_BUCKET}
    
-   # Delete IAM role
+   # Delete Lambda IAM role and policy
+   aws iam detach-role-policy \
+       --role-name FraudDetectorLambdaRole \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   
+   aws iam detach-role-policy \
+       --role-name FraudDetectorLambdaRole \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/FraudDetectorLambdaPolicy
+   
+   aws iam delete-policy \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/FraudDetectorLambdaPolicy
+   
+   aws iam delete-role --role-name FraudDetectorLambdaRole
+   
+   # Delete Fraud Detector IAM role
    aws iam detach-role-policy \
        --role-name FraudDetectorServiceRole \
        --policy-arn arn:aws:iam::aws:policy/AmazonFraudDetectorFullAccessPolicy
@@ -776,6 +850,8 @@ echo "✅ S3 bucket created: ${FRAUD_BUCKET}"
    
    # Clean up local files
    rm -f fraud-detector-trust-policy.json
+   rm -f lambda-trust-policy.json
+   rm -f lambda-fraud-detector-policy.json
    rm -f training-data.csv
    rm -f fraud-processor.py
    rm -f fraud-processor.zip
@@ -787,11 +863,11 @@ echo "✅ S3 bucket created: ${FRAUD_BUCKET}"
 
 Amazon Fraud Detector simplifies the implementation of sophisticated fraud detection systems by combining machine learning models with rule-based logic. The service leverages transfer learning, utilizing patterns learned from Amazon's extensive fraud detection experience, which significantly improves model performance even with limited training data. This approach is particularly valuable for organizations that lack the resources to build custom ML infrastructure from scratch.
 
-The architecture demonstrates several key concepts in fraud detection: feature engineering through variable selection, model training with labeled historical data, and real-time prediction scoring. The combination of ML-based scoring with rule-based decision logic provides flexibility to implement business-specific fraud policies while maintaining high accuracy. The system can handle both supervised learning scenarios (with labeled fraud data) and unsupervised scenarios (detecting anomalies in transaction patterns).
+The architecture demonstrates several key concepts in fraud detection: feature engineering through variable selection, model training with labeled historical data, and real-time prediction scoring. The combination of ML-based scoring with rule-based decision logic provides flexibility to implement business-specific fraud policies while maintaining high accuracy. The system follows AWS security best practices with proper IAM role management and least-privilege access controls.
 
-Cost optimization is achieved through the pay-per-use model, where organizations only pay for model training time, data storage, and prediction requests. The service automatically scales to handle varying transaction volumes without requiring infrastructure management. For high-volume applications, implementing prediction caching and batching strategies can further reduce costs while maintaining real-time response capabilities.
+Cost optimization is achieved through the pay-per-use model, where organizations only pay for model training time, data storage, and prediction requests. The service automatically scales to handle varying transaction volumes without requiring infrastructure management. For high-volume applications, implementing prediction caching and batching strategies can further reduce costs while maintaining real-time response capabilities. The serverless Lambda integration provides additional cost benefits by eliminating idle compute charges.
 
-Integration patterns vary based on application architecture. Real-time fraud detection typically involves API Gateway or Lambda functions calling the Fraud Detector service during transaction processing, while batch processing scenarios can use scheduled jobs to score large datasets. The service supports both synchronous and asynchronous processing patterns, making it suitable for various application requirements.
+Integration patterns vary based on application architecture. Real-time fraud detection typically involves API Gateway or Lambda functions calling the Fraud Detector service during transaction processing, while batch processing scenarios can use scheduled jobs to score large datasets. The service supports both synchronous and asynchronous processing patterns, making it suitable for various application requirements. See the [AWS Fraud Detector User Guide](https://docs.aws.amazon.com/frauddetector/latest/ug/what-is-frauddetector.html) for additional implementation patterns and best practices.
 
 > **Tip**: Start with a simple model using basic transaction features, then gradually add more sophisticated variables like device fingerprinting, behavioral analytics, and network analysis to improve detection accuracy.
 

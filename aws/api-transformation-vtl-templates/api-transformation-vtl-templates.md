@@ -4,14 +4,14 @@ id: 14dc1653
 category: serverless
 difficulty: 300
 subject: aws
-services: api,gateway,lambda,cloudwatch,s3
+services: API Gateway, Lambda, CloudWatch, S3
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: api,gateway,lambda,cloudwatch,s3
+tags: api gateway, lambda, cloudwatch, s3, vtl templates, transformation, mapping
 recipe-generator-version: 1.3
 ---
 
@@ -229,7 +229,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    zip data-processor.zip data-processor.py
    aws lambda create-function \
        --function-name ${FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler data-processor.lambda_handler \
        --zip-file fileb://data-processor.zip \
@@ -654,7 +654,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    }
    EOF
    
-   # Create S3 integration for GET method (demonstrating different integration type)
+   # Create Lambda integration for GET method (using same Lambda function)
    aws apigateway put-integration \
        --rest-api-id ${API_ID} \
        --resource-id ${USERS_RESOURCE_ID} \
@@ -921,17 +921,15 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 
 ## Discussion
 
-This recipe demonstrates sophisticated API Gateway transformation capabilities that enable seamless integration between diverse client applications and backend services. The Velocity Template Language (VTL) provides powerful declarative transformation logic without requiring custom code or additional infrastructure components.
+This recipe demonstrates sophisticated API Gateway transformation capabilities that enable seamless integration between diverse client applications and backend services. The Velocity Template Language (VTL) provides powerful declarative transformation logic without requiring custom code or additional infrastructure components, following the [AWS Well-Architected Framework's](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles of operational excellence and cost optimization.
 
-**Request Transformation Benefits**: The VTL mapping templates enable complex data restructuring, field renaming, type conversion, and conditional logic. This approach decouples client API contracts from backend service interfaces, allowing independent evolution of both layers. The request validation using JSON Schema models provides early error detection and comprehensive input validation before transformation occurs.
+**Request Transformation Benefits**: The VTL mapping templates enable complex data restructuring, field renaming, type conversion, and conditional logic. This approach decouples client API contracts from backend service interfaces, allowing independent evolution of both layers. The request validation using JSON Schema models provides early error detection and comprehensive input validation before transformation occurs, following security best practices outlined in the [API Gateway developer guide](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-mapping-variable-examples.html).
 
-**Response Transformation Patterns**: The response transformation layer standardizes output formats across different backend services, implements HATEOAS principles for RESTful API design, and provides consistent error response structures. This abstraction layer ensures that client applications receive predictable response formats regardless of backend service variations.
+**Response Transformation Patterns**: The response transformation layer standardizes output formats across different backend services, implements HATEOAS principles for RESTful API design, and provides consistent error response structures. This abstraction layer ensures that client applications receive predictable response formats regardless of backend service variations. The transformation templates follow AWS recommended patterns for enterprise API design.
 
-**Advanced Error Handling**: Custom gateway responses provide sophisticated error handling with detailed validation messages, standardized error codes, and contextual information. The error templates transform technical validation failures into user-friendly error messages while maintaining debugging information for developers.
+**Performance and Monitoring Considerations**: VTL transformations execute within API Gateway's infrastructure, providing low-latency processing without additional compute costs. CloudWatch integration enables detailed logging of transformation logic, request/response payloads, and performance metrics. The template execution is logged for debugging and troubleshooting complex transformation scenarios, as documented in the [AWS Lambda monitoring guide](https://docs.aws.amazon.com/lambda/latest/dg/services-apigateway.html).
 
-**Performance and Monitoring Considerations**: VTL transformations execute within API Gateway's infrastructure, providing low-latency processing without additional compute costs. CloudWatch integration enables detailed logging of transformation logic, request/response payloads, and performance metrics. The template execution is logged for debugging and troubleshooting complex transformation scenarios.
-
-> **Tip**: Use API Gateway's test feature in the AWS Console to interactively test and debug VTL mapping templates before deploying to production environments.
+> **Tip**: Use API Gateway's test feature in the AWS Console to interactively test and debug VTL mapping templates before deploying to production environments. This approach reduces deployment iterations and improves development velocity.
 
 ## Challenge
 

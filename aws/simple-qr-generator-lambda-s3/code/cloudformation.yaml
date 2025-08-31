@@ -1,0 +1,811 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Simple QR Code Generator with Lambda and S3
+  This template creates a serverless QR code generator using AWS Lambda, S3, and API Gateway.
+  The solution processes text input, generates QR code images, stores them in S3, and returns
+  downloadable URLs through a REST API endpoint.
+
+# Template Parameters for Customization
+Parameters:
+  ProjectName:
+    Type: String
+    Default: qr-generator
+    Description: Name prefix for all resources (lowercase, no spaces)
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name (dev, test, prod)
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    ConstraintDescription: Must be dev, test, or prod
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: Lambda function timeout in seconds
+    MinValue: 10
+    MaxValue: 300
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: Lambda function memory size in MB
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+
+  EnablePublicRead:
+    Type: String
+    Default: 'true'
+    Description: Enable public read access to QR code images in S3
+    AllowedValues: ['true', 'false']
+    ConstraintDescription: Must be true or false
+
+  QRCodeRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Number of days to retain QR code images in S3 (0 = no expiration)
+    MinValue: 0
+    MaxValue: 3650
+
+# Conditional Resources Based on Parameters
+Conditions:
+  EnablePublicAccess: !Equals [!Ref EnablePublicRead, 'true']
+  EnableLifecyclePolicy: !Not [!Equals [!Ref QRCodeRetentionDays, 0]]
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# CloudFormation Resources
+Resources:
+  # S3 Bucket for storing QR code images with versioning and encryption
+  QRCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-bucket-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: !If [EnablePublicAccess, false, true]
+        BlockPublicPolicy: !If [EnablePublicAccess, false, true]
+        IgnorePublicAcls: !If [EnablePublicAccess, false, true]
+        RestrictPublicBuckets: !If [EnablePublicAccess, false, true]
+      LifecycleConfiguration:
+        Rules:
+          - Id: QRCodeRetentionRule
+            Status: !If [EnableLifecyclePolicy, Enabled, Disabled]
+            ExpirationInDays: !If [EnableLifecyclePolicy, !Ref QRCodeRetentionDays, !Ref 'AWS::NoValue']
+          - Id: IncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: QR Code Storage
+
+  # S3 Bucket Policy for public read access (conditional)
+  QRCodeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: EnablePublicAccess
+    Properties:
+      Bucket: !Ref QRCodeBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub '${QRCodeBucket}/*'
+            Condition:
+              StringEquals:
+                's3:ExistingObjectTag/Public': 'true'
+
+  # CloudWatch Log Group for S3 events
+  S3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-${Environment}'
+      RetentionInDays: !If [IsProduction, 365, 30]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Lambda function with least privilege permissions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:PutObjectTagging
+                Resource: !Sub '${QRCodeBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                Resource: !Ref QRCodeBucket
+        - PolicyName: CloudWatchMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': !Sub '${ProjectName}/${Environment}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for Lambda function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-function-${Environment}'
+      RetentionInDays: !If [IsProduction, 365, 30]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda function for QR code generation
+  QRGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-function-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref QRCodeBucket
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          PUBLIC_READ_ENABLED: !Ref EnablePublicRead
+      DeadLetterQueue:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import qrcode
+          import io
+          from datetime import datetime
+          import uuid
+          import os
+          import base64
+          
+          # Initialize clients outside handler for connection reuse
+          s3_client = boto3.client('s3')
+          cloudwatch_client = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse request body
+                  if 'body' in event:
+                      if event.get('isBase64Encoded', False):
+                          body = json.loads(base64.b64decode(event['body']).decode('utf-8'))
+                      else:
+                          body = json.loads(event['body'])
+                  else:
+                      body = event
+                  
+                  text = body.get('text', '').strip()
+                  if not text:
+                      return create_response(400, {'error': 'Text parameter is required'})
+                  
+                  # Limit text length for security and performance
+                  if len(text) > 1000:
+                      return create_response(400, {'error': 'Text too long (max 1000 characters)'})
+                  
+                  # Extract optional parameters
+                  error_correction = body.get('error_correction', 'L')
+                  box_size = min(max(body.get('box_size', 10), 1), 20)  # Limit box size
+                  border = min(max(body.get('border', 4), 1), 10)  # Limit border
+                  
+                  # Map error correction levels
+                  error_correction_map = {
+                      'L': qrcode.constants.ERROR_CORRECT_L,
+                      'M': qrcode.constants.ERROR_CORRECT_M,
+                      'Q': qrcode.constants.ERROR_CORRECT_Q,
+                      'H': qrcode.constants.ERROR_CORRECT_H
+                  }
+                  
+                  # Generate QR code with custom parameters
+                  qr = qrcode.QRCode(
+                      version=1,
+                      error_correction=error_correction_map.get(error_correction, qrcode.constants.ERROR_CORRECT_L),
+                      box_size=box_size,
+                      border=border,
+                  )
+                  qr.add_data(text)
+                  qr.make(fit=True)
+                  
+                  # Create QR code image
+                  img = qr.make_image(fill_color="black", back_color="white")
+                  
+                  # Convert to bytes
+                  img_buffer = io.BytesIO()
+                  img.save(img_buffer, format='PNG')
+                  img_buffer.seek(0)
+                  
+                  # Generate unique filename with timestamp
+                  timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                  unique_id = str(uuid.uuid4())[:8]
+                  filename = f"qr_{timestamp}_{unique_id}.png"
+                  
+                  bucket_name = os.environ.get('BUCKET_NAME')
+                  public_read_enabled = os.environ.get('PUBLIC_READ_ENABLED', 'false').lower() == 'true'
+                  
+                  # Prepare S3 upload parameters
+                  upload_params = {
+                      'Bucket': bucket_name,
+                      'Key': filename,
+                      'Body': img_buffer.getvalue(),
+                      'ContentType': 'image/png',
+                      'CacheControl': 'max-age=31536000',  # Cache for 1 year
+                      'Metadata': {
+                          'text-length': str(len(text)),
+                          'error-correction': error_correction,
+                          'generated-by': 'qr-generator-lambda'
+                      }
+                  }
+                  
+                  # Add public read tags if enabled
+                  if public_read_enabled:
+                      upload_params['Tagging'] = 'Public=true'
+                  
+                  # Upload to S3
+                  s3_client.put_object(**upload_params)
+                  
+                  # Generate URL based on public access configuration
+                  if public_read_enabled:
+                      region = boto3.Session().region_name
+                      url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{filename}"
+                  else:
+                      # Generate presigned URL for private access (expires in 1 hour)
+                      url = s3_client.generate_presigned_url(
+                          'get_object',
+                          Params={'Bucket': bucket_name, 'Key': filename},
+                          ExpiresIn=3600
+                      )
+                  
+                  # Send custom metrics to CloudWatch
+                  try:
+                      cloudwatch_client.put_metric_data(
+                          Namespace=f"{os.environ.get('PROJECT_NAME', 'qr-generator')}/{os.environ.get('ENVIRONMENT', 'dev')}",
+                          MetricData=[
+                              {
+                                  'MetricName': 'QRCodesGenerated',
+                                  'Value': 1,
+                                  'Unit': 'Count',
+                                  'Dimensions': [
+                                      {
+                                          'Name': 'ErrorCorrection',
+                                          'Value': error_correction
+                                      }
+                                  ]
+                              },
+                              {
+                                  'MetricName': 'TextLength',
+                                  'Value': len(text),
+                                  'Unit': 'Count'
+                              }
+                          ]
+                      )
+                  except Exception as e:
+                      print(f"Failed to send metrics: {str(e)}")
+                  
+                  return create_response(200, {
+                      'message': 'QR code generated successfully',
+                      'url': url,
+                      'filename': filename,
+                      'text_length': len(text),
+                      'expires_in': '1 hour' if not public_read_enabled else 'never',
+                      'public_access': public_read_enabled
+                  })
+                  
+              except json.JSONDecodeError:
+                  return create_response(400, {'error': 'Invalid JSON in request body'})
+              except Exception as e:
+                  # Log error for debugging
+                  print(f"Error generating QR code: {str(e)}")
+                  return create_response(500, {'error': 'Internal server error'})
+          
+          def create_response(status_code, body):
+              """Create a standardized API response"""
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                  },
+                  'body': json.dumps(body, indent=2)
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SQS Dead Letter Queue for Lambda function error handling
+  LambdaDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Layer for QR code library dependencies
+  QRCodeLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${ProjectName}-qrcode-layer-${Environment}'
+      Description: QR code generation library with PIL support
+      Content:
+        ZipFile: |
+          # This is a placeholder. In practice, you would upload a proper layer
+          # containing the qrcode library and its dependencies.
+          # To create the layer:
+          # 1. mkdir python
+          # 2. pip install qrcode[pil] -t python/
+          # 3. zip -r qrcode-layer.zip python/
+          pass
+      CompatibleRuntimes:
+        - python3.12
+        - python3.11
+      CompatibleArchitectures:
+        - x86_64
+
+  # API Gateway REST API
+  QRCodeAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      Description: QR Code Generator REST API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway Resource for /generate endpoint
+  GenerateResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref QRCodeAPI
+      ParentId: !GetAtt QRCodeAPI.RootResourceId
+      PathPart: generate
+
+  # API Gateway POST Method
+  GenerateMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref QRCodeAPI
+      ResourceId: !Ref GenerateResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: !If [IsProduction, true, false]
+      RequestValidatorId: !Ref RequestValidator
+      RequestModels:
+        application/json: !Ref QRRequestModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations'
+          - LambdaArn: !GetAtt QRGeneratorFunction.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: |
+                #set($inputRoot = $input.path('$'))
+                $inputRoot
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: !Ref QRResponseModel
+        - StatusCode: 400
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+        - StatusCode: 500
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+
+  # OPTIONS method for CORS support
+  GenerateOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref QRCodeAPI
+      ResourceId: !Ref GenerateResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Request Validator for API Gateway
+  RequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref QRCodeAPI
+      Name: RequestValidator
+      ValidateRequestBody: true
+      ValidateRequestParameters: false
+
+  # API Gateway Models for request/response validation
+  QRRequestModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref QRCodeAPI
+      ContentType: application/json
+      Name: QRRequestModel
+      Schema:
+        $schema: http://json-schema.org/draft-04/schema#
+        type: object
+        required:
+          - text
+        properties:
+          text:
+            type: string
+            minLength: 1
+            maxLength: 1000
+            description: Text to encode in QR code
+          error_correction:
+            type: string
+            enum: ['L', 'M', 'Q', 'H']
+            description: Error correction level
+          box_size:
+            type: integer
+            minimum: 1
+            maximum: 20
+            description: Size of each box in pixels
+          border:
+            type: integer
+            minimum: 1
+            maximum: 10
+            description: Border size in boxes
+
+  QRResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref QRCodeAPI
+      ContentType: application/json
+      Name: QRResponseModel
+      Schema:
+        $schema: http://json-schema.org/draft-04/schema#
+        type: object
+        properties:
+          message:
+            type: string
+          url:
+            type: string
+          filename:
+            type: string
+          text_length:
+            type: integer
+          expires_in:
+            type: string
+          public_access:
+            type: boolean
+
+  ErrorResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref QRCodeAPI
+      ContentType: application/json
+      Name: ErrorResponseModel
+      Schema:
+        $schema: http://json-schema.org/draft-04/schema#
+        type: object
+        properties:
+          error:
+            type: string
+
+  # Lambda permission for API Gateway
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QRGeneratorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourcePath: !Sub '${QRCodeAPI}/*/*'
+
+  # API Gateway Deployment
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GenerateMethod
+      - GenerateOptionsMethod
+    Properties:
+      RestApiId: !Ref QRCodeAPI
+      Description: !Sub 'Deployment for ${Environment} environment'
+
+  # API Gateway Stage
+  APIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref QRCodeAPI
+      DeploymentId: !Ref APIDeployment
+      StageName: !Ref Environment
+      Description: !Sub '${Environment} stage for QR Code Generator API'
+      MethodSettings:
+        - ResourcePath: /*
+          HttpMethod: '*'
+          LoggingLevel: !If [IsProduction, ERROR, INFO]
+          DataTraceEnabled: !If [IsProduction, false, true]
+          MetricsEnabled: true
+          ThrottlingBurstLimit: !If [IsProduction, 2000, 100]
+          ThrottlingRateLimit: !If [IsProduction, 1000, 50]
+      AccessLogSetting:
+        DestinationArn: !GetAtt APILogGroup.Arn
+        Format: >
+          {"requestId": "$requestId", "ip": "$sourceIp", "caller": "$caller",
+          "user": "$user", "requestTime": "$requestTime", "httpMethod": "$httpMethod",
+          "resourcePath": "$resourcePath", "status": "$status", "error": "$error.message",
+          "responseLength": "$responseLength"}
+      TracingConfig:
+        TracingEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for API Gateway access logs
+  APILogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-${Environment}'
+      RetentionInDays: !If [IsProduction, 365, 30]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Key for production environment (conditional)
+  APIKey:
+    Type: AWS::ApiGateway::ApiKey
+    Condition: IsProduction
+    Properties:
+      Name: !Sub '${ProjectName}-api-key-${Environment}'
+      Description: API Key for QR Code Generator
+      Enabled: true
+      Value: !Sub '${ProjectName}-${AWS::AccountId}-${Environment}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Usage Plan for API throttling (conditional)
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Condition: IsProduction
+    Properties:
+      UsagePlanName: !Sub '${ProjectName}-usage-plan-${Environment}'
+      Description: Usage plan for QR Code Generator API
+      ApiStages:
+        - ApiId: !Ref QRCodeAPI
+          Stage: !Ref APIStage
+      Throttle:
+        BurstLimit: 2000
+        RateLimit: 1000
+      Quota:
+        Limit: 100000
+        Period: MONTH
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Usage Plan Key to associate API Key with Usage Plan (conditional)
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Condition: IsProduction
+    Properties:
+      KeyId: !Ref APIKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  # CloudWatch Dashboard for monitoring
+  QRGeneratorDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${QRGeneratorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${ProjectName}-api-${Environment}" ],
+                  [ ".", "4XXError", ".", "." ],
+                  [ ".", "5XXError", ".", "." ],
+                  [ ".", "Latency", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/${Environment}", "QRCodesGenerated" ],
+                  [ ".", "TextLength" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Custom Application Metrics"
+              }
+            }
+          ]
+        }
+
+# CloudFormation Outputs
+Outputs:
+  APIEndpoint:
+    Description: API Gateway endpoint URL for QR code generation
+    Value: !Sub 'https://${QRCodeAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/generate'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-endpoint'
+
+  S3BucketName:
+    Description: S3 bucket name for QR code storage
+    Value: !Ref QRCodeBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-bucket-name'
+
+  S3BucketURL:
+    Description: S3 bucket URL for QR code access
+    Value: !Sub 'https://${QRCodeBucket}.s3.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-bucket-url'
+
+  LambdaFunctionName:
+    Description: Lambda function name for QR code generation
+    Value: !Ref QRGeneratorFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-function-name'
+
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt QRGeneratorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-function-arn'
+
+  APIKeyId:
+    Condition: IsProduction
+    Description: API Key ID for authenticated access (production only)
+    Value: !Ref APIKey
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-key-id'
+
+  DashboardURL:
+    Description: CloudWatch Dashboard URL for monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-dashboard'
+
+  TestCommand:
+    Description: Sample curl command to test the API
+    Value: !Sub |
+      curl -X POST https://${QRCodeAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/generate \
+        -H "Content-Type: application/json" \
+        -d '{"text": "Hello, World! This is my first QR code."}'
+
+  StackResources:
+    Description: Summary of created resources
+    Value: !Sub |
+      Created resources:
+      - S3 Bucket: ${QRCodeBucket}
+      - Lambda Function: ${QRGeneratorFunction}
+      - API Gateway: ${QRCodeAPI}
+      - CloudWatch Dashboard: ${ProjectName}-${Environment}-dashboard
+      - IAM Role: ${LambdaExecutionRole}

@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure SQL Database Hyperscale, Azure Logic Apps, Azure Monitor, Azure Key Vault
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database-scaling, automation, monitoring, hyperscale, logic-apps
 recipe-generator-version: 1.3
@@ -38,6 +38,7 @@ graph TB
     subgraph "Orchestration Layer"
         LApp[Logic Apps Workflow]
         KV[Key Vault]
+        AG[Action Group]
     end
     
     subgraph "Database Layer"
@@ -53,7 +54,8 @@ graph TB
     APP-->SQLH
     SQLH-->AM
     AM-->LA
-    AM-->LApp
+    AM-->AG
+    AG-->LApp
     LApp-->KV
     LApp-->SQLH
     SQLH-->SR
@@ -177,11 +179,12 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
        --resource-group ${RESOURCE_GROUP} \
        --server ${SQL_SERVER_NAME} \
        --name ${SQL_DATABASE_NAME} \
-       --service-objective HS_Gen5_2 \
+       --service-level-objective HS_Gen5_2 \
        --edition Hyperscale \
-       --family Gen5 \
+       -f Gen5 \
        --capacity 2 \
-       --zone-redundant false
+       --zone-redundant false \
+       --backup-storage-redundancy Local
    
    echo "✅ Hyperscale database created with 2 vCores baseline configuration"
    ```
@@ -206,7 +209,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
        --resource-group ${RESOURCE_GROUP} \
        --short-name "ScaleAlert"
    
-   # Create CPU scale-up alert rule
+   # Create CPU scale-up alert rule using modern syntax
    az monitor metrics alert create \
        --name "CPU-Scale-Up-Alert" \
        --resource-group ${RESOURCE_GROUP} \
@@ -217,7 +220,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
        --action ${ACTION_GROUP_NAME} \
        --description "Trigger scale-up when CPU exceeds 80% for 5 minutes"
    
-   # Create CPU scale-down alert rule
+   # Create CPU scale-down alert rule using modern syntax
    az monitor metrics alert create \
        --name "CPU-Scale-Down-Alert" \
        --resource-group ${RESOURCE_GROUP} \
@@ -238,42 +241,47 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
    Azure Logic Apps provides serverless workflow orchestration for complex scaling logic including cooldown periods, validation checks, and integration with multiple Azure services. This approach enables sophisticated scaling patterns while maintaining cost-effective execution through consumption-based pricing.
 
    ```bash
+   # Create basic workflow definition file
+   cat > basic-workflow.json << 'EOF'
+   {
+     "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+     "contentVersion": "1.0.0.0",
+     "parameters": {},
+     "triggers": {
+       "manual": {
+         "type": "Request",
+         "kind": "Http",
+         "inputs": {
+           "schema": {
+             "type": "object",
+             "properties": {
+               "alertType": {"type": "string"},
+               "resourceId": {"type": "string"},
+               "metricValue": {"type": "number"}
+             }
+           }
+         }
+       }
+     },
+     "actions": {
+       "Initialize_scaling_logic": {
+         "type": "Compose",
+         "inputs": {
+           "message": "Scaling workflow triggered",
+           "timestamp": "@utcnow()"
+         }
+       }
+     },
+     "outputs": {}
+   }
+   EOF
+   
    # Create Logic App with system-assigned managed identity
    az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${LOGIC_APP_NAME} \
        --location ${LOCATION} \
-       --definition '{
-         "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-         "contentVersion": "1.0.0.0",
-         "parameters": {},
-         "triggers": {
-           "manual": {
-             "type": "Request",
-             "kind": "Http",
-             "inputs": {
-               "schema": {
-                 "type": "object",
-                 "properties": {
-                   "alertType": {"type": "string"},
-                   "resourceId": {"type": "string"},
-                   "metricValue": {"type": "number"}
-                 }
-               }
-             }
-           }
-         },
-         "actions": {
-           "Initialize_scaling_logic": {
-             "type": "Compose",
-             "inputs": {
-               "message": "Scaling workflow triggered",
-               "timestamp": "@utcnow()"
-             }
-           }
-         },
-         "outputs": {}
-       }'
+       --definition @basic-workflow.json
    
    # Enable system-assigned managed identity
    az logic workflow identity assign \
@@ -290,23 +298,23 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
    Implement intelligent scaling algorithms that consider current performance metrics, historical patterns, and business rules to make optimal scaling decisions. Safety controls prevent rapid scaling oscillations and ensure cost containment while maintaining application performance requirements.
 
    ```bash
-   # Update Logic App with comprehensive scaling logic
-   cat > scaling-workflow.json << 'EOF'
+   # Create comprehensive scaling workflow
+   cat > scaling-workflow.json << EOF
    {
-     "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+     "\$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
      "contentVersion": "1.0.0.0",
      "parameters": {
        "resourceGroup": {
          "type": "string",
-         "defaultValue": "'${RESOURCE_GROUP}'"
+         "defaultValue": "${RESOURCE_GROUP}"
        },
        "serverName": {
          "type": "string", 
-         "defaultValue": "'${SQL_SERVER_NAME}'"
+         "defaultValue": "${SQL_SERVER_NAME}"
        },
        "databaseName": {
          "type": "string",
-         "defaultValue": "'${SQL_DATABASE_NAME}'"
+         "defaultValue": "${SQL_DATABASE_NAME}"
        }
      },
      "triggers": {
@@ -330,7 +338,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
          "type": "Http",
          "inputs": {
            "method": "GET",
-           "uri": "https://management.azure.com/subscriptions/'${SUBSCRIPTION_ID}'/resourceGroups/@{parameters('resourceGroup')}/providers/Microsoft.Sql/servers/@{parameters('serverName')}/databases/@{parameters('databaseName')}",
+           "uri": "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/@{parameters('resourceGroup')}/providers/Microsoft.Sql/servers/@{parameters('serverName')}/databases/@{parameters('databaseName')}",
            "queries": {
              "api-version": "2021-11-01"
            },
@@ -348,19 +356,19 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
              "actions": {
                "Calculate_new_capacity": {
                  "type": "Compose",
-                 "inputs": "@min(add(body('Get_current_database_configuration')['properties']['currentServiceObjectiveId'], 2), 40)"
+                 "inputs": "@min(add(int(split(body('Get_current_database_configuration')['properties']['currentServiceObjectiveName'], '_')[2]), 2), 40)"
                },
                "Scale_up_database": {
                  "type": "Http",
                  "inputs": {
                    "method": "PATCH",
-                   "uri": "https://management.azure.com/subscriptions/'${SUBSCRIPTION_ID}'/resourceGroups/@{parameters('resourceGroup')}/providers/Microsoft.Sql/servers/@{parameters('serverName')}/databases/@{parameters('databaseName')}",
+                   "uri": "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/@{parameters('resourceGroup')}/providers/Microsoft.Sql/servers/@{parameters('serverName')}/databases/@{parameters('databaseName')}",
                    "queries": {
                      "api-version": "2021-11-01"
                    },
                    "body": {
                      "properties": {
-                       "requestedServiceObjectiveName": "@concat('HS_Gen5_', outputs('Calculate_new_capacity'))"
+                       "serviceObjectiveName": "@concat('HS_Gen5_', outputs('Calculate_new_capacity'))"
                      }
                    },
                    "authentication": {
@@ -375,19 +383,19 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
              "actions": {
                "Calculate_reduced_capacity": {
                  "type": "Compose",
-                 "inputs": "@max(sub(body('Get_current_database_configuration')['properties']['currentServiceObjectiveId'], 2), 2)"
+                 "inputs": "@max(sub(int(split(body('Get_current_database_configuration')['properties']['currentServiceObjectiveName'], '_')[2]), 2), 2)"
                },
                "Scale_down_database": {
                  "type": "Http",
                  "inputs": {
                    "method": "PATCH",
-                   "uri": "https://management.azure.com/subscriptions/'${SUBSCRIPTION_ID}'/resourceGroups/@{parameters('resourceGroup')}/providers/Microsoft.Sql/servers/@{parameters('serverName')}/databases/@{parameters('databaseName')}",
+                   "uri": "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/@{parameters('resourceGroup')}/providers/Microsoft.Sql/servers/@{parameters('serverName')}/databases/@{parameters('databaseName')}",
                    "queries": {
                      "api-version": "2021-11-01"
                    },
                    "body": {
                      "properties": {
-                       "requestedServiceObjectiveName": "@concat('HS_Gen5_', outputs('Calculate_reduced_capacity'))"
+                       "serviceObjectiveName": "@concat('HS_Gen5_', outputs('Calculate_reduced_capacity'))"
                      }
                    },
                    "authentication": {
@@ -403,7 +411,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
          "type": "Http",
          "inputs": {
            "method": "POST",
-           "uri": "https://'${LOG_ANALYTICS_NAME}'.ods.opinsights.azure.com/api/logs",
+           "uri": "https://${LOG_ANALYTICS_NAME}.ods.opinsights.azure.com/api/logs",
            "headers": {
              "Log-Type": "DatabaseScaling"
            },
@@ -424,9 +432,10 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
    EOF
    
    # Update Logic App with scaling workflow
-   az logic workflow update \
+   az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${LOGIC_APP_NAME} \
+       --location ${LOCATION} \
        --definition @scaling-workflow.json
    
    echo "✅ Comprehensive scaling logic implemented with safety controls and logging"

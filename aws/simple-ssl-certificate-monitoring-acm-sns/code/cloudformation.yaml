@@ -1,0 +1,472 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SSL Certificate Monitoring with AWS Certificate Manager and SNS
+  Creates CloudWatch alarms to monitor certificate expiration and send notifications
+  via SNS when certificates are approaching expiration (30 days or less).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - AlertThresholdDays
+      - Label:
+          default: "Certificate Configuration"
+        Parameters:
+          - CertificateArn
+          - MonitorAllCertificates
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+    ParameterLabels:
+      NotificationEmail:
+        default: "Email Address for Alerts"
+      AlertThresholdDays:
+        default: "Alert Threshold (Days)"
+      CertificateArn:
+        default: "Certificate ARN to Monitor"
+      MonitorAllCertificates:
+        default: "Monitor All Certificates"
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive SSL certificate expiration alerts
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  AlertThresholdDays:
+    Type: Number
+    Description: Number of days before certificate expiration to trigger alert
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    ConstraintDescription: Must be between 1 and 365 days
+
+  CertificateArn:
+    Type: String
+    Description: >
+      ARN of the specific certificate to monitor. Leave empty if MonitorAllCertificates is true.
+      Format: arn:aws:acm:region:account:certificate/certificate-id
+    Default: ""
+    AllowedPattern: ^(arn:aws:acm:[a-z0-9-]+:[0-9]{12}:certificate\/[a-f0-9-]+)?$
+    ConstraintDescription: Must be a valid ACM certificate ARN or empty
+
+  MonitorAllCertificates:
+    Type: String
+    Description: >
+      If true, creates alarms for all certificates in the account.
+      If false, only monitors the certificate specified in CertificateArn parameter.
+    Default: false
+    AllowedValues:
+      - true
+      - false
+
+  ResourcePrefix:
+    Type: String
+    Description: Prefix for resource names to ensure uniqueness
+    Default: ssl-cert-monitor
+    MinLength: 1
+    MaxLength: 20
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+
+Conditions:
+  # Condition to check if we should monitor all certificates
+  MonitorAll: !Equals [!Ref MonitorAllCertificates, true]
+  
+  # Condition to check if we should monitor a specific certificate
+  MonitorSpecific: !And
+    - !Equals [!Ref MonitorAllCertificates, false]
+    - !Not [!Equals [!Ref CertificateArn, ""]]
+
+  # Condition to validate that either MonitorAll is true OR CertificateArn is provided
+  ValidConfiguration: !Or
+    - !Condition MonitorAll
+    - !Condition MonitorSpecific
+
+Resources:
+  # SNS Topic for certificate expiration notifications
+  CertificateAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ResourcePrefix}-alerts"
+      DisplayName: SSL Certificate Expiration Alerts
+      Description: Notifications for SSL certificate expiration warnings
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Purpose
+          Value: SSL Certificate Monitoring
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Environment
+          Value: Production
+
+  # SNS Topic Policy to allow CloudWatch to publish messages
+  CertificateAlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref CertificateAlertTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref CertificateAlertTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # Email subscription to the SNS topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CertificateAlertTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm for specific certificate (created only when MonitorSpecific condition is true)
+  SpecificCertificateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: MonitorSpecific
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-specific-certificate"
+      AlarmDescription: !Sub >
+        SSL Certificate expiration alarm for specific certificate.
+        Triggers when certificate expires in ${AlertThresholdDays} days or less.
+      MetricName: DaysToExpiry
+      Namespace: AWS/CertificateManager
+      Statistic: Minimum
+      Period: 86400  # 24 hours in seconds
+      EvaluationPeriods: 1
+      Threshold: !Ref AlertThresholdDays
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: CertificateArn
+          Value: !Ref CertificateArn
+      AlarmActions:
+        - !Ref CertificateAlertTopic
+      OKActions:
+        - !Ref CertificateAlertTopic
+      Tags:
+        - Key: Purpose
+          Value: SSL Certificate Monitoring
+        - Key: CertificateArn
+          Value: !Ref CertificateArn
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Custom Resource to create alarms for all certificates (when MonitorAll is true)
+  AllCertificatesMonitoringRole:
+    Type: AWS::IAM::Role
+    Condition: MonitorAll
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CertificateMonitoringPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - acm:ListCertificates
+                  - acm:DescribeCertificate
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref CertificateAlertTopic
+
+  # Lambda function to manage alarms for all certificates
+  AllCertificatesMonitoringFunction:
+    Type: AWS::Lambda::Function
+    Condition: MonitorAll
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-certificate-manager"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt AllCertificatesMonitoringRole.Arn
+      Timeout: 300
+      Description: Manages CloudWatch alarms for all ACM certificates
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref CertificateAlertTopic
+          THRESHOLD_DAYS: !Ref AlertThresholdDays
+          RESOURCE_PREFIX: !Ref ResourcePrefix
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          import os
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Custom resource handler for managing certificate monitoring alarms
+              """
+              try:
+                  # Initialize AWS clients
+                  acm_client = boto3.client('acm')
+                  cloudwatch_client = boto3.client('cloudwatch')
+                  
+                  # Get environment variables
+                  sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+                  threshold_days = int(os.environ['THRESHOLD_DAYS'])
+                  resource_prefix = os.environ['RESOURCE_PREFIX']
+                  
+                  request_type = event['RequestType']
+                  
+                  if request_type in ['Create', 'Update']:
+                      # List all issued certificates
+                      certificates = acm_client.list_certificates(
+                          CertificateStatuses=['ISSUED']
+                      )
+                      
+                      alarm_names = []
+                      
+                      for cert in certificates['CertificateSummaryList']:
+                          cert_arn = cert['CertificateArn']
+                          domain_name = cert['DomainName']
+                          
+                          # Create a safe alarm name
+                          safe_domain = domain_name.replace('.', '-').replace('*', 'wildcard')
+                          alarm_name = f"{resource_prefix}-{safe_domain}"
+                          
+                          # Create CloudWatch alarm
+                          cloudwatch_client.put_metric_alarm(
+                              AlarmName=alarm_name,
+                              AlarmDescription=f'SSL Certificate expiration alarm for {domain_name}',
+                              MetricName='DaysToExpiry',
+                              Namespace='AWS/CertificateManager',
+                              Statistic='Minimum',
+                              Period=86400,
+                              EvaluationPeriods=1,
+                              Threshold=threshold_days,
+                              ComparisonOperator='LessThanThreshold',
+                              TreatMissingData='notBreaching',
+                              Dimensions=[
+                                  {
+                                      'Name': 'CertificateArn',
+                                      'Value': cert_arn
+                                  }
+                              ],
+                              AlarmActions=[sns_topic_arn],
+                              OKActions=[sns_topic_arn],
+                              Tags=[
+                                  {
+                                      'Key': 'Purpose',
+                                      'Value': 'SSL Certificate Monitoring'
+                                  },
+                                  {
+                                      'Key': 'DomainName',
+                                      'Value': domain_name
+                                  },
+                                  {
+                                      'Key': 'CertificateArn',
+                                      'Value': cert_arn
+                                  },
+                                  {
+                                      'Key': 'ManagedBy',
+                                      'Value': 'CloudFormation-CustomResource'
+                                  }
+                              ]
+                          )
+                          
+                          alarm_names.append(alarm_name)
+                          logger.info(f"Created alarm {alarm_name} for certificate {domain_name}")
+                      
+                      response_data = {
+                          'AlarmNames': alarm_names,
+                          'CertificateCount': len(certificates['CertificateSummaryList'])
+                      }
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                      
+                  elif request_type == 'Delete':
+                      # Delete all alarms created by this resource
+                      try:
+                          # Get all alarms with our prefix
+                          alarms = cloudwatch_client.describe_alarms(
+                              AlarmNamePrefix=resource_prefix
+                          )
+                          
+                          alarm_names = [alarm['AlarmName'] for alarm in alarms['MetricAlarms']]
+                          
+                          if alarm_names:
+                              cloudwatch_client.delete_alarms(AlarmNames=alarm_names)
+                              logger.info(f"Deleted alarms: {alarm_names}")
+                          
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                          
+                      except Exception as e:
+                          logger.error(f"Error during cleanup: {str(e)}")
+                          # Don't fail the delete operation
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+
+  # Custom resource to trigger the Lambda function
+  AllCertificatesMonitoring:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: MonitorAll
+    Properties:
+      ServiceToken: !GetAtt AllCertificatesMonitoringFunction.Arn
+      # Add a timestamp to force updates when parameters change
+      Timestamp: !Sub "${AlertThresholdDays}-${AWS::StackId}"
+
+  # Validation Custom Resource to ensure proper configuration
+  ConfigurationValidator:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ConfigurationValidatorFunction.Arn
+      MonitorAllCertificates: !Ref MonitorAllCertificates
+      CertificateArn: !Ref CertificateArn
+
+  ConfigurationValidatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  ConfigurationValidatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt ConfigurationValidatorRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              try:
+                  monitor_all = event['ResourceProperties']['MonitorAllCertificates']
+                  certificate_arn = event['ResourceProperties']['CertificateArn']
+                  
+                  # Validate configuration
+                  if monitor_all == 'false' and not certificate_arn:
+                      error_msg = "CertificateArn must be provided when MonitorAllCertificates is false"
+                      logger.error(error_msg)
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {
+                          'Error': error_msg
+                      })
+                      return
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Status': 'Configuration is valid'
+                  })
+                  
+              except Exception as e:
+                  logger.error(f"Validation error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+
+Outputs:
+  SNSTopicArn:
+    Description: ARN of the SNS topic for certificate alerts
+    Value: !Ref CertificateAlertTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopicArn"
+
+  SNSTopicName:
+    Description: Name of the SNS topic for certificate alerts
+    Value: !GetAtt CertificateAlertTopic.TopicName
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopicName"
+
+  NotificationEmail:
+    Description: Email address configured for notifications
+    Value: !Ref NotificationEmail
+
+  AlertThreshold:
+    Description: Number of days before expiration that triggers alerts
+    Value: !Ref AlertThresholdDays
+
+  MonitoringScope:
+    Description: Scope of certificate monitoring (all certificates or specific)
+    Value: !If
+      - MonitorAll
+      - "All certificates in the account"
+      - !Sub "Specific certificate: ${CertificateArn}"
+
+  SpecificCertificateAlarmName:
+    Condition: MonitorSpecific
+    Description: Name of the CloudWatch alarm for the specific certificate
+    Value: !Ref SpecificCertificateAlarm
+
+  AllCertificatesMonitoringStatus:
+    Condition: MonitorAll
+    Description: Status of all certificates monitoring setup
+    Value: !GetAtt AllCertificatesMonitoring.CertificateCount
+
+  StackRegion:
+    Description: AWS Region where the stack is deployed
+    Value: !Ref AWS::Region
+
+  AccountId:
+    Description: AWS Account ID where the stack is deployed
+    Value: !Ref AWS::AccountId
+
+  CloudWatchAlarmsConsole:
+    Description: URL to view CloudWatch alarms in the AWS Console
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#alarmsV2:?search=${ResourcePrefix}"
+
+  SNSConsole:
+    Description: URL to view SNS topic in the AWS Console
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/sns/v3/home?region=${AWS::Region}#/topic/${CertificateAlertTopic}"
+
+  DeploymentInstructions:
+    Description: Instructions for verifying the deployment
+    Value: |
+      1. Check your email for SNS subscription confirmation and click the confirmation link
+      2. View CloudWatch alarms in the AWS Console using the provided URL
+      3. Test notifications by temporarily lowering the alert threshold
+      4. Monitor certificate expiration status through CloudWatch metrics

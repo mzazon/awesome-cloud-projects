@@ -1,0 +1,452 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Simple Website Uptime Monitoring with Route53 Health Checks and SNS Notifications
+  
+  This template creates a comprehensive uptime monitoring solution that monitors website
+  availability using Route53 health checks and sends email notifications via SNS when
+  downtime is detected. The solution includes CloudWatch alarms for both failure and
+  recovery notifications, providing complete visibility into website status changes.
+  
+  Architecture Components:
+  - Route53 Health Check: Monitors website from multiple global locations
+  - SNS Topic: Provides reliable email notification delivery
+  - CloudWatch Alarms: Trigger notifications based on health check status
+  - Resource Tags: Enable proper cost allocation and organization
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Website Monitoring Configuration"
+        Parameters:
+          - WebsiteURL
+          - AdminEmail
+          - EnvironmentName
+      - Label:
+          default: "Health Check Settings"
+        Parameters:
+          - HealthCheckInterval
+          - FailureThreshold
+          - MonitoringPath
+      - Label:
+          default: "Alarm Configuration"
+        Parameters:
+          - AlarmEvaluationPeriods
+          - RecoveryEvaluationPeriods
+    ParameterLabels:
+      WebsiteURL:
+        default: "Website URL to Monitor"
+      AdminEmail:
+        default: "Administrator Email Address"
+      EnvironmentName:
+        default: "Environment Name"
+      HealthCheckInterval:
+        default: "Health Check Interval (seconds)"
+      FailureThreshold:
+        default: "Failure Threshold"
+      MonitoringPath:
+        default: "Path to Monitor"
+      AlarmEvaluationPeriods:
+        default: "Alarm Evaluation Periods"
+      RecoveryEvaluationPeriods:
+        default: "Recovery Evaluation Periods"
+
+# Input Parameters
+Parameters:
+  WebsiteURL:
+    Type: String
+    Description: |
+      The complete URL of the website to monitor (including protocol).
+      Examples: https://example.com, http://mysite.org
+    Default: "https://example.com"
+    AllowedPattern: "^https?://[a-zA-Z0-9.-]+(?:\\.[a-zA-Z]{2,})+/?.*$"
+    ConstraintDescription: "Must be a valid HTTP or HTTPS URL"
+
+  AdminEmail:
+    Type: String
+    Description: |
+      Email address that will receive uptime monitoring alerts.
+      This email will need to confirm the SNS subscription.
+    AllowedPattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+    ConstraintDescription: "Must be a valid email address"
+
+  EnvironmentName:
+    Type: String
+    Description: |
+      Name of the environment (e.g., Production, Staging, Development).
+      Used for resource naming and tagging.
+    Default: "Production"
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9-]*$"
+    ConstraintDescription: "Must start with a letter and contain only alphanumeric characters and hyphens"
+    MaxLength: 20
+
+  HealthCheckInterval:
+    Type: Number
+    Description: |
+      How often Route53 health checkers request the endpoint (in seconds).
+      Standard interval is 30 seconds, fast interval is 10 seconds (higher cost).
+    Default: 30
+    AllowedValues: [10, 30]
+    ConstraintDescription: "Must be either 10 or 30 seconds"
+
+  FailureThreshold:
+    Type: Number
+    Description: |
+      Number of consecutive health check failures before marking endpoint as unhealthy.
+      Higher values reduce false positives but increase detection time.
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    ConstraintDescription: "Must be between 1 and 10"
+
+  MonitoringPath:
+    Type: String
+    Description: |
+      Path to monitor on the website (relative to domain root).
+      Use "/" to monitor the homepage or "/health" for health check endpoints.
+    Default: "/"
+    AllowedPattern: "^/.*$"
+    ConstraintDescription: "Must start with a forward slash"
+
+  AlarmEvaluationPeriods:
+    Type: Number
+    Description: |
+      Number of periods the metric must breach the threshold before triggering alarm.
+      Higher values reduce false positives.
+    Default: 1
+    MinValue: 1
+    MaxValue: 5
+    ConstraintDescription: "Must be between 1 and 5"
+
+  RecoveryEvaluationPeriods:
+    Type: Number
+    Description: |
+      Number of periods the metric must be healthy before sending recovery notification.
+      Higher values ensure stable recovery before notification.
+    Default: 2
+    MinValue: 1
+    MaxValue: 5
+    ConstraintDescription: "Must be between 1 and 5"
+
+# Conditional Logic
+Conditions:
+  # Determine if the website uses HTTPS
+  IsHTTPS: !Equals [!Select [0, !Split ["://", !Ref WebsiteURL]], "https"]
+  
+  # Check if fast health check interval is selected (impacts cost)
+  IsFastHealthCheck: !Equals [!Ref HealthCheckInterval, 10]
+
+# AWS Resources
+Resources:
+  # SNS Topic for Alert Notifications
+  UptimeAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${EnvironmentName}-website-uptime-alerts"
+      DisplayName: !Sub "${EnvironmentName} Website Uptime Monitoring"
+      Description: |
+        SNS topic for website uptime monitoring alerts and recovery notifications.
+        Delivers real-time notifications when website availability changes.
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-uptime-alerts-topic"
+        - Key: Purpose
+          Value: "UptimeMonitoring"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: "CloudFormation"
+        - Key: Website
+          Value: !Ref WebsiteURL
+
+  # Email Subscription for Admin Notifications
+  AdminEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref UptimeAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AdminEmail
+      # Note: Email subscriptions require manual confirmation
+      # The admin will receive a confirmation email that must be clicked
+
+  # Route53 Health Check for Website Monitoring
+  WebsiteHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      Type: !If [IsHTTPS, "HTTPS", "HTTP"]
+      ResourcePath: !Ref MonitoringPath
+      FullyQualifiedDomainName: !Select [1, !Split ["://", !Select [0, !Split ["/", !Ref WebsiteURL]]]]
+      Port: !If [IsHTTPS, 443, 80]
+      RequestInterval: !Ref HealthCheckInterval
+      FailureThreshold: !Ref FailureThreshold
+      EnableSNI: !If [IsHTTPS, true, false]
+      # Measure latency to track performance trends
+      MeasureLatency: true
+      # Additional health check configurations for reliability
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-website-health-check"
+        - Key: Website
+          Value: !Ref WebsiteURL
+        - Key: Purpose
+          Value: "UptimeMonitoring"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: "CloudFormation"
+        - Key: MonitoringPath
+          Value: !Ref MonitoringPath
+        - Key: CheckInterval
+          Value: !Sub "${HealthCheckInterval}s"
+
+  # CloudWatch Alarm for Website Downtime Detection
+  WebsiteDownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-Website-Down-Alert"
+      AlarmDescription: !Sub |
+        Critical Alert: Website ${WebsiteURL} is currently down or unreachable.
+        
+        This alarm triggers when Route53 health checks detect that the website
+        has failed ${FailureThreshold} consecutive checks from multiple global locations.
+        
+        Immediate action required to investigate and resolve the outage.
+      
+      # Route53 health check metrics configuration
+      MetricName: HealthCheckStatus
+      Namespace: AWS/Route53
+      Statistic: Minimum
+      Period: 60
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      TreatMissingData: breaching
+      
+      # Link alarm to health check
+      Dimensions:
+        - Name: HealthCheckId
+          Value: !Ref WebsiteHealthCheck
+      
+      # Notification actions
+      AlarmActions:
+        - !Ref UptimeAlertsTopic
+      OKActions:
+        - !Ref UptimeAlertsTopic
+      
+      # Resource tags
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-website-down-alarm"
+        - Key: Purpose
+          Value: "UptimeMonitoring"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: "CloudFormation"
+        - Key: Severity
+          Value: "Critical"
+        - Key: Website
+          Value: !Ref WebsiteURL
+
+  # CloudWatch Alarm for Website Recovery Notification
+  WebsiteRecoveryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-Website-Recovery-Alert"
+      AlarmDescription: !Sub |
+        Recovery Notice: Website ${WebsiteURL} has been restored and is now accessible.
+        
+        This alarm triggers when Route53 health checks confirm that the website
+        has successfully responded for ${RecoveryEvaluationPeriods} consecutive evaluation periods,
+        indicating stable recovery from the previous outage.
+        
+        Service restoration confirmed across multiple global monitoring locations.
+      
+      # Route53 health check metrics configuration
+      MetricName: HealthCheckStatus
+      Namespace: AWS/Route53
+      Statistic: Minimum
+      Period: 60
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: !Ref RecoveryEvaluationPeriods
+      TreatMissingData: breaching
+      
+      # Link alarm to health check
+      Dimensions:
+        - Name: HealthCheckId
+          Value: !Ref WebsiteHealthCheck
+      
+      # Notification actions (only send recovery notifications)
+      AlarmActions:
+        - !Ref UptimeAlertsTopic
+      
+      # Resource tags
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-website-recovery-alarm"
+        - Key: Purpose
+          Value: "UptimeMonitoring"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: "CloudFormation"
+        - Key: Severity
+          Value: "Informational"
+        - Key: Website
+          Value: !Ref WebsiteURL
+
+  # CloudWatch Alarm for High Response Time (Optional Enhancement)
+  WebsiteLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-Website-High-Latency-Alert"
+      AlarmDescription: !Sub |
+        Performance Warning: Website ${WebsiteURL} is experiencing high response times.
+        
+        This alarm triggers when the average response time exceeds 5 seconds,
+        which may indicate performance degradation or capacity issues that
+        could lead to user experience problems.
+        
+        Consider investigating server performance, database queries, or CDN configuration.
+      
+      # Route53 connection time metrics
+      MetricName: ConnectionTime
+      Namespace: AWS/Route53
+      Statistic: Average
+      Period: 300
+      Threshold: 5000  # 5 seconds in milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      TreatMissingData: notBreaching
+      
+      # Link alarm to health check
+      Dimensions:
+        - Name: HealthCheckId
+          Value: !Ref WebsiteHealthCheck
+      
+      # Notification actions
+      AlarmActions:
+        - !Ref UptimeAlertsTopic
+      OKActions:
+        - !Ref UptimeAlertsTopic
+      
+      # Resource tags
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-website-latency-alarm"
+        - Key: Purpose
+          Value: "PerformanceMonitoring"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: "CloudFormation"
+        - Key: Severity
+          Value: "Warning"
+        - Key: Website
+          Value: !Ref WebsiteURL
+
+# Stack Outputs
+Outputs:
+  # SNS Topic Information
+  SNSTopicArn:
+    Description: |
+      ARN of the SNS topic used for uptime monitoring notifications.
+      Use this ARN to add additional subscriptions (SMS, webhooks, etc.).
+    Value: !Ref UptimeAlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNS-Topic-ARN"
+
+  SNSTopicName:
+    Description: "Name of the SNS topic for uptime monitoring alerts"
+    Value: !GetAtt UptimeAlertsTopic.TopicName
+    Export:
+      Name: !Sub "${AWS::StackName}-SNS-Topic-Name"
+
+  # Route53 Health Check Information
+  HealthCheckId:
+    Description: |
+      ID of the Route53 health check monitoring the website.
+      Use this ID to view health check status and metrics in AWS Console.
+    Value: !Ref WebsiteHealthCheck
+    Export:
+      Name: !Sub "${AWS::StackName}-Health-Check-ID"
+
+  HealthCheckURL:
+    Description: "Complete URL being monitored by the health check"
+    Value: !Sub |
+      ${WebsiteURL}${MonitoringPath}
+    Export:
+      Name: !Sub "${AWS::StackName}-Monitored-URL"
+
+  # CloudWatch Alarm Information
+  DowntimeAlarmName:
+    Description: |
+      Name of the CloudWatch alarm that triggers when website is down.
+      Use this to view alarm history and status in CloudWatch console.
+    Value: !Ref WebsiteDownAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-Downtime-Alarm-Name"
+
+  RecoveryAlarmName:
+    Description: |
+      Name of the CloudWatch alarm that triggers when website recovers.
+      Provides confirmation when service is restored.
+    Value: !Ref WebsiteRecoveryAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-Recovery-Alarm-Name"
+
+  LatencyAlarmName:
+    Description: |
+      Name of the CloudWatch alarm that monitors website response time.
+      Helps detect performance issues before complete outages.
+    Value: !Ref WebsiteLatencyAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-Latency-Alarm-Name"
+
+  # Monitoring Configuration Summary
+  MonitoringConfiguration:
+    Description: |
+      Summary of the monitoring configuration deployed by this stack.
+      Review these settings to ensure they meet your requirements.
+    Value: !Sub |
+      Website: ${WebsiteURL}${MonitoringPath}
+      Check Interval: ${HealthCheckInterval} seconds
+      Failure Threshold: ${FailureThreshold} failures
+      Protocol: ${!If [IsHTTPS, "HTTPS", "HTTP"]}
+      Admin Email: ${AdminEmail}
+      Environment: ${EnvironmentName}
+
+  # Cost Estimation Information
+  EstimatedMonthlyCost:
+    Description: |
+      Estimated monthly cost for this monitoring solution (USD).
+      Actual costs may vary based on usage and AWS pricing changes.
+    Value: !Sub |
+      Health Check: $${!If [IsFastHealthCheck, "1.00", "0.50"]}
+      SNS Notifications: $0.50 (estimated for 100 notifications)
+      CloudWatch Alarms: $0.30 (3 alarms)
+      Total Estimated: $${!If [IsFastHealthCheck, "1.80", "1.30"]} per month
+
+  # Next Steps Information
+  DeploymentInstructions:
+    Description: |
+      Important next steps to complete the monitoring setup.
+      Follow these instructions to activate email notifications.
+    Value: !Sub |
+      1. Check email (${AdminEmail}) for SNS subscription confirmation
+      2. Click the confirmation link to activate email notifications
+      3. Monitor CloudWatch console for alarm status
+      4. Test the system by temporarily blocking the website (optional)
+      5. Review Route53 health check metrics for baseline performance
+
+  # AWS Console Links (for convenience)
+  AWSConsoleLinks:
+    Description: |
+      Direct links to AWS console resources for monitoring and management.
+      Bookmark these for quick access to monitoring dashboards.
+    Value: !Sub |
+      Route53 Health Checks: https://console.aws.amazon.com/route53/healthchecks/home#/
+      CloudWatch Alarms: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#alarmsV2:
+      SNS Topics: https://console.aws.amazon.com/sns/v3/home?region=${AWS::Region}#/topics

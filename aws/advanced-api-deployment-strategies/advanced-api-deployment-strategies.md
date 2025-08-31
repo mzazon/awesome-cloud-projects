@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: API Gateway, Lambda, CloudWatch, Route 53
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: api-gateway, deployment, blue-green, canary, serverless
 recipe-generator-version: 1.3
@@ -202,7 +202,7 @@ echo "✅ Environment prepared with API name: ${API_NAME}"
    zip blue-function.zip blue-function.py
    aws lambda create-function \
        --function-name ${BLUE_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler blue-function.lambda_handler \
        --zip-file fileb://blue-function.zip \
@@ -212,7 +212,7 @@ echo "✅ Environment prepared with API name: ${API_NAME}"
    zip green-function.zip green-function.py
    aws lambda create-function \
        --function-name ${GREEN_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler green-function.lambda_handler \
        --zip-file fileb://green-function.zip \
@@ -464,18 +464,24 @@ echo "✅ Environment prepared with API name: ${API_NAME}"
        echo "Monitoring for 2 minutes..."
        sleep 120
        
-       # Check error rates
+       # Check error rates using compatible date command
+       local start_time=$(date -u -d '5 minutes ago' '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || \
+                          date -u -v-5M '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || \
+                          date -u '+%Y-%m-%dT%H:%M:%S')
+       local end_time=$(date -u '+%Y-%m-%dT%H:%M:%S')
+       
        local error_count=$(aws cloudwatch get-metric-statistics \
            --namespace AWS/ApiGateway \
            --metric-name 5XXError \
            --dimensions Name=ApiName,Value=${API_NAME} Name=Stage,Value=production \
-           --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S) \
-           --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+           --start-time ${start_time} \
+           --end-time ${end_time} \
            --period 300 \
            --statistics Sum \
            --query 'Datapoints[0].Sum' --output text 2>/dev/null || echo "0")
        
-       if [ "${error_count}" != "null" ] && [ "${error_count}" != "None" ] && [ $(echo "${error_count} > 0" | bc) -eq 1 ]; then
+       if [ "${error_count}" != "null" ] && [ "${error_count}" != "None" ] && \
+          [ "${error_count}" != "0" ] && [ -n "${error_count}" ]; then
            echo "❌ Error detected! Rolling back..."
            rollback_deployment
            return 1
@@ -634,8 +640,9 @@ echo "✅ Environment prepared with API name: ${API_NAME}"
        --namespace AWS/ApiGateway \
        --metric-name Count \
        --dimensions Name=ApiName,Value=${API_NAME} Name=Stage,Value=production \
-       --start-time $(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%S) \
-       --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+       --start-time $(date -u -d '10 minutes ago' '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || \
+                     date -u -v-10M '+%Y-%m-%dT%H:%M:%S') \
+       --end-time $(date -u '+%Y-%m-%dT%H:%M:%S') \
        --period 300 \
        --statistics Sum
    ```
@@ -718,29 +725,29 @@ echo "✅ Environment prepared with API name: ${API_NAME}"
 
 This recipe demonstrates sophisticated API Gateway deployment strategies that are essential for enterprise-grade applications. The implementation combines blue-green deployments with canary releases to provide multiple layers of risk mitigation during API updates.
 
-**Blue-Green Deployment Benefits**: This pattern maintains two identical production environments, allowing instant rollback capabilities and zero-downtime deployments. The blue environment serves current production traffic while the green environment hosts the new version. Once validated, traffic switches completely to green, making blue available for the next deployment cycle.
+**Blue-Green Deployment Benefits**: This pattern maintains two identical production environments, allowing instant rollback capabilities and zero-downtime deployments. The blue environment serves current production traffic while the green environment hosts the new version. Once validated, traffic switches completely to green, making blue available for the next deployment cycle. This approach follows AWS Well-Architected Framework principles for operational excellence and reliability.
 
-**Canary Release Strategy**: By gradually shifting traffic percentages (10% → 25% → 50% → 100%), canary deployments enable early detection of issues with minimal user impact. The automated monitoring integration with CloudWatch alarms provides objective criteria for promotion or rollback decisions based on error rates and latency metrics.
+**Canary Release Strategy**: By gradually shifting traffic percentages (10% → 25% → 50% → 100%), canary deployments enable early detection of issues with minimal user impact. The automated monitoring integration with CloudWatch alarms provides objective criteria for promotion or rollback decisions based on error rates and latency metrics. This progressive approach aligns with AWS best practices for continuous deployment and risk management.
 
-**Advanced Monitoring Integration**: The CloudWatch alarms monitor critical metrics including 4XX/5XX error rates and response latency. These metrics drive automated decision-making in the deployment pipeline, ensuring that problematic deployments are detected and rolled back before affecting a significant portion of users. The integration with API Gateway's built-in metrics provides comprehensive visibility into API performance and health.
+**Advanced Monitoring Integration**: The CloudWatch alarms monitor critical metrics including 4XX/5XX error rates and response latency. These metrics drive automated decision-making in the deployment pipeline, ensuring that problematic deployments are detected and rolled back before affecting a significant portion of users. The integration with API Gateway's built-in metrics provides comprehensive visibility into API performance and health, supporting the reliability pillar of the AWS Well-Architected Framework.
 
-**Production Considerations**: For production use, consider implementing additional features such as custom domain names with SSL certificates, API keys for authentication, request/response logging to CloudWatch Logs, and integration with CI/CD pipelines. The deployment automation script provides a foundation for integration with tools like AWS CodePipeline, Jenkins, or GitHub Actions.
+**Production Considerations**: For production use, consider implementing additional features such as custom domain names with AWS Certificate Manager SSL certificates, API keys for authentication, request/response logging to CloudWatch Logs, and integration with CI/CD pipelines using AWS CodePipeline. The deployment automation script provides a foundation for integration with tools like Jenkins or GitHub Actions, enabling enterprise-scale deployment automation.
 
-> **Tip**: Use API Gateway's stage variables to parameterize backend integrations, enabling dynamic configuration changes without requiring new deployments.
+> **Tip**: Use API Gateway's stage variables to parameterize backend integrations, enabling dynamic configuration changes without requiring new deployments. This approach follows AWS best practices for environment-specific configuration management.
 
 ## Challenge
 
 Extend this deployment strategy by implementing these advanced features:
 
-1. **Multi-Region Deployment**: Implement cross-region blue-green deployments using Route 53 health checks and weighted routing policies for global API availability and disaster recovery.
+1. **Multi-Region Deployment**: Implement cross-region blue-green deployments using Route 53 health checks and weighted routing policies for global API availability and disaster recovery scenarios.
 
-2. **Automated Testing Integration**: Add automated testing phases to the deployment pipeline including smoke tests, integration tests, and load tests that must pass before traffic shifting continues.
+2. **Automated Testing Integration**: Add automated testing phases to the deployment pipeline including smoke tests, integration tests, and load tests that must pass before traffic shifting continues, using AWS CodeBuild or Lambda functions.
 
-3. **Custom Domain Management**: Integrate SSL certificate management with AWS Certificate Manager and implement custom domain switching for true blue-green URL swapping.
+3. **Custom Domain Management**: Integrate SSL certificate management with AWS Certificate Manager and implement custom domain switching for true blue-green URL swapping with Route 53 alias records.
 
-4. **Advanced Metrics and Dashboards**: Create custom CloudWatch dashboards with business metrics, implement custom metrics from Lambda functions, and integrate with AWS X-Ray for distributed tracing.
+4. **Advanced Metrics and Dashboards**: Create custom CloudWatch dashboards with business metrics, implement custom metrics from Lambda functions using CloudWatch embedded metrics format, and integrate with AWS X-Ray for distributed tracing.
 
-5. **Database Migration Coordination**: Extend the pattern to handle database schema migrations and data consistency requirements during blue-green deployments with backward compatibility strategies.
+5. **Database Migration Coordination**: Extend the pattern to handle database schema migrations and data consistency requirements during blue-green deployments with backward compatibility strategies using AWS Database Migration Service.
 
 ## Infrastructure Code
 

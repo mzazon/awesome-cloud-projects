@@ -6,10 +6,10 @@ difficulty: 400
 subject: aws
 services: managed-blockchain, lambda, eventbridge, s3
 estimated-time: 240 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: blockchain, cross-organization, data-sharing, hyperledger-fabric, smart-contracts, event-driven, audit-trail, compliance
 recipe-generator-version: 1.3
@@ -150,24 +150,24 @@ echo "✅ Environment prepared with network: ${NETWORK_NAME}"
 
 1. **Create Multi-Organization Blockchain Network**:
 
-   This step establishes the foundational blockchain network using Amazon Managed Blockchain with Hyperledger Fabric. The network requires a voting policy that defines how decisions are made across participating organizations, ensuring democratic governance.
+   [Amazon Managed Blockchain with Hyperledger Fabric](https://docs.aws.amazon.com/managed-blockchain/latest/hyperledger-fabric-dev/what-is-managed-blockchain.html) provides enterprise-grade blockchain infrastructure that eliminates the complexity of setting up blockchain nodes and network management. This step establishes the foundational blockchain network with democratic governance through voting policies that define how decisions are made across participating organizations.
 
    ```bash
    # Create the initial blockchain network with voting policy
-   # The 66% threshold ensures that a supermajority is required for network changes
+   # The 50% threshold ensures democratic governance for network changes
    NETWORK_ID=$(aws managedblockchain create-network \
        --name ${NETWORK_NAME} \
        --description "Cross-Organization Data Sharing Network" \
        --framework HYPERLEDGER_FABRIC \
        --framework-version 2.2 \
        --framework-configuration '{
-           "NetworkFabricConfiguration": {
+           "Fabric": {
                "Edition": "STANDARD"
            }
        }' \
        --voting-policy '{
            "ApprovalThresholdPolicy": {
-               "ThresholdPercentage": 66,
+               "ThresholdPercentage": 50,
                "ProposalDurationInHours": 24,
                "ThresholdComparator": "GREATER_THAN"
            }
@@ -175,9 +175,11 @@ echo "✅ Environment prepared with network: ${NETWORK_NAME}"
        --member-configuration '{
            "Name": "'${ORG_A_MEMBER}'",
            "Description": "Financial Institution Member",
-           "MemberFabricConfiguration": {
-               "AdminUsername": "admin",
-               "AdminPassword": "TempPassword123!"
+           "FrameworkConfiguration": {
+               "Fabric": {
+                   "AdminUsername": "admin",
+                   "AdminPassword": "TempPassword123!"
+               }
            }
        }' \
        --query 'NetworkId' --output text)
@@ -186,9 +188,11 @@ echo "✅ Environment prepared with network: ${NETWORK_NAME}"
    echo "✅ Created blockchain network: ${NETWORK_ID}"
    ```
 
+   The blockchain network is now initializing with the first organization as a founding member. This establishes the network governance structure and creates the cryptographic foundation needed for secure multi-organization data sharing operations.
+
 2. **Wait for Network Creation and Setup First Organization**:
 
-   Network creation is an asynchronous process that can take several minutes. We use the AWS CLI wait command to ensure the network is fully provisioned before proceeding with member operations.
+   Network creation is an asynchronous process that provisions the Hyperledger Fabric ordering service and establishes the network infrastructure. The AWS CLI wait command ensures the network is fully operational before proceeding with additional member operations.
 
    ```bash
    # Wait for network to be active
@@ -205,9 +209,11 @@ echo "✅ Environment prepared with network: ${NETWORK_NAME}"
    echo "✅ Organization A Member ID: ${ORG_A_MEMBER_ID}"
    ```
 
+   Organization A is now an active member of the blockchain network with established cryptographic identity and governance rights. This membership enables the organization to participate in network decisions, create peer nodes, and initiate data sharing agreements with other members.
+
 3. **Create Peer Nodes for Organization A**:
 
-   [Peer nodes](https://docs.aws.amazon.com/managed-blockchain/latest/hyperledger-fabric-dev/managed-blockchain-hyperledger-peer-nodes.html) are the backbone of Hyperledger Fabric networks, maintaining local copies of the blockchain ledger and executing smart contracts. Each organization requires at least one peer node to participate in blockchain operations, validate transactions, and maintain data integrity. The peer node acts as the organization's gateway to the blockchain network, enabling secure communication with other members while maintaining organizational autonomy.
+   [Peer nodes](https://docs.aws.amazon.com/managed-blockchain/latest/hyperledger-fabric-dev/managed-blockchain-hyperledger-peer-nodes.html) are the computational backbone of Hyperledger Fabric networks, maintaining local copies of the blockchain ledger and executing smart contracts. Each organization requires at least one peer node to participate in blockchain operations, validate transactions, and maintain data integrity while ensuring organizational autonomy in the distributed network architecture.
 
    ```bash
    # Create primary peer node for Organization A
@@ -231,15 +237,15 @@ echo "✅ Environment prepared with network: ${NETWORK_NAME}"
    echo "✅ Created Organization A peer node: ${ORG_A_NODE_ID}"
    ```
 
-   The peer node is now operational and ready to participate in blockchain transactions. This establishes Organization A's presence on the network and provides the computational resources needed for chaincode execution and ledger maintenance. The bc.t3.medium instance type provides sufficient resources for development and testing workloads while maintaining cost efficiency.
+   The peer node is now operational and ready to participate in blockchain transactions. This establishes Organization A's computational presence on the network with sufficient resources for chaincode execution and ledger maintenance. The bc.t3.medium instance type provides balanced performance for development and testing workloads while maintaining cost efficiency.
 
 4. **Invite Second Organization to Network**:
 
-   In a multi-organization blockchain network, new members must be invited through a [democratic proposal process](https://docs.aws.amazon.com/managed-blockchain/latest/hyperledger-fabric-dev/get-started-joint-channel.html). This ensures that existing members can evaluate and approve new participants before they join the network.
+   In multi-organization blockchain networks, new members join through a [democratic proposal process](https://docs.aws.amazon.com/managed-blockchain/latest/hyperledger-fabric-dev/get-started-joint-channel.html) that ensures existing members can evaluate and approve new participants. This governance mechanism maintains network integrity and trust relationships between organizations.
 
    ```bash
    # Create member proposal for Organization B
-   # Proposals allow democratic governance of network membership
+   # Democratic proposals ensure network governance and member approval
    PROPOSAL_ID=$(aws managedblockchain create-proposal \
        --network-id ${NETWORK_ID} \
        --member-id ${ORG_A_MEMBER_ID} \
@@ -265,11 +271,13 @@ echo "✅ Environment prepared with network: ${NETWORK_NAME}"
    echo "✅ Created and voted on proposal: ${PROPOSAL_ID}"
    ```
 
+   The invitation proposal has been created and approved, establishing the governance pathway for Organization B to join the network. This democratic process ensures that all network changes are transparent and require member consensus, maintaining trust and security in the cross-organizational environment.
+
    > **Warning**: In production environments, ensure proper identity verification and due diligence before inviting organizations to your blockchain network. Refer to [AWS Managed Blockchain security best practices](https://docs.aws.amazon.com/managed-blockchain/latest/managementguide/managed-blockchain-security.html).
 
 5. **Accept Invitation and Create Organization B**:
 
-   The invitation acceptance process is crucial for establishing trust relationships between organizations in a blockchain network. This step transforms the approved proposal into an active membership, enabling the second organization to participate in network governance and data sharing operations. The member configuration establishes the organization's identity and administrative credentials within the Hyperledger Fabric network.
+   The invitation acceptance process establishes trust relationships between organizations in the blockchain network. This step transforms the approved proposal into active membership, enabling the second organization to participate in network governance and data sharing operations while maintaining its independent cryptographic identity.
 
    ```bash
    # Wait for proposal to be approved
@@ -286,9 +294,11 @@ echo "✅ Environment prepared with network: ${NETWORK_NAME}"
        --member-configuration '{
            "Name": "'${ORG_B_MEMBER}'",
            "Description": "Healthcare Provider Member",
-           "MemberFabricConfiguration": {
-               "AdminUsername": "admin",
-               "AdminPassword": "TempPassword123!"
+           "FrameworkConfiguration": {
+               "Fabric": {
+                   "AdminUsername": "admin",
+                   "AdminPassword": "TempPassword123!"
+               }
            }
        }' \
        --query 'MemberId' --output text)
@@ -297,11 +307,11 @@ echo "✅ Environment prepared with network: ${NETWORK_NAME}"
    echo "✅ Created Organization B member: ${ORG_B_MEMBER_ID}"
    ```
 
-   Organization B is now an active member of the blockchain network with its own unique identity and cryptographic certificates. This establishes the healthcare provider's autonomous presence in the network, enabling it to participate in data sharing agreements while maintaining independent control over its operations and data.
+   Organization B is now an active member of the blockchain network with its own unique cryptographic identity and administrative credentials. This establishes the healthcare provider's autonomous presence in the network, enabling participation in data sharing agreements while maintaining independent control over operations and sensitive data.
 
 6. **Create Peer Node for Organization B**:
 
-   Each organization requires its own peer node infrastructure to maintain network decentralization and ensure data sovereignty. Organization B's peer node will operate independently from Organization A, maintaining its own copy of the blockchain ledger and executing smart contracts from the healthcare provider's perspective. This distributed architecture ensures that no single organization has centralized control over the network.
+   Each organization requires independent peer node infrastructure to maintain network decentralization and ensure data sovereignty. Organization B's peer node operates autonomously from Organization A, maintaining its own copy of the blockchain ledger and executing smart contracts from the healthcare provider's perspective, ensuring no single organization has centralized control.
 
    ```bash
    # Create peer node for Organization B
@@ -325,17 +335,17 @@ echo "✅ Environment prepared with network: ${NETWORK_NAME}"
    echo "✅ Created Organization B peer node: ${ORG_B_NODE_ID}"
    ```
 
-   The multi-organization blockchain network is now fully operational with both organizations running independent peer nodes. This configuration enables secure, peer-to-peer data sharing while maintaining organizational autonomy and providing the redundancy necessary for enterprise-grade blockchain operations. The network is ready for chaincode deployment and cross-organization data sharing agreements.
+   The multi-organization blockchain network is now fully operational with both organizations running independent peer nodes. This distributed architecture enables secure, peer-to-peer data sharing while maintaining organizational autonomy and providing the redundancy necessary for enterprise-grade blockchain operations ready for chaincode deployment and cross-organization data sharing agreements.
 
 7. **Create Cross-Organization Data Sharing Chaincode**:
 
-   Chaincode (smart contracts) defines the business logic for data sharing operations on the blockchain. This chaincode implements access controls, audit logging, and data sharing agreements that automatically enforce policies across all participating organizations.
+   [Chaincode (smart contracts)](https://docs.aws.amazon.com/managed-blockchain/latest/hyperledger-fabric-dev/managed-blockchain-hyperledger-develop-chaincode.html) defines the business logic for data sharing operations on the blockchain. This chaincode implements comprehensive access controls, audit logging, and data sharing agreements that automatically enforce policies across all participating organizations while maintaining immutable transaction records.
 
    ```bash
    # Create chaincode directory and files
    mkdir -p chaincode/cross-org-data-sharing
 
-   # Create package.json for chaincode
+   # Create package.json for chaincode dependencies
    cat > chaincode/cross-org-data-sharing/package.json << 'EOF'
 {
   "name": "cross-org-data-sharing-chaincode",
@@ -348,7 +358,7 @@ echo "✅ Environment prepared with network: ${NETWORK_NAME}"
 }
 EOF
 
-   # Create main chaincode file with data sharing logic
+   # Create main chaincode file with comprehensive data sharing logic
    cat > chaincode/cross-org-data-sharing/index.js << 'EOF'
 const { Contract } = require('fabric-contract-api');
 
@@ -478,7 +488,7 @@ class CrossOrgDataSharingContract extends Contract {
         return JSON.stringify(dataRecord);
     }
     
-    // Access shared data (with access logging)
+    // Access shared data (with comprehensive access logging)
     async accessSharedData(ctx, agreementId, dataId) {
         const dataKey = `DATA_${agreementId}_${dataId}`;
         const dataBytes = await ctx.stub.getState(dataKey);
@@ -494,7 +504,7 @@ class CrossOrgDataSharingContract extends Contract {
             throw new Error(`Organization ${accessorOrg} is not authorized to access this data`);
         }
         
-        // Log the access
+        // Log the access with comprehensive audit trail
         dataRecord.accessHistory.push({
             accessedBy: accessorOrg,
             accessedAt: new Date().toISOString(),
@@ -552,7 +562,7 @@ class CrossOrgDataSharingContract extends Contract {
         return JSON.stringify(agreements);
     }
     
-    // Get audit trail for an agreement
+    // Get comprehensive audit trail for an agreement
     async getAgreementAuditTrail(ctx, agreementId) {
         const agreementBytes = await ctx.stub.getState(agreementId);
         if (!agreementBytes || agreementBytes.length === 0) {
@@ -577,27 +587,30 @@ class CrossOrgDataSharingContract extends Contract {
 module.exports = CrossOrgDataSharingContract;
 EOF
 
-   # Package chaincode
+   # Package chaincode with proper dependencies
    cd chaincode/cross-org-data-sharing
-   npm init -y
    npm install fabric-contract-api
    cd ../..
 
-   # Create chaincode archive
-   tar -czf cross-org-data-sharing-chaincode.tar.gz -C chaincode cross-org-data-sharing/
+   # Create chaincode archive for deployment
+   tar -czf cross-org-data-sharing-chaincode.tar.gz \
+       -C chaincode cross-org-data-sharing/
 
-   # Upload chaincode to S3
-   aws s3 cp cross-org-data-sharing-chaincode.tar.gz s3://${BUCKET_NAME}/
+   # Upload chaincode to S3 for network deployment
+   aws s3 cp cross-org-data-sharing-chaincode.tar.gz \
+       s3://${BUCKET_NAME}/
 
    echo "✅ Created and uploaded cross-organization data sharing chaincode"
    ```
 
+   The chaincode is now packaged and uploaded, ready for deployment across the blockchain network. This smart contract establishes the business logic foundation for secure, auditable data sharing between organizations with comprehensive access controls and immutable audit trails.
+
 8. **Create Lambda Function for Data Validation and Event Processing**:
 
-   AWS Lambda provides serverless event processing that seamlessly integrates with blockchain operations, enabling real-time response to data sharing events. This Lambda function serves as the bridge between the blockchain network and AWS services, automatically processing chaincode events, validating data integrity, and maintaining audit trails. The serverless architecture ensures cost-effective processing that scales automatically with blockchain activity while providing the flexibility to implement complex business logic for compliance and monitoring.
+   [AWS Lambda](https://docs.aws.amazon.com/lambda/latest/dg/lambda-nodejs.html) provides serverless event processing that seamlessly integrates with blockchain operations, enabling real-time response to data sharing events. This Lambda function serves as the bridge between the blockchain network and AWS services, automatically processing chaincode events, validating data integrity, and maintaining comprehensive audit trails with cost-effective, auto-scaling processing.
 
    ```bash
-   # Create Lambda function code for data validation
+   # Create Lambda function code for blockchain event processing
    cat > lambda-function.js << 'EOF'
 const AWS = require('aws-sdk');
 
@@ -609,7 +622,7 @@ exports.handler = async (event) => {
     try {
         console.log('Processing blockchain event:', JSON.stringify(event, null, 2));
         
-        // Extract blockchain event data
+        // Extract and validate blockchain event data
         const blockchainEvent = {
             eventType: event.eventType || 'UNKNOWN',
             agreementId: event.agreementId,
@@ -619,12 +632,12 @@ exports.handler = async (event) => {
             metadata: event.metadata || {}
         };
         
-        // Validate event data
+        // Validate required event data
         if (!blockchainEvent.agreementId) {
-            throw new Error('Agreement ID is required');
+            throw new Error('Agreement ID is required for all blockchain events');
         }
         
-        // Store audit trail in DynamoDB
+        // Store comprehensive audit trail in DynamoDB
         const auditRecord = {
             TransactionId: `${blockchainEvent.agreementId}-${blockchainEvent.timestamp}`,
             Timestamp: blockchainEvent.timestamp,
@@ -640,7 +653,7 @@ exports.handler = async (event) => {
             Item: auditRecord
         }).promise();
         
-        // Process different event types
+        // Process different event types with specialized handlers
         switch (blockchainEvent.eventType) {
             case 'DataSharingAgreementCreated':
                 await processAgreementCreated(blockchainEvent);
@@ -658,7 +671,7 @@ exports.handler = async (event) => {
                 console.log(`Unknown event type: ${blockchainEvent.eventType}`);
         }
         
-        // Send notification via EventBridge
+        // Send notification via EventBridge for cross-service integration
         await eventbridge.putEvents({
             Entries: [{
                 Source: 'cross-org.blockchain',
@@ -685,7 +698,7 @@ exports.handler = async (event) => {
 async function processAgreementCreated(event) {
     console.log(`Processing agreement creation: ${event.agreementId}`);
     
-    // Create metadata record in S3
+    // Create metadata record in S3 for agreement tracking
     const metadata = {
         agreementId: event.agreementId,
         creator: event.organizationId,
@@ -705,21 +718,21 @@ async function processAgreementCreated(event) {
 async function processOrganizationJoined(event) {
     console.log(`Processing organization join: ${event.organizationId} to ${event.agreementId}`);
     
-    // Update participant notification
+    // Update participant notifications for compliance monitoring
     // In production, this would send targeted notifications to all participants
 }
 
 async function processDataShared(event) {
     console.log(`Processing data sharing: ${event.dataId} in ${event.agreementId}`);
     
-    // Validate data integrity and compliance
+    // Validate data integrity and compliance requirements
     // In production, this would perform additional validation checks
 }
 
 async function processDataAccessed(event) {
     console.log(`Processing data access: ${event.dataId} by ${event.organizationId}`);
     
-    // Log access for compliance and audit purposes
+    // Log access for comprehensive compliance and audit purposes
     // In production, this would trigger additional compliance checks
 }
 EOF
@@ -727,7 +740,7 @@ EOF
    # Create Lambda deployment package
    zip lambda-function.zip lambda-function.js
 
-   # Create Lambda execution role
+   # Create Lambda execution role with comprehensive permissions
    cat > lambda-trust-policy.json << 'EOF'
 {
   "Version": "2012-10-17",
@@ -747,7 +760,7 @@ EOF
        --role-name CrossOrgDataSharingLambdaRole \
        --assume-role-policy-document file://lambda-trust-policy.json || true
 
-   # Attach policies to Lambda role
+   # Attach necessary policies to Lambda role for blockchain operations
    aws iam attach-role-policy \
        --role-name CrossOrgDataSharingLambdaRole \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
@@ -767,10 +780,10 @@ EOF
    # Wait for role propagation
    sleep 10
 
-   # Create Lambda function
+   # Create Lambda function with latest Node.js runtime
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime nodejs18.x \
+       --runtime nodejs20.x \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/CrossOrgDataSharingLambdaRole \
        --handler lambda-function.handler \
        --zip-file fileb://lambda-function.zip \
@@ -781,14 +794,14 @@ EOF
    echo "✅ Created Lambda function for cross-organization data processing"
    ```
 
-   The Lambda function is now deployed and ready to process blockchain events in real-time. This establishes the event-driven architecture that enables automatic compliance monitoring, audit trail creation, and cross-organization notifications. The function's integration with DynamoDB, S3, and EventBridge creates a comprehensive data pipeline that transforms blockchain events into actionable business insights and regulatory compliance records.
+   The Lambda function is now deployed and ready to process blockchain events in real-time. This establishes the event-driven architecture that enables automatic compliance monitoring, audit trail creation, and cross-organization notifications with seamless integration between blockchain operations and AWS cloud services.
 
 9. **Create EventBridge Rules for Cross-Organization Notifications**:
 
-   Amazon EventBridge provides enterprise-grade event routing that enables real-time notifications across organizations when blockchain events occur. This step creates event rules that automatically trigger notifications when data sharing agreements are created, organizations join networks, or data access events occur. The integration with SNS enables multi-channel notifications including email, SMS, and webhook endpoints, ensuring that stakeholders across different organizations stay informed about critical blockchain activities.
+   [Amazon EventBridge](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-run-lambda-schedule.html) provides enterprise-grade event routing that enables real-time notifications across organizations when blockchain events occur. This step creates sophisticated event rules that automatically trigger notifications for data sharing agreements, organization membership changes, and data access events with multi-channel delivery capabilities.
 
    ```bash
-   # Create EventBridge rule for data sharing events
+   # Create EventBridge rule for comprehensive data sharing events
    aws events put-rule \
        --name CrossOrgDataSharingRule \
        --description "Rule for cross-organization data sharing events" \
@@ -808,7 +821,7 @@ EOF
        --name cross-org-notifications \
        --query 'TopicArn' --output text)
 
-   # Add EventBridge target to SNS topic
+   # Configure EventBridge target to SNS topic for notifications
    aws events put-targets \
        --rule CrossOrgDataSharingRule \
        --targets "Id"="1","Arn"="${TOPIC_ARN}"
@@ -824,11 +837,11 @@ EOF
    echo "✅ Created EventBridge rules for cross-organization notifications"
    ```
 
-   The event-driven notification system is now operational, providing real-time visibility into blockchain activities across all participating organizations. This architecture enables immediate response to data sharing events, ensuring that compliance officers, data stewards, and business stakeholders receive timely notifications about critical blockchain operations. The system forms the foundation for automated compliance monitoring and audit trail management.
+   The event-driven notification system is now operational, providing real-time visibility into blockchain activities across all participating organizations. This architecture enables immediate response to data sharing events, ensuring compliance officers, data stewards, and business stakeholders receive timely notifications about critical blockchain operations while forming the foundation for automated compliance monitoring.
 
 10. **Create Blockchain Client for Cross-Organization Operations**:
 
-    The blockchain client serves as the application layer that organizations use to interact with the Hyperledger Fabric network. This client abstracts the complexity of blockchain operations, providing a simple interface for creating data sharing agreements, joining networks, and accessing shared data. In production environments, this client would integrate with the organization's existing applications and use the official Hyperledger Fabric SDK for secure, authenticated blockchain interactions.
+    The blockchain client serves as the application layer that organizations use to interact with the Hyperledger Fabric network. This client abstracts blockchain complexity, providing a simple interface for creating data sharing agreements, joining networks, and accessing shared data. In production environments, this client would integrate with existing applications using the official [Hyperledger Fabric SDK](https://docs.aws.amazon.com/managed-blockchain/latest/hyperledger-fabric-dev/managed-blockchain-hyperledger-develop-chaincode.html) for secure, authenticated blockchain interactions.
 
     ```bash
     # Create blockchain client script for cross-organization operations
@@ -857,7 +870,7 @@ class CrossOrgBlockchainClient {
             creator: this.memberId
         };
         
-        // Trigger Lambda function for event processing
+        // Trigger Lambda function for comprehensive event processing
         await this.triggerLambdaEvent('DataSharingAgreementCreated', {
             agreementId,
             organizationId: this.memberId,
@@ -901,7 +914,7 @@ class CrossOrgBlockchainClient {
             authorizedOrganizations: authorizedOrgs
         };
         
-        // Trigger Lambda function for event processing
+        // Trigger Lambda function for data sharing event processing
         await this.triggerLambdaEvent('DataShared', {
             agreementId,
             dataId,
@@ -931,7 +944,7 @@ class CrossOrgBlockchainClient {
             }
         };
         
-        // Trigger Lambda function for event processing
+        // Trigger Lambda function for access event processing
         await this.triggerLambdaEvent('DataAccessed', {
             agreementId,
             dataId,
@@ -966,7 +979,7 @@ class CrossOrgBlockchainClient {
 module.exports = CrossOrgBlockchainClient;
 EOF
 
-    # Create simulation script for testing cross-organization operations
+    # Create comprehensive simulation script for testing cross-organization operations
     cat > simulate-cross-org-operations.js << 'EOF'
 const CrossOrgBlockchainClient = require('./cross-org-client');
 
@@ -999,7 +1012,7 @@ async function simulateCrossOrgOperations() {
             terms: 'Data sharing limited to authorized analytics only'
         });
         
-        // Wait between operations
+        // Wait between operations for proper event processing
         await new Promise(resolve => setTimeout(resolve, 2000));
         
         // Step 2: Organization B joins the agreement
@@ -1058,14 +1071,14 @@ EOF
     echo "✅ Created blockchain client and cross-organization simulation tools"
     ```
 
-    The blockchain client and simulation tools are now ready to demonstrate cross-organization data sharing capabilities. These tools provide a realistic simulation of how organizations would interact with the blockchain network in production, including creating agreements, sharing data, and accessing shared resources. The client establishes the foundation for building enterprise applications that leverage blockchain technology for secure, auditable data sharing across organizational boundaries.
+    The blockchain client and simulation tools are now ready to demonstrate comprehensive cross-organization data sharing capabilities. These tools provide realistic simulation of how organizations would interact with the blockchain network in production, establishing the foundation for enterprise applications that leverage blockchain technology for secure, auditable data sharing across organizational boundaries.
 
 11. **Set Up CloudWatch Monitoring for Cross-Organization Operations**:
 
-    CloudWatch monitoring provides comprehensive visibility into blockchain operations, enabling proactive identification of performance issues and security anomalies. This monitoring setup tracks Lambda function performance, EventBridge event processing, and DynamoDB usage patterns to ensure optimal system performance. The dashboards and alarms enable operations teams to maintain high availability and quickly respond to any issues that might impact cross-organization data sharing operations.
+    [CloudWatch monitoring](https://docs.aws.amazon.com/lambda/latest/dg/lambda-monitoring.html) provides comprehensive visibility into blockchain operations, enabling proactive identification of performance issues and security anomalies. This monitoring setup tracks Lambda function performance, EventBridge event processing, and DynamoDB usage patterns with detailed dashboards and automated alarms for maintaining high availability.
 
     ```bash
-    # Create CloudWatch dashboard for cross-organization monitoring
+    # Create comprehensive CloudWatch dashboard for cross-organization monitoring
     cat > cross-org-dashboard.json << 'EOF'
 {
   "widgets": [
@@ -1113,16 +1126,16 @@ EOF
 }
 EOF
 
-    # Replace environment variables in dashboard config
+    # Replace environment variables in dashboard configuration
     sed -i "s/\${LAMBDA_FUNCTION_NAME}/${LAMBDA_FUNCTION_NAME}/g" cross-org-dashboard.json
     sed -i "s/\${AWS_REGION}/${AWS_REGION}/g" cross-org-dashboard.json
 
-    # Create CloudWatch dashboard
+    # Create CloudWatch dashboard for operational visibility
     aws cloudwatch put-dashboard \
         --dashboard-name CrossOrgDataSharing \
         --dashboard-body file://cross-org-dashboard.json
 
-    # Create alarm for Lambda errors
+    # Create alarm for Lambda errors with SNS notification
     aws cloudwatch put-metric-alarm \
         --alarm-name "CrossOrg-Lambda-Errors" \
         --alarm-description "Alert on cross-organization Lambda function errors" \
@@ -1139,14 +1152,14 @@ EOF
     echo "✅ Created CloudWatch monitoring for cross-organization operations"
     ```
 
-    The monitoring infrastructure is now active, providing real-time visibility into all aspects of the cross-organization data sharing system. This comprehensive monitoring enables proactive issue detection, performance optimization, and compliance verification. The dashboards provide stakeholders with actionable insights into system health, while automated alarms ensure rapid response to any operational issues that could impact data sharing capabilities.
+    The monitoring infrastructure is now active, providing real-time visibility into all aspects of the cross-organization data sharing system. This comprehensive monitoring enables proactive issue detection, performance optimization, and compliance verification with automated alerting for rapid response to operational issues.
 
 12. **Create Access Control and Compliance Monitoring**:
 
-    Access control and compliance monitoring are essential for maintaining regulatory compliance and ensuring data security in cross-organization environments. This step implements fine-grained IAM policies that enforce least privilege access principles and continuous compliance monitoring that tracks data access patterns, retention policies, and regulatory requirements. The compliance monitoring system helps organizations meet requirements for regulations like GDPR, HIPAA, and SOX by providing automated compliance checks and audit trail analysis.
+    Access control and compliance monitoring are essential for maintaining regulatory compliance and ensuring data security in cross-organization environments. This step implements fine-grained [IAM policies](https://docs.aws.amazon.com/managed-blockchain/latest/managementguide/managed-blockchain-security.html) that enforce least privilege access principles and continuous compliance monitoring for regulations like GDPR, HIPAA, and SOX.
 
     ```bash
-    # Create IAM policy for cross-organization access control
+    # Create comprehensive IAM policy for cross-organization access control
     cat > cross-org-access-policy.json << 'EOF'
 {
     "Version": "2012-10-17",
@@ -1193,12 +1206,12 @@ EOF
     sed -i "s/\${AWS_REGION}/${AWS_REGION}/g" cross-org-access-policy.json
     sed -i "s/\${AWS_ACCOUNT_ID}/${AWS_ACCOUNT_ID}/g" cross-org-access-policy.json
 
-    # Create IAM policy
+    # Create IAM policy for controlled blockchain access
     aws iam create-policy \
         --policy-name CrossOrgDataSharingAccessPolicy \
         --policy-document file://cross-org-access-policy.json || true
 
-    # Create compliance monitoring Lambda
+    # Create compliance monitoring Lambda function
     cat > compliance-monitor.js << 'EOF'
 const AWS = require('aws-sdk');
 const dynamodb = new AWS.DynamoDB.DocumentClient();
@@ -1207,11 +1220,10 @@ exports.handler = async (event) => {
     try {
         console.log('Monitoring compliance for cross-organization data sharing');
         
-        // Query recent audit trail entries
+        // Query recent audit trail entries for compliance analysis
         const params = {
             TableName: 'CrossOrgAuditTrail',
-            IndexName: 'TimestampIndex',
-            KeyConditionExpression: '#ts BETWEEN :start AND :end',
+            FilterExpression: '#ts BETWEEN :start AND :end',
             ExpressionAttributeNames: {
                 '#ts': 'Timestamp'
             },
@@ -1227,7 +1239,7 @@ exports.handler = async (event) => {
         return {
             statusCode: 200,
             body: JSON.stringify({
-                message: 'Compliance monitoring completed',
+                message: 'Compliance monitoring completed successfully',
                 timestamp: new Date().toISOString()
             })
         };
@@ -1239,17 +1251,17 @@ exports.handler = async (event) => {
 };
 EOF
 
-    echo "✅ Created access control and compliance monitoring"
+    echo "✅ Created comprehensive access control and compliance monitoring"
     ```
 
-    The access control and compliance monitoring system is now operational, providing comprehensive security governance for cross-organization data sharing operations. This system ensures that only authorized personnel can access blockchain resources and shared data, while continuous compliance monitoring helps organizations maintain regulatory compliance and identify potential security issues before they become problems. The system forms the security foundation that enables trusted data sharing between organizations.
+    The access control and compliance monitoring system is operational, providing comprehensive security governance for cross-organization data sharing operations. This system ensures authorized access to blockchain resources while continuous compliance monitoring helps organizations maintain regulatory compliance and identify potential security issues proactively.
 
 ## Validation & Testing
 
 1. **Verify blockchain network and member creation**:
 
    ```bash
-   # Check network status
+   # Check network status and availability
    aws managedblockchain get-network \
        --network-id ${NETWORK_ID} \
        --query 'Network.Status' --output text
@@ -1260,7 +1272,7 @@ EOF
 2. **Verify both organizations are active members**:
 
    ```bash
-   # List all members in the network
+   # List all active members in the network
    aws managedblockchain list-members \
        --network-id ${NETWORK_ID} \
        --query 'Members[*].[Name,Status,Id]' --output table
@@ -1268,10 +1280,10 @@ EOF
 
    Expected output: Both organizations with `AVAILABLE` status
 
-3. **Test cross-organization simulation**:
+3. **Test comprehensive cross-organization simulation**:
 
    ```bash
-   # Set environment variables for simulation
+   # Set environment variables for simulation execution
    export NETWORK_ID=${NETWORK_ID}
    export ORG_A_MEMBER_ID=${ORG_A_MEMBER_ID}
    export ORG_B_MEMBER_ID=${ORG_B_MEMBER_ID}
@@ -1279,20 +1291,20 @@ EOF
    export ORG_B_NODE_ID=${ORG_B_NODE_ID}
    export LAMBDA_FUNCTION_NAME=${LAMBDA_FUNCTION_NAME}
 
-   # Run the cross-organization simulation
+   # Execute the cross-organization simulation
    node simulate-cross-org-operations.js
    ```
 
 4. **Verify Lambda function execution and audit trail**:
 
    ```bash
-   # Check Lambda function logs
+   # Check Lambda function logs for event processing
    aws logs filter-log-events \
        --log-group-name "/aws/lambda/${LAMBDA_FUNCTION_NAME}" \
        --start-time $(date -d '10 minutes ago' +%s)000 \
        --query 'events[*].[timestamp,message]' --output table
 
-   # Check audit trail in DynamoDB
+   # Verify comprehensive audit trail in DynamoDB
    aws dynamodb scan \
        --table-name CrossOrgAuditTrail \
        --limit 10 \
@@ -1303,7 +1315,7 @@ EOF
 5. **Validate EventBridge event processing**:
 
    ```bash
-   # Check EventBridge rule metrics
+   # Check EventBridge rule metrics for event processing
    aws cloudwatch get-metric-statistics \
        --namespace AWS/Events \
        --metric-name MatchedEvents \
@@ -1324,7 +1336,7 @@ EOF
    aws cloudwatch delete-alarms \
        --alarm-names "CrossOrg-Lambda-Errors"
 
-   # Delete dashboard
+   # Delete monitoring dashboard
    aws cloudwatch delete-dashboards \
        --dashboard-names CrossOrgDataSharing
 
@@ -1391,7 +1403,7 @@ EOF
 4. **Remove blockchain network and members**:
 
    ```bash
-   # Delete peer nodes
+   # Delete peer nodes in parallel
    aws managedblockchain delete-node \
        --network-id ${NETWORK_ID} \
        --member-id ${ORG_A_MEMBER_ID} \
@@ -1402,7 +1414,7 @@ EOF
        --member-id ${ORG_B_MEMBER_ID} \
        --node-id ${ORG_B_NODE_ID}
 
-   # Wait for node deletion
+   # Wait for node deletion to complete
    sleep 60
 
    # Delete members
@@ -1414,20 +1426,20 @@ EOF
        --network-id ${NETWORK_ID} \
        --member-id ${ORG_A_MEMBER_ID}
 
-   # Wait for member deletion
+   # Wait for member deletion to complete
    sleep 60
 
-   # Delete network
+   # Delete the entire network
    aws managedblockchain delete-network \
        --network-id ${NETWORK_ID}
 
-   echo "✅ Deleted blockchain network and members"
+   echo "✅ Deleted blockchain network and all members"
    ```
 
 5. **Remove storage resources and clean up local files**:
 
    ```bash
-   # Delete DynamoDB table
+   # Delete DynamoDB audit trail table
    aws dynamodb delete-table \
        --table-name CrossOrgAuditTrail
 
@@ -1435,7 +1447,7 @@ EOF
    aws s3 rm s3://${BUCKET_NAME} --recursive
    aws s3 rb s3://${BUCKET_NAME}
 
-   # Clean up local files
+   # Clean up all local files
    rm -rf chaincode/
    rm -f cross-org-data-sharing-chaincode.tar.gz
    rm -f lambda-function.zip
@@ -1445,7 +1457,7 @@ EOF
    rm -f compliance-monitor.js
    rm -f *.json
 
-   echo "✅ Deleted storage resources and cleaned up local files"
+   echo "✅ Deleted all storage resources and cleaned up local files"
    ```
 
 ## Discussion
@@ -1456,15 +1468,15 @@ The solution leverages Hyperledger Fabric's sophisticated [channel architecture]
 
 The integration with [AWS Lambda and EventBridge](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-run-lambda-schedule.html) creates a responsive event-driven architecture that automatically processes blockchain events, validates data sharing operations, and triggers compliance monitoring workflows. This automation reduces manual oversight requirements while ensuring that all data sharing activities are properly logged and monitored for regulatory compliance. The [DynamoDB audit trail](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html) provides queryable records for compliance reporting and forensic analysis.
 
-Smart contracts (chaincode) enforce business rules and access policies at the blockchain level, ensuring that data sharing agreements are automatically enforced without relying on external systems. The chaincode validates organization membership, checks authorization levels, and maintains comprehensive access logs for every data sharing operation. This creates an immutable record of who accessed what data and when, which is critical for regulatory compliance in industries like healthcare and finance.
+Smart contracts (chaincode) enforce business rules and access policies at the blockchain level, ensuring that data sharing agreements are automatically enforced without relying on external systems. The chaincode validates organization membership, checks authorization levels, and maintains comprehensive access logs for every data sharing operation. This creates an immutable record of who accessed what data and when, which is critical for regulatory compliance in industries like healthcare and finance where [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles ensure security, reliability, and operational excellence.
 
-> **Tip**: Consider implementing zero-knowledge proof mechanisms for additional privacy when sharing sensitive analytics results without revealing underlying raw data.
+> **Tip**: Consider implementing zero-knowledge proof mechanisms for additional privacy when sharing sensitive analytics results without revealing underlying raw data, enhancing security while maintaining data utility.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Advanced Privacy Mechanisms**: Implement zero-knowledge proofs and homomorphic encryption to enable analytics on shared data without exposing raw information, allowing organizations to derive insights while maintaining data privacy.
+1. **Advanced Privacy Mechanisms**: Implement zero-knowledge proofs and homomorphic encryption to enable analytics on shared data without exposing raw information, allowing organizations to derive insights while maintaining data privacy and regulatory compliance.
 
 2. **Automated Compliance Orchestration**: Create AWS Config rules and Systems Manager automation documents that continuously monitor data sharing activities for compliance with regulations like GDPR, HIPAA, and SOX, automatically generating compliance reports and triggering remediation workflows.
 

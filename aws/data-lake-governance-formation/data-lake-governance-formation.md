@@ -6,17 +6,16 @@ difficulty: 400
 subject: aws
 services: Lake Formation, DataZone, S3, Glue
 estimated-time: 240 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-lake, governance, lake-formation, datazone, analytics
 recipe-generator-version: 1.3
 ---
 
 # Data Lake Governance with Lake Formation
-
 
 ## Problem
 
@@ -526,8 +525,21 @@ echo "✅ Environment prepared for data lake governance setup"
    
    echo "DataZone Domain ID: ${DOMAIN_ID}"
    
-   # Wait for domain to be created
-   aws datazone wait domain-created --identifier ${DOMAIN_ID}
+   # Poll domain status until created (DataZone doesn't have wait command yet)
+   echo "Waiting for DataZone domain creation..."
+   while true; do
+     STATUS=$(aws datazone get-domain --identifier ${DOMAIN_ID} \
+         --query 'status' --output text 2>/dev/null || echo "CREATING")
+     if [ "$STATUS" = "AVAILABLE" ]; then
+       echo "Domain is available"
+       break
+     elif [ "$STATUS" = "FAILED" ]; then
+       echo "Domain creation failed"
+       exit 1
+     fi
+     echo "Domain status: $STATUS - waiting..."
+     sleep 30
+   done
    
    # Create business glossary terms
    GLOSSARY_ID=$(aws datazone create-glossary \
@@ -641,7 +653,7 @@ echo "✅ Environment prepared for data lake governance setup"
    # Upload script to S3
    aws s3 cp customer_data_etl.py s3://${DATA_LAKE_BUCKET}/scripts/
    
-   # Create Glue job with enhanced lineage tracking
+   # Create Glue job with modern worker type configuration
    aws glue create-job \
        --name "CustomerDataETLWithLineage" \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/LakeFormationServiceRole \
@@ -662,7 +674,8 @@ echo "✅ Environment prepared for data lake governance setup"
        }' \
        --max-retries 1 \
        --timeout 60 \
-       --max-capacity 2.0 \
+       --worker-type G.1X \
+       --number-of-workers 2 \
        --glue-version "4.0"
    
    echo "✅ ETL job with data lineage tracking created"
@@ -750,14 +763,15 @@ echo "✅ Environment prepared for data lake governance setup"
    aws cloudwatch put-metric-alarm \
        --alarm-name "DataLakeETLFailures" \
        --alarm-description "Alert when ETL jobs fail" \
-       --metric-name "glue.ALL.job.failure" \
-       --namespace "AWS/Glue" \
+       --metric-name "glue.driver.aggregate.numCompletedTasks" \
+       --namespace "Glue" \
        --statistic Sum \
        --period 300 \
-       --threshold 1 \
-       --comparison-operator GreaterThanOrEqualToThreshold \
-       --evaluation-periods 1 \
-       --alarm-actions ${ALERT_TOPIC_ARN}
+       --threshold 0 \
+       --comparison-operator LessThanThreshold \
+       --evaluation-periods 2 \
+       --alarm-actions ${ALERT_TOPIC_ARN} \
+       --dimensions Name=JobName,Value=CustomerDataETLWithLineage
    
    # Create data quality rule using Glue DataBrew (if available)
    cat > data_quality_rules.json << EOF
@@ -1000,7 +1014,7 @@ Lake Formation provides the foundation for fine-grained access control with its 
 
 Amazon DataZone extends this foundation by providing business-friendly data discovery capabilities and comprehensive lineage tracking. The business glossary feature helps bridge the gap between technical and business teams by providing standardized definitions for data assets. The automatic lineage capture from Glue ETL jobs provides transparency into data transformations and helps with impact analysis when changes are made to upstream systems.
 
-The architecture supports multiple data zones (raw, curated, analytics) that represent different stages of data maturity and quality. This tiered approach enables progressive data refinement while maintaining clear boundaries for access control and data quality standards. The integration with monitoring and alerting ensures that data quality issues are detected and addressed promptly.
+The architecture supports multiple data zones (raw, curated, analytics) that represent different stages of data maturity and quality. This tiered approach enables progressive data refinement while maintaining clear boundaries for access control and data quality standards. The integration with monitoring and alerting ensures that data quality issues are detected and addressed promptly. Following AWS Well-Architected Framework principles, this solution provides operational excellence through automated monitoring, security through fine-grained access controls, reliability through data quality validation, performance efficiency through optimized data formats, and cost optimization through lifecycle management policies.
 
 > **Warning**: This solution involves complex IAM permissions and cross-service integrations. Test thoroughly in non-production environments before implementing in production systems. Review the [AWS Lake Formation security best practices](https://docs.aws.amazon.com/lake-formation/latest/dg/security-best-practices.html) before deploying to production.
 

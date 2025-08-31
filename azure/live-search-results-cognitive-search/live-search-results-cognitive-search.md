@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Cognitive Search, Azure SignalR Service, Azure Functions, Azure Event Grid
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: real-time, search, signalr, cognitive-search, event-driven
 recipe-generator-version: 1.3
@@ -19,11 +19,11 @@ recipe-generator-version: 1.3
 
 ## Problem
 
-Modern applications require search functionality that updates instantly as data changes, providing users with real-time results without manual refresh. Traditional search implementations suffer from stale results, requiring users to repeatedly refresh pages to see new content. This creates poor user experiences in scenarios like live inventory tracking, real-time analytics dashboards, or collaborative document search where immediate visibility of changes is critical.
+Modern applications require search functionality that updates instantly as data changes, providing users with real-time results without manual refresh. Traditional search implementations suffer from stale results, requiring users to repeatedly refresh pages to see new content. This creates poor user experiences in scenarios like live inventory tracking, real-time analytics dashboards, or collaborative document search where immediate visibility of changes is critical for business operations and user satisfaction.
 
 ## Solution
 
-Combine Azure Cognitive Search's powerful full-text search capabilities with Azure SignalR Service for real-time push notifications. Azure Functions and Event Grid orchestrate the solution, automatically triggering index updates and broadcasting changes to connected clients. This serverless architecture ensures instant search result updates while maintaining scalability and cost-effectiveness through event-driven processing.
+Combine Azure Cognitive Search's powerful full-text search capabilities with Azure SignalR Service for real-time push notifications. Azure Functions and Event Grid orchestrate the solution, automatically triggering index updates and broadcasting changes to connected clients. This serverless architecture ensures instant search result updates while maintaining scalability and cost-effectiveness through event-driven processing, eliminating the need for constant polling and reducing server load.
 
 ## Architecture Diagram
 
@@ -49,20 +49,18 @@ graph TB
     end
     
     subgraph "Data Storage"
-        STORAGE[Azure Blob Storage]
         COSMOS[Azure Cosmos DB]
     end
     
     CLIENT-->|1. Search Query|SEARCH
     CLIENT<-->|2. WebSocket Connection|SIGNALR
-    STORAGE-->|3. Data Change|EVENTGRID
-    COSMOS-->|4. Data Change|EVENTGRID
-    EVENTGRID-->|5. Trigger|FUNC1
-    FUNC1-->|6. Update|INDEX
-    FUNC1-->|7. Notify|EVENTGRID
-    EVENTGRID-->|8. Trigger|FUNC2
-    FUNC2-->|9. Broadcast|SIGNALR
-    SIGNALR-->|10. Push Update|CLIENT
+    COSMOS-->|3. Data Change|EVENTGRID
+    EVENTGRID-->|4. Trigger|FUNC1
+    FUNC1-->|5. Update|INDEX
+    FUNC1-->|6. Notify|EVENTGRID
+    EVENTGRID-->|7. Trigger|FUNC2
+    FUNC2-->|8. Broadcast|SIGNALR
+    SIGNALR-->|9. Push Update|CLIENT
     
     style SEARCH fill:#FF9900
     style SIGNALR fill:#3F8624
@@ -71,30 +69,33 @@ graph TB
 
 ## Prerequisites
 
-1. Azure subscription with appropriate permissions to create resources
+1. Azure subscription with appropriate permissions to create resources including search services, SignalR, Functions, and Cosmos DB
 2. Azure CLI v2.50+ installed and configured (or use Azure Cloud Shell)
-3. Basic understanding of REST APIs and WebSocket connections
-4. Familiarity with Azure Functions and event-driven architectures
-5. Node.js 18+ installed locally for Function development
-6. Estimated cost: ~$50-100/month for moderate usage
+3. Basic understanding of REST APIs, WebSocket connections, and event-driven architectures
+4. Familiarity with Azure Functions development and JavaScript/Node.js
+5. Node.js 18+ installed locally for Function development and testing
+6. Estimated cost: ~$50-100/month for moderate usage with basic tiers
 
-> **Note**: This recipe uses Azure Cognitive Search (now branded as Azure AI Search) which provides advanced search capabilities including vector search and semantic ranking.
+> **Note**: This recipe uses Azure Cognitive Search (now branded as Azure AI Search) which provides advanced search capabilities including vector search and semantic ranking for modern AI-powered applications.
 
 ## Preparation
 
 ```bash
-# Set environment variables for resource naming
-export RESOURCE_GROUP="rg-realtimesearch-demo"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-realtimesearch-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
-export SEARCH_SERVICE="search${RANDOM}"
-export SIGNALR_SERVICE="signalr${RANDOM}"
-export STORAGE_ACCOUNT="storage${RANDOM}"
-export FUNCTION_APP="func${RANDOM}"
-export EVENT_GRID_TOPIC="topic${RANDOM}"
-export COSMOS_ACCOUNT="cosmos${RANDOM}"
+export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for globally unique names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
+
+# Set service names with unique suffix
+export SEARCH_SERVICE="search${RANDOM_SUFFIX}"
+export SIGNALR_SERVICE="signalr${RANDOM_SUFFIX}"
+export STORAGE_ACCOUNT="storage${RANDOM_SUFFIX}"
+export FUNCTION_APP="func${RANDOM_SUFFIX}"
+export EVENT_GRID_TOPIC="topic${RANDOM_SUFFIX}"
+export COSMOS_ACCOUNT="cosmos${RANDOM_SUFFIX}"
 
 # Create resource group
 az group create \
@@ -119,7 +120,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
 1. **Create Azure Cognitive Search Service**:
 
-   Azure Cognitive Search provides enterprise-grade search capabilities with features like full-text search, faceted navigation, and AI-powered enrichment. The service automatically handles indexing, query processing, and result ranking, making it ideal for building sophisticated search experiences. By choosing the Basic tier, we balance cost with functionality for our real-time search scenario.
+   Azure Cognitive Search provides enterprise-grade search capabilities with features like full-text search, faceted navigation, and AI-powered enrichment. The service automatically handles indexing, query processing, and result ranking, making it ideal for building sophisticated search experiences. By choosing the Basic tier, we balance cost with functionality for our real-time search scenario while supporting multiple replicas and partitions.
 
    ```bash
    # Create Cognitive Search service
@@ -144,7 +145,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "Search endpoint: ${SEARCH_ENDPOINT}"
    ```
 
-   The Cognitive Search service is now ready to host our search index. The admin key enables full control over index creation and management, while the endpoint provides the base URL for all search operations.
+   The Cognitive Search service is now ready to host our search index. The admin key enables full control over index creation and management, while the endpoint provides the base URL for all search operations. This foundational service will power our real-time search capabilities.
 
 2. **Deploy Azure SignalR Service**:
 
@@ -169,11 +170,11 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ SignalR Service created: ${SIGNALR_SERVICE}"
    ```
 
-   SignalR Service is configured in Serverless mode, which integrates seamlessly with Azure Functions for handling connection management and message distribution without maintaining server infrastructure.
+   SignalR Service is configured in Serverless mode, which integrates seamlessly with Azure Functions for handling connection management and message distribution without maintaining server infrastructure. This enables efficient real-time communication with automatic scaling.
 
 3. **Set Up Azure Cosmos DB for Data Storage**:
 
-   Azure Cosmos DB provides globally distributed, multi-model database capabilities with guaranteed low latency. For our real-time search application, Cosmos DB serves as the primary data store with automatic change feed capabilities. The change feed enables real-time event streaming whenever documents are created or modified, triggering our search index updates automatically.
+   Azure Cosmos DB provides globally distributed, multi-model database capabilities with guaranteed low latency. For our real-time search application, Cosmos DB serves as the primary data store with automatic change feed capabilities. The change feed enables real-time event streaming whenever documents are created or modified, triggering our search index updates automatically without polling overhead.
 
    ```bash
    # Create Cosmos DB account
@@ -208,11 +209,11 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Cosmos DB created with Products container"
    ```
 
-   The Products container is now ready to store searchable documents. The partition key on 'category' enables efficient querying and scaling across product categories.
+   The Products container is now ready to store searchable documents. The partition key on 'category' enables efficient querying and scaling across product categories while the change feed will automatically trigger index updates.
 
 4. **Create Azure Event Grid Topic**:
 
-   Azure Event Grid provides reliable event delivery at massive scale, acting as the central nervous system for our event-driven architecture. It ensures that every data change triggers the appropriate downstream actions, from index updates to client notifications. Event Grid's advanced filtering capabilities allow precise control over which events trigger which functions.
+   Azure Event Grid provides reliable event delivery at massive scale, acting as the central nervous system for our event-driven architecture. It ensures that every data change triggers the appropriate downstream actions, from index updates to client notifications. Event Grid's advanced filtering capabilities allow precise control over which events trigger which functions, enabling sophisticated routing logic.
 
    ```bash
    # Create Event Grid topic
@@ -235,11 +236,11 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Event Grid topic created: ${EVENT_GRID_TOPIC}"
    ```
 
-   Event Grid now provides a reliable message bus for coordinating between data changes, search index updates, and client notifications.
+   Event Grid now provides a reliable message bus for coordinating between data changes, search index updates, and client notifications with guaranteed delivery and retry capabilities.
 
 5. **Deploy Azure Function App**:
 
-   Azure Functions provides the serverless compute layer that processes events and orchestrates our real-time search updates. The consumption plan automatically scales based on demand, ensuring cost-effectiveness during low-traffic periods while handling traffic spikes seamlessly. Functions integrate natively with Event Grid, Cosmos DB, and SignalR Service through built-in bindings.
+   Azure Functions provides the serverless compute layer that processes events and orchestrates our real-time search updates. The consumption plan automatically scales based on demand, ensuring cost-effectiveness during low-traffic periods while handling traffic spikes seamlessly. Functions integrate natively with Event Grid, Cosmos DB, and SignalR Service through built-in bindings, simplifying development and deployment.
 
    ```bash
    # Create Function App
@@ -262,17 +263,16 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        "SignalRConnection=${SIGNALR_CONNECTION}" \
        "CosmosDBConnection=${COSMOS_CONNECTION}" \
        "EventGridEndpoint=${EVENT_GRID_ENDPOINT}" \
-       "EventGridKey=${EVENT_GRID_KEY}" \
-       "AzureWebJobsStorage=DefaultEndpointsProtocol=https;AccountName=${STORAGE_ACCOUNT};EndpointSuffix=core.windows.net;AccountKey=$(az storage account keys list --resource-group ${RESOURCE_GROUP} --account-name ${STORAGE_ACCOUNT} --query '[0].value' -o tsv)"
+       "EventGridKey=${EVENT_GRID_KEY}"
    
    echo "✅ Function App created and configured"
    ```
 
-   The Function App is now configured with all necessary connection strings and ready to host our serverless functions for index updates and real-time notifications.
+   The Function App is now configured with all necessary connection strings and ready to host our serverless functions for index updates and real-time notifications. The consumption plan ensures we only pay for actual execution time.
 
 6. **Create Search Index Schema**:
 
-   The search index defines the structure and searchability of your data. Azure Cognitive Search supports various field types, analyzers, and scoring profiles to optimize search relevance. This schema includes full-text searchable fields, facetable categories, and sortable properties, enabling rich search experiences with filters and faceted navigation.
+   The search index defines the structure and searchability of your data. Azure Cognitive Search supports various field types, analyzers, and scoring profiles to optimize search relevance. This schema includes full-text searchable fields, facetable categories, and sortable properties, enabling rich search experiences with filters and faceted navigation while supporting autocomplete functionality.
 
    ```bash
    # Create index definition file
@@ -302,8 +302,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    }
    EOF
    
-   # Create the index using REST API
-   curl -X PUT "${SEARCH_ENDPOINT}/indexes/products-index?api-version=2021-04-30-Preview" \
+   # Create the index using REST API with latest stable version
+   curl -X PUT "${SEARCH_ENDPOINT}/indexes/products-index?api-version=2024-07-01" \
      -H "Content-Type: application/json" \
      -H "api-key: ${SEARCH_ADMIN_KEY}" \
      -d @index-schema.json
@@ -311,11 +311,11 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Search index created with schema"
    ```
 
-   The search index now supports sophisticated queries with autocomplete suggestions, relevance boosting for in-stock items, and freshness scoring to prioritize recently updated products.
+   The search index now supports sophisticated queries with autocomplete suggestions, relevance boosting for in-stock items, and freshness scoring to prioritize recently updated products. The scoring profile ensures relevant results based on recency and availability.
 
 7. **Implement Index Update Function**:
 
-   This Azure Function automatically updates the search index whenever data changes in Cosmos DB. The function uses change feed processing to capture modifications in near real-time, ensuring search results always reflect the current state of your data. Built-in error handling and retry logic ensure reliability even during transient failures.
+   This Azure Function automatically updates the search index whenever data changes in Cosmos DB. The function uses change feed processing to capture modifications in near real-time, ensuring search results always reflect the current state of your data. Built-in error handling and retry logic ensure reliability even during transient failures, while the Event Grid integration enables downstream notifications.
 
    ```bash
    # Create function directory
@@ -356,14 +356,14 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
            await searchClient.mergeOrUploadDocuments(searchDocuments);
            
            // Publish event for real-time notification
-           await context.bindings.eventGridOutput.push({
+           context.bindings.eventGridOutput = {
                eventType: "SearchIndexUpdated",
                subject: "products/updated",
                data: {
                    documentIds: documents.map(d => d.id),
                    updateTime: new Date().toISOString()
                }
-           });
+           };
            
            context.log(`Updated ${documents.length} documents in search index`);
        } catch (error) {
@@ -373,14 +373,38 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    };
    EOF
    
+   # Update function.json for proper bindings
+   cat > IndexUpdateFunction/function.json << 'EOF'
+   {
+     "bindings": [
+       {
+         "type": "cosmosDBTrigger",
+         "name": "documents",
+         "direction": "in",
+         "connectionStringSetting": "CosmosDBConnection",
+         "databaseName": "SearchDatabase",
+         "containerName": "Products",
+         "createLeaseContainerIfNotExists": true
+       },
+       {
+         "type": "eventGrid",
+         "name": "eventGridOutput",
+         "direction": "out",
+         "topicEndpointUri": "EventGridEndpoint",
+         "topicAccessKey": "EventGridKey"
+       }
+     ]
+   }
+   EOF
+   
    echo "✅ Index update function created"
    ```
 
-   The function transforms Cosmos DB documents into the search index format, updates the index, and publishes an event to notify connected clients about the changes.
+   The function transforms Cosmos DB documents into the search index format, updates the index, and publishes an event to notify connected clients about the changes. The CosmosDB trigger ensures immediate processing of data changes.
 
 8. **Create Real-Time Notification Function**:
 
-   This function broadcasts search index updates to all connected clients via SignalR Service. It processes Event Grid events and uses SignalR's hub pattern to send targeted messages. The serverless SignalR binding automatically handles connection management, scaling, and message delivery across multiple regions.
+   This function broadcasts search index updates to all connected clients via SignalR Service. It processes Event Grid events and uses SignalR's hub pattern to send targeted messages. The serverless SignalR binding automatically handles connection management, scaling, and message delivery across multiple regions without requiring server maintenance.
 
    ```bash
    # Create notification function
@@ -429,11 +453,11 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Notification function created"
    ```
 
-   The notification function completes the real-time loop by informing all connected clients whenever the search index updates, enabling instant UI updates without polling.
+   The notification function completes the real-time loop by informing all connected clients whenever the search index updates, enabling instant UI updates without polling and reducing unnecessary network traffic.
 
 9. **Deploy Functions to Azure**:
 
-   Deploying the functions to Azure enables them to process events at scale. The deployment includes all dependencies and configurations, ensuring the functions can immediately begin processing Cosmos DB changes and broadcasting notifications. Azure Functions' built-in monitoring and diagnostics help track performance and troubleshoot issues.
+   Deploying the functions to Azure enables them to process events at scale. The deployment includes all dependencies and configurations, ensuring the functions can immediately begin processing Cosmos DB changes and broadcasting notifications. Azure Functions' built-in monitoring and diagnostics help track performance and troubleshoot issues in production environments.
 
    ```bash
    # Install dependencies
@@ -445,22 +469,15 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    # Create Event Grid subscription for notifications
    az eventgrid event-subscription create \
        --name search-notification-sub \
-       --source-resource-id $(az eventgrid topic show \
-           --name ${EVENT_GRID_TOPIC} \
-           --resource-group ${RESOURCE_GROUP} \
-           --query id -o tsv) \
+       --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.EventGrid/topics/${EVENT_GRID_TOPIC}" \
        --endpoint-type azurefunction \
-       --endpoint $(az functionapp function show \
-           --name ${FUNCTION_APP} \
-           --resource-group ${RESOURCE_GROUP} \
-           --function-name NotificationFunction \
-           --query id -o tsv) \
-       --event-types SearchIndexUpdated
+       --endpoint "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Web/sites/${FUNCTION_APP}/functions/NotificationFunction" \
+       --event-types Microsoft.EventGrid.SubscriptionValidationEvent SearchIndexUpdated
    
    echo "✅ Functions deployed and Event Grid subscription created"
    ```
 
-   The serverless infrastructure is now fully deployed and ready to process real-time search updates automatically as data changes occur.
+   The serverless infrastructure is now fully deployed and ready to process real-time search updates automatically as data changes occur. The Event Grid subscription ensures reliable event delivery to the notification function.
 
 ## Validation & Testing
 
@@ -516,8 +533,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    # Wait for indexing (typically 1-2 seconds)
    sleep 5
    
-   # Search for the product
-   curl -X POST "${SEARCH_ENDPOINT}/indexes/products-index/docs/search?api-version=2021-04-30-Preview" \
+   # Search for the product using latest API version
+   curl -X POST "${SEARCH_ENDPOINT}/indexes/products-index/docs/search?api-version=2024-07-01" \
      -H "Content-Type: application/json" \
      -H "api-key: ${SEARCH_ADMIN_KEY}" \
      -d '{"search": "wireless", "select": "name,price,inStock"}'
@@ -525,7 +542,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
    Expected output: JSON response containing the test product with matching search results.
 
-> **Tip**: Use Azure Monitor and Application Insights to track function execution times, search query performance, and SignalR message delivery metrics for production optimization.
+> **Tip**: Use Azure Monitor and Application Insights to track function execution times, search query performance, and SignalR message delivery metrics for production optimization and debugging.
 
 ## Cleanup
 
@@ -555,29 +572,30 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    unset STORAGE_ACCOUNT FUNCTION_APP EVENT_GRID_TOPIC COSMOS_ACCOUNT
    unset SEARCH_ADMIN_KEY SEARCH_ENDPOINT SIGNALR_CONNECTION
    unset COSMOS_CONNECTION EVENT_GRID_ENDPOINT EVENT_GRID_KEY
+   unset SUBSCRIPTION_ID RANDOM_SUFFIX
    
    echo "✅ Local cleanup completed"
    ```
 
 ## Discussion
 
-Building real-time search applications requires careful orchestration of multiple Azure services working in harmony. Azure Cognitive Search provides the foundation with its powerful indexing and querying capabilities, while SignalR Service enables efficient real-time communication at scale. This architecture follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles, ensuring reliability, security, and cost optimization. For detailed implementation guidance, see the [Azure Cognitive Search documentation](https://docs.microsoft.com/en-us/azure/search/) and [SignalR Service best practices](https://docs.microsoft.com/en-us/azure/azure-signalr/signalr-concept-performance).
+Building real-time search applications requires careful orchestration of multiple Azure services working in harmony. Azure Cognitive Search provides the foundation with its powerful indexing and querying capabilities, while SignalR Service enables efficient real-time communication at scale. This architecture follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles, ensuring reliability, security, and cost optimization. For detailed implementation guidance, see the [Azure AI Search documentation](https://docs.microsoft.com/en-us/azure/search/) and [SignalR Service best practices](https://docs.microsoft.com/en-us/azure/azure-signalr/signalr-concept-performance).
 
-The event-driven pattern using Azure Functions and Event Grid provides loose coupling between components, allowing independent scaling and maintenance. This serverless approach eliminates infrastructure management overhead while providing automatic scaling based on actual usage. The change feed capability in Cosmos DB ensures no data modifications are missed, maintaining search index consistency. For comprehensive event-driven patterns, review the [Event Grid documentation](https://docs.microsoft.com/en-us/azure/event-grid/overview) and [Azure Functions triggers guide](https://docs.microsoft.com/en-us/azure/azure-functions/functions-triggers-bindings).
+The event-driven pattern using Azure Functions and Event Grid provides loose coupling between components, allowing independent scaling and maintenance. This serverless approach eliminates infrastructure management overhead while providing automatic scaling based on actual usage. The change feed capability in Cosmos DB ensures no data modifications are missed, maintaining search index consistency without resource-intensive polling. For comprehensive event-driven patterns, review the [Event Grid documentation](https://docs.microsoft.com/en-us/azure/event-grid/overview) and [Azure Functions triggers guide](https://docs.microsoft.com/en-us/azure/azure-functions/functions-triggers-bindings).
 
-From a performance perspective, this solution can handle millions of search queries while simultaneously processing thousands of index updates per second. The combination of Cognitive Search's distributed architecture and SignalR's WebSocket management ensures low-latency updates even under high load. Cost optimization is achieved through consumption-based pricing for Functions and Event Grid, while the Basic tier of Cognitive Search provides an affordable entry point. For production deployments, consider the [Cognitive Search capacity planning guide](https://docs.microsoft.com/en-us/azure/search/search-capacity-planning) and implement caching strategies to reduce search service load.
+From a performance perspective, this solution can handle millions of search queries while simultaneously processing thousands of index updates per second. The combination of Cognitive Search's distributed architecture and SignalR's WebSocket management ensures low-latency updates even under high load. Cost optimization is achieved through consumption-based pricing for Functions and Event Grid, while the Basic tier of Cognitive Search provides an affordable entry point. For production deployments, consider the [Azure AI Search capacity planning guide](https://docs.microsoft.com/en-us/azure/search/search-capacity-planning) and implement caching strategies to reduce search service load and improve response times.
 
-> **Warning**: Monitor your Cognitive Search service usage closely as the Basic tier has limits on index size (2GB) and number of indexes (15). Plan for scaling to Standard tier as your application grows.
+> **Warning**: Monitor your Cognitive Search service usage closely as the Basic tier has limits on index size (2GB) and number of indexes (15). Plan for scaling to Standard tier as your application grows and requires more capacity.
 
 ## Challenge
 
 Extend this real-time search solution with these advanced features:
 
-1. Implement semantic search capabilities using Azure Cognitive Search's semantic ranking feature to improve result relevance based on context understanding
-2. Add geo-spatial search functionality for location-based queries with real-time updates as inventory changes across different locations
-3. Create a machine learning pipeline using Azure Machine Learning to analyze search patterns and automatically optimize search relevance scoring
-4. Build a multi-tenant solution with index-per-tenant isolation while maintaining real-time updates across all tenants efficiently
-5. Integrate Azure API Management to provide rate limiting, authentication, and usage analytics for your real-time search API endpoints
+1. Implement semantic search capabilities using Azure Cognitive Search's semantic ranking feature to improve result relevance based on context understanding and natural language processing
+2. Add geo-spatial search functionality for location-based queries with real-time updates as inventory changes across different physical locations or geographic regions
+3. Create a machine learning pipeline using Azure Machine Learning to analyze search patterns and automatically optimize search relevance scoring based on user behavior and click-through rates
+4. Build a multi-tenant solution with index-per-tenant isolation while maintaining real-time updates across all tenants efficiently using Azure's resource management capabilities
+5. Integrate Azure API Management to provide rate limiting, authentication, usage analytics, and developer portal access for your real-time search API endpoints
 
 ## Infrastructure Code
 

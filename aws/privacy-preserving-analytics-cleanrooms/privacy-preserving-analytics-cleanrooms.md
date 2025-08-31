@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: Clean Rooms, QuickSight, S3, Glue
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: privacy, data-collaboration, analytics, clean-rooms, quicksight, differential-privacy
 recipe-generator-version: 1.3
@@ -82,9 +82,9 @@ graph TB
 3. Basic understanding of data analytics, SQL queries, and privacy concepts
 4. Sample datasets for testing (customer demographics, transaction data, etc.)
 5. QuickSight subscription (Standard or Enterprise edition)
-6. Estimated cost: $50-100 for Clean Rooms collaboration, $24/month for QuickSight Standard, $5-20 for S3 and Glue usage
+6. Estimated cost: $0.50-2.00 per GB scanned for Clean Rooms queries, $24/month for QuickSight Standard, $5-20 for S3 and Glue usage
 
-> **Note**: Clean Rooms pricing is based on query compute units and data scanned. Differential privacy features may have additional costs for enhanced privacy protections.
+> **Note**: Clean Rooms pricing is based on data scanned per query and collaboration membership. The Spark analytics engine is now the recommended option as Clean Rooms SQL will be deprecated after July 16, 2025.
 
 ## Preparation
 
@@ -311,7 +311,8 @@ EOF
    aws glue start-crawler --name "crawler-org-b-${RANDOM_SUFFIX}"
    
    # Wait for crawlers to complete
-   sleep 30
+   echo "Waiting for Glue crawlers to complete schema discovery..."
+   sleep 60
    
    echo "✅ Glue database and crawlers created, schema discovery initiated"
    ```
@@ -323,23 +324,37 @@ EOF
    Clean Rooms collaboration establishes the secure environment where multiple organizations can jointly analyze data while maintaining privacy controls. This step creates the foundational collaboration space with configurable privacy settings, query restrictions, and differential privacy parameters that protect individual data points. The collaboration framework implements cryptographic protections and mathematical privacy guarantees to ensure regulatory compliance.
 
    ```bash
-   # Create Clean Rooms collaboration
+   # Create Clean Rooms collaboration with updated CLI syntax
    aws cleanrooms create-collaboration \
        --name "${CLEAN_ROOMS_NAME}" \
        --description "Privacy-preserving analytics collaboration for cross-organizational insights" \
-       --member-abilities "CAN_QUERY,CAN_RECEIVE_RESULTS" \
+       --creator-member-abilities "CAN_QUERY" "CAN_RECEIVE_RESULTS" \
+       --creator-display-name "Analytics Lead" \
        --query-log-status "ENABLED" \
-       --data-encryption-metadata "{\"preserveNulls\": true, \"allowCleartext\": false, \"allowDuplicates\": false, \"allowJoinsOnColumnsWithDifferentNames\": false}"
+       --analytics-engine "SPARK" \
+       --data-encryption-metadata preserveNulls=true,allowCleartext=false,allowDuplicates=false,allowJoinsOnColumnsWithDifferentNames=false \
+       --members []
    
    # Wait for collaboration creation to complete
-   sleep 10
+   sleep 15
    
    # Store collaboration ID for later use
    COLLABORATION_ID=$(aws cleanrooms list-collaborations \
        --query "collaborationList[?name=='${CLEAN_ROOMS_NAME}'].id" \
        --output text)
    
+   # Create membership to join the collaboration
+   aws cleanrooms create-membership \
+       --collaboration-identifier "${COLLABORATION_ID}" \
+       --query-log-status "ENABLED"
+   
+   # Get membership ID
+   MEMBERSHIP_ID=$(aws cleanrooms list-memberships \
+       --query "membershipSummaries[?collaborationName=='${CLEAN_ROOMS_NAME}'].id" \
+       --output text)
+   
    echo "✅ Clean Rooms collaboration created: ${COLLABORATION_ID}"
+   echo "✅ Membership created: ${MEMBERSHIP_ID}"
    ```
 
    The collaboration environment is now active with privacy protections enabled. This secure workspace provides the foundation for multi-party analytics while ensuring that raw data never leaves each organization's control boundaries.
@@ -350,7 +365,8 @@ EOF
 
    ```bash
    # Wait for Glue crawlers to complete and verify tables exist
-   sleep 60
+   echo "Verifying Glue table discovery completion..."
+   sleep 90
    
    # Get table names from Glue catalog
    ORG_A_TABLE=$(aws glue get-tables \
@@ -378,20 +394,22 @@ EOF
            --output text)
    fi
    
+   echo "Found tables: ${ORG_A_TABLE}, ${ORG_B_TABLE}"
+   
    # Configure table for Organization A
    aws cleanrooms create-configured-table \
        --name "org-a-customers" \
        --description "Organization A customer data for privacy-preserving analytics" \
-       --table-reference "{\"glue\": {\"tableName\": \"${ORG_A_TABLE}\", \"databaseName\": \"${GLUE_DATABASE}\"}}" \
-       --allowed-columns "age_group,region,product_category,purchase_amount" \
+       --table-reference glue="{tableName=${ORG_A_TABLE},databaseName=${GLUE_DATABASE}}" \
+       --allowed-columns "age_group" "region" "product_category" "purchase_amount" \
        --analysis-method "DIRECT_QUERY"
    
    # Configure table for Organization B  
    aws cleanrooms create-configured-table \
        --name "org-b-customers" \
        --description "Organization B customer data for privacy-preserving analytics" \
-       --table-reference "{\"glue\": {\"tableName\": \"${ORG_B_TABLE}\", \"databaseName\": \"${GLUE_DATABASE}\"}}" \
-       --allowed-columns "age_group,region,channel_preference,engagement_score" \
+       --table-reference glue="{tableName=${ORG_B_TABLE},databaseName=${GLUE_DATABASE}}" \
+       --allowed-columns "age_group" "region" "channel_preference" "engagement_score" \
        --analysis-method "DIRECT_QUERY"
    
    echo "✅ Configured tables created in Clean Rooms"
@@ -417,14 +435,14 @@ EOF
    aws cleanrooms create-configured-table-association \
        --name "org-a-association" \
        --description "Association for Organization A data with privacy controls" \
-       --membership-identifier "${COLLABORATION_ID}" \
+       --membership-identifier "${MEMBERSHIP_ID}" \
        --configured-table-identifier "${ORG_A_TABLE_ID}" \
        --role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/CleanRoomsAnalyticsRole"
    
    aws cleanrooms create-configured-table-association \
        --name "org-b-association" \
        --description "Association for Organization B data with privacy controls" \
-       --membership-identifier "${COLLABORATION_ID}" \
+       --membership-identifier "${MEMBERSHIP_ID}" \
        --configured-table-identifier "${ORG_B_TABLE_ID}" \
        --role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/CleanRoomsAnalyticsRole"
    
@@ -435,7 +453,7 @@ EOF
 
 7. **Execute Privacy-Preserving Queries**:
 
-   Clean Rooms enables SQL queries that aggregate data across organizations while applying differential privacy protections. These queries demonstrate how to extract meaningful business insights without exposing individual customer records, using techniques like noise injection and result filtering to maintain privacy guarantees. The query execution engine automatically applies privacy controls and ensures that results meet differential privacy standards.
+   Clean Rooms enables SQL queries that aggregate data across organizations while applying differential privacy protections. These queries demonstrate how to extract meaningful business insights without exposing individual customer records, using techniques like noise injection and result filtering to maintain privacy guarantees. The Spark analytics engine automatically applies privacy controls and ensures that results meet differential privacy standards.
 
    ```bash
    # Create output S3 bucket for query results
@@ -464,12 +482,12 @@ GROUP BY age_group, region
 HAVING COUNT(*) >= 3
 EOF
    
-   # Start protected query
+   # Start protected query with updated syntax
    QUERY_ID=$(aws cleanrooms start-protected-query \
        --type "SQL" \
-       --membership-identifier "${COLLABORATION_ID}" \
-       --sql-parameters "{\"queryString\": \"$(cat privacy_query.sql | tr '\n' ' ')\"}" \
-       --result-configuration "{\"outputConfiguration\": {\"s3\": {\"resultFormat\": \"CSV\", \"bucket\": \"${RESULTS_BUCKET}\", \"keyPrefix\": \"query-results/\"}}}" \
+       --membership-identifier "${MEMBERSHIP_ID}" \
+       --sql-parameters queryString="$(cat privacy_query.sql | tr '\n' ' ')" \
+       --result-configuration outputConfiguration="{s3={resultFormat=CSV,bucket=${RESULTS_BUCKET},keyPrefix=query-results/}}" \
        --query "protectedQueryId" --output text)
    
    echo "✅ Privacy-preserving query executed: ${QUERY_ID}"
@@ -483,7 +501,14 @@ EOF
 
    ```bash
    # Wait for query to complete before setting up visualization
-   sleep 120
+   echo "Waiting for protected query to complete..."
+   sleep 180
+   
+   # Check query status
+   aws cleanrooms get-protected-query \
+       --membership-identifier "${MEMBERSHIP_ID}" \
+       --protected-query-identifier "${QUERY_ID}" \
+       --query "status"
    
    # Check if QuickSight subscription exists
    aws quicksight describe-account-settings \
@@ -512,80 +537,45 @@ EOF
        --data-source-id "clean-rooms-results-${RANDOM_SUFFIX}" \
        --name "Clean Rooms Analytics Results" \
        --type "S3" \
-       --data-source-parameters "{\"S3Parameters\": {\"ManifestFileLocation\": {\"Bucket\": \"${RESULTS_BUCKET}\", \"Key\": \"query-results/\"}}}" \
-       --permissions "[{\"Principal\": \"arn:aws:iam::${AWS_ACCOUNT_ID}:root\", \"Actions\": [\"quicksight:DescribeDataSource\", \"quicksight:DescribeDataSourcePermissions\", \"quicksight:PassDataSource\", \"quicksight:UpdateDataSource\", \"quicksight:DeleteDataSource\", \"quicksight:UpdateDataSourcePermissions\"]}]"
+       --data-source-parameters S3Parameters="{ManifestFileLocation={Bucket=${RESULTS_BUCKET},Key=query-results/}}" \
+       --permissions Principal="arn:aws:iam::${AWS_ACCOUNT_ID}:root",Actions="quicksight:DescribeDataSource,quicksight:DescribeDataSourcePermissions,quicksight:PassDataSource,quicksight:UpdateDataSource,quicksight:DeleteDataSource,quicksight:UpdateDataSourcePermissions"
    
    echo "✅ QuickSight data source configured for Clean Rooms results"
    ```
 
    QuickSight is now configured to access privacy-preserved analytics results. The visualization platform provides secure access to aggregated data while maintaining the privacy guarantees established by Clean Rooms differential privacy protections.
 
-9. **Configure Differential Privacy Settings**:
+9. **Create Interactive Dashboard**:
 
-   Differential privacy adds mathematical guarantees that individual data points cannot be identified from query results. This configuration sets privacy budgets, noise parameters, and result filtering thresholds that balance privacy protection with analytical utility, ensuring compliance with privacy regulations while enabling meaningful insights. The epsilon parameter controls the privacy-utility tradeoff, with lower values providing stronger privacy at the cost of analytical precision.
+   QuickSight dashboards enable business users to explore privacy-preserved analytics results through interactive visualizations. This step creates charts and filters that help organizations understand cross-sectional insights while maintaining confidence that individual customer privacy is protected through differential privacy guarantees. The dashboard provides self-service analytics capabilities while respecting privacy boundaries established by Clean Rooms.
 
    ```bash
-   # Create differential privacy configuration
-   cat > dp_config.json << 'EOF'
-{
-  "columnName": "customer_id",
-  "aggregationFunction": "COUNT",
-  "aggregationParameters": {
-    "dimensions": ["age_group", "region"],
-    "scalarFunctions": ["AVG"],
-    "outputColumns": ["customer_count", "avg_purchase_amount", "avg_engagement_score"]
-  },
-  "resultPolicy": {
-    "noiseMechanism": "LAPLACE",
-    "epsilon": 1.0,
-    "usersNoisePerQuery": 100
-  }
-}
-EOF
+   # Wait for query results to be available
+   sleep 60
    
-   # Note: Update collaboration with differential privacy settings
-   # (This configuration example shows the structure - actual implementation
-   # depends on AWS Clean Rooms differential privacy feature availability)
-   echo "Differential privacy configuration prepared"
-   echo "Epsilon value: 1.0 (balanced privacy-utility tradeoff)"
-   echo "Noise mechanism: Laplace (standard for count queries)"
+   # Verify query results exist
+   aws s3 ls s3://${RESULTS_BUCKET}/query-results/ --recursive
    
-   echo "✅ Differential privacy configuration prepared"
+   # Create QuickSight dataset from query results
+   aws quicksight create-data-set \
+       --aws-account-id "${AWS_ACCOUNT_ID}" \
+       --data-set-id "privacy-analytics-dataset-${RANDOM_SUFFIX}" \
+       --name "Privacy Analytics Dataset" \
+       --physical-table-map CleanRoomsResults="{S3Source={DataSourceArn=arn:aws:quicksight:${AWS_REGION}:${AWS_ACCOUNT_ID}:datasource/clean-rooms-results-${RANDOM_SUFFIX},InputColumns=[{Name=age_group,Type=STRING},{Name=region,Type=STRING},{Name=customer_count,Type=INTEGER},{Name=avg_purchase_amount,Type=DECIMAL},{Name=avg_engagement_score,Type=DECIMAL}]}}" \
+       --permissions Principal="arn:aws:iam::${AWS_ACCOUNT_ID}:root",Actions="quicksight:DescribeDataSet,quicksight:DescribeDataSetPermissions,quicksight:PassDataSet,quicksight:DescribeIngestion,quicksight:ListIngestions,quicksight:UpdateDataSet,quicksight:DeleteDataSet,quicksight:CreateIngestion,quicksight:CancelIngestion,quicksight:UpdateDataSetPermissions"
+   
+   # Create QuickSight analysis for privacy-preserving insights
+   aws quicksight create-analysis \
+       --aws-account-id "${AWS_ACCOUNT_ID}" \
+       --analysis-id "${QUICKSIGHT_ANALYSIS}" \
+       --name "Privacy-Preserving Analytics Dashboard" \
+       --permissions Principal="arn:aws:iam::${AWS_ACCOUNT_ID}:root",Actions="quicksight:RestoreAnalysis,quicksight:UpdateAnalysisPermissions,quicksight:DeleteAnalysis,quicksight:DescribeAnalysisPermissions,quicksight:QueryAnalysis,quicksight:DescribeAnalysis,quicksight:UpdateAnalysis" \
+       --definition DataSetIdentifierDeclarations="[{DataSetArn=arn:aws:quicksight:${AWS_REGION}:${AWS_ACCOUNT_ID}:dataset/privacy-analytics-dataset-${RANDOM_SUFFIX},Identifier=CleanRoomsResults}]",Sheets="[{SheetId=sheet1,Name=Privacy Analytics,Visuals=[{BarChartVisual={VisualId=visual1,Title={Visibility=VISIBLE,FormatText={PlainText=Customer Segments by Demographics}},Subtitle={Visibility=VISIBLE,FormatText={PlainText=Privacy-preserved cross-organizational insights}}}}]}]"
+   
+   echo "✅ Interactive QuickSight dashboard created for privacy analytics"
    ```
 
-   The differential privacy configuration is prepared with carefully chosen parameters that provide formal privacy guarantees. The epsilon value of 1.0 provides a balanced approach between privacy protection and analytical utility for business insights.
-
-10. **Create Interactive Dashboard**:
-
-    QuickSight dashboards enable business users to explore privacy-preserved analytics results through interactive visualizations. This step creates charts and filters that help organizations understand cross-sectional insights while maintaining confidence that individual customer privacy is protected through differential privacy guarantees. The dashboard provides self-service analytics capabilities while respecting privacy boundaries established by Clean Rooms.
-
-    ```bash
-    # Wait for query results to be available
-    sleep 60
-    
-    # Verify query results exist
-    aws s3 ls s3://${RESULTS_BUCKET}/query-results/ --recursive
-    
-    # Create QuickSight dataset from query results
-    aws quicksight create-data-set \
-        --aws-account-id "${AWS_ACCOUNT_ID}" \
-        --data-set-id "privacy-analytics-dataset-${RANDOM_SUFFIX}" \
-        --name "Privacy Analytics Dataset" \
-        --physical-table-map "{\"CleanRoomsResults\": {\"S3Source\": {\"DataSourceArn\": \"arn:aws:quicksight:${AWS_REGION}:${AWS_ACCOUNT_ID}:datasource/clean-rooms-results-${RANDOM_SUFFIX}\", \"InputColumns\": [{\"Name\": \"age_group\", \"Type\": \"STRING\"}, {\"Name\": \"region\", \"Type\": \"STRING\"}, {\"Name\": \"customer_count\", \"Type\": \"INTEGER\"}, {\"Name\": \"avg_purchase_amount\", \"Type\": \"DECIMAL\"}, {\"Name\": \"avg_engagement_score\", \"Type\": \"DECIMAL\"}]}}}" \
-        --permissions "[{\"Principal\": \"arn:aws:iam::${AWS_ACCOUNT_ID}:root\", \"Actions\": [\"quicksight:DescribeDataSet\", \"quicksight:DescribeDataSetPermissions\", \"quicksight:PassDataSet\", \"quicksight:DescribeIngestion\", \"quicksight:ListIngestions\", \"quicksight:UpdateDataSet\", \"quicksight:DeleteDataSet\", \"quicksight:CreateIngestion\", \"quicksight:CancelIngestion\", \"quicksight:UpdateDataSetPermissions\"]}]"
-    
-    # Create QuickSight analysis for privacy-preserving insights
-    aws quicksight create-analysis \
-        --aws-account-id "${AWS_ACCOUNT_ID}" \
-        --analysis-id "${QUICKSIGHT_ANALYSIS}" \
-        --name "Privacy-Preserving Analytics Dashboard" \
-        --permissions "[{\"Principal\": \"arn:aws:iam::${AWS_ACCOUNT_ID}:root\", \"Actions\": [\"quicksight:RestoreAnalysis\", \"quicksight:UpdateAnalysisPermissions\", \"quicksight:DeleteAnalysis\", \"quicksight:DescribeAnalysisPermissions\", \"quicksight:QueryAnalysis\", \"quicksight:DescribeAnalysis\", \"quicksight:UpdateAnalysis\"]}]" \
-        --definition "{\"DataSetIdentifierDeclarations\": [{\"DataSetArn\": \"arn:aws:quicksight:${AWS_REGION}:${AWS_ACCOUNT_ID}:dataset/privacy-analytics-dataset-${RANDOM_SUFFIX}\", \"Identifier\": \"CleanRoomsResults\"}], \"Sheets\": [{\"SheetId\": \"sheet1\", \"Name\": \"Privacy Analytics\", \"Visuals\": [{\"BarChartVisual\": {\"VisualId\": \"visual1\", \"Title\": {\"Visibility\": \"VISIBLE\", \"FormatText\": {\"PlainText\": \"Customer Segments by Demographics\"}}, \"Subtitle\": {\"Visibility\": \"VISIBLE\", \"FormatText\": {\"PlainText\": \"Privacy-preserved cross-organizational insights\"}}}}]}]}"
-    
-    echo "✅ Interactive QuickSight dashboard created for privacy analytics"
-    ```
-
-    The QuickSight dashboard is now available with privacy-preserved analytics results. Business users can explore cross-organizational insights through interactive visualizations while maintaining confidence that individual customer privacy is protected through Clean Rooms' differential privacy mechanisms.
+   The QuickSight dashboard is now available with privacy-preserved analytics results. Business users can explore cross-organizational insights through interactive visualizations while maintaining confidence that individual customer privacy is protected through Clean Rooms' differential privacy mechanisms.
 
 ## Validation & Testing
 
@@ -596,9 +586,13 @@ EOF
    aws cleanrooms get-collaboration \
        --collaboration-identifier "${COLLABORATION_ID}"
    
+   # Verify membership status
+   aws cleanrooms get-membership \
+       --membership-identifier "${MEMBERSHIP_ID}"
+   
    # Verify table associations
    aws cleanrooms list-configured-table-associations \
-       --membership-identifier "${COLLABORATION_ID}"
+       --membership-identifier "${MEMBERSHIP_ID}"
    ```
 
    Expected output: Collaboration status should show "ACTIVE" with configured tables properly associated and privacy settings enabled.
@@ -608,14 +602,14 @@ EOF
    ```bash
    # List protected queries
    aws cleanrooms list-protected-queries \
-       --membership-identifier "${COLLABORATION_ID}"
+       --membership-identifier "${MEMBERSHIP_ID}"
    
    # Check query results in S3
    aws s3 ls s3://${RESULTS_BUCKET}/query-results/ --recursive
    
    # Verify query completion status
    aws cleanrooms get-protected-query \
-       --membership-identifier "${COLLABORATION_ID}" \
+       --membership-identifier "${MEMBERSHIP_ID}" \
        --protected-query-identifier "${QUERY_ID}"
    ```
 
@@ -672,11 +666,11 @@ EOF
    # Delete configured table associations
    aws cleanrooms delete-configured-table-association \
        --configured-table-association-identifier "org-a-association" \
-       --membership-identifier "${COLLABORATION_ID}"
+       --membership-identifier "${MEMBERSHIP_ID}"
    
    aws cleanrooms delete-configured-table-association \
        --configured-table-association-identifier "org-b-association" \
-       --membership-identifier "${COLLABORATION_ID}"
+       --membership-identifier "${MEMBERSHIP_ID}"
    
    # Delete configured tables
    aws cleanrooms delete-configured-table \
@@ -684,6 +678,10 @@ EOF
    
    aws cleanrooms delete-configured-table \
        --configured-table-identifier "${ORG_B_TABLE_ID}"
+   
+   # Delete membership
+   aws cleanrooms delete-membership \
+       --membership-identifier "${MEMBERSHIP_ID}"
    
    # Delete collaboration
    aws cleanrooms delete-collaboration \
@@ -732,7 +730,7 @@ EOF
    aws s3 rb s3://${RESULTS_BUCKET}
    
    # Clean up local files
-   rm -f customer_data_org_*.csv privacy_query.sql dp_config.json
+   rm -f customer_data_org_*.csv privacy_query.sql
    rm -f *-trust-policy.json *-policy.json
    
    echo "✅ All infrastructure and local files deleted"
@@ -740,7 +738,7 @@ EOF
 
 ## Discussion
 
-AWS Clean Rooms revolutionizes multi-party data collaboration by enabling secure analytics without exposing raw datasets to participating organizations. This architecture leverages cryptographic protections and differential privacy techniques to ensure individual data points remain protected while allowing meaningful aggregate insights. The service implements mathematical privacy guarantees that provide formal proof of privacy preservation, making it suitable for highly regulated industries and cross-border data collaborations. For comprehensive technical details, see the [AWS Clean Rooms User Guide](https://docs.aws.amazon.com/clean-rooms/latest/userguide/what-is.html) and [differential privacy documentation](https://docs.aws.amazon.com/clean-rooms/latest/userguide/differential-privacy.html).
+AWS Clean Rooms revolutionizes multi-party data collaboration by enabling secure analytics without exposing raw datasets to participating organizations. This architecture leverages cryptographic protections and differential privacy techniques to ensure individual data points remain protected while allowing meaningful aggregate insights. The service implements mathematical privacy guarantees that provide formal proof of privacy preservation, making it suitable for highly regulated industries and cross-border data collaborations. The Spark analytics engine is now the recommended choice for new implementations, as the legacy Clean Rooms SQL engine will be deprecated after July 16, 2025. For comprehensive technical details, see the [AWS Clean Rooms User Guide](https://docs.aws.amazon.com/clean-rooms/latest/userguide/what-is.html) and [differential privacy documentation](https://docs.aws.amazon.com/clean-rooms/latest/userguide/differential-privacy.html).
 
 The integration with AWS Glue provides automated data preparation and schema discovery, reducing the operational overhead typically associated with multi-party analytics. Glue crawlers automatically detect data formats and create metadata catalogs that enable Clean Rooms to understand data relationships while maintaining privacy boundaries. This approach follows the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles by implementing security by design, operational excellence through automation, and cost optimization through serverless architectures. The [AWS Glue Developer Guide](https://docs.aws.amazon.com/glue/latest/dg/what-is-glue.html) provides detailed guidance on implementing data cataloging best practices.
 

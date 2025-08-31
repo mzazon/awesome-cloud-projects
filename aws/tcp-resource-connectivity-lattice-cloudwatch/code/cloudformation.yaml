@@ -1,0 +1,674 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'TCP Resource Connectivity with VPC Lattice and CloudWatch - Production-ready infrastructure for secure cross-VPC database access'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and naming'
+    
+  ProjectName:
+    Type: String
+    Default: 'tcp-lattice-connectivity'
+    Description: 'Project name for resource naming and tagging'
+    MaxLength: 50
+    ConstraintDescription: 'Project name must be 50 characters or less'
+    
+  # VPC Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where resources will be deployed'
+    
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of subnet IDs for RDS deployment (minimum 2 subnets required)'
+    
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: 'Existing security group ID for VPC Lattice and RDS access'
+    
+  # Database Configuration
+  DatabaseInstanceClass:
+    Type: String
+    Default: 'db.t3.micro'
+    AllowedValues: 
+      - 'db.t3.micro'
+      - 'db.t3.small'
+      - 'db.t3.medium'
+      - 'db.t3.large'
+    Description: 'RDS instance class for the MySQL database'
+    
+  DatabaseName:
+    Type: String
+    Default: 'latticedb'
+    Description: 'Name for the MySQL database'
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+    ConstraintDescription: 'Database name must begin with a letter and contain only alphanumeric characters'
+    
+  DatabaseUsername:
+    Type: String
+    Default: 'admin'
+    Description: 'Master username for the RDS database'
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+    ConstraintDescription: 'Username must begin with a letter and contain only alphanumeric characters'
+    
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    Description: 'Master password for the RDS database (minimum 8 characters)'
+    MinLength: 8
+    MaxLength: 128
+    AllowedPattern: '^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[a-zA-Z\d@$!%*?&]{8,}$'
+    ConstraintDescription: 'Password must be at least 8 characters with uppercase, lowercase, and numeric characters'
+    
+  DatabasePort:
+    Type: Number
+    Default: 3306
+    MinValue: 1150
+    MaxValue: 65535
+    Description: 'Port number for the MySQL database'
+    
+  DatabaseStorageSize:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    Description: 'Storage size in GB for the RDS instance'
+    
+  # VPC Lattice Configuration
+  ServiceNetworkName:
+    Type: String
+    Default: 'database-service-network'
+    Description: 'Name for the VPC Lattice service network'
+    MaxLength: 40
+    
+  DatabaseServiceName:
+    Type: String
+    Default: 'rds-database-service'
+    Description: 'Name for the VPC Lattice database service'
+    MaxLength: 40
+    
+  TargetGroupName:
+    Type: String
+    Default: 'rds-tcp-targets'
+    Description: 'Name for the TCP target group'
+    MaxLength: 32
+    
+  # Monitoring Configuration
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable detailed CloudWatch monitoring for RDS'
+    
+  CreateCloudWatchDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Create CloudWatch dashboard for VPC Lattice metrics'
+    
+  AlarmThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Threshold for connection error alarm'
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  CreateDashboard: !Equals [!Ref CreateCloudWatchDashboard, 'true']
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # -------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # -------------------------------------------------------------------------
+  VPCLatticeServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-vpc-lattice-service-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-lattice.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/VPCLatticeServicesInvokeAccess
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'VPC Lattice Service Role'
+
+  # -------------------------------------------------------------------------
+  # DATABASE SUBNET GROUP
+  # -------------------------------------------------------------------------
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-db-subnet-group-${Environment}'
+      DBSubnetGroupDescription: !Sub 'Subnet group for ${ProjectName} RDS instance'
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-subnet-group-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -------------------------------------------------------------------------
+  # RDS DATABASE INSTANCE
+  # -------------------------------------------------------------------------
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-db-${Environment}'
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      Engine: mysql
+      EngineVersion: '8.0.35'
+      MasterUsername: !Ref DatabaseUsername
+      MasterUserPassword: !Ref DatabasePassword
+      DBName: !Ref DatabaseName
+      AllocatedStorage: !Ref DatabaseStorageSize
+      StorageType: gp2
+      StorageEncrypted: true
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !Ref SecurityGroupId
+      Port: !Ref DatabasePort
+      PubliclyAccessible: false
+      BackupRetentionPeriod: !If [IsProduction, 7, 1]
+      DeletionProtection: !If [IsProduction, true, false]
+      MonitoringInterval: !If [EnableMonitoring, 60, 0]
+      MonitoringRoleArn: !If 
+        - EnableMonitoring
+        - !Sub 'arn:aws:iam::${AWS::AccountId}:role/rds-monitoring-role'
+        - !Ref AWS::NoValue
+      EnablePerformanceInsights: !If [IsProduction, true, false]
+      PerformanceInsightsRetentionPeriod: !If [IsProduction, 7, !Ref AWS::NoValue]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-database-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'TCP connectivity demonstration via VPC Lattice'
+
+  # -------------------------------------------------------------------------
+  # VPC LATTICE SERVICE NETWORK
+  # -------------------------------------------------------------------------
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub '${ServiceNetworkName}-${Environment}'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceNetworkName}-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Cross-VPC database connectivity'
+
+  # -------------------------------------------------------------------------
+  # VPC LATTICE TARGET GROUP
+  # -------------------------------------------------------------------------
+  DatabaseTargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: !Sub '${TargetGroupName}-${Environment}'
+      Type: IP
+      Config:
+        Port: !Ref DatabasePort
+        Protocol: TCP
+        VpcIdentifier: !Ref VpcId
+        HealthCheck:
+          Enabled: true
+          Protocol: TCP
+          Port: !Ref DatabasePort
+          HealthCheckIntervalSeconds: 30
+          HealthCheckTimeoutSeconds: 5
+          HealthyThresholdCount: 2
+          UnhealthyThresholdCount: 2
+      Tags:
+        - Key: Name
+          Value: !Sub '${TargetGroupName}-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'RDS TCP target group'
+
+  # -------------------------------------------------------------------------
+  # VPC LATTICE SERVICE
+  # -------------------------------------------------------------------------
+  DatabaseService:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Sub '${DatabaseServiceName}-${Environment}'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub '${DatabaseServiceName}-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Database service via VPC Lattice'
+
+  # -------------------------------------------------------------------------
+  # VPC LATTICE LISTENER
+  # -------------------------------------------------------------------------
+  DatabaseListener:
+    Type: AWS::VpcLattice::Listener
+    Properties:
+      ServiceIdentifier: !Ref DatabaseService
+      Name: !Sub 'mysql-tcp-listener-${Environment}'
+      Protocol: TCP
+      Port: !Ref DatabasePort
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref DatabaseTargetGroup
+              Weight: 100
+      Tags:
+        - Key: Name
+          Value: !Sub 'mysql-tcp-listener-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -------------------------------------------------------------------------
+  # VPC LATTICE SERVICE NETWORK ASSOCIATIONS
+  # -------------------------------------------------------------------------
+  ServiceNetworkServiceAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      ServiceIdentifier: !Ref DatabaseService
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ServiceNetworkVpcAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      VpcIdentifier: !Ref VpcId
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -------------------------------------------------------------------------
+  # CLOUDWATCH DASHBOARD
+  # -------------------------------------------------------------------------
+  VPCLatticeDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboard
+    Properties:
+      DashboardName: !Sub 'VPCLattice-Database-Monitoring-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/VpcLattice", "NewConnectionCount", "TargetGroup", "${DatabaseTargetGroup}"],
+                  [".", "ActiveConnectionCount", ".", "."],
+                  [".", "ConnectionErrorCount", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Database Connection Metrics",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/VpcLattice", "ProcessedBytes", "TargetGroup", "${DatabaseTargetGroup}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Database Traffic Volume",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/VpcLattice", "TargetResponseTime", "TargetGroup", "${DatabaseTargetGroup}"],
+                  [".", "HealthyTargetCount", ".", "."],
+                  [".", "UnhealthyTargetCount", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Target Health and Performance",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "${DatabaseInstance}"],
+                  [".", "CPUUtilization", ".", "."],
+                  [".", "FreeableMemory", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "RDS Performance Metrics",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+  # -------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS
+  # -------------------------------------------------------------------------
+  ConnectionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'VPCLattice-Database-Connection-Errors-${Environment}'
+      AlarmDescription: 'Alert when VPC Lattice database connection errors exceed threshold'
+      MetricName: ConnectionErrorCount
+      Namespace: AWS/VpcLattice
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref AlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !Ref DatabaseTargetGroup
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  UnhealthyTargetAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'VPCLattice-Unhealthy-Targets-${Environment}'
+      AlarmDescription: 'Alert when targets become unhealthy'
+      MetricName: UnhealthyTargetCount
+      Namespace: AWS/VpcLattice
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !Ref DatabaseTargetGroup
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DatabaseCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub 'RDS-High-CPU-${Environment}'
+      AlarmDescription: 'Alert when RDS CPU utilization exceeds 80%'
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # Database Information
+  DatabaseInstanceId:
+    Description: 'RDS Database Instance Identifier'
+    Value: !Ref DatabaseInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseInstanceId'
+      
+  DatabaseEndpoint:
+    Description: 'RDS Database Endpoint'
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseEndpoint'
+      
+  DatabasePort:
+    Description: 'RDS Database Port'
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabasePort'
+
+  # VPC Lattice Information
+  ServiceNetworkArn:
+    Description: 'VPC Lattice Service Network ARN'
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetworkArn'
+      
+  ServiceNetworkId:
+    Description: 'VPC Lattice Service Network ID'
+    Value: !GetAtt ServiceNetwork.Id
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetworkId'
+      
+  DatabaseServiceArn:
+    Description: 'VPC Lattice Database Service ARN'
+    Value: !Ref DatabaseService
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseServiceArn'
+      
+  DatabaseServiceId:
+    Description: 'VPC Lattice Database Service ID'
+    Value: !GetAtt DatabaseService.Id
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseServiceId'
+      
+  TargetGroupArn:
+    Description: 'VPC Lattice Target Group ARN'
+    Value: !Ref DatabaseTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-TargetGroupArn'
+      
+  TargetGroupId:
+    Description: 'VPC Lattice Target Group ID'
+    Value: !GetAtt DatabaseTargetGroup.Id
+    Export:
+      Name: !Sub '${AWS::StackName}-TargetGroupId'
+
+  # Connection Information
+  ServiceEndpoint:
+    Description: 'VPC Lattice Service Endpoint for Database Connections'
+    Value: !Sub '${DatabaseServiceName}-${Environment}.${ServiceNetwork.Id}.vpc-lattice-svcs.${AWS::Region}.on.aws'
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceEndpoint'
+
+  # Monitoring Information
+  DashboardURL:
+    Condition: CreateDashboard
+    Description: 'CloudWatch Dashboard URL for VPC Lattice Monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${VPCLatticeDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  # IAM Role
+  VPCLatticeServiceRoleArn:
+    Description: 'VPC Lattice Service Role ARN'
+    Value: !GetAtt VPCLatticeServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCLatticeServiceRoleArn'
+
+  # Connection Command
+  MySQLConnectionCommand:
+    Description: 'MySQL connection command using VPC Lattice endpoint'
+    Value: !Sub 'mysql -h ${DatabaseServiceName}-${Environment}.${ServiceNetwork.Id}.vpc-lattice-svcs.${AWS::Region}.on.aws -P ${DatabasePort} -u ${DatabaseUsername} -p ${DatabaseName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-MySQLConnectionCommand'
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Environment Configuration'
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: 'Network Configuration'
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - SecurityGroupId
+      - Label:
+          default: 'Database Configuration'
+        Parameters:
+          - DatabaseInstanceClass
+          - DatabaseName
+          - DatabaseUsername
+          - DatabasePassword
+          - DatabasePort
+          - DatabaseStorageSize
+      - Label:
+          default: 'VPC Lattice Configuration'
+        Parameters:
+          - ServiceNetworkName
+          - DatabaseServiceName
+          - TargetGroupName
+      - Label:
+          default: 'Monitoring Configuration'
+        Parameters:
+          - EnableDetailedMonitoring
+          - CreateCloudWatchDashboard
+          - AlarmThreshold
+    ParameterLabels:
+      Environment:
+        default: 'Environment Name'
+      ProjectName:
+        default: 'Project Name'
+      VpcId:
+        default: 'VPC ID'
+      SubnetIds:
+        default: 'Subnet IDs'
+      SecurityGroupId:
+        default: 'Security Group ID'
+      DatabaseInstanceClass:
+        default: 'Database Instance Class'
+      DatabaseName:
+        default: 'Database Name'
+      DatabaseUsername:
+        default: 'Database Username'
+      DatabasePassword:
+        default: 'Database Password'
+      DatabasePort:
+        default: 'Database Port'
+      DatabaseStorageSize:
+        default: 'Database Storage Size (GB)'
+      ServiceNetworkName:
+        default: 'Service Network Name'
+      DatabaseServiceName:
+        default: 'Database Service Name'
+      TargetGroupName:
+        default: 'Target Group Name'
+      EnableDetailedMonitoring:
+        default: 'Enable Detailed Monitoring'
+      CreateCloudWatchDashboard:
+        default: 'Create CloudWatch Dashboard'
+      AlarmThreshold:
+        default: 'Connection Error Alarm Threshold'
+
+  # Template Information
+  TemplateInfo:
+    Version: '1.1'
+    Description: 'CloudFormation template for TCP Resource Connectivity with VPC Lattice and CloudWatch'
+    Recipe: 'tcp-resource-connectivity-lattice-cloudwatch'
+    Provider: 'AWS'
+    Services: 'VPC Lattice, RDS, CloudWatch, IAM'
+    LastUpdated: '2025-07-12'
+    
+  # Cost Estimation
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost breakdown'
+    Components:
+      RDS: '$15-20/month for db.t3.micro instance'
+      VPCLattice: '$10-15/month for service network and data processing'
+      CloudWatch: '$5-10/month for metrics and alarms'
+      Total: '$30-45/month'

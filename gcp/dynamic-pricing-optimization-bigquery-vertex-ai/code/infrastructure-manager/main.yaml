@@ -1,0 +1,613 @@
+# Infrastructure Manager Configuration for Dynamic Pricing Optimization
+# This configuration deploys a complete pricing optimization system using
+# BigQuery, Vertex AI, Cloud Functions, and Cloud Scheduler
+
+# Main deployment resource that orchestrates all infrastructure
+resources:
+  # Generate random suffix for unique resource naming
+  - name: random-suffix
+    type: gcp-types/cloudresourcemanager-v1:projects
+    metadata:
+      runtimePolicy:
+        - CREATE
+    properties:
+      projectId: $(ref.project-id.projectId)
+      name: pricing-optimization-$(ref.random-id.hex)
+    
+  # Random ID generator for unique naming
+  - name: random-id
+    type: random-id
+    properties:
+      byteLength: 3
+
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: deploymentmanager.v2.composite
+    properties:
+      templates:
+        - name: apis
+          type: gcp-types/serviceusage-v1:services
+          properties:
+            name: projects/$(ref.project-id.projectId)/services/bigquery.googleapis.com
+            parent: projects/$(ref.project-id.projectId)
+        - name: vertex-ai-api
+          type: gcp-types/serviceusage-v1:services
+          properties:
+            name: projects/$(ref.project-id.projectId)/services/aiplatform.googleapis.com
+            parent: projects/$(ref.project-id.projectId)
+        - name: functions-api
+          type: gcp-types/serviceusage-v1:services
+          properties:
+            name: projects/$(ref.project-id.projectId)/services/cloudfunctions.googleapis.com
+            parent: projects/$(ref.project-id.projectId)
+        - name: scheduler-api
+          type: gcp-types/serviceusage-v1:services
+          properties:
+            name: projects/$(ref.project-id.projectId)/services/cloudscheduler.googleapis.com
+            parent: projects/$(ref.project-id.projectId)
+        - name: storage-api
+          type: gcp-types/serviceusage-v1:services
+          properties:
+            name: projects/$(ref.project-id.projectId)/services/storage.googleapis.com
+            parent: projects/$(ref.project-id.projectId)
+        - name: monitoring-api
+          type: gcp-types/serviceusage-v1:services
+          properties:
+            name: projects/$(ref.project-id.projectId)/services/monitoring.googleapis.com
+            parent: projects/$(ref.project-id.projectId)
+        - name: artifact-registry-api
+          type: gcp-types/serviceusage-v1:services
+          properties:
+            name: projects/$(ref.project-id.projectId)/services/artifactregistry.googleapis.com
+            parent: projects/$(ref.project-id.projectId)
+
+  # Cloud Storage bucket for data and model artifacts
+  - name: pricing-data-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: pricing-data-$(ref.random-id.hex)
+      project: $(ref.project-id.projectId)
+      location: us-central1
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - condition:
+              age: 90
+            action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+          - condition:
+              age: 365
+            action:
+              type: Delete
+      labels:
+        purpose: pricing-optimization
+        environment: production
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # BigQuery dataset for pricing optimization data
+  - name: pricing-optimization-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: pricing_optimization
+      projectId: $(ref.project-id.projectId)
+      location: us-central1
+      description: Dataset for dynamic pricing optimization data and models
+      defaultTableExpirationMs: 31536000000  # 1 year in milliseconds
+      access:
+        - role: OWNER
+          userByEmail: $(ref.cloud-function-sa.email)
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+      labels:
+        purpose: pricing-optimization
+        data-classification: business-critical
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # BigQuery table for sales history data
+  - name: sales-history-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: $(ref.project-id.projectId)
+      datasetId: $(ref.pricing-optimization-dataset.datasetId)
+      tableId: sales_history
+      description: Historical sales data for pricing model training
+      schema:
+        fields:
+          - name: product_id
+            type: STRING
+            mode: REQUIRED
+            description: Unique identifier for the product
+          - name: sale_date
+            type: DATE
+            mode: REQUIRED
+            description: Date of the sale transaction
+          - name: price
+            type: FLOAT
+            mode: REQUIRED
+            description: Sale price of the product
+          - name: quantity
+            type: INTEGER
+            mode: REQUIRED
+            description: Quantity sold
+          - name: revenue
+            type: FLOAT
+            mode: REQUIRED
+            description: Total revenue from the sale
+          - name: competitor_price
+            type: FLOAT
+            mode: NULLABLE
+            description: Competitor price at time of sale
+          - name: inventory_level
+            type: INTEGER
+            mode: REQUIRED
+            description: Inventory level at time of sale
+          - name: season
+            type: STRING
+            mode: REQUIRED
+            description: Season when sale occurred
+          - name: promotion
+            type: BOOLEAN
+            mode: REQUIRED
+            description: Whether product was on promotion
+      timePartitioning:
+        type: DAY
+        field: sale_date
+        requirePartitionFilter: false
+      clustering:
+        fields:
+          - product_id
+          - season
+      labels:
+        table-type: transactional-data
+        update-frequency: daily
+    metadata:
+      dependsOn:
+        - pricing-optimization-dataset
+
+  # BigQuery table for competitor pricing data
+  - name: competitor-pricing-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: $(ref.project-id.projectId)
+      datasetId: $(ref.pricing-optimization-dataset.datasetId)
+      tableId: competitor_pricing
+      description: Real-time competitor pricing information
+      schema:
+        fields:
+          - name: product_id
+            type: STRING
+            mode: REQUIRED
+            description: Product identifier
+          - name: competitor
+            type: STRING
+            mode: REQUIRED
+            description: Competitor name or identifier
+          - name: price
+            type: FLOAT
+            mode: REQUIRED
+            description: Competitor's price
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: When the price was observed
+          - name: availability
+            type: BOOLEAN
+            mode: REQUIRED
+            description: Product availability at competitor
+      timePartitioning:
+        type: HOUR
+        field: timestamp
+        requirePartitionFilter: false
+      clustering:
+        fields:
+          - product_id
+          - competitor
+      labels:
+        table-type: market-data
+        update-frequency: hourly
+    metadata:
+      dependsOn:
+        - pricing-optimization-dataset
+
+  # Service account for Cloud Function
+  - name: cloud-function-sa
+    type: gcp-types/iam-v1:serviceAccounts
+    properties:
+      accountId: pricing-function-sa-$(ref.random-id.hex)
+      projectId: $(ref.project-id.projectId)
+      displayName: Pricing Optimization Cloud Function Service Account
+      description: Service account for pricing optimization Cloud Function
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # IAM binding for BigQuery access
+  - name: bigquery-iam-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.cloud-function-sa.email)
+    metadata:
+      dependsOn:
+        - cloud-function-sa
+        - pricing-optimization-dataset
+
+  # IAM binding for Vertex AI access
+  - name: vertex-ai-iam-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.cloud-function-sa.email)
+    metadata:
+      dependsOn:
+        - cloud-function-sa
+
+  # IAM binding for Cloud Storage access
+  - name: storage-iam-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.cloud-function-sa.email)
+    metadata:
+      dependsOn:
+        - cloud-function-sa
+        - pricing-data-bucket
+
+  # Cloud Function source code bucket object
+  - name: function-source-archive
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.pricing-data-bucket.name)
+      name: cloud-functions/pricing-optimizer-source.zip
+      # Note: In production, this would reference actual source code
+      # For Infrastructure Manager, source code deployment is typically
+      # handled separately through CI/CD pipelines
+    metadata:
+      dependsOn:
+        - pricing-data-bucket
+
+  # Cloud Function for pricing optimization
+  - name: pricing-optimizer-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project-id.projectId)/locations/us-central1
+      function: pricing-optimizer-$(ref.random-id.hex)
+      description: Function to optimize product pricing using ML models
+      sourceArchiveUrl: gs://$(ref.pricing-data-bucket.name)/cloud-functions/pricing-optimizer-source.zip
+      entryPoint: optimize_pricing
+      runtime: python311
+      timeout: 60s
+      availableMemoryMb: 512
+      maxInstances: 100
+      minInstances: 0
+      httpsTrigger: {}
+      serviceAccountEmail: $(ref.cloud-function-sa.email)
+      environmentVariables:
+        PROJECT_ID: $(ref.project-id.projectId)
+        DATASET_ID: $(ref.pricing-optimization-dataset.datasetId)
+        BUCKET_NAME: $(ref.pricing-data-bucket.name)
+      labels:
+        component: pricing-optimization
+        environment: production
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - cloud-function-sa
+        - pricing-optimization-dataset
+        - function-source-archive
+        - bigquery-iam-binding
+        - vertex-ai-iam-binding
+        - storage-iam-binding
+
+  # Service account for Cloud Scheduler
+  - name: scheduler-sa
+    type: gcp-types/iam-v1:serviceAccounts
+    properties:
+      accountId: pricing-scheduler-sa-$(ref.random-id.hex)
+      projectId: $(ref.project-id.projectId)
+      displayName: Pricing Scheduler Service Account
+      description: Service account for Cloud Scheduler pricing jobs
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # IAM binding for Cloud Scheduler to invoke functions
+  - name: scheduler-function-invoker-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/cloudfunctions.invoker
+      member: serviceAccount:$(ref.scheduler-sa.email)
+    metadata:
+      dependsOn:
+        - scheduler-sa
+        - pricing-optimizer-function
+
+  # Cloud Scheduler job for Product 1 pricing optimization
+  - name: pricing-scheduler-prod001
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/us-central1
+      job:
+        name: projects/$(ref.project-id.projectId)/locations/us-central1/jobs/pricing-optimization-prod001
+        description: Automated pricing optimization for PROD001
+        schedule: "0 */6 * * *"  # Every 6 hours
+        timeZone: America/New_York
+        httpTarget:
+          uri: $(ref.pricing-optimizer-function.httpsTrigger.url)
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: '{"product_id": "PROD001"}'
+          oidcToken:
+            serviceAccountEmail: $(ref.scheduler-sa.email)
+            audience: $(ref.pricing-optimizer-function.httpsTrigger.url)
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: 300s
+          minBackoffDuration: 5s
+          maxBackoffDuration: 60s
+          maxDoublings: 3
+    metadata:
+      dependsOn:
+        - pricing-optimizer-function
+        - scheduler-sa
+        - scheduler-function-invoker-binding
+
+  # Cloud Scheduler job for Product 2 pricing optimization
+  - name: pricing-scheduler-prod002
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/us-central1
+      job:
+        name: projects/$(ref.project-id.projectId)/locations/us-central1/jobs/pricing-optimization-prod002
+        description: Automated pricing optimization for PROD002
+        schedule: "0 */6 * * *"  # Every 6 hours
+        timeZone: America/New_York
+        httpTarget:
+          uri: $(ref.pricing-optimizer-function.httpsTrigger.url)
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: '{"product_id": "PROD002"}'
+          oidcToken:
+            serviceAccountEmail: $(ref.scheduler-sa.email)
+            audience: $(ref.pricing-optimizer-function.httpsTrigger.url)
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: 300s
+          minBackoffDuration: 5s
+          maxBackoffDuration: 60s
+          maxDoublings: 3
+    metadata:
+      dependsOn:
+        - pricing-optimizer-function
+        - scheduler-sa
+        - scheduler-function-invoker-binding
+
+  # Cloud Scheduler job for Product 3 pricing optimization
+  - name: pricing-scheduler-prod003
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/us-central1
+      job:
+        name: projects/$(ref.project-id.projectId)/locations/us-central1/jobs/pricing-optimization-prod003
+        description: Automated pricing optimization for PROD003
+        schedule: "0 */6 * * *"  # Every 6 hours
+        timeZone: America/New_York
+        httpTarget:
+          uri: $(ref.pricing-optimizer-function.httpsTrigger.url)
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: '{"product_id": "PROD003"}'
+          oidcToken:
+            serviceAccountEmail: $(ref.scheduler-sa.email)
+            audience: $(ref.pricing-optimizer-function.httpsTrigger.url)
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: 300s
+          minBackoffDuration: 5s
+          maxBackoffDuration: 60s
+          maxDoublings: 3
+    metadata:
+      dependsOn:
+        - pricing-optimizer-function
+        - scheduler-sa
+        - scheduler-function-invoker-binding
+
+  # Monitoring dashboard for pricing optimization
+  - name: pricing-monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/$(ref.project-id.projectId)
+      dashboard:
+        displayName: Dynamic Pricing Optimization Dashboard
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: Cloud Function Executions
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        unitOverride: "1"
+                        timeSeriesFilter:
+                          filter: 'resource.type="cloud_function" AND resource.labels.function_name="$(ref.pricing-optimizer-function.name)"'
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                  yAxis:
+                    label: Executions per minute
+                    scale: LINEAR
+            - width: 6
+              height: 4
+              widget:
+                title: Function Execution Duration
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="cloud_function" AND resource.labels.function_name="$(ref.pricing-optimizer-function.name)" AND metric.type="cloudfunctions.googleapis.com/function/execution_time"'
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_MEAN
+                  yAxis:
+                    label: Duration (ms)
+                    scale: LINEAR
+            - width: 12
+              height: 4
+              widget:
+                title: BigQuery Query Performance
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="bigquery_dataset" AND resource.labels.dataset_id="$(ref.pricing-optimization-dataset.datasetId)"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                  yAxis:
+                    label: Queries per 5 minutes
+                    scale: LINEAR
+    metadata:
+      dependsOn:
+        - pricing-optimizer-function
+        - pricing-optimization-dataset
+
+  # Notification channel for alerts (email)
+  - name: email-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: projects/$(ref.project-id.projectId)
+      notificationChannel:
+        type: email
+        displayName: Pricing Optimization Alerts
+        description: Email notifications for pricing system alerts
+        labels:
+          email_address: admin@example.com  # Replace with actual email
+        enabled: true
+
+  # Alert policy for function failures
+  - name: function-failure-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project-id.projectId)
+      alertPolicy:
+        displayName: Pricing Function Failure Alert
+        documentation:
+          content: Alert triggered when pricing optimization function fails
+          mimeType: text/markdown
+        conditions:
+          - displayName: Function execution errors
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.labels.function_name="$(ref.pricing-optimizer-function.name)" AND metric.type="cloudfunctions.googleapis.com/function/execution_count"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+                  groupByFields:
+                    - resource.labels.function_name
+        combiner: OR
+        enabled: true
+        notificationChannels:
+          - $(ref.email-notification-channel.name)
+        alertStrategy:
+          autoClose: 86400s  # 24 hours
+    metadata:
+      dependsOn:
+        - pricing-optimizer-function
+        - email-notification-channel
+
+# Configuration parameters for customization
+parameters:
+  - name: project-id
+    type: string
+    description: Google Cloud Project ID
+    default: my-pricing-project
+
+  - name: region
+    type: string
+    description: Google Cloud region for resources
+    default: us-central1
+
+  - name: notification-email
+    type: string
+    description: Email address for monitoring alerts
+    default: admin@example.com
+
+# Outputs for verification and integration
+outputs:
+  - name: project-id
+    description: The Google Cloud Project ID
+    value: $(ref.project-id.projectId)
+
+  - name: bucket-name
+    description: Cloud Storage bucket for data and artifacts
+    value: $(ref.pricing-data-bucket.name)
+
+  - name: dataset-id
+    description: BigQuery dataset ID for pricing data
+    value: $(ref.pricing-optimization-dataset.datasetId)
+
+  - name: function-url
+    description: Cloud Function HTTPS trigger URL
+    value: $(ref.pricing-optimizer-function.httpsTrigger.url)
+
+  - name: function-name
+    description: Cloud Function name
+    value: $(ref.pricing-optimizer-function.name)
+
+  - name: dashboard-url
+    description: Monitoring dashboard URL
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.pricing-monitoring-dashboard.name)?project=$(ref.project-id.projectId)
+
+  - name: service-account-email
+    description: Cloud Function service account email
+    value: $(ref.cloud-function-sa.email)
+
+  - name: scheduler-jobs
+    description: Cloud Scheduler job names
+    value:
+      - $(ref.pricing-scheduler-prod001.name)
+      - $(ref.pricing-scheduler-prod002.name)
+      - $(ref.pricing-scheduler-prod003.name)
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: Complete infrastructure for dynamic pricing optimization using BigQuery and Vertex AI
+  author: Google Cloud Recipe Generator
+  tags:
+    - pricing-optimization
+    - machine-learning
+    - bigquery
+    - vertex-ai
+    - automation
+  estimated-cost: "$20-35 per month for moderate usage"
+  security-level: enterprise
+  compliance:
+    - google-cloud-security-foundations
+    - least-privilege-iam
+    - data-encryption-at-rest

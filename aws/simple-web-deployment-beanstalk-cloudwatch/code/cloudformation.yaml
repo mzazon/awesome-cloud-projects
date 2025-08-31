@@ -1,0 +1,869 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simple Web Application Deployment with Elastic Beanstalk and CloudWatch - Infrastructure as Code for beginner web application deployment with comprehensive monitoring'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ApplicationName
+          - EnvironmentName
+          - ApplicationVersion
+      - Label:
+          default: "Infrastructure Configuration"
+        Parameters:
+          - InstanceType
+          - PlatformVersion
+          - MinInstances
+          - MaxInstances
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - LogRetentionDays
+          - HealthCheckRetentionDays
+          - EnableEnhancedMonitoring
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableAlarmNotifications
+    ParameterLabels:
+      ApplicationName:
+        default: "Application Name"
+      EnvironmentName:
+        default: "Environment Name"
+      ApplicationVersion:
+        default: "Application Version"
+      InstanceType:
+        default: "EC2 Instance Type"
+      PlatformVersion:
+        default: "Elastic Beanstalk Platform Version"
+      MinInstances:
+        default: "Minimum Instance Count"
+      MaxInstances:
+        default: "Maximum Instance Count"
+      LogRetentionDays:
+        default: "CloudWatch Log Retention (Days)"
+      HealthCheckRetentionDays:
+        default: "Health Check Log Retention (Days)"
+      EnableEnhancedMonitoring:
+        default: "Enable Enhanced Health Monitoring"
+      NotificationEmail:
+        default: "Notification Email Address"
+      EnableAlarmNotifications:
+        default: "Enable CloudWatch Alarm Notifications"
+
+# Input Parameters
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: simple-web-app
+    Description: Name for the Elastic Beanstalk application
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z0-9\-]{1,100}$'
+    ConstraintDescription: Application name must be 1 to 100 characters and contain only alphanumeric characters and hyphens
+
+  EnvironmentName:
+    Type: String
+    Default: simple-web-env
+    Description: Name for the Elastic Beanstalk environment
+    MinLength: 4
+    MaxLength: 40
+    AllowedPattern: '^[a-zA-Z0-9\-]{4,40}$'
+    ConstraintDescription: Environment name must be 4 to 40 characters and contain only alphanumeric characters and hyphens
+
+  ApplicationVersion:
+    Type: String
+    Default: v1.0.0
+    Description: Version label for the application deployment
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z0-9\-\.]{1,100}$'
+    ConstraintDescription: Version must be 1 to 100 characters and contain only alphanumeric characters, hyphens, and periods
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for the Elastic Beanstalk environment
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  PlatformVersion:
+    Type: String
+    Default: 64bit Amazon Linux 2023 v4.6.1 running Python 3.11
+    Description: Elastic Beanstalk solution stack for Python applications
+    AllowedValues:
+      - 64bit Amazon Linux 2023 v4.6.1 running Python 3.11
+      - 64bit Amazon Linux 2023 v4.5.1 running Python 3.11
+      - 64bit Amazon Linux 2023 v4.4.1 running Python 3.11
+    ConstraintDescription: Must be a valid Python platform version
+
+  MinInstances:
+    Type: Number
+    Default: 1
+    Description: Minimum number of EC2 instances in the Auto Scaling group
+    MinValue: 1
+    MaxValue: 10
+    ConstraintDescription: Must be between 1 and 10
+
+  MaxInstances:
+    Type: Number
+    Default: 2
+    Description: Maximum number of EC2 instances in the Auto Scaling group
+    MinValue: 1
+    MaxValue: 20
+    ConstraintDescription: Must be between 1 and 20
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    Description: Number of days to retain CloudWatch logs
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    ConstraintDescription: Must be a valid CloudWatch log retention period
+
+  HealthCheckRetentionDays:
+    Type: Number
+    Default: 7
+    Description: Number of days to retain health check logs
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    ConstraintDescription: Must be a valid CloudWatch log retention period
+
+  EnableEnhancedMonitoring:
+    Type: String
+    Default: 'true'
+    Description: Enable enhanced health reporting and monitoring
+    AllowedValues: ['true', 'false']
+    ConstraintDescription: Must be true or false
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for CloudWatch alarm notifications (optional)
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+  EnableAlarmNotifications:
+    Type: String
+    Default: 'false'
+    Description: Enable SNS notifications for CloudWatch alarms
+    AllowedValues: ['true', 'false']
+    ConstraintDescription: Must be true or false
+
+# Conditional Resources
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableNotifications: !And 
+    - !Condition HasNotificationEmail
+    - !Equals [!Ref EnableAlarmNotifications, 'true']
+  IsEnhancedMonitoringEnabled: !Equals [!Ref EnableEnhancedMonitoring, 'true']
+  IsProductionEnvironment: !Or
+    - !Equals [!Ref EnvironmentName, 'production']
+    - !Equals [!Ref EnvironmentName, 'prod']
+
+# AWS Resources
+Resources:
+  # S3 Bucket for Application Source Bundles
+  ApplicationSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ApplicationName}-source-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref ApplicationSourceLogGroup
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: ElasticBeanstalkSourceStorage
+
+  # CloudWatch Log Group for S3 Events
+  ApplicationSourceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ApplicationName}-source-bucket'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # IAM Service Role for Elastic Beanstalk
+  ElasticBeanstalkServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-eb-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticbeanstalk.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSElasticBeanstalkEnhancedHealth
+        - arn:aws:iam::aws:policy/AWSElasticBeanstalkManagedUpdatesCustomerRolePolicy
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # IAM Instance Profile for EC2 Instances
+  ElasticBeanstalkInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ApplicationName}-eb-instance-profile'
+      Roles:
+        - !Ref ElasticBeanstalkInstanceRole
+
+  # IAM Role for EC2 Instances
+  ElasticBeanstalkInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-eb-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSElasticBeanstalkWebTier
+        - arn:aws:iam::aws:policy/AWSElasticBeanstalkMulticontainerDocker
+        - arn:aws:iam::aws:policy/AWSElasticBeanstalkWorkerTier
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/elasticbeanstalk/*'
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${ApplicationSourceBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref ApplicationSourceBucket
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # SNS Topic for Alarm Notifications (Conditional)
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableNotifications
+    Properties:
+      TopicName: !Sub '${ApplicationName}-${EnvironmentName}-alarms'
+      DisplayName: !Sub 'CloudWatch Alarms for ${ApplicationName}'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # SNS Subscription for Email Notifications (Conditional)
+  EmailNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableNotifications
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlarmNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Elastic Beanstalk Application
+  ElasticBeanstalkApplication:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: !Ref ApplicationName
+      Description: !Sub 'Simple web application - ${ApplicationName}'
+      ApplicationVersions:
+        - VersionLabel: !Ref ApplicationVersion
+          Description: !Sub 'Initial version ${ApplicationVersion} of ${ApplicationName}'
+          SourceBundle:
+            S3Bucket: !Ref ApplicationSourceBucket
+            S3Key: !Sub '${ApplicationName}-source.zip'
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Configuration Template for Elastic Beanstalk Environment
+  ElasticBeanstalkConfigurationTemplate:
+    Type: AWS::ElasticBeanstalk::ConfigurationTemplate
+    Properties:
+      ApplicationName: !Ref ElasticBeanstalkApplication
+      Description: !Sub 'Configuration template for ${ApplicationName}'
+      SolutionStackName: !Ref PlatformVersion
+      OptionSettings:
+        # Instance Configuration
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: InstanceType
+          Value: !Ref InstanceType
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: IamInstanceProfile
+          Value: !Ref ElasticBeanstalkInstanceProfile
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: SecurityGroups
+          Value: !Ref ElasticBeanstalkSecurityGroup
+        
+        # Auto Scaling Configuration
+        - Namespace: aws:autoscaling:asg
+          OptionName: MinSize
+          Value: !Ref MinInstances
+        - Namespace: aws:autoscaling:asg
+          OptionName: MaxSize
+          Value: !Ref MaxInstances
+        - Namespace: aws:autoscaling:trigger
+          OptionName: MeasureName
+          Value: CPUUtilization
+        - Namespace: aws:autoscaling:trigger
+          OptionName: Statistic
+          Value: Average
+        - Namespace: aws:autoscaling:trigger
+          OptionName: Unit
+          Value: Percent
+        - Namespace: aws:autoscaling:trigger
+          OptionName: UpperThreshold
+          Value: 80
+        - Namespace: aws:autoscaling:trigger
+          OptionName: LowerThreshold
+          Value: 20
+        
+        # Load Balancer Configuration
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: LoadBalancerType
+          Value: application
+        - Namespace: aws:elbv2:loadbalancer
+          OptionName: SecurityGroups
+          Value: !Ref LoadBalancerSecurityGroup
+        - Namespace: aws:elbv2:listener:80
+          OptionName: Protocol
+          Value: HTTP
+        
+        # CloudWatch Logs Configuration
+        - Namespace: aws:elasticbeanstalk:cloudwatch:logs
+          OptionName: StreamLogs
+          Value: 'true'
+        - Namespace: aws:elasticbeanstalk:cloudwatch:logs
+          OptionName: DeleteOnTerminate
+          Value: 'false'
+        - Namespace: aws:elasticbeanstalk:cloudwatch:logs
+          OptionName: RetentionInDays
+          Value: !Ref LogRetentionDays
+        
+        # Health Monitoring Configuration
+        - Namespace: aws:elasticbeanstalk:cloudwatch:logs:health
+          OptionName: HealthStreamingEnabled
+          Value: 'true'
+        - Namespace: aws:elasticbeanstalk:cloudwatch:logs:health
+          OptionName: DeleteOnTerminate
+          Value: 'false'
+        - Namespace: aws:elasticbeanstalk:cloudwatch:logs:health
+          OptionName: RetentionInDays
+          Value: !Ref HealthCheckRetentionDays
+        
+        # Enhanced Health Reporting
+        - Namespace: aws:elasticbeanstalk:healthreporting:system
+          OptionName: SystemType
+          Value: !If [IsEnhancedMonitoringEnabled, 'enhanced', 'basic']
+        - Namespace: aws:elasticbeanstalk:healthreporting:system
+          OptionName: EnhancedHealthAuthEnabled
+          Value: !Ref EnableEnhancedMonitoring
+        
+        # Environment Variables
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: PYTHONPATH
+          Value: '/var/app/current'
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: ENV_NAME
+          Value: !Ref EnvironmentName
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: APP_NAME
+          Value: !Ref ApplicationName
+        
+        # Platform-specific Configuration
+        - Namespace: aws:elasticbeanstalk:container:python
+          OptionName: WSGIPath
+          Value: application.py
+        
+        # Service Role
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: ServiceRole
+          Value: !Ref ElasticBeanstalkServiceRole
+
+  # Security Group for Elastic Beanstalk Instances
+  ElasticBeanstalkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ApplicationName}-eb-instances-sg'
+      GroupDescription: Security group for Elastic Beanstalk EC2 instances
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          Description: HTTP traffic from load balancer
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          Description: HTTPS traffic from load balancer
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-eb-instances-sg'
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Security Group for Load Balancer
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ApplicationName}-lb-sg'
+      GroupDescription: Security group for Elastic Beanstalk load balancer
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP traffic from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS traffic from internet
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          DestinationSecurityGroupId: !Ref ElasticBeanstalkSecurityGroup
+          Description: HTTP traffic to instances
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref ElasticBeanstalkSecurityGroup
+          Description: HTTPS traffic to instances
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-lb-sg'
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Elastic Beanstalk Environment
+  ElasticBeanstalkEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref ElasticBeanstalkApplication
+      EnvironmentName: !Ref EnvironmentName
+      Description: !Sub 'Elastic Beanstalk environment for ${ApplicationName}'
+      TemplateName: !Ref ElasticBeanstalkConfigurationTemplate
+      VersionLabel: !Ref ApplicationVersion
+      Tier:
+        Name: WebServer
+        Type: Standard
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # CloudWatch Alarm: Environment Health
+  EnvironmentHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${EnvironmentName}-health-alarm'
+      AlarmDescription: Monitor Elastic Beanstalk environment health status
+      MetricName: EnvironmentHealth
+      Namespace: AWS/ElasticBeanstalk
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 15
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: EnvironmentName
+          Value: !Ref EnvironmentName
+      AlarmActions: !If
+        - EnableNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+      OKActions: !If
+        - EnableNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+      TreatMissingData: breaching
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # CloudWatch Alarm: Application 4xx Errors
+  Application4xxErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${EnvironmentName}-4xx-errors'
+      AlarmDescription: Monitor 4xx application errors
+      MetricName: ApplicationRequests4xx
+      Namespace: AWS/ElasticBeanstalk
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: EnvironmentName
+          Value: !Ref EnvironmentName
+      AlarmActions: !If
+        - EnableNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+      OKActions: !If
+        - EnableNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # CloudWatch Alarm: Application 5xx Errors
+  Application5xxErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${EnvironmentName}-5xx-errors'
+      AlarmDescription: Monitor 5xx server errors
+      MetricName: ApplicationRequests5xx
+      Namespace: AWS/ElasticBeanstalk
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: EnvironmentName
+          Value: !Ref EnvironmentName
+      AlarmActions: !If
+        - EnableNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+      OKActions: !If
+        - EnableNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # CloudWatch Alarm: High Response Time
+  HighResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsEnhancedMonitoringEnabled
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${EnvironmentName}-high-response-time'
+      AlarmDescription: Monitor application response time
+      MetricName: ApplicationLatencyP99
+      Namespace: AWS/ElasticBeanstalk
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: EnvironmentName
+          Value: !Ref EnvironmentName
+      AlarmActions: !If
+        - EnableNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+      OKActions: !If
+        - EnableNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # CloudWatch Alarm: High CPU Utilization
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${EnvironmentName}-high-cpu'
+      AlarmDescription: Monitor EC2 instance CPU utilization
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Sub 'awseb-e-${ElasticBeanstalkEnvironment}-stack-AWSEBAutoScalingGroup-*'
+      AlarmActions: !If
+        - EnableNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+      OKActions: !If
+        - EnableNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # CloudWatch Dashboard
+  ApplicationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ApplicationName}-${EnvironmentName}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ElasticBeanstalk", "EnvironmentHealth", "EnvironmentName", "${EnvironmentName}" ],
+                  [ ".", "ApplicationRequests2xx", ".", "." ],
+                  [ ".", "ApplicationRequests4xx", ".", "." ],
+                  [ ".", "ApplicationRequests5xx", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Application Health and Requests",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ElasticBeanstalk", "ApplicationLatencyP50", "EnvironmentName", "${EnvironmentName}" ],
+                  [ ".", "ApplicationLatencyP95", ".", "." ],
+                  [ ".", "ApplicationLatencyP99", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Application Latency",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "awseb-e-${ElasticBeanstalkEnvironment}-stack-AWSEBAutoScalingGroup" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Instance CPU Utilization",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/elasticbeanstalk/${EnvironmentName}/var/log/eb-engine.log'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Application Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# Template Outputs
+Outputs:
+  ApplicationName:
+    Description: Name of the Elastic Beanstalk application
+    Value: !Ref ElasticBeanstalkApplication
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationName'
+
+  EnvironmentName:
+    Description: Name of the Elastic Beanstalk environment
+    Value: !Ref ElasticBeanstalkEnvironment
+    Export:
+      Name: !Sub '${AWS::StackName}-EnvironmentName'
+
+  ApplicationURL:
+    Description: URL of the deployed web application
+    Value: !Sub 'http://${ElasticBeanstalkEnvironment.EndpointURL}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationURL'
+
+  EnvironmentId:
+    Description: Elastic Beanstalk environment ID
+    Value: !Ref ElasticBeanstalkEnvironment
+    Export:
+      Name: !Sub '${AWS::StackName}-EnvironmentId'
+
+  SourceBucket:
+    Description: S3 bucket for application source bundles
+    Value: !Ref ApplicationSourceBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucket'
+
+  SourceBucketName:
+    Description: Name of the S3 bucket for application source bundles
+    Value: !Sub '${ApplicationName}-source-${AWS::AccountId}-${AWS::Region}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucketName'
+
+  LoadBalancerSecurityGroup:
+    Description: Security group ID for the load balancer
+    Value: !Ref LoadBalancerSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerSecurityGroup'
+
+  InstanceSecurityGroup:
+    Description: Security group ID for EC2 instances
+    Value: !Ref ElasticBeanstalkSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceSecurityGroup'
+
+  ServiceRole:
+    Description: IAM service role for Elastic Beanstalk
+    Value: !Ref ElasticBeanstalkServiceRole
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceRole'
+
+  InstanceProfile:
+    Description: IAM instance profile for EC2 instances
+    Value: !Ref ElasticBeanstalkInstanceProfile
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceProfile'
+
+  HealthAlarm:
+    Description: CloudWatch alarm for environment health monitoring
+    Value: !Ref EnvironmentHealthAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthAlarm'
+
+  ErrorsAlarm:
+    Description: CloudWatch alarm for 4xx error monitoring
+    Value: !Ref Application4xxErrorsAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorsAlarm'
+
+  DashboardURL:
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ApplicationName}-${EnvironmentName}-dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  SNSTopicArn:
+    Description: SNS topic ARN for alarm notifications (if enabled)
+    Condition: EnableNotifications
+    Value: !Ref AlarmNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  DeploymentInstructions:
+    Description: Instructions for deploying application code
+    Value: !Sub |
+      To deploy your application:
+      1. Package your application code into a ZIP file
+      2. Upload to S3: aws s3 cp app.zip s3://${ApplicationSourceBucket}/${ApplicationName}-source.zip
+      3. Create application version: aws elasticbeanstalk create-application-version --application-name ${ApplicationName} --version-label v2 --source-bundle S3Bucket=${ApplicationSourceBucket},S3Key=${ApplicationName}-source.zip
+      4. Deploy: aws elasticbeanstalk update-environment --environment-name ${EnvironmentName} --version-label v2
+
+  MonitoringSetup:
+    Description: Monitoring and logging setup summary
+    Value: !Sub |
+      Monitoring configured:
+      - CloudWatch Logs: /aws/elasticbeanstalk/${EnvironmentName}/
+      - CloudWatch Dashboard: ${ApplicationName}-${EnvironmentName}-dashboard
+      - Health Monitoring: ${EnableEnhancedMonitoring}
+      - Log Retention: ${LogRetentionDays} days
+      - Alarm Notifications: ${EnableAlarmNotifications}

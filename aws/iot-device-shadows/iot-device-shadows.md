@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: iot-core, device-shadows, lambda, iam
 estimated-time: 60 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: iot, device-shadows, state-management, iot-core
 recipe-generator-version: 1.3
@@ -364,7 +364,7 @@ echo "AWS Region: ${AWS_REGION}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_FUNCTION}-role \
        --handler lambda-function.lambda_handler \
        --zip-file fileb://lambda-function.zip \
@@ -509,11 +509,15 @@ echo "AWS Region: ${AWS_REGION}"
    aws logs describe-log-groups \
        --log-group-name-prefix "/aws/lambda/${LAMBDA_FUNCTION}"
    
-   # Get recent log events
+   # Get recent log events (adjust date command for compatibility)
    LOG_GROUP="/aws/lambda/${LAMBDA_FUNCTION}"
+   START_TIME=$(date -d '5 minutes ago' +%s 2>/dev/null || \
+       date -v-5M +%s 2>/dev/null || \
+       python3 -c "import time; print(int(time.time() - 300))")
+   
    aws logs filter-log-events \
        --log-group-name ${LOG_GROUP} \
-       --start-time $(date -d '5 minutes ago' +%s)000
+       --start-time ${START_TIME}000
    ```
 
    Expected output: Log entries showing successful shadow update processing.
@@ -614,27 +618,27 @@ echo "AWS Region: ${AWS_REGION}"
 
 ## Discussion
 
-Device Shadows serve as the authoritative state store for IoT devices, enabling robust state management in distributed environments with unreliable connectivity. The shadow document structure separates reported state (device's current condition) from desired state (target configuration), creating a reliable synchronization mechanism that works seamlessly across network interruptions.
+Device Shadows serve as the authoritative state store for IoT devices, enabling robust state management in distributed environments with unreliable connectivity. The shadow document structure separates reported state (device's current condition) from desired state (target configuration), creating a reliable synchronization mechanism that works seamlessly across network interruptions. This architectural pattern aligns with AWS Well-Architected Framework principles by providing operational excellence through automation and reliability through decoupled components.
 
-The architecture demonstrated here showcases event-driven processing patterns using IoT Rules Engine and Lambda functions. This approach enables real-time response to device state changes while maintaining cost efficiency through serverless compute. The integration with DynamoDB provides persistent storage for state history, enabling analytics, compliance reporting, and operational insights that drive business value.
+The architecture demonstrated here showcases event-driven processing patterns using IoT Rules Engine and Lambda functions. This approach enables real-time response to device state changes while maintaining cost efficiency through serverless compute. The integration with DynamoDB provides persistent storage for state history, enabling analytics, compliance reporting, and operational insights that drive business value. The event-driven model ensures scalability and fault tolerance by automatically handling varying loads without manual intervention.
 
-Security considerations include device-specific access controls through IoT policies that use dynamic variables to restrict access to individual device shadows. This approach scales efficiently across device fleets while maintaining strict security boundaries. The IAM role configuration for Lambda follows least privilege principles, ensuring the processing function has only the permissions necessary for its operation.
+Security considerations include device-specific access controls through IoT policies that use dynamic variables to restrict access to individual device shadows. This approach scales efficiently across device fleets while maintaining strict security boundaries. The IAM role configuration for Lambda follows least privilege principles, ensuring the processing function has only the permissions necessary for its operation. Certificate-based authentication provides strong cryptographic identity verification for all device communications.
 
-> **Tip**: For production deployments, implement shadow versioning and conflict resolution strategies. AWS IoT Device Shadows support optimistic locking through version numbers, enabling safe concurrent updates from multiple sources. See the [AWS IoT Device Shadow Service documentation](https://docs.aws.amazon.com/iot/latest/developerguide/iot-device-shadows.html) for advanced patterns.
+> **Tip**: For production deployments, implement shadow versioning and conflict resolution strategies. AWS IoT Device Shadows support optimistic locking through version numbers, enabling safe concurrent updates from multiple sources. See the [AWS IoT Device Shadow Service documentation](https://docs.aws.amazon.com/iot/latest/developerguide/iot-device-shadows.html) for advanced patterns and the [AWS IoT Core Best Practices](https://docs.aws.amazon.com/iot/latest/developerguide/iot-bp.html) for production deployment guidance.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Named Shadows**: Create multiple named shadows per device to separate different state categories (configuration, telemetry, diagnostics) for better organization and access control.
+1. **Named Shadows**: Create multiple named shadows per device to separate different state categories (configuration, telemetry, diagnostics) for better organization and access control using the AWS IoT console or CLI.
 
-2. **Delta Processing**: Implement device-side delta processing that responds only to desired state changes, optimizing bandwidth and processing efficiency for resource-constrained devices.
+2. **Delta Processing**: Implement device-side delta processing that responds only to desired state changes, optimizing bandwidth and processing efficiency for resource-constrained devices by subscribing to shadow delta topics.
 
-3. **Shadow Metrics**: Add CloudWatch custom metrics to track shadow update frequency, size, and synchronization latency for operational monitoring and alerting.
+3. **Shadow Metrics**: Add CloudWatch custom metrics to track shadow update frequency, size, and synchronization latency for operational monitoring and alerting using the AWS IoT Device Management features.
 
-4. **Conflict Resolution**: Build a conflict resolution system that handles simultaneous updates from multiple sources using shadow versioning and business logic-based merge strategies.
+4. **Conflict Resolution**: Build a conflict resolution system that handles simultaneous updates from multiple sources using shadow versioning and business logic-based merge strategies with Lambda functions.
 
-5. **Fleet Management**: Scale the solution to manage shadow states across thousands of devices using IoT Device Management job documents and bulk operations for configuration updates.
+5. **Fleet Management**: Scale the solution to manage shadow states across thousands of devices using IoT Device Management job documents and bulk operations for configuration updates across device fleets.
 
 ## Infrastructure Code
 

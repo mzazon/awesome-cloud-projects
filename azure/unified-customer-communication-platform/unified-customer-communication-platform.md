@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Communication Services, Azure Event Grid, Azure Functions, Azure Cosmos DB
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: communication, messaging, event-driven, multi-channel, real-time, customer-service
 recipe-generator-version: 1.3
@@ -79,7 +79,7 @@ graph TB
 ## Prerequisites
 
 1. Azure account with appropriate permissions for Communication Services, Event Grid, Functions, and Cosmos DB
-2. Azure CLI v2 installed and configured (or Azure CloudShell)
+2. Azure CLI v2.40 or later installed and configured (or Azure CloudShell)
 3. Basic knowledge of event-driven architectures and messaging patterns
 4. Understanding of Azure Functions development and deployment
 5. Familiarity with Azure Cosmos DB operations and data modeling
@@ -90,8 +90,8 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables
-export RESOURCE_GROUP="rg-multi-channel-comms"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-recipe-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
@@ -107,7 +107,7 @@ export STORAGE_ACCOUNT_NAME="stacomms${RANDOM_SUFFIX}"
 az group create \
     --name ${RESOURCE_GROUP} \
     --location ${LOCATION} \
-    --tags purpose=multi-channel-comms environment=development
+    --tags purpose=recipe environment=demo
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
 ```
@@ -326,7 +326,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    
    # Create function code
    cat > /tmp/communication-functions/MessageProcessor/index.js << 'EOF'
-   const { CommunicationServiceClient } = require('@azure/communication-administration');
+   const { CommunicationIdentityClient } = require('@azure/communication-identity');
    const { CosmosClient } = require('@azure/cosmos');
    
    module.exports = async function (context, eventGridEvent) {
@@ -382,14 +382,14 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    }
    EOF
    
-   # Create package.json
+   # Create package.json with current SDK versions
    cat > /tmp/communication-functions/package.json << 'EOF'
    {
      "name": "communication-platform-functions",
      "version": "1.0.0",
      "dependencies": {
-       "@azure/communication-administration": "^1.0.0",
-       "@azure/cosmos": "^4.0.0"
+       "@azure/communication-identity": "^1.3.2",
+       "@azure/cosmos": "^4.1.1"
      }
    }
    EOF
@@ -436,7 +436,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    EOF
    
    cat > /tmp/communication-functions/MessageRouter/index.js << 'EOF'
-   const { CommunicationServiceClient } = require('@azure/communication-administration');
+   const { CommunicationIdentityClient } = require('@azure/communication-identity');
    const { EventGridPublisherClient } = require('@azure/eventgrid');
    
    module.exports = async function (context, req) {
@@ -675,13 +675,13 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
 ## Discussion
 
-This multi-channel customer communication platform demonstrates the power of Azure's event-driven architecture for building scalable, responsive messaging solutions. Azure Communication Services provides the foundation for multi-channel messaging, supporting email, SMS, and WhatsApp communications through unified APIs that simplify integration and reduce development complexity. The service handles complex carrier relationships, protocol management, and compliance requirements, allowing developers to focus on business logic rather than communication infrastructure. For comprehensive guidance on implementing communication solutions, see the [Azure Communication Services documentation](https://docs.microsoft.com/en-us/azure/communication-services/) and [multi-channel messaging best practices](https://docs.microsoft.com/en-us/azure/communication-services/concepts/messaging/messaging-overview).
+This multi-channel customer communication platform demonstrates the power of Azure's event-driven architecture for building scalable, responsive messaging solutions. Azure Communication Services provides the foundation for multi-channel messaging, supporting email, SMS, and WhatsApp communications through unified APIs that simplify integration and reduce development complexity. The service handles complex carrier relationships, protocol management, and compliance requirements, allowing developers to focus on business logic rather than communication infrastructure. For comprehensive guidance on implementing communication solutions, see the [Azure Communication Services documentation](https://learn.microsoft.com/en-us/azure/communication-services/) and [multi-channel messaging best practices](https://learn.microsoft.com/en-us/azure/communication-services/concepts/messaging/messaging-overview).
 
-The event-driven architecture pattern implemented through Azure Event Grid enables loose coupling between system components, supporting independent scaling and evolution of different platform capabilities. Event Grid's reliable event delivery ensures that message status updates, delivery confirmations, and customer interactions are processed consistently, even during high-volume scenarios. This approach follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of reliability and scalability, enabling the platform to handle millions of messages while maintaining responsive performance.
+The event-driven architecture pattern implemented through Azure Event Grid enables loose coupling between system components, supporting independent scaling and evolution of different platform capabilities. Event Grid's reliable event delivery ensures that message status updates, delivery confirmations, and customer interactions are processed consistently, even during high-volume scenarios. This approach follows the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) principles of reliability and scalability, enabling the platform to handle millions of messages while maintaining responsive performance.
 
-Azure Functions provides the serverless compute layer that processes communication events and orchestrates message workflows without requiring infrastructure management. The consumption-based pricing model ensures cost-effective operation by scaling automatically based on message volume, while the event-driven trigger model enables immediate response to customer communications. Azure Cosmos DB's globally distributed, multi-model database capabilities provide the foundation for storing conversation history and message metadata with low-latency access patterns optimized for real-time messaging scenarios. For detailed guidance on optimizing serverless architectures, review the [Azure Functions performance guide](https://docs.microsoft.com/en-us/azure/azure-functions/functions-scale).
+Azure Functions provides the serverless compute layer that processes communication events and orchestrates message workflows without requiring infrastructure management. The consumption-based pricing model ensures cost-effective operation by scaling automatically based on message volume, while the event-driven trigger model enables immediate response to customer communications. Azure Cosmos DB's globally distributed, multi-model database capabilities provide the foundation for storing conversation history and message metadata with low-latency access patterns optimized for real-time messaging scenarios. For detailed guidance on optimizing serverless architectures, review the [Azure Functions performance guide](https://learn.microsoft.com/en-us/azure/azure-functions/functions-scale).
 
-The platform's multi-channel routing capabilities enable intelligent message delivery optimization based on customer preferences, message urgency, and channel availability. This approach maximizes engagement rates while providing fallback options when primary channels are unavailable. The unified conversation tracking across all channels provides customer service representatives with complete interaction history, enabling more personalized and effective support experiences. For advanced messaging scenarios, consider implementing [Azure Bot Framework](https://docs.microsoft.com/en-us/azure/bot-service/) integration for AI-powered customer interactions.
+The platform's multi-channel routing capabilities enable intelligent message delivery optimization based on customer preferences, message urgency, and channel availability. This approach maximizes engagement rates while providing fallback options when primary channels are unavailable. The unified conversation tracking across all channels provides customer service representatives with complete interaction history, enabling more personalized and effective support experiences. For advanced messaging scenarios, consider implementing [Azure Bot Framework](https://learn.microsoft.com/en-us/azure/bot-service/) integration for AI-powered customer interactions.
 
 > **Tip**: Implement message templating and localization features to support global customer communications. Azure Communication Services integrates with Azure Cognitive Services for automatic language detection and translation capabilities, enabling seamless international customer support.
 

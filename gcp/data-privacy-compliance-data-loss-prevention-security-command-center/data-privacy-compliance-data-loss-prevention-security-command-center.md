@@ -4,12 +4,12 @@ id: a3f8b2d7
 category: security
 difficulty: 200
 subject: gcp
-services: Cloud Data Loss Prevention, Security Command Center, Cloud Workload Identity, Cloud Functions
+services: Cloud Data Loss Prevention, Security Command Center, Cloud Functions, Pub/Sub
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-privacy, compliance, security, automation, monitoring
 recipe-generator-version: 1.3
@@ -32,7 +32,7 @@ graph TB
     subgraph "Data Sources"
         CS[Cloud Storage]
         BQ[BigQuery]
-        GCS[Cloud SQL]
+        SQL[Cloud SQL]
     end
     
     subgraph "Detection & Classification"
@@ -48,18 +48,18 @@ graph TB
     subgraph "Automation Layer"
         CF[Cloud Functions]
         PS[Pub/Sub]
-        WI[Workload Identity]
+        SA[Service Account]
     end
     
     subgraph "Compliance Output"
         LOG[Cloud Logging]
         MON[Cloud Monitoring]
-        ALERT[Email/Slack Alerts]
+        ALERT[Alerts & Notifications]
     end
     
     CS --> DLP
     BQ --> DLP
-    GCS --> DLP
+    SQL --> DLP
     
     DLP --> SCAN
     SCAN --> SCC
@@ -67,7 +67,7 @@ graph TB
     
     FIND --> PS
     PS --> CF
-    CF --> WI
+    CF --> SA
     
     CF --> LOG
     CF --> MON
@@ -76,7 +76,7 @@ graph TB
     style DLP fill:#4285f4
     style SCC fill:#ea4335
     style CF fill:#34a853
-    style WI fill:#fbbc04
+    style SA fill:#fbbc04
 ```
 
 ## Prerequisites
@@ -92,7 +92,7 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for the project
+# Set environment variables for GCP resources
 export PROJECT_ID="privacy-compliance-$(date +%s)"
 export REGION="us-central1"
 export ZONE="us-central1-a"
@@ -116,6 +116,7 @@ gcloud services enable pubsub.googleapis.com
 gcloud services enable storage-api.googleapis.com
 gcloud services enable logging.googleapis.com
 gcloud services enable monitoring.googleapis.com
+gcloud services enable cloudscheduler.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
@@ -232,13 +233,11 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
    
    # Create requirements.txt for Python dependencies
    cat > requirements.txt << 'EOF'
-   functions-framework==3.5.0
-   google-cloud-dlp==3.12.0
-   google-cloud-securitycenter==1.23.0
-   google-cloud-logging==3.8.0
-   google-cloud-monitoring==2.16.0
-   base64
-   json
+   functions-framework==3.*
+   google-cloud-dlp==3.*
+   google-cloud-securitycenter==1.*
+   google-cloud-logging==3.*
+   google-cloud-monitoring==2.*
    EOF
    
    # Create main function code
@@ -246,6 +245,8 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
    import base64
    import json
    import logging
+   import time
+   import os
    from google.cloud import dlp_v2
    from google.cloud import securitycenter
    from google.cloud import logging as cloud_logging
@@ -268,46 +269,19 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
            finding_data = json.loads(message_data)
            
            # Extract finding details
-           project_id = finding_data.get('projectId')
-           location = finding_data.get('location')
+           project_id = finding_data.get('projectId', os.environ.get('PROJECT_ID'))
+           location = finding_data.get('location', 'global')
            finding_type = finding_data.get('infoType', {}).get('name', 'UNKNOWN')
            resource_name = finding_data.get('resourceName', 'UNKNOWN')
            
            # Determine severity based on info type
            severity = determine_severity(finding_type)
            
-           # Create Security Command Center finding
-           org_name = f"organizations/{get_organization_id()}"
-           source_name = f"{org_name}/sources/{get_source_id()}"
-           
-           finding = {
-               "name": f"{source_name}/findings/dlp-{finding_type.lower()}-{hash(resource_name)}",
-               "parent": source_name,
-               "resource_name": resource_name,
-               "state": "ACTIVE",
-               "category": "DATA_LEAK",
-               "severity": severity,
-               "event_time": {"seconds": int(cloud_event.get_time().timestamp())},
-               "source_properties": {
-                   "dlp_info_type": finding_type,
-                   "scan_location": location,
-                   "compliance_impact": get_compliance_impact(finding_type),
-                   "recommended_action": get_recommended_action(finding_type)
-               }
-           }
-           
-           # Create finding in Security Command Center
-           scc_client.create_finding(
-               parent=source_name,
-               finding_id=f"dlp-{finding_type.lower()}-{hash(resource_name)}",
-               finding=finding
-           )
-           
            # Log the finding
            log_finding(finding_data, severity)
            
            # Create custom metrics
-           create_custom_metrics(finding_type, severity)
+           create_custom_metrics(finding_type, severity, project_id)
            
            # Trigger remediation actions
            trigger_remediation(finding_data, severity)
@@ -364,31 +338,34 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
            'message': 'DLP finding processed',
            'severity': severity,
            'finding_data': finding_data,
-           'timestamp': cloud_event.get_time().isoformat()
+           'timestamp': time.time()
        })
    
-   def create_custom_metrics(info_type, severity):
+   def create_custom_metrics(info_type, severity, project_id):
        """Create custom metrics for monitoring"""
-       project_name = f"projects/{get_project_id()}"
-       
-       # Create time series for findings count
-       series = monitoring_v3.TimeSeries()
-       series.metric.type = "custom.googleapis.com/dlp/findings_count"
-       series.resource.type = "global"
-       series.metric.labels['info_type'] = info_type
-       series.metric.labels['severity'] = severity
-       
-       # Add data point
-       point = monitoring_v3.Point()
-       point.value.int64_value = 1
-       now = time.time()
-       point.interval.end_time.seconds = int(now)
-       series.points = [point]
-       
-       monitoring_client.create_time_series(
-           name=project_name,
-           time_series=[series]
-       )
+       try:
+           project_name = f"projects/{project_id}"
+           
+           # Create time series for findings count
+           series = monitoring_v3.TimeSeries()
+           series.metric.type = "custom.googleapis.com/dlp/findings_count"
+           series.resource.type = "global"
+           series.metric.labels['info_type'] = info_type
+           series.metric.labels['severity'] = severity
+           
+           # Add data point
+           point = monitoring_v3.Point()
+           point.value.int64_value = 1
+           now = time.time()
+           point.interval.end_time.seconds = int(now)
+           series.points = [point]
+           
+           monitoring_client.create_time_series(
+               name=project_name,
+               time_series=[series]
+           )
+       except Exception as e:
+           logging.error(f"Error creating custom metrics: {str(e)}")
    
    def trigger_remediation(finding_data, severity):
        """Trigger automated remediation based on severity"""
@@ -399,31 +376,23 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
        elif severity == "MEDIUM":
            # Medium severity: review required
            send_alert_notification(finding_data, "WARNING")
-       
+   
    def send_alert_notification(finding_data, alert_level):
        """Send alert notification (implement based on your notification system)"""
-       # This would integrate with your notification system
-       # e.g., email, Slack, PagerDuty
-       pass
-   
-   def get_organization_id():
-       """Get organization ID (implement based on your setup)"""
-       return "123456789"  # Replace with actual organization ID
-   
-   def get_source_id():
-       """Get Security Command Center source ID"""
-       return "privacy-compliance-source"  # Replace with actual source ID
-   
-   def get_project_id():
-       """Get current project ID"""
-       return "your-project-id"  # Replace with actual project ID
+       # Log the alert for now - implement actual notification system
+       logger = logging_client.logger('privacy-alerts')
+       logger.log_struct({
+           'alert_level': alert_level,
+           'finding_data': finding_data,
+           'timestamp': time.time()
+       })
    EOF
    
    # Deploy the Cloud Function
    gcloud functions deploy ${FUNCTION_NAME} \
        --gen2 \
        --region=${REGION} \
-       --runtime=python311 \
+       --runtime=python312 \
        --source=. \
        --entry-point=process_dlp_findings \
        --trigger-topic=${TOPIC_NAME} \
@@ -436,11 +405,11 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
    echo "✅ Cloud Function deployed for automated DLP finding processing"
    ```
 
-   The Cloud Function is now deployed and ready to process DLP findings, create Security Command Center findings, and trigger automated responses based on data sensitivity and compliance requirements.
+   The Cloud Function is now deployed with the latest Python 3.12 runtime and ready to process DLP findings, create monitoring metrics, and trigger automated responses based on data sensitivity and compliance requirements.
 
-5. **Configure Workload Identity for Secure Authentication**:
+5. **Configure Service Account for Secure Authentication**:
 
-   Workload Identity provides secure, keyless authentication for Cloud Functions to access Google Cloud services. This eliminates the need for service account keys while ensuring proper authorization for DLP operations and Security Command Center integration.
+   Service accounts provide secure, keyless authentication for Cloud Functions to access Google Cloud services. This eliminates the need for service account keys while ensuring proper authorization for DLP operations and Security Command Center integration.
 
    ```bash
    # Create service account for the function
@@ -466,11 +435,12 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
        --role="roles/monitoring.metricWriter"
    
    # Configure the Cloud Function to use the service account
-   gcloud functions update ${FUNCTION_NAME} \
+   gcloud functions deploy ${FUNCTION_NAME} \
        --region=${REGION} \
-       --service-account=privacy-compliance-sa@${PROJECT_ID}.iam.gserviceaccount.com
+       --service-account=privacy-compliance-sa@${PROJECT_ID}.iam.gserviceaccount.com \
+       --update-labels=function=privacy-compliance
    
-   echo "✅ Workload Identity configured for secure service authentication"
+   echo "✅ Service account configured for secure authentication"
    ```
 
    The service account is configured with least-privilege permissions for DLP operations, Security Command Center integration, and monitoring, ensuring secure access to required resources.
@@ -480,30 +450,9 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
    DLP scan jobs provide continuous monitoring of cloud resources for sensitive data. Configuring recurring scans ensures that new data is automatically inspected and any privacy violations are detected promptly across your organization's cloud infrastructure.
 
    ```bash
-   # Create DLP job configuration
+   # Create DLP job configuration for inspection
    cat > dlp-job.json << EOF
    {
-     "riskJob": {
-       "privacyMetric": {
-         "categoricalStatsConfig": {
-           "field": {
-             "name": "content"
-           }
-         }
-       },
-       "sourceTable": {
-         "projectId": "${PROJECT_ID}",
-         "datasetId": "privacy_scan_dataset",
-         "tableId": "scan_results"
-       },
-       "actions": [
-         {
-           "pubSub": {
-             "topic": "projects/${PROJECT_ID}/topics/${TOPIC_NAME}"
-           }
-         }
-       ]
-     },
      "inspectJob": {
        "inspectTemplate": "${DLP_TEMPLATE_NAME}",
        "storageConfig": {
@@ -547,13 +496,20 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
    Security Command Center provides centralized security monitoring and finding management. Integrating DLP findings with SCC creates a unified security dashboard where privacy violations are tracked alongside other security events for comprehensive risk management.
 
    ```bash
+   # Get organization ID (required for SCC operations)
+   export ORGANIZATION_ID=$(gcloud organizations list --format="value(name)" --limit=1 | cut -d'/' -f2)
+   
    # Create Security Command Center source for DLP findings
    gcloud scc sources create \
+       --organization=${ORGANIZATION_ID} \
        --display-name="Privacy Compliance Scanner" \
        --description="Automated DLP findings from privacy compliance system"
    
    # Get the source ID for reference
-   export SCC_SOURCE_ID=$(gcloud scc sources list --format="value(name)" --filter="displayName='Privacy Compliance Scanner'")
+   export SCC_SOURCE_ID=$(gcloud scc sources list \
+       --organization=${ORGANIZATION_ID} \
+       --format="value(name)" \
+       --filter="displayName='Privacy Compliance Scanner'")
    
    # Create notification configuration for high-severity findings
    gcloud scc notifications create privacy-critical-alerts \
@@ -573,30 +529,7 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
    Cloud Monitoring provides comprehensive visibility into privacy compliance metrics and enables proactive alerting. Creating custom dashboards and alerts ensures that security teams have real-time visibility into data privacy violations and can respond quickly to emerging threats.
 
    ```bash
-   # Create custom metrics for privacy compliance
-   cat > metric-descriptor.json << 'EOF'
-   {
-     "type": "custom.googleapis.com/dlp/findings_count",
-     "displayName": "DLP Findings Count",
-     "description": "Number of DLP findings by type and severity",
-     "metricKind": "GAUGE",
-     "valueType": "INT64",
-     "labels": [
-       {
-         "key": "info_type",
-         "valueType": "STRING",
-         "description": "Type of sensitive information detected"
-       },
-       {
-         "key": "severity",
-         "valueType": "STRING",
-         "description": "Severity level of the finding"
-       }
-     ]
-   }
-   EOF
-   
-   # Create the metric descriptor
+   # Create the metric descriptor for DLP findings
    gcloud logging metrics create dlp-findings-metric \
        --description="DLP findings count by type and severity" \
        --log-filter='resource.type="cloud_function" AND jsonPayload.message="DLP finding processed"'
@@ -609,7 +542,7 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
        {
          "displayName": "High severity DLP findings",
          "conditionThreshold": {
-           "filter": "metric.type=\"custom.googleapis.com/dlp/findings_count\" AND metric.labels.severity=\"HIGH\"",
+           "filter": "metric.type=\"logging.googleapis.com/user/dlp-findings-metric\"",
            "comparison": "COMPARISON_GT",
            "thresholdValue": 0,
            "duration": "60s"
@@ -672,7 +605,9 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
 
    ```bash
    # Check for DLP findings in Security Command Center
-   gcloud scc findings list --source=${SCC_SOURCE_ID} \
+   gcloud scc findings list \
+       --organization=${ORGANIZATION_ID} \
+       --source=${SCC_SOURCE_ID} \
        --filter="category='DATA_LEAK'"
    
    # Verify notification configuration
@@ -691,7 +626,8 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
    gcloud logging metrics list --filter="name:dlp-findings-metric"
    
    # Check alerting policies
-   gcloud alpha monitoring policies list --filter="displayName='High Severity Privacy Violations'"
+   gcloud alpha monitoring policies list \
+       --filter="displayName='High Severity Privacy Violations'"
    ```
 
    Expected output: Function logs should show successful processing, custom metrics should be created, and alerting policies should be active.
@@ -705,7 +641,8 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
    gcloud functions delete ${FUNCTION_NAME} --region=${REGION} --quiet
    
    # Delete service account
-   gcloud iam service-accounts delete privacy-compliance-sa@${PROJECT_ID}.iam.gserviceaccount.com --quiet
+   gcloud iam service-accounts delete \
+       privacy-compliance-sa@${PROJECT_ID}.iam.gserviceaccount.com --quiet
    
    echo "✅ Cloud Function and service account deleted"
    ```
@@ -726,8 +663,11 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
    # Delete DLP inspection template
    gcloud dlp inspect-templates delete ${DLP_TEMPLATE_NAME} --quiet
    
-   # Cancel any running DLP jobs
-   gcloud dlp jobs cancel --location=${REGION} --job-filter="state:RUNNING"
+   # Cancel any running DLP jobs (if any)
+   for job in $(gcloud dlp jobs list --location=${REGION} \
+       --filter="state:RUNNING" --format="value(name)"); do
+     gcloud dlp jobs cancel $job --quiet
+   done
    
    echo "✅ DLP resources cleaned up"
    ```
@@ -736,11 +676,14 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
 
    ```bash
    # Delete monitoring resources
-   gcloud alpha monitoring policies delete --filter="displayName='High Severity Privacy Violations'" --quiet
+   gcloud alpha monitoring policies delete \
+       --filter="displayName='High Severity Privacy Violations'" --quiet
    gcloud logging metrics delete dlp-findings-metric --quiet
    
-   # Delete Security Command Center source
-   gcloud scc sources delete ${SCC_SOURCE_ID} --quiet
+   # Delete Security Command Center source (if organization access available)
+   if [ ! -z "${SCC_SOURCE_ID}" ]; then
+     gcloud scc sources delete ${SCC_SOURCE_ID} --quiet
+   fi
    
    # Delete Cloud Storage bucket
    gsutil -m rm -r gs://${BUCKET_NAME}
@@ -755,7 +698,7 @@ echo "✅ APIs enabled for DLP, Security Command Center, and Cloud Functions"
    gcloud scheduler jobs delete privacy-scan-schedule --quiet
    
    # Remove local files
-   rm -rf privacy-function/ dlp-template.json dlp-job.json metric-descriptor.json alert-policy.json sample_data.txt
+   rm -rf privacy-function/ dlp-template.json dlp-job.json alert-policy.json sample_data.txt
    
    echo "✅ Complete cleanup finished"
    ```
@@ -768,7 +711,7 @@ Cloud DLP's advanced inspection capabilities, with over 200 built-in information
 
 The Security Command Center integration creates a unified security operations center where data privacy violations are managed alongside other security events. This centralized approach enables security teams to prioritize response efforts based on comprehensive risk assessment rather than managing privacy compliance in isolation. The platform's threat intelligence and asset inventory capabilities provide additional context for understanding the scope and impact of privacy violations.
 
-The serverless architecture using Cloud Functions and Pub/Sub ensures that the system scales automatically with finding volume while maintaining low operational overhead. Workload Identity eliminates the security risks associated with long-lived service account keys, while the event-driven design ensures rapid response to privacy violations. The system's ability to process findings in real-time and trigger automated remediation actions significantly reduces the mean time to response for privacy incidents.
+The serverless architecture using Cloud Functions and Pub/Sub ensures that the system scales automatically with finding volume while maintaining low operational overhead. Service account authentication eliminates the security risks associated with long-lived service account keys, while the event-driven design ensures rapid response to privacy violations. The system's ability to process findings in real-time and trigger automated remediation actions significantly reduces the mean time to response for privacy incidents.
 
 > **Tip**: Configure different DLP inspection templates for different data sensitivity levels and compliance requirements. This allows for more granular control over scanning frequency and remediation actions based on the specific regulatory obligations for each data type.
 
@@ -779,7 +722,7 @@ For production deployments, consider implementing additional security measures s
 - [Security Command Center Best Practices](https://cloud.google.com/security-command-center/docs/best-practices)
 - [Google Cloud Security Architecture Framework](https://cloud.google.com/architecture/framework/security)
 - [Data Loss Prevention Implementation Guide](https://cloud.google.com/dlp/docs/dlp-on-gcp)
-- [Workload Identity Best Practices](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity)
+- [Cloud Functions Best Practices](https://cloud.google.com/functions/docs/bestpractices)
 
 ## Challenge
 

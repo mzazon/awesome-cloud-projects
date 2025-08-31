@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Dev Box, Azure Deployment Environments, Azure DevCenter
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: developer-productivity, self-service, infrastructure-as-code, devcenter
 recipe-generator-version: 1.3
@@ -53,7 +53,7 @@ graph TB
     end
     
     subgraph "Governance"
-        AAD[Azure AD]
+        ENTRA[Microsoft Entra ID]
         SUB[Azure Subscriptions]
         POL[Azure Policy]
     end
@@ -65,7 +65,7 @@ graph TB
     CAT-->|5. Templates|ED
     DBP-->|6. Deploys|DBI
     ED-->|7. Deploys|ENV
-    AAD-->|8. Authentication|DC
+    ENTRA-->|8. Authentication|DC
     SUB-->|9. Resources|ENV
     POL-->|10. Compliance|DC
     CI-->|11. Images|DBP
@@ -80,26 +80,29 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with Owner or Contributor role permissions
-2. Azure CLI v2.55.0 or later installed and configured (or use Azure CloudShell)
-3. Azure AD with appropriate user licenses for Dev Box (Microsoft 365 E3/E5 or Windows 365)
+2. Azure CLI v2.61.0 or later installed and configured (or use Azure Cloud Shell)
+3. Microsoft Entra ID with appropriate user licenses for Dev Box (Microsoft 365 E3/E5 or Windows 365)
 4. Basic knowledge of Azure resource management and identity concepts
 5. GitHub repository or Azure DevOps repo for storing environment definitions (optional but recommended)
-6. Estimated cost: $5-10/hour per Dev Box when running, Deployment Environments usage-based
+6. Estimated cost: $8-15/hour per active Dev Box when running, Deployment Environments usage-based
 
-> **Note**: Azure Dev Box requires specific licensing. Ensure your organization has appropriate Microsoft 365 or Windows 365 licenses before proceeding.
+> **Note**: Azure Dev Box requires specific licensing. Ensure your organization has appropriate Microsoft 365 or Windows 365 licenses before proceeding. The licensing cost is separate from Azure compute costs.
 
 ## Preparation
 
 ```bash
 # Set environment variables for the deployment
-export RESOURCE_GROUP="rg-devinfra-demo"
+export RESOURCE_GROUP="rg-devinfra-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
-export DEVCENTER_NAME="dc-selfservice-demo"
+export DEVCENTER_NAME="dc-selfservice-${RANDOM_SUFFIX}"
 export PROJECT_NAME="proj-webapp-team"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
+
+# Install and update the devcenter extension
+az extension add --name devcenter --upgrade
 
 # Create the resource group
 az group create \
@@ -114,7 +117,7 @@ az provider register --namespace Microsoft.Compute
 
 # Wait for provider registration
 echo "⏳ Waiting for resource provider registration..."
-sleep 30
+sleep 45
 
 echo "✅ Preparation completed successfully"
 ```
@@ -181,16 +184,17 @@ echo "✅ Preparation completed successfully"
    
    # Wait for catalog sync to complete
    echo "⏳ Waiting for catalog synchronization..."
-   sleep 60
+   sleep 90
    
    # Verify catalog sync status
-   az devcenter admin catalog show \
+   SYNC_STATE=$(az devcenter admin catalog show \
        --name "QuickStartCatalog" \
        --dev-center ${DEVCENTER_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query syncState \
-       --output tsv
+       --output tsv)
    
+   echo "Catalog sync state: ${SYNC_STATE}"
    echo "✅ Quick start catalog attached and synchronized"
    ```
 
@@ -236,7 +240,11 @@ echo "✅ Preparation completed successfully"
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --subnet-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/vnet-devbox-${RANDOM_SUFFIX}/subnets/snet-devbox" \
-       --network-connection-type "AzureADJoin"
+       --domain-join-type "AzureADJoin"
+   
+   # Wait for network connection provisioning
+   echo "⏳ Waiting for network connection provisioning..."
+   sleep 60
    
    # Attach network connection to dev center
    az devcenter admin attached-network create \
@@ -253,18 +261,20 @@ echo "✅ Preparation completed successfully"
    Dev Box definitions specify the hardware configuration and base image for developer workstations. This step creates a high-performance configuration with Visual Studio pre-installed, eliminating hours of manual setup for each developer. The definition ensures consistency across all team members while allowing customization through additional tools and configurations.
 
    ```bash
-   # Create a Dev Box definition with Visual Studio
+   # Create a Dev Box definition with Visual Studio and hibernation support
    az devcenter admin devbox-definition create \
        --name "VSEnterprise-8cpu-32gb" \
        --dev-center ${DEVCENTER_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --image-reference id="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DevCenter/devcenters/${DEVCENTER_NAME}/galleries/default/images/MicrosoftWindowsDesktop_windows-ent-cpc_win11-22h2-ent-cpc-vs2022" \
+       --image-reference name="MicrosoftWindowsDesktop_Windows-11-Enterprise-Microsoft-365-Apps_win11-24h2-ent-cpc-m365" \
        --sku-name "general_i_8c32gb256ssd_v2" \
        --hibernate-support "Enabled"
    
-   echo "✅ Dev Box definition created"
+   echo "✅ Dev Box definition created with hibernation support"
    ```
+
+   The Dev Box definition now supports hibernation, which significantly reduces costs by allowing idle dev boxes to be paused while preserving the current state of applications and work.
 
 7. **Create Project and Configure Access**:
 
@@ -307,7 +317,7 @@ echo "✅ Preparation completed successfully"
        --local-administrator "Enabled" \
        --location ${LOCATION}
    
-   # Create auto-stop schedule (stop at 7 PM local time)
+   # Create auto-stop schedule (stop at 7 PM Eastern time)
    az devcenter admin schedule create \
        --name "AutoStop-7PM" \
        --pool-name "WebDevPool" \
@@ -321,6 +331,8 @@ echo "✅ Preparation completed successfully"
    
    echo "✅ Dev Box pool created with auto-stop schedule"
    ```
+
+   The auto-stop schedule ensures cost optimization by automatically hibernating Dev Boxes at 7 PM daily, reducing compute costs while preserving developer work state.
 
 9. **Assign Developer Access**:
 
@@ -416,9 +428,10 @@ echo "✅ Preparation completed successfully"
    az devcenter admin project delete \
        --name ${PROJECT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --yes
+       --yes \
+       --no-wait
    
-   echo "✅ Project deleted"
+   echo "✅ Project deletion initiated"
    ```
 
 2. Remove DevCenter and network resources:
@@ -428,15 +441,17 @@ echo "✅ Preparation completed successfully"
    az devcenter admin network-connection delete \
        --name "nc-devbox-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
-       --yes
+       --yes \
+       --no-wait
    
    # Delete the dev center
    az devcenter admin devcenter delete \
        --name ${DEVCENTER_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --yes
+       --yes \
+       --no-wait
    
-   echo "✅ DevCenter and network resources deleted"
+   echo "✅ DevCenter and network resources deletion initiated"
    ```
 
 3. Clean up remaining Azure resources:
@@ -448,21 +463,21 @@ echo "✅ Preparation completed successfully"
        --yes \
        --no-wait
    
-   echo "✅ Resource group deletion initiated"
+   echo "✅ Resource group deletion initiated: ${RESOURCE_GROUP}"
    echo "Note: Full cleanup may take 10-15 minutes to complete"
    ```
 
 ## Discussion
 
-Azure Dev Box and Azure Deployment Environments fundamentally transform how development teams access and manage infrastructure by implementing a self-service model that balances developer productivity with enterprise governance. This platform approach addresses the traditional friction between development velocity and IT control by providing governed self-service capabilities. According to the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/), this model exemplifies operational excellence by automating repetitive tasks and enabling teams to focus on value-adding activities.
+Azure Dev Box and Azure Deployment Environments fundamentally transform how development teams access and manage infrastructure by implementing a self-service model that balances developer productivity with enterprise governance. This platform approach addresses the traditional friction between development velocity and IT control by providing governed self-service capabilities. According to the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/), this model exemplifies operational excellence by automating repetitive tasks and enabling teams to focus on value-adding activities.
 
-The integration between Dev Box and Deployment Environments creates a cohesive developer experience where workstations and project infrastructure are provisioned from the same portal with consistent governance. Dev Box leverages Windows 365 technology to provide high-performance, cloud-based development workstations that can be accessed from any device, while Deployment Environments uses Infrastructure-as-Code templates to provision consistent project resources. This combination is particularly powerful for scenarios like microservices development, where developers need both powerful workstations and complex multi-service environments. The [Microsoft Dev Box documentation](https://docs.microsoft.com/en-us/azure/dev-box/) provides extensive guidance on optimizing these workstations for different development scenarios.
+The integration between Dev Box and Deployment Environments creates a cohesive developer experience where workstations and project infrastructure are provisioned from the same portal with consistent governance. Dev Box leverages Windows 365 technology to provide high-performance, cloud-based development workstations that can be accessed from any device, while Deployment Environments uses Infrastructure-as-Code templates to provision consistent project resources. This combination is particularly powerful for scenarios like microservices development, where developers need both powerful workstations and complex multi-service environments. The [Microsoft Dev Box documentation](https://learn.microsoft.com/en-us/azure/dev-box/) provides extensive guidance on optimizing these workstations for different development scenarios.
 
-From a cost optimization perspective, the consumption-based model with auto-stop schedules ensures organizations only pay for active usage. Dev Boxes automatically shut down during non-working hours, and deployment environments can be configured with expiration policies to prevent resource sprawl. The platform's integration with [Azure Cost Management](https://docs.microsoft.com/en-us/azure/cost-management-billing/costs/overview-cost-management) enables detailed tracking of development infrastructure costs by project, team, or individual developer. For additional cost optimization strategies specific to development environments, refer to the [Azure cost optimization documentation](https://docs.microsoft.com/en-us/azure/architecture/framework/cost/optimize-dev-test).
+From a cost optimization perspective, the consumption-based model with hibernation and auto-stop schedules ensures organizations only pay for active usage. Dev Boxes can automatically hibernate during non-working hours, preserving the complete state of applications and work while eliminating compute charges. Deployment environments can be configured with expiration policies to prevent resource sprawl. The platform's integration with [Azure Cost Management](https://learn.microsoft.com/en-us/azure/cost-management-billing/costs/overview-cost-management) enables detailed tracking of development infrastructure costs by project, team, or individual developer. For additional cost optimization strategies specific to development environments, refer to the [Azure cost optimization documentation](https://learn.microsoft.com/en-us/azure/architecture/framework/cost/optimize-dev-test).
 
-Security and compliance are built into the platform through Azure AD integration, managed identities, and policy-based governance. Dev Boxes are managed like any other corporate device through Microsoft Intune, enabling consistent security policies across cloud and on-premises workstations. The [Azure security baseline for DevCenter](https://docs.microsoft.com/en-us/security/benchmark/azure/baselines/dev-box-security-baseline) provides comprehensive guidance on implementing defense-in-depth security for developer infrastructure.
+Security and compliance are built into the platform through Microsoft Entra ID integration, managed identities, and policy-based governance. Dev Boxes are managed like any other corporate device through Microsoft Intune, enabling consistent security policies across cloud and on-premises workstations. The [Azure security baseline for DevCenter](https://learn.microsoft.com/en-us/security/benchmark/azure/baselines/dev-box-security-baseline) provides comprehensive guidance on implementing defense-in-depth security for developer infrastructure.
 
-> **Tip**: Start with a pilot project to establish patterns and gather feedback before rolling out to all development teams. Use Azure Policy to enforce naming conventions and resource tags for better cost tracking and compliance reporting.
+> **Tip**: Start with a pilot project to establish patterns and gather feedback before rolling out to all development teams. Use Azure Policy to enforce naming conventions and resource tags for better cost tracking and compliance reporting. Enable hibernation on all Dev Box definitions to maximize cost savings.
 
 ## Challenge
 
@@ -470,13 +485,13 @@ Extend this solution by implementing these enhancements:
 
 1. Create custom environment definitions in a Git repository that include your organization's standard application architectures, then attach this repository as an additional catalog to provide team-specific templates
 
-2. Implement automated Dev Box customization using configuration scripts that install team-specific development tools, configure Git repositories, and set up development certificates when a new Dev Box is created
+2. Implement automated Dev Box customization using Azure Image Builder and PowerShell DSC that installs team-specific development tools, configures Git repositories, and sets up development certificates when a new Dev Box is created
 
-3. Integrate the deployment environments with your CI/CD pipelines to automatically provision ephemeral environments for pull request validation, enabling developers to test changes in isolated environments before merging
+3. Integrate the deployment environments with your CI/CD pipelines using GitHub Actions or Azure DevOps to automatically provision ephemeral environments for pull request validation, enabling developers to test changes in isolated environments before merging
 
-4. Build a cost optimization dashboard using Azure Monitor Workbooks that tracks Dev Box usage patterns, identifies idle resources, and provides recommendations for right-sizing Dev Box definitions based on actual CPU and memory utilization
+4. Build a comprehensive cost optimization dashboard using Azure Monitor Workbooks and Log Analytics that tracks Dev Box usage patterns, identifies idle resources, and provides recommendations for right-sizing Dev Box definitions based on actual CPU and memory utilization
 
-5. Implement a governance framework using Azure Policy that enforces security baselines for all Dev Boxes and deployment environments, including required security agents, network restrictions, and compliance scanning
+5. Implement a governance framework using Azure Policy that enforces security baselines for all Dev Boxes and deployment environments, including required security agents, network restrictions, and compliance scanning with automatic remediation
 
 ## Infrastructure Code
 

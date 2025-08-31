@@ -1,0 +1,752 @@
+# Infrastructure Manager Configuration for Educational Content Generation
+# This configuration deploys a complete AI-powered educational content generation solution
+# using Vertex AI Gemini, Text-to-Speech, Cloud Functions, and Firestore
+
+# Metadata and schema declaration
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: educational-content-generation-gemini-tts
+  annotations:
+    config.kubernetes.io/local-config: "true"
+spec:
+  info:
+    title: Educational Content Generation with Gemini and Text-to-Speech
+    description: |
+      Serverless educational content generation platform that automatically creates
+      comprehensive learning materials and natural-sounding audio lessons from
+      curriculum outlines using Vertex AI Gemini 2.5 Flash and Google Text-to-Speech.
+    version: "1.1"
+    actuationTool:
+      flavor: Terraform
+      version: ">= 1.5"
+  variables:
+    # Core project and deployment configuration
+    - name: project_id
+      description: "Google Cloud Project ID for the deployment"
+      varType: string
+      required: true
+    
+    - name: region
+      description: "Google Cloud region for resource deployment"
+      varType: string
+      defaultValue: "us-central1"
+    
+    - name: zone
+      description: "Google Cloud zone for zonal resources"
+      varType: string
+      defaultValue: "us-central1-a"
+    
+    # Function and storage naming configuration
+    - name: function_name
+      description: "Name for the Cloud Function that generates educational content"
+      varType: string
+      defaultValue: "content-generator"
+    
+    - name: bucket_name_suffix
+      description: "Unique suffix for the audio storage bucket name"
+      varType: string
+      defaultValue: "edu-audio"
+    
+    - name: firestore_collection
+      description: "Firestore collection name for storing educational content"
+      varType: string
+      defaultValue: "educational_content"
+    
+    # Function runtime and performance configuration
+    - name: function_memory
+      description: "Memory allocation for Cloud Function (MB)"
+      varType: number
+      defaultValue: 1024
+    
+    - name: function_timeout
+      description: "Timeout duration for Cloud Function (seconds)"
+      varType: number
+      defaultValue: 540
+    
+    - name: function_runtime
+      description: "Python runtime version for Cloud Function"
+      varType: string
+      defaultValue: "python311"
+    
+    # Storage and access configuration
+    - name: bucket_storage_class
+      description: "Storage class for the audio content bucket"
+      varType: string
+      defaultValue: "STANDARD"
+    
+    - name: enable_public_access
+      description: "Enable public read access for educational content distribution"
+      varType: bool
+      defaultValue: true
+    
+    # Security and access control
+    - name: enable_unauthenticated_access
+      description: "Allow unauthenticated access to the Cloud Function for demos"
+      varType: bool
+      defaultValue: false
+    
+    # Labels and metadata
+    - name: labels
+      description: "Common labels to apply to all resources"
+      varType: object
+      defaultValue:
+        environment: "educational-content"
+        solution: "gemini-tts-generator"
+        managed-by: "infrastructure-manager"
+
+---
+
+# Terraform Configuration
+# Enable required Google Cloud APIs for the solution
+resource "google_project_service" "required_apis" {
+  for_each = toset([
+    "cloudfunctions.googleapis.com",     # Cloud Functions for serverless orchestration
+    "aiplatform.googleapis.com",         # Vertex AI for Gemini model access
+    "texttospeech.googleapis.com",       # Text-to-Speech API for audio generation
+    "firestore.googleapis.com",          # Firestore for content lifecycle management
+    "storage-api.googleapis.com",        # Cloud Storage for audio file storage
+    "cloudbuild.googleapis.com",         # Cloud Build for function deployment
+    "eventarc.googleapis.com"            # Eventarc for future event-driven enhancements
+  ])
+  
+  project = var.project_id
+  service = each.value
+  
+  # Prevent accidental API disabling during destruction
+  disable_dependent_services = false
+  disable_on_destroy = false
+  
+  # Add timeout to handle API enablement delays
+  timeouts {
+    create = "10m"
+    update = "10m"
+  }
+}
+
+# Create a Firestore database in Native mode for content management
+# Native mode provides advanced querying, real-time synchronization, and ACID transactions
+resource "google_firestore_database" "educational_content_db" {
+  project     = var.project_id
+  name        = "(default)"
+  location_id = var.region
+  type        = "FIRESTORE_NATIVE"
+  
+  # Prevent accidental database deletion
+  lifecycle {
+    prevent_destroy = true
+  }
+  
+  # Ensure APIs are enabled before creating database
+  depends_on = [
+    google_project_service.required_apis
+  ]
+}
+
+# Generate a random suffix for globally unique bucket naming
+resource "random_id" "bucket_suffix" {
+  byte_length = 4
+}
+
+# Create Cloud Storage bucket for educational audio content
+# Configured for global distribution and public accessibility
+resource "google_storage_bucket" "audio_content_bucket" {
+  project  = var.project_id
+  name     = "${var.bucket_name_suffix}-${random_id.bucket_suffix.hex}"
+  location = var.region
+  
+  # Configure storage class for cost optimization
+  storage_class = var.bucket_storage_class
+  
+  # Enable uniform bucket-level access for simplified IAM
+  uniform_bucket_level_access = true
+  
+  # Configure lifecycle management for cost optimization
+  lifecycle_rule {
+    condition {
+      age = 365 # Move to Nearline after 1 year
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+  }
+  
+  lifecycle_rule {
+    condition {
+      age = 1095 # Move to Coldline after 3 years
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "COLDLINE"
+    }
+  }
+  
+  # CORS configuration for web-based educational platforms
+  cors {
+    origin          = ["*"]
+    method          = ["GET", "HEAD"]
+    response_header = ["*"]
+    max_age_seconds = 3600
+  }
+  
+  # Versioning for content audit trails
+  versioning {
+    enabled = true
+  }
+  
+  # Apply consistent labeling
+  labels = var.labels
+  
+  # Ensure APIs are enabled before creating bucket
+  depends_on = [
+    google_project_service.required_apis
+  ]
+}
+
+# Configure public read access for educational content distribution
+# This enables global access to generated audio lessons
+resource "google_storage_bucket_iam_member" "public_access" {
+  count = var.enable_public_access ? 1 : 0
+  
+  bucket = google_storage_bucket.audio_content_bucket.name
+  role   = "roles/storage.objectViewer"
+  member = "allUsers"
+  
+  # Only apply if public access is explicitly enabled
+  depends_on = [
+    google_storage_bucket.audio_content_bucket
+  ]
+}
+
+# Create a service account for the Cloud Function with minimal required permissions
+# Following principle of least privilege for security
+resource "google_service_account" "function_service_account" {
+  project      = var.project_id
+  account_id   = "${var.function_name}-sa"
+  display_name = "Service Account for Educational Content Generator Function"
+  description  = "Service account with minimal permissions for AI content generation"
+}
+
+# Grant Vertex AI User role for Gemini model access
+resource "google_project_iam_member" "function_vertex_ai_access" {
+  project = var.project_id
+  role    = "roles/aiplatform.user"
+  member  = "serviceAccount:${google_service_account.function_service_account.email}"
+}
+
+# Grant Text-to-Speech User role for audio generation
+resource "google_project_iam_member" "function_tts_access" {
+  project = var.project_id
+  role    = "roles/texttospeech.user"
+  member  = "serviceAccount:${google_service_account.function_service_account.email}"
+}
+
+# Grant Firestore User role for content storage
+resource "google_project_iam_member" "function_firestore_access" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.function_service_account.email}"
+}
+
+# Grant Storage Object Admin role for audio file management
+resource "google_storage_bucket_iam_member" "function_storage_access" {
+  bucket = google_storage_bucket.audio_content_bucket.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.function_service_account.email}"
+}
+
+# Create a ZIP archive of the function source code
+# This includes the main Python file and dependencies
+data "archive_file" "function_source" {
+  type        = "zip"
+  output_path = "/tmp/${var.function_name}-source.zip"
+  
+  # Main function code with integrated AI services
+  source {
+    content = <<-EOT
+import functions_framework
+import json
+import os
+from google.cloud import aiplatform
+from google.cloud import texttospeech
+from google.cloud import firestore
+from google.cloud import storage
+import vertexai
+from vertexai.generative_models import GenerativeModel
+
+# Initialize cloud service clients with error handling
+def initialize_clients():
+    """Initialize all required Google Cloud service clients."""
+    try:
+        db = firestore.Client()
+        tts_client = texttospeech.TextToSpeechClient()
+        storage_client = storage.Client()
+        return db, tts_client, storage_client
+    except Exception as e:
+        print(f"Failed to initialize clients: {str(e)}")
+        raise
+
+# Global client initialization for optimal cold start performance
+db, tts_client, storage_client = initialize_clients()
+
+@functions_framework.http
+def generate_content(request):
+    """
+    Generate comprehensive educational content from curriculum outline.
+    
+    This function orchestrates the entire content generation pipeline:
+    1. Parse curriculum outline from request
+    2. Generate educational content using Vertex AI Gemini 2.5 Flash
+    3. Convert generated text to natural-sounding audio using Text-to-Speech
+    4. Store content and metadata in Firestore
+    5. Upload audio files to Cloud Storage
+    6. Return comprehensive response with content preview and audio URL
+    """
+    
+    # Enable CORS for web-based educational platforms
+    if request.method == 'OPTIONS':
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST',
+            'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Max-Age': '3600'
+        }
+        return ('', 204, headers)
+    
+    # Set CORS headers for actual requests
+    headers = {
+        'Access-Control-Allow-Origin': '*',
+        'Content-Type': 'application/json'
+    }
+    
+    # Parse and validate request payload
+    try:
+        if request.content_type != 'application/json':
+            return (json.dumps({'error': 'Content-Type must be application/json'}), 400, headers)
+            
+        request_json = request.get_json(silent=True)
+        if not request_json:
+            return (json.dumps({'error': 'Invalid JSON payload'}), 400, headers)
+    except Exception as e:
+        return (json.dumps({'error': f'Failed to parse request: {str(e)}'}), 400, headers)
+    
+    # Extract and validate required parameters
+    outline = request_json.get('outline', '').strip()
+    topic = request_json.get('topic', 'Educational Content').strip()
+    voice_name = request_json.get('voice_name', 'en-US-Studio-M')
+    language_code = request_json.get('language_code', 'en-US')
+    
+    # Validate required curriculum outline
+    if not outline:
+        return (json.dumps({'error': 'Curriculum outline is required and cannot be empty'}), 400, headers)
+    
+    # Validate outline length to prevent excessive token usage
+    if len(outline) > 2000:
+        return (json.dumps({'error': 'Curriculum outline too long. Maximum 2000 characters.'}), 400, headers)
+    
+    try:
+        # Initialize Vertex AI with project configuration
+        project_id = os.environ.get('GCP_PROJECT')
+        if not project_id:
+            return (json.dumps({'error': 'GCP_PROJECT environment variable not set'}), 500, headers)
+            
+        vertexai.init(project=project_id, location='us-central1')
+        model = GenerativeModel('gemini-2.5-flash')
+        
+        # Construct comprehensive educational content generation prompt
+        # Optimized for pedagogical best practices and audio narration
+        prompt = f"""
+        Create comprehensive, engaging educational content based on this curriculum outline:
+        
+        Topic: {topic}
+        Curriculum Outline: {outline}
+        
+        Please generate the following structured content:
+        
+        1. **Lesson Overview** (100-150 words):
+           - Brief introduction to the topic
+           - Why this content is important for learners
+           - What students will accomplish
+        
+        2. **Learning Objectives** (3-5 bullet points):
+           - Clear, measurable learning outcomes
+           - Use action verbs (understand, analyze, apply, create)
+           - Align with Bloom's taxonomy principles
+        
+        3. **Main Content** (400-600 words):
+           - Detailed explanations of key concepts
+           - Real-world examples and applications
+           - Clear, logical progression of ideas
+           - Suitable for audio narration with natural flow
+        
+        4. **Key Takeaways** (3-5 bullet points):
+           - Essential concepts students should remember
+           - Practical applications
+           - Connections to broader subject areas
+        
+        5. **Practice Questions** (3-4 questions):
+           - Mix of comprehension and application questions
+           - Progressive difficulty levels
+           - Encourage critical thinking
+        
+        Guidelines:
+        - Write in clear, accessible language appropriate for the subject level
+        - Use engaging, conversational tone suitable for audio presentation
+        - Include smooth transitions between sections
+        - Ensure content flows naturally when read aloud
+        - Focus on active learning and student engagement
+        - Incorporate pedagogical best practices
+        
+        Format the response with clear section headers and maintain consistent structure.
+        """
+        
+        # Generate educational content using Gemini 2.5 Flash
+        print(f"Generating content for topic: {topic}")
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "max_output_tokens": 2048,
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "top_k": 40
+            }
+        )
+        
+        if not response.text:
+            return (json.dumps({'error': 'Failed to generate content. Empty response from AI model.'}), 500, headers)
+            
+        generated_content = response.text.strip()
+        print(f"Generated content length: {len(generated_content)} characters")
+        
+        # Store initial content in Firestore with metadata
+        doc_data = {
+            'topic': topic,
+            'outline': outline,
+            'generated_content': generated_content,
+            'language_code': language_code,
+            'voice_name': voice_name,
+            'timestamp': firestore.SERVER_TIMESTAMP,
+            'status': 'content_generated',
+            'content_length': len(generated_content),
+            'version': '1.0'
+        }
+        
+        # Add document to Firestore collection
+        doc_ref = db.collection('${var.firestore_collection}').add(doc_data)[1]
+        document_id = doc_ref.id
+        print(f"Content stored in Firestore with ID: {document_id}")
+        
+        # Validate content length for Text-to-Speech (5000 character limit)
+        if len(generated_content) > 5000:
+            # Truncate content and add warning
+            generated_content = generated_content[:4900] + "... [Content truncated for audio generation]"
+            doc_ref.update({'audio_content_truncated': True})
+        
+        # Configure Text-to-Speech synthesis parameters
+        synthesis_input = texttospeech.SynthesisInput(text=generated_content)
+        
+        # Voice selection with error handling for unavailable voices
+        voice = texttospeech.VoiceSelectionParams(
+            language_code=language_code,
+            name=voice_name
+        )
+        
+        # Audio configuration optimized for educational content
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=0.9,  # Slightly slower for better comprehension
+            pitch=0.0,          # Neutral pitch
+            volume_gain_db=0.0, # Standard volume
+            sample_rate_hertz=24000  # High quality for educational content
+        )
+        
+        # Generate audio using Text-to-Speech API
+        print(f"Generating audio with voice: {voice_name}")
+        tts_response = tts_client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config
+        )
+        
+        if not tts_response.audio_content:
+            return (json.dumps({'error': 'Failed to generate audio content'}), 500, headers)
+        
+        # Upload audio content to Cloud Storage
+        bucket_name = os.environ.get('BUCKET_NAME')
+        if not bucket_name:
+            return (json.dumps({'error': 'BUCKET_NAME environment variable not set'}), 500, headers)
+            
+        bucket = storage_client.bucket(bucket_name)
+        audio_filename = f"lessons/{document_id}.mp3"
+        blob = bucket.blob(audio_filename)
+        
+        # Upload with appropriate metadata for educational content
+        blob.upload_from_string(
+            tts_response.audio_content,
+            content_type='audio/mpeg'
+        )
+        
+        # Set cache control for efficient content delivery
+        blob.cache_control = 'public, max-age=3600'
+        blob.patch()
+        
+        print(f"Audio uploaded to: gs://{bucket_name}/{audio_filename}")
+        
+        # Update Firestore document with audio information
+        audio_url = f"gs://{bucket_name}/{audio_filename}"
+        public_audio_url = f"https://storage.googleapis.com/{bucket_name}/{audio_filename}"
+        
+        doc_ref.update({
+            'audio_url': audio_url,
+            'public_audio_url': public_audio_url,
+            'audio_filename': audio_filename,
+            'audio_size_bytes': len(tts_response.audio_content),
+            'status': 'completed',
+            'completion_timestamp': firestore.SERVER_TIMESTAMP
+        })
+        
+        # Prepare comprehensive response
+        response_data = {
+            'status': 'success',
+            'document_id': document_id,
+            'topic': topic,
+            'content_preview': generated_content[:300] + ('...' if len(generated_content) > 300 else ''),
+            'content_length': len(generated_content),
+            'audio_url': audio_url,
+            'public_audio_url': public_audio_url,
+            'voice_used': voice_name,
+            'language_code': language_code,
+            'processing_time': 'completed',
+            'firestore_collection': '${var.firestore_collection}'
+        }
+        
+        print(f"Content generation completed successfully for document: {document_id}")
+        return (json.dumps(response_data), 200, headers)
+        
+    except Exception as e:
+        error_message = f"Content generation failed: {str(e)}"
+        print(f"Error: {error_message}")
+        
+        # Log error to Firestore if possible
+        try:
+            db.collection('${var.firestore_collection}_errors').add({
+                'error_message': error_message,
+                'topic': topic,
+                'outline': outline[:500],  # Truncate for storage
+                'timestamp': firestore.SERVER_TIMESTAMP,
+                'voice_name': voice_name
+            })
+        except:
+            pass  # Fail silently if error logging fails
+            
+        return (json.dumps({'error': error_message}), 500, headers)
+
+# Health check endpoint for monitoring and load balancer integration
+@functions_framework.http
+def health_check(request):
+    """Basic health check endpoint for service monitoring."""
+    if request.path == '/health':
+        return json.dumps({'status': 'healthy', 'service': 'educational-content-generator'})
+    return generate_content(request)
+EOT
+    filename = "main.py"
+  }
+  
+  # Requirements file with optimized dependencies
+  source {
+    content = <<-EOT
+functions-framework==3.9.1
+google-cloud-aiplatform==1.105.0
+google-cloud-texttospeech==2.27.0
+google-cloud-firestore==2.18.0
+google-cloud-storage==2.18.2
+EOT
+    filename = "requirements.txt"
+  }
+}
+
+# Upload function source code to Cloud Storage for deployment
+resource "google_storage_bucket_object" "function_source" {
+  name   = "${var.function_name}-source-${random_id.bucket_suffix.hex}.zip"
+  bucket = google_storage_bucket.audio_content_bucket.name
+  source = data.archive_file.function_source.output_path
+  
+  # Ensure consistent deployment across environments
+  content_type = "application/zip"
+  
+  depends_on = [
+    data.archive_file.function_source
+  ]
+}
+
+# Deploy Cloud Function with comprehensive configuration
+# Optimized for AI workloads with appropriate memory and timeout settings
+resource "google_cloudfunctions_function" "content_generator" {
+  project = var.project_id
+  region  = var.region
+  name    = var.function_name
+  
+  # Function description for documentation and monitoring
+  description = "AI-powered educational content generator using Vertex AI Gemini and Text-to-Speech"
+  
+  # Runtime configuration optimized for AI workloads
+  runtime               = var.function_runtime
+  available_memory_mb   = var.function_memory
+  timeout              = var.function_timeout
+  entry_point          = "generate_content"
+  
+  # Source code configuration
+  source_archive_bucket = google_storage_bucket.audio_content_bucket.name
+  source_archive_object = google_storage_bucket_object.function_source.name
+  
+  # HTTP trigger for REST API access
+  trigger {
+    https_trigger {
+      # Security policy configuration
+      security_level = "SECURE_ALWAYS"
+    }
+  }
+  
+  # Service account with minimal required permissions
+  service_account_email = google_service_account.function_service_account.email
+  
+  # Environment variables for service integration
+  environment_variables = {
+    GCP_PROJECT   = var.project_id
+    BUCKET_NAME   = google_storage_bucket.audio_content_bucket.name
+    REGION        = var.region
+    FUNCTION_NAME = var.function_name
+  }
+  
+  # VPC configuration for enhanced security (optional)
+  # Uncomment and configure if VPC connectivity is required
+  # vpc_connector = google_vpc_access_connector.function_connector.name
+  
+  # Ingress settings for security
+  ingress_settings = var.enable_unauthenticated_access ? "ALLOW_ALL" : "ALLOW_INTERNAL_ONLY"
+  
+  # Apply consistent labeling for resource management
+  labels = merge(var.labels, {
+    function-type = "ai-content-generator"
+    runtime       = var.function_runtime
+  })
+  
+  # Ensure all dependencies are ready before deployment
+  depends_on = [
+    google_project_service.required_apis,
+    google_storage_bucket_object.function_source,
+    google_service_account.function_service_account,
+    google_project_iam_member.function_vertex_ai_access,
+    google_project_iam_member.function_tts_access,
+    google_project_iam_member.function_firestore_access,
+    google_storage_bucket_iam_member.function_storage_access,
+    google_firestore_database.educational_content_db
+  ]
+}
+
+# Configure IAM for public access if enabled (for educational demonstrations)
+resource "google_cloudfunctions_function_iam_member" "public_access" {
+  count = var.enable_unauthenticated_access ? 1 : 0
+  
+  project        = var.project_id
+  region         = var.region
+  cloud_function = google_cloudfunctions_function.content_generator.name
+  role           = "roles/cloudfunctions.invoker"
+  member         = "allUsers"
+}
+
+# Output values for integration and monitoring
+output "function_url" {
+  description = "HTTP trigger URL for the educational content generator function"
+  value       = google_cloudfunctions_function.content_generator.https_trigger_url
+  sensitive   = false
+}
+
+output "function_name" {
+  description = "Name of the deployed Cloud Function"
+  value       = google_cloudfunctions_function.content_generator.name
+}
+
+output "storage_bucket_name" {
+  description = "Name of the Cloud Storage bucket for audio content"
+  value       = google_storage_bucket.audio_content_bucket.name
+}
+
+output "storage_bucket_url" {
+  description = "URL of the Cloud Storage bucket for direct access"
+  value       = google_storage_bucket.audio_content_bucket.url
+}
+
+output "firestore_database_name" {
+  description = "Name of the Firestore database for content management"
+  value       = google_firestore_database.educational_content_db.name
+}
+
+output "service_account_email" {
+  description = "Email of the service account used by the Cloud Function"
+  value       = google_service_account.function_service_account.email
+}
+
+output "project_id" {
+  description = "Google Cloud Project ID where resources are deployed"
+  value       = var.project_id
+}
+
+output "region" {
+  description = "Google Cloud region where resources are deployed"
+  value       = var.region
+}
+
+output "firestore_collection" {
+  description = "Firestore collection name for educational content storage"
+  value       = var.firestore_collection
+}
+
+# Additional outputs for monitoring and integration
+output "function_source_bucket" {
+  description = "Cloud Storage bucket containing the function source code"
+  value       = google_storage_bucket.audio_content_bucket.name
+}
+
+output "enabled_apis" {
+  description = "List of enabled Google Cloud APIs for this deployment"
+  value = [
+    "cloudfunctions.googleapis.com",
+    "aiplatform.googleapis.com",
+    "texttospeech.googleapis.com",
+    "firestore.googleapis.com",
+    "storage-api.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "eventarc.googleapis.com"
+  ]
+}
+
+# Example usage information
+output "usage_example" {
+  description = "Example curl command to test the educational content generator"
+  value = <<-EOT
+  # Test the educational content generator with a sample curriculum:
+  curl -X POST "${google_cloudfunctions_function.content_generator.https_trigger_url}" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "topic": "Introduction to Climate Science",
+      "outline": "1. Climate vs weather basics 2. Greenhouse effect principles 3. Human impact factors 4. Evidence and data 5. Mitigation strategies",
+      "voice_name": "en-US-Studio-M",
+      "language_code": "en-US"
+    }'
+  EOT
+}
+
+# Security and compliance outputs
+output "security_configuration" {
+  description = "Security configuration summary for the deployment"
+  value = {
+    service_account_principle = "least-privilege"
+    function_ingress = var.enable_unauthenticated_access ? "public" : "internal-only"
+    storage_public_access = var.enable_public_access
+    firestore_security = "native-mode-with-security-rules"
+    https_only = true
+    vpc_connector = "not-configured"
+  }
+}

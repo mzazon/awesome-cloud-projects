@@ -6,10 +6,10 @@ difficulty: 400
 subject: aws
 services: QLDB, IAM, S3, Kinesis
 estimated-time: 240 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database, ledger, acid, cryptographic-verification, financial-services, audit-trail, immutable-storage
 recipe-generator-version: 1.3
@@ -75,9 +75,9 @@ graph TB
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of SQL, JSON, and cryptographic hashing concepts
 4. Familiarity with financial transaction processing and audit requirements
-5. Estimated cost: $10-50 for QLDB usage, S3 storage, and Kinesis streaming (4 hours)
+5. Estimated cost: $15-75 for QLDB I/O operations, S3 storage, and Kinesis streaming (4 hours)
 
-> **Note**: QLDB charges based on I/O requests and storage. Monitor usage carefully during testing.
+> **Warning**: Amazon QLDB end-of-support is July 31, 2025. This recipe is provided for educational purposes and existing workload migration. Consider Amazon Aurora PostgreSQL for new projects.
 
 ## Preparation
 
@@ -102,6 +102,12 @@ export KINESIS_STREAM_NAME="qldb-journal-stream-${RANDOM_SUFFIX}"
 # Create S3 bucket for journal exports
 aws s3 mb s3://${S3_BUCKET_NAME} --region ${AWS_REGION}
 
+# Enable S3 bucket encryption by default
+aws s3api put-bucket-encryption \
+    --bucket ${S3_BUCKET_NAME} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
 # Create Kinesis stream for real-time journal streaming
 aws kinesis create-stream \
     --stream-name ${KINESIS_STREAM_NAME} \
@@ -118,7 +124,7 @@ echo "✅ Environment prepared successfully"
 
 1. **Create IAM Role for QLDB Operations**:
 
-   IAM roles provide secure, temporary credentials for AWS services to access other resources without hardcoding credentials. For QLDB operations, we need a dedicated role that enables journal streaming to Kinesis and data export to S3. This follows AWS security best practices by implementing the principle of least privilege, ensuring QLDB can only access the specific resources required for journal streaming and export operations.
+   IAM roles provide secure, temporary credentials for AWS services to access other resources without hardcoding credentials. For QLDB operations, we need a dedicated role that enables journal streaming to Kinesis and data export to S3. This follows AWS security best practices by implementing the principle of least privilege from the [AWS Well-Architected Security Pillar](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html), ensuring QLDB can only access the specific resources required for journal streaming and export operations.
 
    ```bash
    # Create trust policy for QLDB
@@ -185,7 +191,7 @@ echo "✅ Environment prepared successfully"
 
 2. **Create QLDB Ledger with Encryption**:
 
-   Amazon QLDB provides a fully managed ledger database that maintains an immutable, cryptographically verifiable transaction log. The ledger uses a journal-first architecture where all changes are recorded in an append-only journal before being materialized into queryable tables. This design ensures complete data lineage and enables cryptographic verification of data integrity, making it ideal for financial applications requiring regulatory compliance and audit trails.
+   Amazon QLDB provides a fully managed ledger database that maintains an immutable, cryptographically verifiable transaction log. The ledger uses a journal-first architecture where all changes are recorded in an append-only journal before being materialized into queryable tables. This design ensures complete data lineage and enables cryptographic verification of data integrity, making it ideal for financial applications requiring regulatory compliance and audit trails as described in the [Amazon QLDB Developer Guide](https://docs.aws.amazon.com/qldb/latest/developerguide/).
 
    ```bash
    # Create QLDB ledger with standard permissions mode
@@ -213,11 +219,11 @@ echo "✅ Environment prepared successfully"
    echo "✅ QLDB ledger created and active"
    ```
 
-   The QLDB ledger is now operational with deletion protection enabled to prevent accidental data loss. This provides the foundation for building ACID-compliant applications with built-in cryptographic verification capabilities. The ledger automatically handles transaction serialization and maintains complete audit trails for all data modifications.
+   The QLDB ledger is now operational with deletion protection enabled to prevent accidental data loss. This provides the foundation for building ACID-compliant applications with built-in cryptographic verification capabilities. The ledger automatically handles transaction serialization and maintains complete audit trails for all data modifications using AWS-owned encryption keys by default.
 
 3. **Create Database Tables and Indexes**:
 
-   QLDB uses PartiQL, a SQL-compatible query language that supports both relational and document data models. Creating appropriate tables and indexes is crucial for query performance and data organization. Unlike traditional databases, QLDB automatically maintains historical versions of all data, enabling temporal queries and complete audit trails without additional configuration.
+   QLDB uses PartiQL, a SQL-compatible query language that supports both relational and document data models as detailed in the [PartiQL documentation](https://docs.aws.amazon.com/qldb/latest/developerguide/ql-reference.html). Creating appropriate tables and indexes is crucial for query performance and data organization. Unlike traditional databases, QLDB automatically maintains historical versions of all data, enabling temporal queries and complete audit trails without additional configuration.
 
    ```bash
    # Create PartiQL script for table creation
@@ -239,11 +245,11 @@ echo "✅ Environment prepared successfully"
    echo "✅ Database schema prepared"
    ```
 
-   The database schema is now defined with optimized indexes for financial transaction queries. QLDB will automatically maintain complete history of all table modifications, enabling both current state queries and historical analysis for compliance reporting and audit requirements.
+   The database schema is now defined with optimized indexes for financial transaction queries. QLDB will automatically maintain complete history of all table modifications, enabling both current state queries and historical analysis for compliance reporting and audit requirements. The indexes improve query performance for common access patterns in financial applications.
 
 4. **Insert Sample Financial Data**:
 
-   Sample financial data demonstrates real-world transaction patterns and account structures typical in banking applications. QLDB's document-oriented storage using Amazon Ion format allows flexible schema evolution while maintaining ACID properties. Each data insertion creates immutable journal entries that can be cryptographically verified, providing the foundation for regulatory compliance and audit trails.
+   Sample financial data demonstrates real-world transaction patterns and account structures typical in banking applications. QLDB's document-oriented storage using Amazon Ion format allows flexible schema evolution while maintaining ACID properties. Each data insertion creates immutable journal entries that can be cryptographically verified, providing the foundation for regulatory compliance and audit trails. The Ion format supports nested data structures and flexible typing required for complex financial instruments.
 
    ```bash
    # Create sample data files
@@ -306,7 +312,7 @@ echo "✅ Environment prepared successfully"
 
 5. **Set up Journal Streaming to Kinesis**:
 
-   Journal streaming enables real-time processing of QLDB transaction data by sending journal blocks to Amazon Kinesis Data Streams. This capability is essential for building responsive financial systems that require immediate fraud detection, compliance monitoring, and analytics. The stream captures all journal data including transaction metadata, enabling comprehensive audit trails and real-time business intelligence.
+   Journal streaming enables real-time processing of QLDB transaction data by sending journal blocks to Amazon Kinesis Data Streams. This capability is essential for building responsive financial systems that require immediate fraud detection, compliance monitoring, and analytics. The stream captures all journal data including transaction metadata, enabling comprehensive audit trails and real-time business intelligence as described in the [Streaming Journal Data Guide](https://docs.aws.amazon.com/qldb/latest/developerguide/streams.html).
 
    ```bash
    # Get IAM role ARN
@@ -344,7 +350,7 @@ echo "✅ Environment prepared successfully"
 
 6. **Generate Cryptographic Digest**:
 
-   QLDB's cryptographic digest provides tamper-evident proof of data integrity using SHA-256 hashing and Merkle tree structures. The digest represents a cryptographic fingerprint of the entire ledger state at a specific point in time, enabling independent verification of data integrity. This capability is crucial for regulatory compliance and forensic analysis in financial applications.
+   QLDB's cryptographic digest provides tamper-evident proof of data integrity using SHA-256 hashing and Merkle tree structures. The digest represents a cryptographic fingerprint of the entire ledger state at a specific point in time, enabling independent verification of data integrity. This capability is crucial for regulatory compliance and forensic analysis in financial applications as detailed in the [Data Verification Documentation](https://docs.aws.amazon.com/qldb/latest/developerguide/verification.html).
 
    ```bash
    # Request a digest from the ledger
@@ -369,7 +375,7 @@ echo "✅ Environment prepared successfully"
 
 7. **Export Journal Data to S3**:
 
-   Exporting journal data to S3 provides long-term archival and enables batch analytics processing. This capability is essential for regulatory compliance in financial services, where transaction records must be retained for extended periods. S3 export maintains the complete journal structure including cryptographic hashes, enabling offline verification and historical analysis of transaction patterns.
+   Exporting journal data to S3 provides long-term archival and enables batch analytics processing. This capability is essential for regulatory compliance in financial services, where transaction records must be retained for extended periods. S3 export maintains the complete journal structure including cryptographic hashes, enabling offline verification and historical analysis of transaction patterns. The export uses server-side encryption to protect data at rest.
 
    ```bash
    # Create S3 export configuration
@@ -470,7 +476,7 @@ echo "✅ Environment prepared successfully"
 
 10. **Create Audit Trail Query Functions**:
 
-    Audit trail queries leverage QLDB's unique ability to query historical data using the `history()` function. This capability enables compliance officers and auditors to examine the complete evolution of account balances and transaction records over time. The temporal query capabilities are essential for regulatory reporting and forensic investigations in financial services.
+    Audit trail queries leverage QLDB's unique ability to query historical data using the `history()` function. This capability enables compliance officers and auditors to examine the complete evolution of account balances and transaction records over time. The temporal query capabilities are essential for regulatory reporting and forensic investigations in financial services as detailed in the [PartiQL Functions Reference](https://docs.aws.amazon.com/qldb/latest/developerguide/ql-functions.html).
 
     ```bash
     # Create audit query scripts
@@ -729,7 +735,7 @@ QLDB's integration with AWS services like Kinesis Data Streams and S3 enables re
 
 The cryptographic verification capabilities through digests and Merkle audit proofs ensure that data integrity can be independently verified, meeting strict regulatory requirements for financial institutions. QLDB's [Data Verification Documentation](https://docs.aws.amazon.com/qldb/latest/developerguide/verification.html) explains how to implement cryptographic verification workflows, while the [Verification Results Guide](https://docs.aws.amazon.com/qldb/latest/developerguide/verification.results.html) details interpreting verification outcomes. This architecture aligns with the [AWS Well-Architected Security Pillar](https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html) principles for building secure, compliant systems.
 
-> **Note**: While QLDB provides excellent immutability and verification features, it's important to note that AWS announced end-of-support for QLDB on July 31, 2025. Organizations should consider migration strategies to Amazon Aurora PostgreSQL or other alternatives for new projects.
+> **Warning**: AWS announced end-of-support for QLDB on July 31, 2025. Organizations should consider migration strategies to Amazon Aurora PostgreSQL or other alternatives for new projects. See the [QLDB to Aurora PostgreSQL Migration Guide](https://aws.amazon.com/blogs/database/migrate-an-amazon-qldb-ledger-to-amazon-aurora-postgresql/) for detailed migration guidance.
 
 > **Tip**: Use QLDB's verification APIs in combination with AWS CloudTrail and AWS Config to create comprehensive audit trails that meet financial services regulatory requirements. The [AWS Well-Architected Reliability Pillar](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html) provides additional guidance on building resilient financial systems.
 
@@ -739,11 +745,11 @@ Performance considerations include understanding QLDB's transaction limits and o
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Region Replication**: Set up cross-region journal streaming to maintain disaster recovery capabilities and improve global data availability.
+1. **Multi-Region Replication**: Set up cross-region journal streaming to maintain disaster recovery capabilities and improve global data availability using multiple Kinesis streams.
 
-2. **Advanced Audit Analytics**: Implement real-time fraud detection by analyzing transaction patterns in the Kinesis stream using Amazon Kinesis Data Analytics.
+2. **Advanced Audit Analytics**: Implement real-time fraud detection by analyzing transaction patterns in the Kinesis stream using Amazon Kinesis Data Analytics and AWS Lambda for pattern recognition.
 
-3. **Compliance Automation**: Create automated compliance reports by integrating with AWS Config and AWS Security Hub to monitor data access patterns and generate audit trails.
+3. **Compliance Automation**: Create automated compliance reports by integrating with AWS Config and AWS Security Hub to monitor data access patterns and generate audit trails for regulatory submissions.
 
 4. **Smart Contract Integration**: Develop blockchain-like smart contract functionality using AWS Lambda triggers on journal events to automate compliance checks and transaction validations.
 

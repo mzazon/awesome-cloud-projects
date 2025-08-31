@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Dataflow, Cloud Pub/Sub, Firestore, Cloud Storage
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: real-time, analytics, streaming, dataflow, firestore, pubsub
 recipe-generator-version: 1.3
@@ -262,11 +262,11 @@ echo "✅ APIs enabled for streaming analytics pipeline"
    # Create directory for pipeline code
    mkdir -p dataflow-pipeline && cd dataflow-pipeline
    
-   # Create requirements file
+   # Create requirements file with updated versions
    cat > requirements.txt << EOF
-   apache-beam[gcp]==2.52.0
-   google-cloud-firestore==2.13.1
-   google-cloud-storage==2.10.0
+   apache-beam[gcp]==2.66.0
+   google-cloud-firestore==2.21.0
+   google-cloud-storage==2.19.0
    EOF
    
    # Create streaming pipeline
@@ -394,10 +394,10 @@ echo "✅ APIs enabled for streaming analytics pipeline"
        run_pipeline()
    EOF
    
-   echo "✅ Apache Beam streaming pipeline created"
+   echo "✅ Apache Beam streaming pipeline created with updated dependencies"
    ```
 
-   The streaming pipeline is now ready to process real-time events with sophisticated windowing and aggregation logic. This implementation demonstrates production-ready patterns for handling high-volume streaming data with multiple output destinations.
+   The streaming pipeline is now ready to process real-time events with sophisticated windowing and aggregation logic. This implementation demonstrates production-ready patterns for handling high-volume streaming data with multiple output destinations, using the latest version of Apache Beam (2.66.0).
 
 6. **Deploy Dataflow Streaming Pipeline**:
 
@@ -769,11 +769,11 @@ Security follows Google Cloud best practices with service accounts using least-p
 
 Extend this real-time analytics platform with these enhancements:
 
-1. **Implement anomaly detection** using [Vertex AI](https://cloud.google.com/vertex-ai) to automatically identify unusual patterns in streaming data and trigger alerts through Cloud Functions and SendGrid integration.
+1. **Implement anomaly detection** using [Vertex AI](https://cloud.google.com/vertex-ai) to automatically identify unusual patterns in streaming data and trigger alerts through Cloud Functions and notification services.
 
 2. **Add geographic analysis** by integrating [BigQuery GIS functions](https://cloud.google.com/bigquery/docs/gis) to process location-based events and create spatial analytics for regional insights and location-based recommendations.
 
-3. **Build predictive analytics** using [AutoML Tables](https://cloud.google.com/automl-tables) to train models on historical data and generate real-time predictions for user behavior, churn probability, or demand forecasting.
+3. **Build predictive analytics** using [Vertex AI AutoML](https://cloud.google.com/vertex-ai/docs/start/automl-users) to train models on historical data and generate real-time predictions for user behavior, churn probability, or demand forecasting.
 
 4. **Implement data quality monitoring** with [Cloud Data Quality](https://cloud.google.com/dataplex/docs/data-quality-overview) to automatically validate incoming events, detect schema changes, and maintain data lineage for compliance and debugging.
 

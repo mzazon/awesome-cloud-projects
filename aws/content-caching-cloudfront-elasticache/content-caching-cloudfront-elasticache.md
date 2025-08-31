@@ -1,22 +1,21 @@
 ---
-title: Content Caching Strategies with CloudFront
+title: Multi-Tier Content Caching with CloudFront and ElastiCache
 id: 48efca0b
 category: networking
 difficulty: 300
 subject: aws
 services: CloudFront, ElastiCache, Lambda, API Gateway
 estimated-time: 90 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cloudfront, elasticache, caching, content-delivery, performance
 recipe-generator-version: 1.3
 ---
 
-# Content Caching Strategies with CloudFront
-
+# Multi-Tier Content Caching with CloudFront and ElastiCache
 
 ## Problem
 
@@ -115,7 +114,8 @@ export DISTRIBUTION_ID=""
 aws s3 mb s3://${BUCKET_NAME} --region ${AWS_REGION}
 
 # Create sample static content
-echo '<!DOCTYPE html>
+cat > index.html << 'EOF'
+<!DOCTYPE html>
 <html>
 <head>
     <title>Cache Demo</title>
@@ -137,7 +137,8 @@ echo '<!DOCTYPE html>
             });
     </script>
 </body>
-</html>' > index.html
+</html>
+EOF
 
 aws s3 cp index.html s3://${BUCKET_NAME}/index.html \
     --content-type "text/html"
@@ -200,6 +201,9 @@ echo "✅ Created S3 bucket and uploaded sample content"
            }
          ]
        }'
+   
+   # Wait for role to be available
+   sleep 10
    
    # Attach necessary policies
    aws iam attach-role-policy \
@@ -273,6 +277,9 @@ def lambda_handler(event, context):
     except Exception as e:
         return {
             'statusCode': 500,
+            'headers': {
+                'Content-Type': 'application/json'
+            },
             'body': json.dumps({
                 'error': str(e),
                 'message': 'Cache connection failed'
@@ -317,7 +324,7 @@ EOF
    
    aws lambda create-function \
        --function-name ${FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda_function.zip \
@@ -398,14 +405,12 @@ EOF
   "DefaultCacheBehavior": {
     "TargetOriginId": "S3-${BUCKET_NAME}",
     "ViewerProtocolPolicy": "redirect-to-https",
-    "MinTTL": 0,
-    "ForwardedValues": {
-      "QueryString": false,
-      "Cookies": {
-        "Forward": "none"
-      }
+    "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+    "TrustedSigners": {
+      "Enabled": false,
+      "Quantity": 0
     },
-    "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+    "Compress": true
   },
   "Origins": [
     {
@@ -423,7 +428,11 @@ EOF
       "CustomOriginConfig": {
         "HTTPPort": 443,
         "HTTPSPort": 443,
-        "OriginProtocolPolicy": "https-only"
+        "OriginProtocolPolicy": "https-only",
+        "OriginSslProtocols": {
+          "Quantity": 1,
+          "Items": ["TLSv1.2"]
+        }
       }
     }
   ],
@@ -432,14 +441,12 @@ EOF
       "PathPattern": "/api/*",
       "TargetOriginId": "API-${API_ID}",
       "ViewerProtocolPolicy": "redirect-to-https",
-      "MinTTL": 0,
-      "ForwardedValues": {
-        "QueryString": true,
-        "Cookies": {
-          "Forward": "none"
-        }
+      "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+      "TrustedSigners": {
+        "Enabled": false,
+        "Quantity": 0
       },
-      "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+      "Compress": true
     }
   ],
   "Enabled": true,
@@ -539,7 +546,8 @@ EOF
    ```bash
    # Create CloudWatch log group for monitoring
    aws logs create-log-group \
-       --log-group-name "/aws/cloudfront/cache-demo"
+       --log-group-name "/aws/cloudfront/cache-demo" \
+       --region ${AWS_REGION}
    
    # Create CloudWatch alarms for cache hit ratio
    aws cloudwatch put-metric-alarm \
@@ -552,7 +560,8 @@ EOF
        --threshold 80 \
        --comparison-operator "LessThanThreshold" \
        --evaluation-periods 2 \
-       --dimensions Name=DistributionId,Value=${DISTRIBUTION_ID}
+       --dimensions Name=DistributionId,Value=${DISTRIBUTION_ID} \
+       --region ${AWS_REGION}
    
    echo "✅ CloudWatch monitoring configured"
    ```
@@ -719,11 +728,15 @@ EOF
    aws elasticache delete-cache-cluster \
        --cache-cluster-id ${CACHE_CLUSTER_ID}
    
+   # Wait for cluster to be deleted before deleting subnet group
+   aws elasticache wait cache-cluster-deleted \
+       --cache-cluster-id ${CACHE_CLUSTER_ID}
+   
    # Delete subnet group
    aws elasticache delete-cache-subnet-group \
        --cache-subnet-group-name "${CACHE_CLUSTER_ID}-subnet-group"
    
-   echo "✅ ElastiCache cluster deletion initiated"
+   echo "✅ ElastiCache cluster deletion completed"
    ```
 
 4. **Delete S3 bucket and cleanup files**:
@@ -742,10 +755,12 @@ EOF
    
    # Delete CloudWatch resources
    aws logs delete-log-group \
-       --log-group-name "/aws/cloudfront/cache-demo"
+       --log-group-name "/aws/cloudfront/cache-demo" \
+       --region ${AWS_REGION}
    
    aws cloudwatch delete-alarms \
-       --alarm-names "CloudFront-CacheHitRatio-Low"
+       --alarm-names "CloudFront-CacheHitRatio-Low" \
+       --region ${AWS_REGION}
    
    echo "✅ All resources cleaned up"
    ```

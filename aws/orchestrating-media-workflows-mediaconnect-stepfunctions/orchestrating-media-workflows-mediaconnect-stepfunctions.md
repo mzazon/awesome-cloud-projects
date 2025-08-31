@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: AWS Elemental MediaConnect, AWS Step Functions, CloudWatch, SNS
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: media, streaming, workflow, monitoring, real-time
 recipe-generator-version: 1.3
@@ -121,7 +121,7 @@ echo "✅ Environment variables set and S3 bucket created"
               Key=Purpose,Value=MediaAlerts \
        --query TopicArn --output text)
    
-   # Subscribe email for notifications
+   # Subscribe email for notifications (replace with your email)
    aws sns subscribe \
        --topic-arn ${SNS_TOPIC_ARN} \
        --protocol email \
@@ -176,6 +176,9 @@ echo "✅ Environment variables set and S3 bucket created"
          ]
        }'
    
+   # Wait for role propagation
+   sleep 10
+   
    LAMBDA_ROLE_ARN=$(aws iam get-role \
        --role-name ${LAMBDA_ROLE_NAME} \
        --query Role.Arn --output text)
@@ -218,6 +221,9 @@ echo "✅ Environment variables set and S3 bucket created"
          ]
        }'
    
+   # Wait for role propagation
+   sleep 10
+   
    SF_ROLE_ARN=$(aws iam get-role \
        --role-name ${SF_ROLE_NAME} \
        --query Role.Arn --output text)
@@ -236,143 +242,173 @@ echo "✅ Environment variables set and S3 bucket created"
    cat > stream-monitor.py << 'EOF'
 import json
 import boto3
+import os
 from datetime import datetime, timedelta
 
 cloudwatch = boto3.client('cloudwatch')
 mediaconnect = boto3.client('mediaconnect')
 
 def lambda_handler(event, context):
-    flow_arn = event['flow_arn']
+    flow_arn = event.get('flow_arn')
+    if not flow_arn:
+        return {
+            'statusCode': 400,
+            'error': 'Missing flow_arn parameter'
+        }
     
-    # Get flow details
-    flow = mediaconnect.describe_flow(FlowArn=flow_arn)
-    flow_name = flow['Flow']['Name']
-    
-    # Query CloudWatch metrics for the last 5 minutes
-    end_time = datetime.utcnow()
-    start_time = end_time - timedelta(minutes=5)
-    
-    # Check source packet loss
-    response = cloudwatch.get_metric_statistics(
-        Namespace='AWS/MediaConnect',
-        MetricName='SourcePacketLossPercent',
-        Dimensions=[
-            {'Name': 'FlowARN', 'Value': flow_arn}
-        ],
-        StartTime=start_time,
-        EndTime=end_time,
-        Period=300,
-        Statistics=['Average', 'Maximum']
-    )
-    
-    # Analyze metrics
-    issues = []
-    if response['Datapoints']:
-        latest = sorted(response['Datapoints'], 
-                       key=lambda x: x['Timestamp'])[-1]
-        if latest['Maximum'] > 0.1:  # 0.1% packet loss threshold
-            issues.append({
-                'metric': 'PacketLoss',
-                'value': latest['Maximum'],
-                'threshold': 0.1,
-                'severity': 'HIGH'
-            })
-    
-    # Check source jitter
-    jitter_response = cloudwatch.get_metric_statistics(
-        Namespace='AWS/MediaConnect',
-        MetricName='SourceJitter',
-        Dimensions=[
-            {'Name': 'FlowARN', 'Value': flow_arn}
-        ],
-        StartTime=start_time,
-        EndTime=end_time,
-        Period=300,
-        Statistics=['Average', 'Maximum']
-    )
-    
-    if jitter_response['Datapoints']:
-        latest_jitter = sorted(jitter_response['Datapoints'], 
-                             key=lambda x: x['Timestamp'])[-1]
-        if latest_jitter['Maximum'] > 50:  # 50ms jitter threshold
-            issues.append({
-                'metric': 'Jitter',
-                'value': latest_jitter['Maximum'],
-                'threshold': 50,
-                'severity': 'MEDIUM'
-            })
-    
-    return {
-        'statusCode': 200,
-        'flow_name': flow_name,
-        'flow_arn': flow_arn,
-        'timestamp': end_time.isoformat(),
-        'issues': issues,
-        'healthy': len(issues) == 0
-    }
+    try:
+        # Get flow details
+        flow = mediaconnect.describe_flow(FlowArn=flow_arn)
+        flow_name = flow['Flow']['Name']
+        
+        # Query CloudWatch metrics for the last 5 minutes
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(minutes=5)
+        
+        # Check source packet loss
+        response = cloudwatch.get_metric_statistics(
+            Namespace='AWS/MediaConnect',
+            MetricName='SourcePacketLossPercent',
+            Dimensions=[
+                {'Name': 'FlowARN', 'Value': flow_arn}
+            ],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=300,
+            Statistics=['Average', 'Maximum']
+        )
+        
+        # Analyze metrics
+        issues = []
+        if response['Datapoints']:
+            latest = sorted(response['Datapoints'], 
+                           key=lambda x: x['Timestamp'])[-1]
+            if latest['Maximum'] > 0.1:  # 0.1% packet loss threshold
+                issues.append({
+                    'metric': 'PacketLoss',
+                    'value': latest['Maximum'],
+                    'threshold': 0.1,
+                    'severity': 'HIGH'
+                })
+        
+        # Check source jitter
+        jitter_response = cloudwatch.get_metric_statistics(
+            Namespace='AWS/MediaConnect',
+            MetricName='SourceJitter',
+            Dimensions=[
+                {'Name': 'FlowARN', 'Value': flow_arn}
+            ],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=300,
+            Statistics=['Average', 'Maximum']
+        )
+        
+        if jitter_response['Datapoints']:
+            latest_jitter = sorted(jitter_response['Datapoints'], 
+                                 key=lambda x: x['Timestamp'])[-1]
+            if latest_jitter['Maximum'] > 50:  # 50ms jitter threshold
+                issues.append({
+                    'metric': 'Jitter',
+                    'value': latest_jitter['Maximum'],
+                    'threshold': 50,
+                    'severity': 'MEDIUM'
+                })
+        
+        return {
+            'statusCode': 200,
+            'flow_name': flow_name,
+            'flow_arn': flow_arn,
+            'timestamp': end_time.isoformat(),
+            'issues': issues,
+            'healthy': len(issues) == 0
+        }
+    except Exception as e:
+        print(f"Error monitoring stream: {str(e)}")
+        return {
+            'statusCode': 500,
+            'error': str(e)
+        }
 EOF
    
    # Create alert handler Lambda function
    cat > alert-handler.py << 'EOF'
 import json
 import boto3
+import os
 
 sns = boto3.client('sns')
 
 def lambda_handler(event, context):
     # Extract monitoring results
     monitoring_result = event
+    sns_topic_arn = event.get('sns_topic_arn', os.environ.get('SNS_TOPIC_ARN'))
     
-    if not monitoring_result['healthy']:
-        # Construct alert message
-        subject = f"MediaConnect Alert: {monitoring_result['flow_name']}"
-        
-        message_lines = [
-            f"Flow: {monitoring_result['flow_name']}",
-            f"Time: {monitoring_result['timestamp']}",
-            f"Status: UNHEALTHY",
-            "",
-            "Issues Detected:"
-        ]
-        
-        for issue in monitoring_result['issues']:
-            message_lines.append(
-                f"- {issue['metric']}: {issue['value']:.2f} "
-                f"(threshold: {issue['threshold']}) "
-                f"[{issue['severity']}]"
+    if not sns_topic_arn:
+        return {
+            'statusCode': 400,
+            'error': 'Missing SNS topic ARN'
+        }
+    
+    try:
+        if not monitoring_result.get('healthy', True):
+            # Construct alert message
+            subject = f"MediaConnect Alert: {monitoring_result['flow_name']}"
+            
+            message_lines = [
+                f"Flow: {monitoring_result['flow_name']}",
+                f"Time: {monitoring_result['timestamp']}",
+                f"Status: UNHEALTHY",
+                "",
+                "Issues Detected:"
+            ]
+            
+            for issue in monitoring_result.get('issues', []):
+                message_lines.append(
+                    f"- {issue['metric']}: {issue['value']:.2f} "
+                    f"(threshold: {issue['threshold']}) "
+                    f"[{issue['severity']}]"
+                )
+            
+            # Extract region from context
+            region = context.invoked_function_arn.split(':')[3]
+            flow_id = monitoring_result['flow_arn'].split('/')[-1]
+            
+            message_lines.extend([
+                "",
+                "Recommended Actions:",
+                "1. Check source encoder stability",
+                "2. Verify network connectivity",
+                "3. Review CloudWatch dashboard for detailed metrics",
+                f"4. Access flow in console: https://console.aws.amazon.com/mediaconnect/home?region={region}#/flows/{flow_id}"
+            ])
+            
+            message = "\n".join(message_lines)
+            
+            # Send SNS notification
+            response = sns.publish(
+                TopicArn=sns_topic_arn,
+                Subject=subject,
+                Message=message
             )
-        
-        message_lines.extend([
-            "",
-            "Recommended Actions:",
-            "1. Check source encoder stability",
-            "2. Verify network connectivity",
-            "3. Review CloudWatch dashboard for detailed metrics",
-            f"4. Access flow in console: https://console.aws.amazon.com/mediaconnect/home?region={context.invoked_function_arn.split(':')[3]}#/flows/{monitoring_result['flow_arn'].split('/')[-1]}"
-        ])
-        
-        message = "\n".join(message_lines)
-        
-        # Send SNS notification
-        sns_topic_arn = event.get('sns_topic_arn', context.invoked_function_arn.replace(':function:', ':sns:').rsplit(':', 1)[0] + f":{monitoring_result['flow_name'].split('-')[0]}-alerts-*")
-        
-        response = sns.publish(
-            TopicArn=sns_topic_arn,
-            Subject=subject,
-            Message=message
-        )
+            
+            return {
+                'statusCode': 200,
+                'notification_sent': True,
+                'message_id': response['MessageId']
+            }
         
         return {
             'statusCode': 200,
-            'notification_sent': True,
-            'message_id': response['MessageId']
+            'notification_sent': False,
+            'reason': 'Flow is healthy'
         }
-    
-    return {
-        'statusCode': 200,
-        'notification_sent': False,
-        'reason': 'Flow is healthy'
-    }
+    except Exception as e:
+        print(f"Error sending alert: {str(e)}")
+        return {
+            'statusCode': 500,
+            'error': str(e)
+        }
 EOF
    
    # Package and deploy Lambda functions
@@ -383,10 +419,10 @@ EOF
    aws s3 cp stream-monitor.zip s3://${LAMBDA_BUCKET}/
    aws s3 cp alert-handler.zip s3://${LAMBDA_BUCKET}/
    
-   # Create Lambda functions
+   # Create Lambda functions with updated runtime
    MONITOR_LAMBDA_ARN=$(aws lambda create-function \
        --function-name stream-monitor-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler stream-monitor.lambda_handler \
        --code S3Bucket=${LAMBDA_BUCKET},S3Key=stream-monitor.zip \
@@ -397,7 +433,7 @@ EOF
    
    ALERT_LAMBDA_ARN=$(aws lambda create-function \
        --function-name alert-handler-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler alert-handler.lambda_handler \
        --code S3Bucket=${LAMBDA_BUCKET},S3Key=alert-handler.zip \
@@ -426,17 +462,25 @@ EOF
       "Type": "Task",
       "Resource": "${MONITOR_LAMBDA_ARN}",
       "Parameters": {
-        "flow_arn.\$": "\$.flow_arn",
+        "flow_arn.$": "$.flow_arn",
         "sns_topic_arn": "${SNS_TOPIC_ARN}"
       },
-      "ResultPath": "\$.monitoring_result",
-      "Next": "EvaluateHealth"
+      "ResultPath": "$.monitoring_result",
+      "Next": "EvaluateHealth",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ]
     },
     "EvaluateHealth": {
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "\$.monitoring_result.healthy",
+          "Variable": "$.monitoring_result.healthy",
           "BooleanEquals": false,
           "Next": "SendAlert"
         }
@@ -447,14 +491,22 @@ EOF
       "Type": "Task",
       "Resource": "${ALERT_LAMBDA_ARN}",
       "Parameters": {
-        "flow_name.\$": "\$.monitoring_result.flow_name",
-        "flow_arn.\$": "\$.monitoring_result.flow_arn",
-        "timestamp.\$": "\$.monitoring_result.timestamp",
-        "issues.\$": "\$.monitoring_result.issues",
-        "healthy.\$": "\$.monitoring_result.healthy",
+        "flow_name.$": "$.monitoring_result.flow_name",
+        "flow_arn.$": "$.monitoring_result.flow_arn",
+        "timestamp.$": "$.monitoring_result.timestamp",
+        "issues.$": "$.monitoring_result.issues",
+        "healthy.$": "$.monitoring_result.healthy",
         "sns_topic_arn": "${SNS_TOPIC_ARN}"
       },
-      "End": true
+      "End": true,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ]
     },
     "HealthyFlow": {
       "Type": "Pass",
@@ -473,7 +525,12 @@ EOF
        --type EXPRESS \
        --logging-configuration '{
          "level": "ERROR",
-         "includeExecutionData": false
+         "includeExecutionData": false,
+         "destinations": [{
+           "cloudWatchLogsLogGroup": {
+             "logGroupArn": "arn:aws:logs:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':log-group:/aws/stepfunctions/'${STATE_MACHINE_NAME}'"
+           }
+         }]
        }' \
        --tags Key=Environment,Value=Production \
               Key=Purpose,Value=MediaMonitoring \
@@ -482,7 +539,7 @@ EOF
    echo "✅ Step Functions state machine created: ${STATE_MACHINE_ARN}"
    ```
 
-   The state machine implements a decision-based workflow that monitors stream health and conditionally sends alerts. Using EXPRESS type ensures low-latency execution suitable for real-time monitoring, while the visual workflow definition makes it easy to understand and modify the monitoring logic. For complex workflows, review the [Step Functions best practices](https://docs.aws.amazon.com/step-functions/latest/dg/bp-express.html) documentation.
+   The state machine implements a decision-based workflow that monitors stream health and conditionally sends alerts. Using EXPRESS type ensures low-latency execution suitable for real-time monitoring, while the visual workflow definition makes it easy to understand and modify the monitoring logic. The enhanced configuration includes retry logic for improved reliability. For complex workflows, review the [Step Functions best practices](https://docs.aws.amazon.com/step-functions/latest/dg/bp-express.html) documentation.
 
 5. **Create MediaConnect Flow**:
 
@@ -494,29 +551,8 @@ EOF
    FLOW_ARN=$(aws mediaconnect create-flow \
        --name ${FLOW_NAME} \
        --availability-zone ${AWS_REGION}a \
-       --source '{
-         "Name": "PrimarySource",
-         "Description": "Primary live stream source",
-         "Protocol": "rtp",
-         "WhitelistCidr": "0.0.0.0/0",
-         "IngestPort": 5000
-       }' \
-       --outputs '[
-         {
-           "Name": "PrimaryOutput",
-           "Description": "Primary stream output",
-           "Protocol": "rtp",
-           "Destination": "10.0.0.100",
-           "Port": 5001
-         },
-         {
-           "Name": "BackupOutput",
-           "Description": "Backup stream output",
-           "Protocol": "rtp",
-           "Destination": "10.0.0.101",
-           "Port": 5002
-         }
-       ]' \
+       --source Name=PrimarySource,Description="Primary live stream source",Protocol=rtp,WhitelistCidr="0.0.0.0/0",IngestPort=5000 \
+       --outputs Name=PrimaryOutput,Description="Primary stream output",Protocol=rtp,Destination="10.0.0.100",Port=5001 Name=BackupOutput,Description="Backup stream output",Protocol=rtp,Destination="10.0.0.101",Port=5002 \
        --query Flow.FlowArn --output text)
    
    # Get the ingest endpoint
@@ -553,7 +589,8 @@ EOF
        --datapoints-to-alarm 1 \
        --evaluation-periods 1 \
        --dimensions Name=FlowARN,Value=${FLOW_ARN} \
-       --alarm-actions ${SNS_TOPIC_ARN}
+       --alarm-actions ${SNS_TOPIC_ARN} \
+       --treat-missing-data notBreaching
    
    # Create CloudWatch alarm for high jitter
    aws cloudwatch put-metric-alarm \
@@ -568,7 +605,8 @@ EOF
        --datapoints-to-alarm 2 \
        --evaluation-periods 2 \
        --dimensions Name=FlowARN,Value=${FLOW_ARN} \
-       --alarm-actions ${SNS_TOPIC_ARN}
+       --alarm-actions ${SNS_TOPIC_ARN} \
+       --treat-missing-data notBreaching
    
    # Create CloudWatch alarm to trigger Step Functions
    aws cloudwatch put-metric-alarm \
@@ -582,7 +620,8 @@ EOF
        --comparison-operator GreaterThanThreshold \
        --datapoints-to-alarm 1 \
        --evaluation-periods 1 \
-       --dimensions Name=FlowARN,Value=${FLOW_ARN}
+       --dimensions Name=FlowARN,Value=${FLOW_ARN} \
+       --treat-missing-data notBreaching
    
    echo "✅ CloudWatch alarms configured for stream monitoring"
    ```
@@ -610,14 +649,6 @@ EOF
        }" \
        --state ENABLED
    
-   # Grant EventBridge permission to invoke Step Functions
-   aws lambda add-permission \
-       --function-name stream-monitor-${RANDOM_SUFFIX} \
-       --statement-id AllowEventBridge \
-       --action lambda:InvokeFunction \
-       --principal events.amazonaws.com \
-       --source-arn arn:aws:events:${AWS_REGION}:${AWS_ACCOUNT_ID}:rule/${FLOW_NAME}-alarm-rule
-   
    # Create IAM role for EventBridge
    aws iam create-role \
        --role-name eventbridge-sf-role-${RANDOM_SUFFIX} \
@@ -641,6 +672,9 @@ EOF
            "Resource": "'${STATE_MACHINE_ARN}'"
          }]
        }'
+   
+   # Wait for role propagation
+   sleep 10
    
    EB_ROLE_ARN=$(aws iam get-role \
        --role-name eventbridge-sf-role-${RANDOM_SUFFIX} \
@@ -678,16 +712,22 @@ EOF
       "height": 6,
       "properties": {
         "metrics": [
-          [ "AWS/MediaConnect", "SourcePacketLossPercent", { "stat": "Maximum" } ],
-          [ ".", "SourceJitter", { "stat": "Average", "yAxis": "right" } ]
+          [ "AWS/MediaConnect", "SourcePacketLossPercent", "FlowARN", "${FLOW_ARN}", { "stat": "Maximum" } ],
+          [ ".", "SourceJitter", ".", ".", { "stat": "Average", "yAxis": "right" } ]
         ],
         "view": "timeSeries",
         "stacked": false,
         "region": "${AWS_REGION}",
         "title": "Stream Health Metrics",
         "period": 300,
-        "dimensions": {
-          "FlowARN": "${FLOW_ARN}"
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "max": 1
+          },
+          "right": {
+            "min": 0
+          }
         }
       }
     },
@@ -699,16 +739,22 @@ EOF
       "height": 6,
       "properties": {
         "metrics": [
-          [ "AWS/MediaConnect", "SourceBitrate", { "stat": "Average" } ],
-          [ ".", "SourceUptime", { "stat": "Maximum", "yAxis": "right" } ]
+          [ "AWS/MediaConnect", "SourceBitrate", "FlowARN", "${FLOW_ARN}", { "stat": "Average" } ],
+          [ ".", "SourceUptime", ".", ".", { "stat": "Maximum", "yAxis": "right" } ]
         ],
         "view": "timeSeries",
         "stacked": false,
         "region": "${AWS_REGION}",
         "title": "Stream Performance",
         "period": 300,
-        "dimensions": {
-          "FlowARN": "${FLOW_ARN}"
+        "yAxis": {
+          "left": {
+            "min": 0
+          },
+          "right": {
+            "min": 0,
+            "max": 100
+          }
         }
       }
     }
@@ -751,7 +797,7 @@ EOF
        --query executionArn --output text)
    
    # Wait for execution to complete
-   sleep 5
+   sleep 10
    
    # Check execution result
    aws stepfunctions describe-execution \
@@ -776,14 +822,15 @@ EOF
 4. Test the complete alert workflow:
 
    ```bash
-   # Simulate an alarm state change (if you have a test stream)
-   # Or manually invoke the Lambda function
+   # Manually invoke the Lambda function for testing
    aws lambda invoke \
        --function-name stream-monitor-${RANDOM_SUFFIX} \
        --payload "{\"flow_arn\": \"${FLOW_ARN}\"}" \
        response.json
    
-   cat response.json
+   # Check the response
+   cat response.json && echo
+   rm response.json
    ```
 
 ## Cleanup
@@ -795,7 +842,7 @@ EOF
    aws mediaconnect stop-flow --flow-arn ${FLOW_ARN}
    
    # Wait for flow to stop
-   sleep 10
+   aws mediaconnect wait flow-deleted --flow-arn ${FLOW_ARN} || sleep 15
    
    # Delete the flow
    aws mediaconnect delete-flow --flow-arn ${FLOW_ARN}
@@ -860,7 +907,7 @@ EOF
 6. Clean up IAM roles and SNS:
 
    ```bash
-   # Detach and delete policies
+   # Detach and delete Lambda role policies
    aws iam delete-role-policy \
        --role-name ${LAMBDA_ROLE_NAME} \
        --policy-name MediaConnectAccess
@@ -871,12 +918,14 @@ EOF
    
    aws iam delete-role --role-name ${LAMBDA_ROLE_NAME}
    
+   # Delete Step Functions role
    aws iam delete-role-policy \
        --role-name ${SF_ROLE_NAME} \
        --policy-name StepFunctionsExecutionPolicy
    
    aws iam delete-role --role-name ${SF_ROLE_NAME}
    
+   # Delete EventBridge role
    aws iam delete-role-policy \
        --role-name eventbridge-sf-role-${RANDOM_SUFFIX} \
        --policy-name InvokeStepFunctions
@@ -890,7 +939,11 @@ EOF
    aws s3 rm s3://${LAMBDA_BUCKET} --recursive
    aws s3 rb s3://${LAMBDA_BUCKET}
    
-   echo "✅ Deleted IAM roles, SNS topic, and S3 bucket"
+   # Clean up local files
+   rm -f stream-monitor.py alert-handler.py state-machine.json dashboard-body.json
+   rm -f stream-monitor.zip alert-handler.zip
+   
+   echo "✅ Deleted IAM roles, SNS topic, S3 bucket, and local files"
    ```
 
 ## Discussion

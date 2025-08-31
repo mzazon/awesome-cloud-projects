@@ -1,0 +1,456 @@
+# Google Cloud Infrastructure Manager Configuration
+# Recipe: Recipe Generation and Meal Planning with Gemini and Storage
+# Version: 1.1
+# Services: Vertex AI, Cloud Functions, Cloud Storage
+# 
+# This Infrastructure Manager configuration deploys a complete AI-powered recipe 
+# generation system using Gemini AI, Cloud Functions, and Cloud Storage.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: recipe-ai-config
+  labels:
+    app: recipe-generation
+    version: "1.1"
+data:
+  # Configuration parameters for the recipe generation system
+  region: "us-central1"
+  zone: "us-central1-a"
+  
+---
+# Infrastructure Manager Deployment Configuration
+apiVersion: config.cloud.google.com/v1beta1
+kind: ResourceManagerDeployment
+metadata:
+  name: recipe-generation-deployment
+  labels:
+    environment: production
+    application: recipe-ai
+spec:
+  # Project Configuration
+  project: 
+    # Note: Replace with your actual project ID
+    projectId: "${var.project_id}"
+    
+  # Regional Configuration  
+  location: us-central1
+  
+  # Enable required Google Cloud APIs
+  services:
+    - name: aiplatform.googleapis.com
+      title: "Vertex AI API"
+      description: "Required for Gemini AI model access"
+    - name: cloudfunctions.googleapis.com  
+      title: "Cloud Functions API"
+      description: "Required for serverless function deployment"
+    - name: storage.googleapis.com
+      title: "Cloud Storage API" 
+      description: "Required for recipe data storage"
+    - name: cloudbuild.googleapis.com
+      title: "Cloud Build API"
+      description: "Required for function deployment builds"
+    - name: run.googleapis.com
+      title: "Cloud Run API"
+      description: "Required for Cloud Functions Gen2 runtime"
+    - name: eventarc.googleapis.com
+      title: "Eventarc API"
+      description: "Required for event-driven function triggers"
+      
+  # Cloud Storage Bucket for Recipe Data
+  resources:
+    - name: recipe-storage-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        # Generate unique bucket name using project ID and timestamp
+        name: "${var.project_id}-recipe-storage-${var.deployment_suffix}"
+        location: US-CENTRAL1
+        storageClass: STANDARD
+        
+        # Enable versioning for data protection and audit trails
+        versioning:
+          enabled: true
+          
+        # Configure lifecycle management for cost optimization
+        lifecycle:
+          rule:
+            - action:
+                type: SetStorageClass
+                storageClass: NEARLINE
+              condition:
+                age: 30
+                matchesStorageClass: [STANDARD]
+            - action:
+                type: SetStorageClass  
+                storageClass: COLDLINE
+              condition:
+                age: 90
+                matchesStorageClass: [NEARLINE]
+                
+        # Enable uniform bucket-level access for simplified IAM
+        iamConfiguration:
+          uniformBucketLevelAccess:
+            enabled: true
+            
+        # Configure CORS for web application access
+        cors:
+          - origin: ["*"]
+            method: ["GET", "POST", "PUT", "DELETE"]
+            maxAgeSeconds: 3600
+            responseHeader: ["Content-Type", "Authorization"]
+            
+        # Apply security labels for governance
+        labels:
+          environment: production
+          application: recipe-ai
+          data-classification: internal
+          cost-center: engineering
+          
+      metadata:
+        description: "Primary storage bucket for AI-generated recipes and user preferences"
+        
+    # Initialize bucket structure with default JSON files
+    - name: recipes-index-object
+      type: gcp-types/storage-v1:objects
+      properties:
+        bucket: $(ref.recipe-storage-bucket.name)
+        name: "data/recipes.json"
+        contentType: "application/json"
+        # Base64 encoded JSON: {"recipes": [], "preferences": {}}
+        data: "eyJyZWNpcGVzIjogW10sICJwcmVmZXJlbmNlcyI6IHt9fQ=="
+      metadata:
+        dependsOn:
+          - recipe-storage-bucket
+        description: "Initialize recipes index file for data organization"
+        
+    - name: preferences-index-object  
+      type: gcp-types/storage-v1:objects
+      properties:
+        bucket: $(ref.recipe-storage-bucket.name)
+        name: "data/preferences.json"
+        contentType: "application/json"
+        # Base64 encoded JSON: {"users": {}}
+        data: "eyJ1c2VycyI6IHt9fQ=="
+      metadata:
+        dependsOn:
+          - recipe-storage-bucket
+        description: "Initialize user preferences file for personalization data"
+
+    # Service Account for Cloud Functions with minimal required permissions
+    - name: recipe-functions-service-account
+      type: gcp-types/iam-v1:serviceAccounts
+      properties:
+        accountId: recipe-functions-sa-${var.deployment_suffix}
+        displayName: "Recipe Generation Functions Service Account"
+        description: "Service account for Cloud Functions with least-privilege access to Vertex AI and Storage"
+      metadata:
+        description: "Dedicated service account following security best practices"
+        
+    # IAM binding for Vertex AI access (AI Platform User role)
+    - name: vertex-ai-user-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: projects/${var.project_id}
+        role: roles/aiplatform.user
+        member: serviceAccount:$(ref.recipe-functions-service-account.email)
+      metadata:
+        dependsOn:
+          - recipe-functions-service-account
+        description: "Grant Vertex AI access for Gemini model interactions"
+        
+    # IAM binding for Cloud Storage access (Storage Object Admin)  
+    - name: storage-object-admin-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: projects/${var.project_id}
+        role: roles/storage.objectAdmin
+        member: serviceAccount:$(ref.recipe-functions-service-account.email)
+      metadata:
+        dependsOn:
+          - recipe-functions-service-account
+        description: "Grant Cloud Storage access for recipe data management"
+
+    # Recipe Generation Cloud Function (Gen 2)
+    - name: recipe-generator-function
+      type: gcp-types/cloudfunctions-v2:projects.locations.functions
+      properties:
+        parent: projects/${var.project_id}/locations/us-central1
+        functionId: recipe-generator-${var.deployment_suffix}
+        
+        # Function configuration optimized for AI workloads
+        buildConfig:
+          runtime: python311
+          entryPoint: generate_recipe
+          source:
+            # Source code will be uploaded separately via Cloud Build
+            storageSource:
+              bucket: $(ref.recipe-storage-bucket.name)
+              object: "functions/generator/source.zip"
+              
+        serviceConfig:
+          # Increased memory and timeout for AI processing
+          availableMemory: 512Mi
+          timeoutSeconds: 60
+          maxInstanceCount: 100
+          minInstanceCount: 0
+          
+          # Environment variables for function configuration
+          environmentVariables:
+            BUCKET_NAME: $(ref.recipe-storage-bucket.name)
+            GCP_PROJECT: ${var.project_id}
+            FUNCTION_REGION: us-central1
+            
+          # Use custom service account with minimal permissions
+          serviceAccountEmail: $(ref.recipe-functions-service-account.email)
+          
+          # Configure ingress for HTTP access
+          ingressSettings: ALLOW_ALL
+          
+        # Labels for resource management and cost tracking
+        labels:
+          environment: production
+          application: recipe-ai
+          function-type: generator
+          cost-center: engineering
+          
+      metadata:
+        dependsOn:
+          - recipe-storage-bucket
+          - recipe-functions-service-account
+          - vertex-ai-user-binding
+          - storage-object-admin-binding
+        description: "Serverless function for AI-powered recipe generation using Gemini"
+
+    # Recipe Retrieval Cloud Function (Gen 2)  
+    - name: recipe-retriever-function
+      type: gcp-types/cloudfunctions-v2:projects.locations.functions
+      properties:
+        parent: projects/${var.project_id}/locations/us-central1
+        functionId: recipe-retriever-${var.deployment_suffix}
+        
+        # Function configuration optimized for data retrieval
+        buildConfig:
+          runtime: python311
+          entryPoint: retrieve_recipes
+          source:
+            # Source code will be uploaded separately via Cloud Build
+            storageSource:
+              bucket: $(ref.recipe-storage-bucket.name)
+              object: "functions/retriever/source.zip"
+              
+        serviceConfig:
+          # Optimized memory and timeout for data operations
+          availableMemory: 256Mi
+          timeoutSeconds: 30
+          maxInstanceCount: 50
+          minInstanceCount: 0
+          
+          # Environment variables for function configuration
+          environmentVariables:
+            BUCKET_NAME: $(ref.recipe-storage-bucket.name)
+            FUNCTION_REGION: us-central1
+            
+          # Use custom service account with minimal permissions
+          serviceAccountEmail: $(ref.recipe-functions-service-account.email)
+          
+          # Configure ingress for HTTP access
+          ingressSettings: ALLOW_ALL
+          
+        # Labels for resource management and cost tracking
+        labels:
+          environment: production
+          application: recipe-ai
+          function-type: retriever
+          cost-center: engineering
+          
+      metadata:
+        dependsOn:
+          - recipe-storage-bucket
+          - recipe-functions-service-account
+          - storage-object-admin-binding
+        description: "Serverless function for recipe search and retrieval operations"
+
+    # Cloud Monitoring Alert Policy for Function Errors
+    - name: function-error-alert-policy
+      type: gcp-types/monitoring-v1:projects.alertPolicies
+      properties:
+        parent: projects/${var.project_id}
+        alertPolicy:
+          displayName: "Recipe Function Error Rate Alert"
+          documentation:
+            content: "Alert when Cloud Functions experience high error rates"
+            mimeType: "text/markdown"
+            
+          # Monitor function error rates across both functions
+          conditions:
+            - displayName: "Function Error Rate"
+              conditionThreshold:
+                filter: 'resource.type="cloud_function" AND resource.labels.function_name=~"recipe-.*"'
+                comparison: COMPARISON_GREATER_THAN
+                thresholdValue: 0.1  # Alert if error rate > 10%
+                duration: 300s  # Over 5 minutes
+                aggregations:
+                  - alignmentPeriod: 60s
+                    perSeriesAligner: ALIGN_RATE
+                    crossSeriesReducer: REDUCE_MEAN
+                    groupByFields:
+                      - resource.labels.function_name
+                      
+          # Enable the alert policy
+          enabled: true
+          
+          # Notification channels (will need to be configured separately)
+          combiner: OR
+          
+        labels:
+          environment: production
+          application: recipe-ai
+          alert-type: error-monitoring
+          
+      metadata:
+        description: "Monitoring alert for proactive error detection in recipe functions"
+
+    # Cloud Logging Sink for Function Logs
+    - name: recipe-function-log-sink
+      type: gcp-types/logging-v2:projects.sinks
+      properties:
+        parent: projects/${var.project_id}
+        uniqueWriterIdentity: true
+        sink:
+          name: recipe-function-logs-${var.deployment_suffix}
+          description: "Export Cloud Function logs for recipe generation system"
+          destination: storage.googleapis.com/$(ref.recipe-storage-bucket.name)/logs
+          
+          # Filter for recipe-related function logs
+          filter: >
+            resource.type="cloud_function" AND
+            (resource.labels.function_name:"recipe-generator" OR 
+             resource.labels.function_name:"recipe-retriever") AND
+            severity>=INFO
+            
+          # Include all log entry fields for comprehensive logging
+          includeChildren: true
+          
+      metadata:
+        dependsOn:
+          - recipe-storage-bucket
+          - recipe-generator-function
+          - recipe-retriever-function
+        description: "Centralized logging for recipe generation system monitoring and debugging"
+
+# Input Variables for Deployment Customization
+variables:
+  - name: project_id
+    type: string
+    description: "Google Cloud Project ID for deployment"
+    required: true
+    
+  - name: deployment_suffix
+    type: string  
+    description: "Unique suffix for resource names to avoid conflicts"
+    default: "001"
+    
+  - name: enable_monitoring
+    type: boolean
+    description: "Enable Cloud Monitoring and alerting features"
+    default: true
+    
+  - name: function_memory_generator
+    type: string
+    description: "Memory allocation for recipe generator function"
+    default: "512Mi"
+    allowed_values: ["256Mi", "512Mi", "1Gi", "2Gi"]
+    
+  - name: function_memory_retriever
+    type: string
+    description: "Memory allocation for recipe retriever function" 
+    default: "256Mi"
+    allowed_values: ["256Mi", "512Mi", "1Gi"]
+    
+  - name: bucket_location
+    type: string
+    description: "Cloud Storage bucket location"
+    default: "US-CENTRAL1"
+    allowed_values: ["US-CENTRAL1", "US-EAST1", "US-WEST1", "EUROPE-WEST1", "ASIA-SOUTHEAST1"]
+
+# Output Values for Integration and Verification
+outputs:
+  - name: storage_bucket_name
+    description: "Name of the created Cloud Storage bucket for recipes"
+    value: $(ref.recipe-storage-bucket.name)
+    
+  - name: storage_bucket_url
+    description: "URL of the Cloud Storage bucket"
+    value: "gs://$(ref.recipe-storage-bucket.name)"
+    
+  - name: generator_function_name
+    description: "Name of the recipe generator Cloud Function"
+    value: $(ref.recipe-generator-function.name)
+    
+  - name: generator_function_url
+    description: "HTTP trigger URL for the recipe generator function"
+    value: $(ref.recipe-generator-function.serviceConfig.uri)
+    
+  - name: retriever_function_name
+    description: "Name of the recipe retriever Cloud Function"  
+    value: $(ref.recipe-retriever-function.name)
+    
+  - name: retriever_function_url
+    description: "HTTP trigger URL for the recipe retriever function"
+    value: $(ref.recipe-retriever-function.serviceConfig.uri)
+    
+  - name: service_account_email
+    description: "Email of the service account used by Cloud Functions"
+    value: $(ref.recipe-functions-service-account.email)
+    
+  - name: project_id
+    description: "Google Cloud Project ID used for deployment"
+    value: ${var.project_id}
+    
+  - name: deployment_region
+    description: "Primary deployment region for all resources"
+    value: "us-central1"
+
+# Deployment Metadata and Documentation
+metadata:
+  name: "Recipe Generation AI System"
+  version: "1.1"
+  description: |
+    Complete Infrastructure Manager configuration for deploying an AI-powered 
+    recipe generation system using Google Cloud services. This configuration 
+    creates a serverless architecture with Vertex AI Gemini integration, 
+    Cloud Functions for API endpoints, and Cloud Storage for data persistence.
+    
+    Key Features:
+    - Gemini AI integration for intelligent recipe generation
+    - Serverless API endpoints with automatic scaling
+    - Secure data storage with lifecycle management
+    - Comprehensive monitoring and logging
+    - IAM security following least-privilege principles
+    
+  author: "Infrastructure Manager Generator v1.3"
+  documentation: "https://cloud.google.com/infrastructure-manager/docs"
+  support: "https://cloud.google.com/support"
+  
+  # Resource cost estimation (monthly, moderate usage)
+  estimated_cost:
+    vertex_ai: "$20-50 (based on API calls)"
+    cloud_functions: "$5-15 (based on invocations)"
+    cloud_storage: "$1-5 (based on storage volume)"
+    total_estimated: "$25-70 per month"
+    
+  # Security and compliance notes
+  security:
+    - "Uses dedicated service account with minimal required permissions"
+    - "Enables uniform bucket-level access for simplified IAM"
+    - "Configures HTTPS-only access for all functions"
+    - "Implements Cloud Storage lifecycle policies for cost optimization"
+    - "Enables comprehensive logging for audit and debugging"
+    
+  # Operational recommendations
+  operations:
+    - "Monitor Vertex AI usage costs closely in production"
+    - "Set up notification channels for monitoring alerts"
+    - "Review and adjust function memory allocations based on usage patterns"
+    - "Implement request rate limiting for production deployments"
+    - "Regular backup verification for critical recipe data"

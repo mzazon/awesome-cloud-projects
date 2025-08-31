@@ -2,14 +2,14 @@
 title: Quantum Supply Chain Network Optimization with Azure Quantum and Digital Twins
 id: f3e8a2b7
 category: compute
-difficulty: 400
+difficulty: 400  
 subject: azure
 services: Azure Quantum, Azure Digital Twins, Azure Functions, Azure Stream Analytics
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: quantum-computing, digital-twins, supply-chain, manufacturing, optimization, real-time-analytics
 recipe-generator-version: 1.3
@@ -92,7 +92,7 @@ graph TB
 1. Azure subscription with appropriate permissions for creating Quantum, Digital Twins, Functions, and Stream Analytics resources
 2. Azure CLI v2.45.0 or later installed and configured (or Azure Cloud Shell)
 3. Understanding of quantum computing concepts, digital twin modeling, and supply chain optimization
-4. Python 3.8+ development environment with Qiskit and Azure SDK libraries
+4. Python 3.10+ development environment with Qiskit and Azure SDK libraries
 5. Estimated cost: $500-1000 USD for quantum computing resources and $200-400 USD for supporting Azure services during development and testing
 
 > **Note**: Azure Quantum pricing varies by quantum provider and algorithm complexity. Review the [Azure Quantum pricing documentation](https://docs.microsoft.com/en-us/azure/quantum/pricing) for detailed cost estimates based on your optimization problem size.
@@ -153,31 +153,17 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    Azure Quantum provides access to quantum computing resources and optimization algorithms specifically designed for combinatorial problems like supply chain routing. The workspace serves as a central hub for quantum computations, offering multiple quantum providers and classical optimization solvers. This managed service eliminates the complexity of quantum hardware management while providing scalable access to quantum annealing and gate-based quantum computers.
 
    ```bash
-   # Create Azure Quantum workspace
+   # Create Azure Quantum workspace with automatic provider addition
    az quantum workspace create \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${QUANTUM_WORKSPACE} \
-       --location ${LOCATION} \
-       --storage-account ${STORAGE_ACCOUNT}
-   
-   # Add optimization provider (1QBit)
-   az quantum workspace provider add \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${QUANTUM_WORKSPACE} \
-       --provider-id "1qbit" \
-       --provider-sku "standard"
-   
-   # Add Microsoft QIO provider for classical optimization
-   az quantum workspace provider add \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${QUANTUM_WORKSPACE} \
-       --provider-id "microsoft-qio" \
-       --provider-sku "standard"
+       -g ${RESOURCE_GROUP} \
+       -w ${QUANTUM_WORKSPACE} \
+       -l ${LOCATION} \
+       -a ${STORAGE_ACCOUNT}
    
    echo "✅ Quantum workspace configured with optimization providers"
    ```
 
-   The quantum workspace is now ready to execute optimization algorithms using both quantum and classical solvers. This hybrid approach enables you to compare quantum advantage against classical methods while ensuring optimal solutions for your supply chain challenges.
+   The quantum workspace is now ready to execute optimization algorithms using both quantum and classical solvers. This hybrid approach enables you to compare quantum advantage against classical methods while ensuring optimal solutions for your supply chain challenges. The workspace automatically includes free-tier providers for initial testing and development.
 
 2. **Deploy Azure Digital Twins Instance with Supply Chain Models**:
 
@@ -282,7 +268,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --storage-account ${STORAGE_ACCOUNT} \
        --consumption-plan-location ${LOCATION} \
        --runtime python \
-       --runtime-version 3.9 \
+       --runtime-version 3.11 \
        --functions-version 4 \
        --assign-identity
    
@@ -293,6 +279,9 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
        --settings \
        "AZURE_QUANTUM_WORKSPACE=${QUANTUM_WORKSPACE}" \
        "AZURE_DIGITAL_TWINS_ENDPOINT=https://${DT_ENDPOINT}" \
+       "SUBSCRIPTION_ID=${SUBSCRIPTION_ID}" \
+       "RESOURCE_GROUP=${RESOURCE_GROUP}" \
+       "LOCATION=${LOCATION}" \
        "COSMOS_CONNECTION_STRING=$(az cosmosdb keys list \
            --name ${COSMOS_ACCOUNT} \
            --resource-group ${RESOURCE_GROUP} \
@@ -324,6 +313,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    cat > optimization-function/__init__.py << 'EOF'
    import json
    import logging
+   import os
    import azure.functions as func
    from azure.quantum import Workspace
    from azure.identity import DefaultAzureCredential
@@ -392,11 +382,14 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    ```bash
    # Create Stream Analytics job
    az stream-analytics job create \
+       --job-name ${STREAM_ANALYTICS_JOB} \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${STREAM_ANALYTICS_JOB} \
        --location ${LOCATION} \
-       --sku Standard \
-       --streaming-units 1
+       --output-error-policy Drop \
+       --out-of-order-policy Drop \
+       --order-max-delay 5 \
+       --arrival-max-delay 16 \
+       --data-locale "en-US"
    
    # Create Event Hub for supply chain data ingestion
    export EVENT_HUB_NAMESPACE="eh-supplychain-${RANDOM_SUFFIX}"
@@ -424,32 +417,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    
    echo "✅ Stream Analytics job and Event Hub created"
    
-   # Configure Stream Analytics input
-   cat > stream-input.json << EOF
-   {
-     "name": "supply-chain-input",
-     "properties": {
-       "type": "Stream",
-       "dataSource": {
-         "type": "Microsoft.ServiceBus/EventHub",
-         "properties": {
-           "eventHubName": "${EVENT_HUB_NAME}",
-           "serviceBusNamespace": "${EVENT_HUB_NAMESPACE}",
-           "sharedAccessPolicyName": "RootManageSharedAccessKey",
-           "sharedAccessPolicyKey": "${EVENT_HUB_CONNECTION}"
-         }
-       },
-       "serialization": {
-         "type": "Json",
-         "properties": {
-           "encoding": "UTF8"
-         }
-       }
-     }
-   }
-   EOF
-   
-   # Create Stream Analytics transformation query
+   # Configure Stream Analytics transformation query
    cat > stream-query.sql << 'EOF'
    WITH FilteredEvents AS (
      SELECT
@@ -477,6 +445,14 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    SELECT * INTO [optimization-trigger] FROM FilteredEvents
    WHERE inventory_level < 100 OR event_type = 'demand_forecast';
    EOF
+   
+   # Create Stream Analytics transformation with the query
+   az stream-analytics transformation create \
+       --job-name ${STREAM_ANALYTICS_JOB} \
+       --resource-group ${RESOURCE_GROUP} \
+       --name "Transformation" \
+       --streaming-units 6 \
+       --saql "$(cat stream-query.sql)"
    
    echo "✅ Stream Analytics configured for supply chain data processing"
    ```
@@ -567,15 +543,16 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    from azure.quantum.optimization import Problem, ProblemType, Term
    from azure.identity import DefaultAzureCredential
    import json
+   import os
    
    def solve_supply_chain_routing(suppliers, warehouses, demand):
        # Initialize Azure Quantum workspace
        credential = DefaultAzureCredential()
        workspace = Workspace(
-           subscription_id="your-subscription-id",
-           resource_group="your-resource-group",
-           name="your-quantum-workspace",
-           location="eastus",
+           subscription_id=os.environ.get('SUBSCRIPTION_ID'),
+           resource_group=os.environ.get('RESOURCE_GROUP'),
+           name=os.environ.get('AZURE_QUANTUM_WORKSPACE'),
+           location=os.environ.get('LOCATION', 'eastus'),
            credential=credential
        )
        
@@ -756,18 +733,6 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    EOF
    
    echo "✅ Monitoring and analytics configured"
-   
-   # Create alert rules for supply chain monitoring
-   az monitor metrics alert create \
-       --resource-group ${RESOURCE_GROUP} \
-       --name "low-inventory-alert" \
-       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Web/sites/${FUNCTION_APP}" \
-       --condition "count traces > 5" \
-       --window-size 5m \
-       --evaluation-frequency 1m \
-       --action-group-ids "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/actionGroups/supply-chain-alerts"
-   
-   echo "✅ Supply chain monitoring alerts configured"
    ```
 
    The monitoring and analytics infrastructure is now fully operational, providing real-time visibility into quantum optimization performance, supply chain metrics, and predictive insights for proactive supply chain management.
@@ -785,8 +750,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    
    # List available quantum providers
    az quantum offerings list \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${QUANTUM_WORKSPACE} \
+       --location ${LOCATION} \
        --output table
    ```
 
@@ -830,26 +794,17 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
 4. **Test Stream Analytics Data Processing**:
 
    ```bash
-   # Send test data to Event Hub
-   az eventhubs eventhub send \
-       --resource-group ${RESOURCE_GROUP} \
-       --namespace-name ${EVENT_HUB_NAMESPACE} \
-       --name ${EVENT_HUB_NAME} \
-       --partition-id 0 \
-       --data '{
-         "supplier_id": "001",
-         "warehouse_id": "001",
-         "inventory_level": 85,
-         "location": "Dallas, TX",
-         "timestamp": "2025-01-15T10:30:00Z",
-         "event_type": "inventory_update"
-       }'
-   
    # Check Stream Analytics job status
    az stream-analytics job show \
        --resource-group ${RESOURCE_GROUP} \
        --name ${STREAM_ANALYTICS_JOB} \
        --output table
+   
+   # Start the Stream Analytics job
+   az stream-analytics job start \
+       --resource-group ${RESOURCE_GROUP} \
+       --name ${STREAM_ANALYTICS_JOB} \
+       --output-start-mode JobStartTime
    ```
 
    Expected output: Stream Analytics job showing "Running" status with successful data processing.
@@ -870,7 +825,7 @@ echo "✅ Cosmos DB account created: ${COSMOS_ACCOUNT}"
    
    # Clean up local files
    rm -f supplier-model.json warehouse-model.json
-   rm -f stream-input.json stream-query.sql
+   rm -f stream-query.sql
    rm -f quantum-optimization.py supply-chain-queries.kql
    rm -rf optimization-function/
    

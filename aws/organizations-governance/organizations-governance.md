@@ -4,14 +4,14 @@ id: 2e993edf
 category: cloud-financial-management
 difficulty: 300
 subject: aws
-services: aws,organizations,iam,cost,explorer,cloudtrail
+services: Organizations, IAM, CloudTrail, Budgets
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: aws,organizations,iam,cost,explorer,cloudtrail
+tags: aws, organizations, iam, cost, explorer, cloudtrail
 recipe-generator-version: 1.3
 ---
 
@@ -98,7 +98,7 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with Organization management permissions
+1. AWS account with Organization management permissions and billing access
 2. AWS CLI v2 installed and configured with appropriate credentials
 3. Understanding of AWS IAM policies and JSON syntax
 4. Multiple AWS accounts or ability to create new accounts
@@ -111,7 +111,7 @@ graph TB
 ```bash
 # Set environment variables
 export AWS_REGION=$(aws configure get region)
-export ORG_MGMT_ACCOUNT_ID=$(aws sts get-caller-identity \
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
     --query Account --output text)
 
 # Generate unique identifiers
@@ -142,18 +142,18 @@ echo "✅ Created foundational S3 buckets"
 
    ```bash
    # Create organization with all features enabled
-   ORG_ID=$(aws organizations create-organization \
+   ORG_ROOT_ID=$(aws organizations create-organization \
        --feature-set ALL \
        --query Organization.Id --output text)
    
-   export ORG_ID
+   export ORG_ROOT_ID
    
    # Verify organization creation
    aws organizations describe-organization \
-       --query 'Organization.[Id,MasterAccountId,FeatureSet]' \
+       --query 'Organization.[Id,ManagementAccountId,FeatureSet]' \
        --output table
    
-   echo "✅ Organization created: ${ORG_ID}"
+   echo "✅ Organization created: ${ORG_ROOT_ID}"
    ```
 
    The organization is now established with centralized governance capabilities enabled. This foundation allows you to implement consistent policies, billing management, and security controls across all member accounts while maintaining individual account autonomy within defined guardrails.
@@ -165,25 +165,25 @@ echo "✅ Created foundational S3 buckets"
    ```bash
    # Create Production OU
    PROD_OU_ID=$(aws organizations create-organizational-unit \
-       --parent-id ${ORG_ID} \
+       --parent-id ${ORG_ROOT_ID} \
        --name "Production" \
        --query OrganizationalUnit.Id --output text)
    
    # Create Development OU
    DEV_OU_ID=$(aws organizations create-organizational-unit \
-       --parent-id ${ORG_ID} \
+       --parent-id ${ORG_ROOT_ID} \
        --name "Development" \
        --query OrganizationalUnit.Id --output text)
    
    # Create Sandbox OU
    SANDBOX_OU_ID=$(aws organizations create-organizational-unit \
-       --parent-id ${ORG_ID} \
+       --parent-id ${ORG_ROOT_ID} \
        --name "Sandbox" \
        --query OrganizationalUnit.Id --output text)
    
    # Create Security OU
    SECURITY_OU_ID=$(aws organizations create-organizational-unit \
-       --parent-id ${ORG_ID} \
+       --parent-id ${ORG_ROOT_ID} \
        --name "Security" \
        --query OrganizationalUnit.Id --output text)
    
@@ -202,12 +202,12 @@ echo "✅ Created foundational S3 buckets"
    ```bash
    # Enable SCP policy type for the organization
    aws organizations enable-policy-type \
-       --root-id ${ORG_ID} \
+       --root-id ${ORG_ROOT_ID} \
        --policy-type SERVICE_CONTROL_POLICY
    
    # Verify policy type is enabled
-   aws organizations describe-organization \
-       --query 'Organization.AvailablePolicyTypes[?Type==`SERVICE_CONTROL_POLICY`]' \
+   aws organizations list-roots \
+       --query 'Roots[0].PolicyTypes[?Type==`SERVICE_CONTROL_POLICY`]' \
        --output table
    
    echo "✅ Service Control Policies enabled"
@@ -277,10 +277,7 @@ echo "✅ Created foundational S3 buckets"
                ],
                "Resource": "*",
                "Condition": {
-                   "Null": {
-                       "aws:RequestedRegion": "false"
-                   },
-                   "ForAllValues:StringNotEquals": {
+                   "ForAllValues:StringNotLike": {
                        "aws:TagKeys": [
                            "Department",
                            "Project",
@@ -325,8 +322,8 @@ echo "✅ Created foundational S3 buckets"
                "Action": "*",
                "Resource": "*",
                "Condition": {
-                   "StringEquals": {
-                       "aws:PrincipalType": "Root"
+                   "StringLike": {
+                       "aws:PrincipalArn": "arn:aws:iam::*:root"
                    }
                }
            },
@@ -359,10 +356,7 @@ echo "✅ Created foundational S3 buckets"
                "Resource": "*",
                "Condition": {
                    "StringNotEquals": {
-                       "s3:x-amz-server-side-encryption": "AES256"
-                   },
-                   "Null": {
-                       "s3:x-amz-server-side-encryption": "true"
+                       "s3:x-amz-server-side-encryption": ["AES256", "aws:kms"]
                    }
                }
            }
@@ -407,7 +401,8 @@ echo "✅ Created foundational S3 buckets"
                    "wafv2:*",
                    "waf-regional:*",
                    "support:*",
-                   "trustedadvisor:*"
+                   "trustedadvisor:*",
+                   "sts:*"
                ],
                "Resource": "*",
                "Condition": {
@@ -486,7 +481,12 @@ echo "✅ Created foundational S3 buckets"
                    "Service": "cloudtrail.amazonaws.com"
                },
                "Action": "s3:GetBucketAcl",
-               "Resource": "arn:aws:s3:::${CLOUDTRAIL_BUCKET}"
+               "Resource": "arn:aws:s3:::${CLOUDTRAIL_BUCKET}",
+               "Condition": {
+                   "StringEquals": {
+                       "AWS:SourceArn": "arn:aws:cloudtrail:${AWS_REGION}:${AWS_ACCOUNT_ID}:trail/OrganizationTrail"
+                   }
+               }
            },
            {
                "Sid": "AWSCloudTrailWrite",
@@ -498,7 +498,8 @@ echo "✅ Created foundational S3 buckets"
                "Resource": "arn:aws:s3:::${CLOUDTRAIL_BUCKET}/*",
                "Condition": {
                    "StringEquals": {
-                       "s3:x-amz-acl": "bucket-owner-full-control"
+                       "s3:x-amz-acl": "bucket-owner-full-control",
+                       "AWS:SourceArn": "arn:aws:cloudtrail:${AWS_REGION}:${AWS_ACCOUNT_ID}:trail/OrganizationTrail"
                    }
                }
            }
@@ -529,24 +530,11 @@ echo "✅ Created foundational S3 buckets"
 
    CloudTrail is now capturing all API activity across your organization, providing comprehensive audit logging that supports security investigations, compliance reporting, and governance monitoring. This centralized logging infrastructure forms the foundation for automated security monitoring and incident response.
 
-9. **Configure Consolidated Billing and Cost Allocation**:
+9. **Configure Cost Allocation Tags and Budgets**:
 
-   Consolidated billing and cost allocation enable financial governance through unified billing management and detailed cost tracking. Cost allocation tags provide granular visibility into resource consumption by department, project, and environment, enabling accurate chargeback and budget accountability across the organization.
+   Cost allocation tags and budgets enable financial governance through unified billing management and detailed cost tracking. These mechanisms provide granular visibility into resource consumption by department, project, and environment, enabling accurate chargeback and budget accountability across the organization.
 
    ```bash
-   # Enable cost allocation tags
-   aws ce put-dimension-key \
-       --key "Department" \
-       --match-options EQUALS
-   
-   aws ce put-dimension-key \
-       --key "Project" \
-       --match-options EQUALS
-   
-   aws ce put-dimension-key \
-       --key "Environment" \
-       --match-options EQUALS
-   
    # Create organization-wide budget
    cat > organization-budget.json << EOF
    {
@@ -562,19 +550,23 @@ echo "✅ Created foundational S3 buckets"
        },
        "BudgetType": "COST",
        "CostFilters": {
-           "LinkedAccount": ["${ORG_MGMT_ACCOUNT_ID}"]
+           "LinkedAccount": ["${AWS_ACCOUNT_ID}"]
        }
    }
    EOF
    
    aws budgets create-budget \
-       --account-id ${ORG_MGMT_ACCOUNT_ID} \
+       --account-id ${AWS_ACCOUNT_ID} \
        --budget file://organization-budget.json
    
-   echo "✅ Configured billing and cost allocation"
+   echo "✅ Configured organization budget"
+   echo "ℹ️  Activate cost allocation tags in the Billing Console:"
+   echo "   1. Navigate to AWS Billing Console > Cost allocation tags"
+   echo "   2. Activate tags: Department, Project, Environment, Owner"
+   echo "   3. Wait 24 hours for tags to appear in Cost Explorer"
    ```
 
-   Cost management infrastructure is now operational, providing unified billing across all accounts with detailed cost allocation capabilities. The organization-wide budget and tag-based cost tracking enable precise financial governance and accountability for resource consumption.
+   Cost management infrastructure is now operational with an organization-wide budget created. The cost allocation tags must be manually activated in the AWS Billing Console to enable detailed cost tracking and chargeback capabilities across all accounts.
 
 10. **Create Governance Monitoring Dashboard**:
 
@@ -593,13 +585,13 @@ echo "✅ Created foundational S3 buckets"
                 "height": 6,
                 "properties": {
                     "metrics": [
-                        [ "AWS/Organizations", "TotalAccounts" ],
-                        [ "AWS/Organizations", "ActiveAccounts" ]
+                        [ "AWS/CloudTrail", "DeliveryErrors" ],
+                        [ "AWS/CloudTrail", "DeliveryDelay" ]
                     ],
                     "view": "timeSeries",
                     "stacked": false,
                     "region": "us-east-1",
-                    "title": "Organization Account Metrics",
+                    "title": "CloudTrail Delivery Metrics",
                     "period": 300
                 }
             },
@@ -610,7 +602,7 @@ echo "✅ Created foundational S3 buckets"
                 "width": 24,
                 "height": 6,
                 "properties": {
-                    "query": "SOURCE '/aws/cloudtrail' | fields @timestamp, sourceIPAddress, userIdentity.type, eventName, errorMessage\n| filter eventName like /organizations/\n| sort @timestamp desc\n| limit 100",
+                    "query": "SOURCE '/aws/cloudtrail/OrganizationTrail' | fields @timestamp, sourceIPAddress, userIdentity.type, eventName, errorMessage\n| filter eventName like /organizations/\n| sort @timestamp desc\n| limit 100",
                     "region": "us-east-1",
                     "title": "Organization API Activity",
                     "view": "table"
@@ -637,7 +629,7 @@ echo "✅ Created foundational S3 buckets"
    ```bash
    # List all organizational units
    aws organizations list-organizational-units \
-       --parent-id ${ORG_ID} \
+       --parent-id ${ORG_ROOT_ID} \
        --query 'OrganizationalUnits[*].[Name,Id]' \
        --output table
    ```
@@ -734,10 +726,14 @@ echo "✅ Created foundational S3 buckets"
 
    ```bash
    # Delete organizational units (must be empty first)
-   aws organizations delete-organizational-unit --organizational-unit-id ${PROD_OU_ID}
-   aws organizations delete-organizational-unit --organizational-unit-id ${DEV_OU_ID}
-   aws organizations delete-organizational-unit --organizational-unit-id ${SANDBOX_OU_ID}
-   aws organizations delete-organizational-unit --organizational-unit-id ${SECURITY_OU_ID}
+   aws organizations delete-organizational-unit \
+       --organizational-unit-id ${PROD_OU_ID}
+   aws organizations delete-organizational-unit \
+       --organizational-unit-id ${DEV_OU_ID}
+   aws organizations delete-organizational-unit \
+       --organizational-unit-id ${SANDBOX_OU_ID}
+   aws organizations delete-organizational-unit \
+       --organizational-unit-id ${SECURITY_OU_ID}
    
    echo "✅ Removed organizational structure"
    ```
@@ -746,11 +742,13 @@ echo "✅ Created foundational S3 buckets"
 
    ```bash
    # Remove policy files
-   rm -f cost-control-scp.json security-baseline-scp.json region-restriction-scp.json
-   rm -f cloudtrail-bucket-policy.json organization-budget.json governance-dashboard.json
+   rm -f cost-control-scp.json security-baseline-scp.json \
+       region-restriction-scp.json
+   rm -f cloudtrail-bucket-policy.json organization-budget.json \
+       governance-dashboard.json
    
    # Unset environment variables
-   unset ORG_ID PROD_OU_ID DEV_OU_ID SANDBOX_OU_ID SECURITY_OU_ID
+   unset ORG_ROOT_ID PROD_OU_ID DEV_OU_ID SANDBOX_OU_ID SECURITY_OU_ID
    unset COST_SCP_ID SECURITY_SCP_ID REGION_SCP_ID
    unset CLOUDTRAIL_BUCKET CONFIG_BUCKET ORG_NAME
    
@@ -759,31 +757,31 @@ echo "✅ Created foundational S3 buckets"
 
 ## Discussion
 
-This comprehensive multi-account governance solution provides enterprise-grade controls for managing large-scale AWS environments. The Service Control Policy framework establishes guardrails that prevent costly mistakes and security violations while maintaining operational flexibility for development teams.
+This comprehensive multi-account governance solution provides enterprise-grade controls for managing large-scale AWS environments following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles. The Service Control Policy framework establishes guardrails that prevent costly mistakes and security violations while maintaining operational flexibility for development teams.
 
 The organizational structure separates different environments and functions, allowing for tailored governance policies. Production accounts receive stricter security controls and cost monitoring, while sandbox accounts have regional restrictions to prevent accidental expensive deployments. The cost control policies enforce mandatory tagging for resource tracking and prevent provisioning of oversized instances that could lead to bill shock.
 
-Key architectural decisions include using the management account for centralized governance services while keeping it isolated from daily operations, implementing graduated policy enforcement across different organizational units, and establishing comprehensive logging and monitoring for compliance auditing. The solution also leverages consolidated billing features to provide unified cost management across all member accounts.
+Key architectural decisions include using the management account for centralized governance services while keeping it isolated from daily operations, implementing graduated policy enforcement across different organizational units, and establishing comprehensive logging and monitoring for compliance auditing. The solution also leverages consolidated billing features to provide unified cost management across all member accounts. For detailed best practices, see the [AWS Organizations User Guide](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_best-practices.html).
 
 > **Warning**: Service Control Policies are powerful tools that can block critical operations if misconfigured. Always test SCP changes in a non-production environment before applying them to production accounts.
 
 > **Tip**: Use AWS IAM Access Analyzer to validate SCP effectiveness and identify potential policy conflicts before deployment. See [AWS IAM Access Analyzer](https://docs.aws.amazon.com/IAM/latest/UserGuide/what-is-access-analyzer.html) for validation guidance.
 
-> **Best Practice**: Regularly review and update Service Control Policies as your organization grows and AWS introduces new services. Consider implementing a policy review process with your security and finance teams.
+> **Note**: Cost allocation tags must be activated manually in the AWS Billing Console and can take up to 24 hours to appear in reports. See [AWS Cost Allocation Tags documentation](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/cost-alloc-tags.html) for complete guidance.
 
 ## Challenge
 
 Extend this governance framework with these advanced capabilities:
 
-1. **Automated Account Provisioning**: Create Lambda functions triggered by service requests that automatically provision new accounts and move them to appropriate OUs with proper SCPs attached.
+1. **Automated Account Provisioning**: Create Lambda functions triggered by service requests that automatically provision new accounts and move them to appropriate OUs with proper SCPs attached using AWS Control Tower Account Factory.
 
-2. **Advanced Cost Anomaly Detection**: Implement cross-account cost anomaly detection using Cost Anomaly Detector APIs with automated response actions via Step Functions.
+2. **Advanced Cost Anomaly Detection**: Implement cross-account cost anomaly detection using AWS Cost Anomaly Detection with automated response actions via Step Functions and SNS notifications.
 
-3. **Compliance Automation**: Integrate AWS Config organization rules and AWS Security Hub to automatically detect and remediate compliance violations across all member accounts.
+3. **Compliance Automation**: Integrate AWS Config organization rules and AWS Security Hub to automatically detect and remediate compliance violations across all member accounts with automated remediation workflows.
 
-4. **Policy Testing Framework**: Build automated testing for SCP changes using AWS IAM Policy Simulator to validate policy effectiveness before deployment.
+4. **Policy Testing Framework**: Build automated testing for SCP changes using AWS IAM Policy Simulator and AWS CloudFormation StackSets to validate policy effectiveness before deployment.
 
-5. **Dynamic Policy Adjustment**: Create intelligent policy management that automatically adjusts spending limits and restrictions based on historical usage patterns and budget cycles.
+5. **Dynamic Policy Adjustment**: Create intelligent policy management using AWS Lambda and Amazon EventBridge that automatically adjusts spending limits and restrictions based on historical usage patterns and budget cycles.
 
 ## Infrastructure Code
 

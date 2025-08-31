@@ -1,0 +1,687 @@
+# Infrastructure Manager Configuration for Privilege Escalation Monitoring with PAM and Pub/Sub
+# This configuration deploys a comprehensive real-time privilege escalation monitoring system
+# using Google Cloud's native audit logging, Pub/Sub messaging, and serverless event processing
+
+apiVersion: krm.kcl.dev/v1alpha1
+kind: KCLRun
+metadata:
+  name: privilege-escalation-monitoring-stack
+  annotations:
+    config.kubernetes.io/local-config: "true"
+spec:
+  source: |-
+    # KCL Configuration for GCP Privilege Escalation Monitoring
+    
+    # Input variables with sensible defaults
+    schema Config:
+        # Project configuration
+        project_id: str
+        region: str = "us-central1"
+        zone: str = "us-central1-a"
+        
+        # Resource naming configuration
+        resource_prefix: str = "privilege-monitoring"
+        random_suffix: str = "$(shell openssl rand -hex 3)"
+        
+        # Function configuration
+        function_memory: str = "256MB"
+        function_timeout: str = "60s"
+        function_max_instances: int = 10
+        function_runtime: str = "python39"
+        
+        # Pub/Sub configuration
+        ack_deadline: str = "60s"
+        message_retention_duration: str = "7d"
+        
+        # Storage configuration
+        storage_class: str = "STANDARD"
+        enable_versioning: bool = True
+        coldline_age_days: int = 30
+        archive_age_days: int = 365
+        
+        # Monitoring configuration
+        alert_threshold: int = 2
+        alert_duration: str = "300s"
+        alignment_period: str = "300s"
+
+    # Configuration instance
+    config: Config = {
+        project_id = "${data.google_project.current.project_id}"
+        region = "us-central1"
+        zone = "us-central1-a"
+        resource_prefix = "privilege-monitoring"
+    }
+
+    # Data sources for current project information
+    data "google_project" "current" {}
+    
+    data "google_client_config" "current" {}
+
+    # Enable required Google Cloud APIs
+    resource "google_project_service" "logging_api" {
+        project = config.project_id
+        service = "logging.googleapis.com"
+        disable_on_destroy = false
+    }
+
+    resource "google_project_service" "pubsub_api" {
+        project = config.project_id
+        service = "pubsub.googleapis.com"
+        disable_on_destroy = false
+    }
+
+    resource "google_project_service" "cloudfunctions_api" {
+        project = config.project_id
+        service = "cloudfunctions.googleapis.com"
+        disable_on_destroy = false
+    }
+
+    resource "google_project_service" "monitoring_api" {
+        project = config.project_id
+        service = "monitoring.googleapis.com"
+        disable_on_destroy = false
+    }
+
+    resource "google_project_service" "storage_api" {
+        project = config.project_id
+        service = "storage.googleapis.com"
+        disable_on_destroy = false
+    }
+
+    resource "google_project_service" "pam_api" {
+        project = config.project_id
+        service = "privilegedaccessmanager.googleapis.com"
+        disable_on_destroy = false
+    }
+
+    # Create Pub/Sub topic for privilege escalation alerts
+    resource "google_pubsub_topic" "privilege_escalation_alerts" {
+        name    = "${config.resource_prefix}-alerts-${config.random_suffix}"
+        project = config.project_id
+        
+        # Topic configuration for reliable message delivery
+        message_storage_policy {
+            allowed_persistence_regions = [config.region]
+        }
+        
+        # Schema enforcement for structured security events
+        schema_settings {
+            encoding = "JSON"
+        }
+        
+        labels = {
+            purpose     = "privilege-escalation-monitoring"
+            environment = "security"
+            managed_by  = "infrastructure-manager"
+        }
+        
+        depends_on = [google_project_service.pubsub_api]
+    }
+
+    # Create Pub/Sub subscription for Cloud Function processing
+    resource "google_pubsub_subscription" "privilege_monitor_subscription" {
+        name    = "${config.resource_prefix}-sub-${config.random_suffix}"
+        project = config.project_id
+        topic   = google_pubsub_topic.privilege_escalation_alerts.name
+        
+        # Subscription configuration for reliable event processing
+        ack_deadline_seconds       = 60
+        message_retention_duration = config.message_retention_duration
+        
+        # Dead letter queue configuration for failed processing
+        dead_letter_policy {
+            dead_letter_topic     = google_pubsub_topic.dead_letter_topic.id
+            max_delivery_attempts = 5
+        }
+        
+        # Retry policy for transient failures
+        retry_policy {
+            minimum_backoff = "10s"
+            maximum_backoff = "600s"
+        }
+        
+        # Exponential backoff for retry attempts
+        expiration_policy {
+            ttl = "2678400s" # 31 days
+        }
+        
+        labels = {
+            purpose     = "privilege-escalation-monitoring"
+            environment = "security"
+            managed_by  = "infrastructure-manager"
+        }
+    }
+
+    # Dead letter topic for failed message processing
+    resource "google_pubsub_topic" "dead_letter_topic" {
+        name    = "${config.resource_prefix}-dlq-${config.random_suffix}"
+        project = config.project_id
+        
+        message_storage_policy {
+            allowed_persistence_regions = [config.region]
+        }
+        
+        labels = {
+            purpose     = "privilege-escalation-monitoring-dlq"
+            environment = "security"
+            managed_by  = "infrastructure-manager"
+        }
+        
+        depends_on = [google_project_service.pubsub_api]
+    }
+
+    # Cloud Storage bucket for alert archival and audit trails
+    resource "google_storage_bucket" "alert_archive" {
+        name     = "${config.resource_prefix}-audit-logs-${config.project_id}-${config.random_suffix}"
+        project  = config.project_id
+        location = config.region
+        
+        # Storage class configuration for cost optimization
+        storage_class = config.storage_class
+        
+        # Enable versioning for audit trail integrity
+        versioning {
+            enabled = config.enable_versioning
+        }
+        
+        # Lifecycle management for cost-effective long-term storage
+        lifecycle_rule {
+            condition {
+                age = config.coldline_age_days
+            }
+            action {
+                type          = "SetStorageClass"
+                storage_class = "COLDLINE"
+            }
+        }
+        
+        lifecycle_rule {
+            condition {
+                age = config.archive_age_days
+            }
+            action {
+                type          = "SetStorageClass"
+                storage_class = "ARCHIVE"
+            }
+        }
+        
+        # Prevent accidental deletion of security audit data
+        lifecycle_rule {
+            condition {
+                age = 2555 # 7 years for compliance retention
+            }
+            action {
+                type = "Delete"
+            }
+        }
+        
+        # Security configuration
+        uniform_bucket_level_access = true
+        
+        # Encryption configuration using Google-managed keys
+        encryption {
+            default_kms_key_name = null
+        }
+        
+        labels = {
+            purpose     = "privilege-escalation-audit-archive"
+            environment = "security"
+            managed_by  = "infrastructure-manager"
+            compliance  = "sox-pci-iso27001"
+        }
+        
+        depends_on = [google_project_service.storage_api]
+    }
+
+    # Service account for Cloud Function with least privilege access
+    resource "google_service_account" "function_service_account" {
+        account_id   = "${config.resource_prefix}-func-sa-${config.random_suffix}"
+        display_name = "Privilege Escalation Monitor Function Service Account"
+        description  = "Service account for the privilege escalation monitoring Cloud Function"
+        project      = config.project_id
+    }
+
+    # IAM binding for Cloud Storage access (least privilege)
+    resource "google_storage_bucket_iam_member" "function_storage_access" {
+        bucket = google_storage_bucket.alert_archive.name
+        role   = "roles/storage.objectCreator"
+        member = "serviceAccount:${google_service_account.function_service_account.email}"
+    }
+
+    # IAM binding for Cloud Monitoring metric creation
+    resource "google_project_iam_member" "function_monitoring_access" {
+        project = config.project_id
+        role    = "roles/monitoring.metricWriter"
+        member  = "serviceAccount:${google_service_account.function_service_account.email}"
+    }
+
+    # IAM binding for Cloud Logging access (for function logs)
+    resource "google_project_iam_member" "function_logging_access" {
+        project = config.project_id
+        role    = "roles/logging.logWriter"
+        member  = "serviceAccount:${google_service_account.function_service_account.email}"
+    }
+
+    # Cloud Function source code archive
+    data "archive_file" "function_source" {
+        type        = "zip"
+        output_path = "/tmp/privilege-monitor-function.zip"
+        source {
+            content = <<-EOF
+import json
+import base64
+import logging
+import os
+from datetime import datetime
+from google.cloud import storage
+from google.cloud import monitoring_v3
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def process_privilege_alert(event, context):
+    """Process privilege escalation events from Pub/Sub"""
+    try:
+        # Decode Pub/Sub message
+        pubsub_message = base64.b64decode(event['data']).decode('utf-8')
+        log_entry = json.loads(pubsub_message)
+        
+        # Extract audit log details
+        proto_payload = log_entry.get('protoPayload', {})
+        method_name = proto_payload.get('methodName', '')
+        service_name = proto_payload.get('serviceName', '')
+        principal_email = proto_payload.get('authenticationInfo', {}).get('principalEmail', 'Unknown')
+        resource_name = proto_payload.get('resourceName', '')
+        
+        # Determine alert severity based on method and service
+        severity = determine_severity(method_name, service_name, proto_payload)
+        
+        # Create alert object
+        alert = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'severity': severity,
+            'principal': principal_email,
+            'method': method_name,
+            'service': service_name,
+            'resource': resource_name,
+            'raw_log': log_entry
+        }
+        
+        # Log alert for monitoring
+        logger.info(f"Privilege escalation detected: {severity} - {principal_email} - {method_name}")
+        
+        # Store alert in Cloud Storage
+        store_alert(alert)
+        
+        # Send to Cloud Monitoring if high severity
+        if severity in ['HIGH', 'CRITICAL']:
+            send_monitoring_alert(alert)
+            
+        return 'Alert processed successfully'
+        
+    except Exception as e:
+        logger.error(f"Error processing alert: {str(e)}")
+        raise
+
+def determine_severity(method_name, service_name, proto_payload):
+    """Determine alert severity based on the method, service, and context"""
+    # Critical PAM operations
+    critical_pam_methods = [
+        'createGrant', 'CreateGrant', 'createEntitlement', 'CreateEntitlement'
+    ]
+    
+    # High-risk IAM methods
+    high_risk_methods = [
+        'CreateRole', 'UpdateRole', 'DeleteRole',
+        'CreateServiceAccount', 'SetIamPolicy'
+    ]
+    
+    # Check for PAM-related activities
+    if service_name == 'privilegedaccessmanager.googleapis.com':
+        if any(method in method_name for method in critical_pam_methods):
+            return 'CRITICAL'
+        else:
+            return 'HIGH'
+    
+    # Check for high-risk IAM operations
+    if any(method in method_name for method in high_risk_methods):
+        return 'HIGH'
+    elif 'setIamPolicy' in method_name:
+        return 'MEDIUM'
+    else:
+        return 'LOW'
+
+def store_alert(alert):
+    """Store alert in Cloud Storage for audit trail"""
+    try:
+        client = storage.Client()
+        bucket_name = os.environ.get('BUCKET_NAME', 'unknown-bucket')
+        bucket = client.bucket(bucket_name)
+        
+        # Create filename with timestamp
+        filename = f"alerts/{alert['timestamp'][:10]}/{alert['timestamp']}.json"
+        blob = bucket.blob(filename)
+        blob.upload_from_string(json.dumps(alert, indent=2))
+        
+    except Exception as e:
+        logger.error(f"Failed to store alert: {str(e)}")
+
+def send_monitoring_alert(alert):
+    """Send high-severity alerts to Cloud Monitoring"""
+    try:
+        client = monitoring_v3.MetricServiceClient()
+        project_name = f"projects/{os.environ.get('GCP_PROJECT', 'unknown')}"
+        
+        # Create custom metric for privilege escalation
+        series = monitoring_v3.TimeSeries()
+        series.metric.type = "custom.googleapis.com/security/privilege_escalation"
+        series.resource.type = "global"
+        
+        point = series.points.add()
+        point.value.int64_value = 1
+        point.interval.end_time.seconds = int(datetime.utcnow().timestamp())
+        
+        client.create_time_series(name=project_name, time_series=[series])
+        
+    except Exception as e:
+        logger.error(f"Failed to send monitoring alert: {str(e)}")
+EOF
+            filename = "main.py"
+        }
+        source {
+            content = <<-EOF
+google-cloud-storage==2.10.0
+google-cloud-monitoring==2.16.0
+EOF
+            filename = "requirements.txt"
+        }
+    }
+
+    # Cloud Storage bucket for function source code
+    resource "google_storage_bucket" "function_source" {
+        name     = "${config.resource_prefix}-function-source-${config.random_suffix}"
+        project  = config.project_id
+        location = config.region
+        
+        uniform_bucket_level_access = true
+        
+        labels = {
+            purpose     = "cloud-function-source"
+            environment = "security"
+            managed_by  = "infrastructure-manager"
+        }
+        
+        depends_on = [google_project_service.storage_api]
+    }
+
+    # Upload function source code to Cloud Storage
+    resource "google_storage_bucket_object" "function_archive" {
+        name   = "privilege-monitor-function-${timestamp()}.zip"
+        bucket = google_storage_bucket.function_source.name
+        source = data.archive_file.function_source.output_path
+    }
+
+    # Cloud Function for privilege escalation event processing
+    resource "google_cloudfunctions_function" "privilege_alert_processor" {
+        name        = "${config.resource_prefix}-processor-${config.random_suffix}"
+        project     = config.project_id
+        region      = config.region
+        runtime     = config.function_runtime
+        description = "Processes privilege escalation alerts from Pub/Sub and stores them for analysis"
+        
+        # Function source configuration
+        source_archive_bucket = google_storage_bucket.function_source.name
+        source_archive_object = google_storage_bucket_object.function_archive.name
+        
+        # Entry point and handler configuration
+        entry_point = "process_privilege_alert"
+        
+        # Resource allocation
+        available_memory_mb = 256
+        timeout             = 60
+        max_instances       = config.function_max_instances
+        
+        # Environment variables for function configuration
+        environment_variables = {
+            BUCKET_NAME = google_storage_bucket.alert_archive.name
+            GCP_PROJECT = config.project_id
+        }
+        
+        # Pub/Sub trigger configuration
+        event_trigger {
+            event_type = "providers/cloud.pubsub/eventTypes/topic.publish"
+            resource   = google_pubsub_topic.privilege_escalation_alerts.name
+        }
+        
+        # Security configuration
+        service_account_email = google_service_account.function_service_account.email
+        
+        # Networking configuration for VPC access if needed
+        vpc_connector_egress_settings = "PRIVATE_RANGES_ONLY"
+        
+        labels = {
+            purpose     = "privilege-escalation-processing"
+            environment = "security"
+            managed_by  = "infrastructure-manager"
+        }
+        
+        depends_on = [
+            google_project_service.cloudfunctions_api,
+            google_storage_bucket_object.function_archive
+        ]
+    }
+
+    # Cloud Logging sink for privilege escalation events
+    resource "google_logging_project_sink" "privilege_escalation_sink" {
+        name = "${config.resource_prefix}-sink-${config.random_suffix}"
+        
+        # Comprehensive filter for privilege escalation detection
+        filter = <<-EOF
+protoPayload.serviceName="iam.googleapis.com" OR
+protoPayload.serviceName="cloudresourcemanager.googleapis.com" OR
+protoPayload.serviceName="serviceusage.googleapis.com" OR
+protoPayload.serviceName="privilegedaccessmanager.googleapis.com" OR
+(protoPayload.methodName=~"setIamPolicy" OR
+ protoPayload.methodName=~"CreateRole" OR
+ protoPayload.methodName=~"UpdateRole" OR
+ protoPayload.methodName=~"CreateServiceAccount" OR
+ protoPayload.methodName=~"SetIamPolicy" OR
+ protoPayload.methodName=~"createGrant" OR
+ protoPayload.methodName=~"CreateGrant" OR
+ protoPayload.methodName=~"searchEntitlements")
+EOF
+        
+        # Route to Pub/Sub topic
+        destination = "pubsub.googleapis.com/projects/${config.project_id}/topics/${google_pubsub_topic.privilege_escalation_alerts.name}"
+        
+        # Include children projects if this is an organization-level deployment
+        include_children = false
+        
+        # Unique writer identity for the sink
+        unique_writer_identity = true
+        
+        depends_on = [
+            google_project_service.logging_api,
+            google_pubsub_topic.privilege_escalation_alerts
+        ]
+    }
+
+    # IAM binding to allow log sink to publish to Pub/Sub topic
+    resource "google_pubsub_topic_iam_member" "sink_publisher" {
+        project = config.project_id
+        topic   = google_pubsub_topic.privilege_escalation_alerts.name
+        role    = "roles/pubsub.publisher"
+        member  = google_logging_project_sink.privilege_escalation_sink.writer_identity
+    }
+
+    # Cloud Monitoring alert policy for privilege escalation detection
+    resource "google_monitoring_alert_policy" "privilege_escalation_alert" {
+        display_name = "Privilege Escalation Detection Alert"
+        project      = config.project_id
+        
+        # Combine multiple conditions with OR logic
+        combiner = "OR"
+        
+        # Condition for high privilege escalation rate
+        conditions {
+            display_name = "High privilege escalation rate detected"
+            
+            condition_threshold {
+                filter         = "metric.type=\"custom.googleapis.com/security/privilege_escalation\""
+                duration       = config.alert_duration
+                comparison     = "COMPARISON_GREATER_THAN"
+                threshold_value = config.alert_threshold
+                
+                aggregations {
+                    alignment_period   = config.alert_duration
+                    per_series_aligner = "ALIGN_RATE"
+                }
+            }
+        }
+        
+        # Alert documentation
+        documentation {
+            content = "Alert triggered when privilege escalation events exceed ${config.alert_threshold} per ${config.alert_duration} window"
+            mime_type = "text/markdown"
+        }
+        
+        # Notification channels (to be configured separately)
+        notification_channels = []
+        
+        # Alert is enabled by default
+        enabled = true
+        
+        depends_on = [
+            google_project_service.monitoring_api,
+            google_cloudfunctions_function.privilege_alert_processor
+        ]
+    }
+
+    # Output values for reference and integration
+    outputs = {
+        # Pub/Sub resources
+        pubsub_topic_name = google_pubsub_topic.privilege_escalation_alerts.name
+        pubsub_subscription_name = google_pubsub_subscription.privilege_monitor_subscription.name
+        
+        # Storage resources
+        alert_archive_bucket = google_storage_bucket.alert_archive.name
+        function_source_bucket = google_storage_bucket.function_source.name
+        
+        # Function resources
+        cloud_function_name = google_cloudfunctions_function.privilege_alert_processor.name
+        function_service_account = google_service_account.function_service_account.email
+        
+        # Logging resources
+        log_sink_name = google_logging_project_sink.privilege_escalation_sink.name
+        log_sink_writer_identity = google_logging_project_sink.privilege_escalation_sink.writer_identity
+        
+        # Monitoring resources
+        alert_policy_name = google_monitoring_alert_policy.privilege_escalation_alert.name
+        
+        # Configuration values
+        project_id = config.project_id
+        region = config.region
+        resource_prefix = config.resource_prefix
+        
+        # Usage instructions
+        deployment_instructions = <<-EOF
+# Privilege Escalation Monitoring Deployment Complete
+# 
+# The following resources have been created:
+# - Pub/Sub topic: ${google_pubsub_topic.privilege_escalation_alerts.name}
+# - Pub/Sub subscription: ${google_pubsub_subscription.privilege_monitor_subscription.name}
+# - Cloud Storage bucket: ${google_storage_bucket.alert_archive.name}
+# - Cloud Function: ${google_cloudfunctions_function.privilege_alert_processor.name}
+# - Log sink: ${google_logging_project_sink.privilege_escalation_sink.name}
+# - Alert policy: ${google_monitoring_alert_policy.privilege_escalation_alert.name}
+#
+# To test the system:
+# 1. Create a test IAM role to trigger audit logs
+# 2. Check Cloud Function logs for processing activity
+# 3. Verify alerts are stored in Cloud Storage
+# 4. Monitor Cloud Monitoring for custom metrics
+#
+# To configure notification channels:
+# 1. Create notification channels in Cloud Monitoring
+# 2. Update the alert policy to include notification channel IDs
+#
+# For PAM integration:
+# 1. Configure PAM entitlements in your project
+# 2. Test grant requests to generate audit events
+# 3. Monitor for PAM-specific alerts with CRITICAL severity
+EOF
+    }
+
+---
+# Infrastructure Manager specific configuration
+terraformConfig:
+  source:
+    repo: "https://github.com/terraform-google-modules/terraform-google-project-factory"
+    ref: "v14.4.0"
+    sourceType: "git"
+  
+inputValues:
+  # Primary configuration values that can be overridden at deployment time
+  project_id:
+    description: "Google Cloud Project ID where resources will be created"
+    type: "string"
+    required: true
+  
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: "string"
+    default: "us-central1"
+  
+  resource_prefix:
+    description: "Prefix for all resource names to ensure uniqueness"
+    type: "string"
+    default: "privilege-monitoring"
+  
+  function_memory:
+    description: "Memory allocation for Cloud Function (MB)"
+    type: "string"
+    default: "256MB"
+  
+  function_timeout:
+    description: "Timeout for Cloud Function execution (seconds)"
+    type: "string"  
+    default: "60s"
+  
+  function_max_instances:
+    description: "Maximum number of concurrent Cloud Function instances"
+    type: "number"
+    default: 10
+  
+  alert_threshold:
+    description: "Number of privilege escalation events that trigger an alert"
+    type: "number"
+    default: 2
+  
+  alert_duration:
+    description: "Time window for alert evaluation (seconds)"
+    type: "string"
+    default: "300s"
+  
+  enable_versioning:
+    description: "Enable versioning on Cloud Storage bucket for audit trail integrity"
+    type: "boolean"
+    default: true
+  
+  coldline_age_days:
+    description: "Number of days before transitioning storage to COLDLINE class"
+    type: "number"
+    default: 30
+  
+  archive_age_days:
+    description: "Number of days before transitioning storage to ARCHIVE class" 
+    type: "number"
+    default: 365
+
+labels:
+  purpose: "privilege-escalation-monitoring"
+  environment: "security"
+  compliance: "sox-pci-iso27001"
+  managed_by: "infrastructure-manager"
+  recipe_id: "f8e2a1b7"
+  recipe_version: "1.1"

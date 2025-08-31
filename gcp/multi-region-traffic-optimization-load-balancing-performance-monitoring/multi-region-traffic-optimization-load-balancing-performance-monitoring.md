@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Load Balancing, Cloud CDN, Network Intelligence Center, Cloud Monitoring
 estimated-time: 105 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: load-balancing, cdn, performance-monitoring, multi-region, traffic-optimization, global-infrastructure
 recipe-generator-version: 1.3
@@ -393,21 +393,30 @@ echo "✅ Required APIs enabled"
    # Enable Network Intelligence Center APIs (if not already enabled)
    gcloud services enable networkmanagement.googleapis.com
    
+   # Get first instance from each region for connectivity tests
+   US_INSTANCE=$(gcloud compute instances list \
+       --filter="zone:${ZONE_US}" \
+       --format="value(name)" | head -1)
+   
+   EU_INSTANCE=$(gcloud compute instances list \
+       --filter="zone:${ZONE_EU}" \
+       --format="value(name)" | head -1)
+   
+   APAC_INSTANCE=$(gcloud compute instances list \
+       --filter="zone:${ZONE_APAC}" \
+       --format="value(name)" | head -1)
+   
    # Create connectivity tests for inter-region monitoring
    gcloud network-management connectivity-tests create us-to-eu-test \
-       --source-instance us-ig-${RANDOM_SUFFIX} \
-       --source-instance-zone ${ZONE_US} \
-       --destination-instance eu-ig-${RANDOM_SUFFIX} \
-       --destination-instance-zone ${ZONE_EU} \
+       --source-instance "projects/${PROJECT_ID}/zones/${ZONE_US}/instances/${US_INSTANCE}" \
+       --destination-instance "projects/${PROJECT_ID}/zones/${ZONE_EU}/instances/${EU_INSTANCE}" \
        --protocol TCP \
        --destination-port 8080 \
        --description="Test connectivity between US and EU regions"
    
    gcloud network-management connectivity-tests create us-to-apac-test \
-       --source-instance us-ig-${RANDOM_SUFFIX} \
-       --source-instance-zone ${ZONE_US} \
-       --destination-instance apac-ig-${RANDOM_SUFFIX} \
-       --destination-instance-zone ${ZONE_APAC} \
+       --source-instance "projects/${PROJECT_ID}/zones/${ZONE_US}/instances/${US_INSTANCE}" \
+       --destination-instance "projects/${PROJECT_ID}/zones/${ZONE_APAC}/instances/${APAC_INSTANCE}" \
        --protocol TCP \
        --destination-port 8080 \
        --description="Test connectivity between US and APAC regions"
@@ -427,7 +436,7 @@ echo "✅ Required APIs enabled"
    echo "Setting up Cloud Monitoring workspace..."
    
    # Create uptime check for global availability monitoring
-   gcloud alpha monitoring uptime create global-app-uptime-${RANDOM_SUFFIX} \
+   gcloud monitoring uptime create global-app-uptime-${RANDOM_SUFFIX} \
        --hostname=${GLOBAL_IP} \
        --path="/" \
        --port=80 \
@@ -464,7 +473,7 @@ echo "✅ Required APIs enabled"
    }
    EOF
    
-   gcloud alpha monitoring policies create --policy-from-file=latency-alert-policy.json
+   gcloud monitoring policies create --policy-from-file=latency-alert-policy.json
    
    echo "✅ Cloud Monitoring configured with uptime checks and alerting"
    echo "Monitor performance at: https://console.cloud.google.com/monitoring"
@@ -601,7 +610,7 @@ echo "✅ Required APIs enabled"
    echo "Generating test load for monitoring validation..."
    
    # Verify uptime check status
-   gcloud alpha monitoring uptime list \
+   gcloud monitoring uptime list \
        --format="table(displayName,httpCheck.path,period)"
    
    # Check recent metrics
@@ -621,6 +630,9 @@ echo "✅ Required APIs enabled"
        --global --quiet
    
    gcloud compute target-http-proxies delete global-http-proxy-${RANDOM_SUFFIX} \
+       --quiet
+   
+   gcloud compute url-maps delete global-url-map-${RANDOM_SUFFIX} \
        --quiet
    
    echo "✅ Load balancer components deleted"
@@ -663,10 +675,19 @@ echo "✅ Required APIs enabled"
    ```bash
    # Delete firewall rules and VPC
    gcloud compute firewall-rules delete allow-http-https \
-       allow-health-checks --quiet
+       --quiet
    
-   gcloud compute networks subnets delete us-subnet eu-subnet apac-subnet \
-       --regions=${REGION_US},${REGION_EU},${REGION_APAC} --quiet
+   gcloud compute firewall-rules delete allow-health-checks \
+       --quiet
+   
+   gcloud compute networks subnets delete us-subnet \
+       --region=${REGION_US} --quiet
+   
+   gcloud compute networks subnets delete eu-subnet \
+       --region=${REGION_EU} --quiet
+   
+   gcloud compute networks subnets delete apac-subnet \
+       --region=${REGION_APAC} --quiet
    
    gcloud compute networks delete global-app-vpc --quiet
    
@@ -678,9 +699,12 @@ echo "✅ Required APIs enabled"
    ```bash
    # Remove connectivity tests and monitoring policies
    gcloud network-management connectivity-tests delete us-to-eu-test \
-       us-to-apac-test --quiet
+       --quiet
    
-   gcloud alpha monitoring uptime delete global-app-uptime-${RANDOM_SUFFIX} \
+   gcloud network-management connectivity-tests delete us-to-apac-test \
+       --quiet
+   
+   gcloud monitoring uptime delete global-app-uptime-${RANDOM_SUFFIX} \
        --quiet
    
    # Delete project (if created specifically for this recipe)
@@ -709,7 +733,7 @@ For production deployments, consider implementing additional optimizations such 
 - [Cloud CDN Best Practices](https://cloud.google.com/cdn/docs/best-practices)
 - [Network Intelligence Center Overview](https://cloud.google.com/network-intelligence-center/docs/overview)
 - [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework)
-- [Advanced Load Balancing Optimizations](https://cloud.google.com/load-balancing/docs/service-lb-policy)
+- [Connectivity Tests Documentation](https://cloud.google.com/network-intelligence-center/docs/connectivity-tests/how-to/running-connectivity-tests)
 
 ## Challenge
 

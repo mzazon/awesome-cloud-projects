@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: AWS Glue, Lambda, S3, CloudWatch
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: serverless, etl, glue, lambda, analytics, data-processing
 recipe-generator-version: 1.3
@@ -249,18 +249,18 @@ echo "✅ S3 bucket and directory structure created"
    ```bash
    # Create sample CSV data file
    cat > sales_data.csv << 'EOF'
-   order_id,customer_id,product_id,quantity,price,order_date,region
-   1001,C001,P001,2,29.99,2024-01-15,North
-   1002,C002,P002,1,49.99,2024-01-15,South
-   1003,C003,P001,3,29.99,2024-01-16,East
-   1004,C001,P003,1,19.99,2024-01-16,North
-   1005,C004,P002,2,49.99,2024-01-17,West
-   1006,C005,P001,1,29.99,2024-01-17,South
-   1007,C002,P003,4,19.99,2024-01-18,East
-   1008,C006,P004,1,99.99,2024-01-18,North
-   1009,C003,P004,2,99.99,2024-01-19,West
-   1010,C007,P002,1,49.99,2024-01-19,South
-   EOF
+order_id,customer_id,product_id,quantity,price,order_date,region
+1001,C001,P001,2,29.99,2024-01-15,North
+1002,C002,P002,1,49.99,2024-01-15,South
+1003,C003,P001,3,29.99,2024-01-16,East
+1004,C001,P003,1,19.99,2024-01-16,North
+1005,C004,P002,2,49.99,2024-01-17,West
+1006,C005,P001,1,29.99,2024-01-17,South
+1007,C002,P003,4,19.99,2024-01-18,East
+1008,C006,P004,1,99.99,2024-01-18,North
+1009,C003,P004,2,99.99,2024-01-19,West
+1010,C007,P002,1,49.99,2024-01-19,South
+EOF
    
    # Upload sample data to S3
    aws s3 cp sales_data.csv \
@@ -268,15 +268,15 @@ echo "✅ S3 bucket and directory structure created"
    
    # Create additional sample data for demonstration
    cat > customer_data.csv << 'EOF'
-   customer_id,name,email,registration_date,status
-   C001,John Smith,john@example.com,2023-01-01,active
-   C002,Jane Doe,jane@example.com,2023-02-15,active
-   C003,Bob Johnson,bob@example.com,2023-03-20,inactive
-   C004,Alice Wilson,alice@example.com,2023-04-10,active
-   C005,Charlie Brown,charlie@example.com,2023-05-05,active
-   C006,Diana Prince,diana@example.com,2023-06-12,active
-   C007,Eve Adams,eve@example.com,2023-07-22,active
-   EOF
+customer_id,name,email,registration_date,status
+C001,John Smith,john@example.com,2023-01-01,active
+C002,Jane Doe,jane@example.com,2023-02-15,active
+C003,Bob Johnson,bob@example.com,2023-03-20,inactive
+C004,Alice Wilson,alice@example.com,2023-04-10,active
+C005,Charlie Brown,charlie@example.com,2023-05-05,active
+C006,Diana Prince,diana@example.com,2023-06-12,active
+C007,Eve Adams,eve@example.com,2023-07-22,active
+EOF
    
    aws s3 cp customer_data.csv \
        "s3://${BUCKET_NAME}/raw-data/customer_data.csv"
@@ -337,102 +337,102 @@ echo "✅ S3 bucket and directory structure created"
    ```bash
    # Create Python script for Glue ETL job
    cat > glue_etl_script.py << 'EOF'
-   import sys
-   from awsglue.transforms import *
-   from awsglue.utils import getResolvedOptions
-   from pyspark.context import SparkContext
-   from awsglue.context import GlueContext
-   from awsglue.job import Job
-   from pyspark.sql import functions as F
-   from pyspark.sql.types import *
-   
-   # Parse job arguments
-   args = getResolvedOptions(sys.argv, [
-       'JOB_NAME',
-       'database_name',
-       'table_prefix',
-       'output_path'
-   ])
-   
-   # Initialize contexts
-   sc = SparkContext()
-   glueContext = GlueContext(sc)
-   spark = glueContext.spark_session
-   job = Job(glueContext)
-   job.init(args['JOB_NAME'], args)
-   
-   # Read data from Glue Data Catalog
-   sales_df = glueContext.create_dynamic_frame.from_catalog(
-       database=args['database_name'],
-       table_name=f"{args['table_prefix']}_sales_data_csv"
-   ).toDF()
-   
-   customer_df = glueContext.create_dynamic_frame.from_catalog(
-       database=args['database_name'],
-       table_name=f"{args['table_prefix']}_customer_data_csv"
-   ).toDF()
-   
-   # Data transformations
-   # 1. Convert price to numeric and calculate total
-   sales_df = sales_df.withColumn("price", F.col("price").cast("double"))
-   sales_df = sales_df.withColumn("total_amount", 
-       F.col("quantity") * F.col("price"))
-   
-   # 2. Convert order_date to proper date format
-   sales_df = sales_df.withColumn("order_date", 
-       F.to_date(F.col("order_date"), "yyyy-MM-dd"))
-   
-   # 3. Join sales with customer data
-   enriched_df = sales_df.join(customer_df, "customer_id", "inner")
-   
-   # 4. Calculate aggregated metrics
-   daily_sales = enriched_df.groupBy("order_date", "region").agg(
-       F.sum("total_amount").alias("daily_revenue"),
-       F.count("order_id").alias("daily_orders"),
-       F.countDistinct("customer_id").alias("unique_customers")
-   )
-   
-   # 5. Calculate customer metrics
-   customer_metrics = enriched_df.groupBy("customer_id", "name", "status").agg(
-       F.sum("total_amount").alias("total_spent"),
-       F.count("order_id").alias("total_orders"),
-       F.avg("total_amount").alias("avg_order_value")
-   )
-   
-   # Write processed data to S3
-   # Convert back to DynamicFrame for writing
-   daily_sales_df = DynamicFrame.fromDF(daily_sales, glueContext, "daily_sales")
-   customer_metrics_df = DynamicFrame.fromDF(customer_metrics, glueContext, "customer_metrics")
-   
-   # Write daily sales data
-   glueContext.write_dynamic_frame.from_options(
-       frame=daily_sales_df,
-       connection_type="s3",
-       connection_options={
-           "path": f"{args['output_path']}/daily_sales/",
-           "partitionKeys": ["order_date"]
-       },
-       format="parquet"
-   )
-   
-   # Write customer metrics
-   glueContext.write_dynamic_frame.from_options(
-       frame=customer_metrics_df,
-       connection_type="s3",
-       connection_options={
-           "path": f"{args['output_path']}/customer_metrics/"
-       },
-       format="parquet"
-   )
-   
-   # Log processing statistics
-   print(f"Processed {sales_df.count()} sales records")
-   print(f"Processed {customer_df.count()} customer records")
-   print(f"Generated {daily_sales.count()} daily sales records")
-   print(f"Generated {customer_metrics.count()} customer metric records")
-   
-   job.commit()
-   EOF
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+
+# Parse job arguments
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'database_name',
+    'table_prefix',
+    'output_path'
+])
+
+# Initialize contexts
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Read data from Glue Data Catalog
+sales_df = glueContext.create_dynamic_frame.from_catalog(
+    database=args['database_name'],
+    table_name=f"{args['table_prefix']}_sales_data_csv"
+).toDF()
+
+customer_df = glueContext.create_dynamic_frame.from_catalog(
+    database=args['database_name'],
+    table_name=f"{args['table_prefix']}_customer_data_csv"
+).toDF()
+
+# Data transformations
+# 1. Convert price to numeric and calculate total
+sales_df = sales_df.withColumn("price", F.col("price").cast("double"))
+sales_df = sales_df.withColumn("total_amount", 
+    F.col("quantity") * F.col("price"))
+
+# 2. Convert order_date to proper date format
+sales_df = sales_df.withColumn("order_date", 
+    F.to_date(F.col("order_date"), "yyyy-MM-dd"))
+
+# 3. Join sales with customer data
+enriched_df = sales_df.join(customer_df, "customer_id", "inner")
+
+# 4. Calculate aggregated metrics
+daily_sales = enriched_df.groupBy("order_date", "region").agg(
+    F.sum("total_amount").alias("daily_revenue"),
+    F.count("order_id").alias("daily_orders"),
+    F.countDistinct("customer_id").alias("unique_customers")
+)
+
+# 5. Calculate customer metrics
+customer_metrics = enriched_df.groupBy("customer_id", "name", "status").agg(
+    F.sum("total_amount").alias("total_spent"),
+    F.count("order_id").alias("total_orders"),
+    F.avg("total_amount").alias("avg_order_value")
+)
+
+# Write processed data to S3
+# Convert back to DynamicFrame for writing
+daily_sales_df = DynamicFrame.fromDF(daily_sales, glueContext, "daily_sales")
+customer_metrics_df = DynamicFrame.fromDF(customer_metrics, glueContext, "customer_metrics")
+
+# Write daily sales data
+glueContext.write_dynamic_frame.from_options(
+    frame=daily_sales_df,
+    connection_type="s3",
+    connection_options={
+        "path": f"{args['output_path']}/daily_sales/",
+        "partitionKeys": ["order_date"]
+    },
+    format="parquet"
+)
+
+# Write customer metrics
+glueContext.write_dynamic_frame.from_options(
+    frame=customer_metrics_df,
+    connection_type="s3",
+    connection_options={
+        "path": f"{args['output_path']}/customer_metrics/"
+    },
+    format="parquet"
+)
+
+# Log processing statistics
+print(f"Processed {sales_df.count()} sales records")
+print(f"Processed {customer_df.count()} customer records")
+print(f"Generated {daily_sales.count()} daily sales records")
+print(f"Generated {customer_metrics.count()} customer metric records")
+
+job.commit()
+EOF
    
    # Upload script to S3
    aws s3 cp glue_etl_script.py \
@@ -447,7 +447,7 @@ echo "✅ S3 bucket and directory structure created"
 
 6. **Create Glue ETL Job**:
 
-   Creating a Glue job configures the execution environment and resource allocation for our ETL script. Glue version 4.0 provides the latest Apache Spark optimizations, while the G.1X worker type offers balanced compute and memory resources suitable for most ETL workloads. The job configuration includes parameters for monitoring, logging, and automatic retries to ensure reliable processing.
+   Creating a Glue job configures the execution environment and resource allocation for our ETL script. Glue version 5.0 provides the latest Apache Spark 3.5 optimizations and significant performance improvements (32% faster than Glue 4.0), while the G.1X worker type offers balanced compute and memory resources suitable for most ETL workloads. The job configuration includes parameters for monitoring, logging, and automatic retries to ensure reliable processing.
 
    ```bash
    # Create Glue ETL job
@@ -470,14 +470,14 @@ echo "✅ S3 bucket and directory structure created"
        }" \
        --max-retries 1 \
        --timeout 60 \
-       --glue-version "4.0" \
+       --glue-version "5.0" \
        --worker-type "G.1X" \
        --number-of-workers 2
    
    echo "✅ Glue ETL job created"
    ```
 
-   The Glue job definition is now registered and ready for execution. This job configuration provides the blueprint for scalable data processing, enabling automatic resource provisioning based on data volume and processing complexity while maintaining cost efficiency through pay-per-use pricing.
+   The Glue job definition is now registered and ready for execution. This job configuration leverages AWS Glue 5.0's enhanced performance and Apache Spark 3.5 capabilities, providing the blueprint for scalable data processing that enables automatic resource provisioning based on data volume and processing complexity while maintaining cost efficiency through pay-per-use pricing.
 
 7. **Create Lambda Function for Pipeline Orchestration**:
 
@@ -486,98 +486,98 @@ echo "✅ S3 bucket and directory structure created"
    ```bash
    # Create Lambda function code
    cat > lambda_function.py << 'EOF'
-   import json
-   import boto3
-   import logging
-   from datetime import datetime
-   
-   # Configure logging
-   logger = logging.getLogger()
-   logger.setLevel(logging.INFO)
-   
-   # Initialize AWS clients
-   glue_client = boto3.client('glue')
-   s3_client = boto3.client('s3')
-   
-   def lambda_handler(event, context):
-       """
-       Lambda function to orchestrate ETL pipeline
-       """
-       try:
-           # Extract configuration from event
-           job_name = event.get('job_name')
-           database_name = event.get('database_name')
-           
-           if not job_name:
-               raise ValueError("job_name is required in event")
-           
-           # Start Glue job
-           response = glue_client.start_job_run(
-               JobName=job_name,
-               Arguments={
-                   '--database_name': database_name,
-                   '--table_prefix': 'raw_data',
-                   '--output_path': event.get('output_path', 's3://default-bucket/processed-data')
-               }
-           )
-           
-           job_run_id = response['JobRunId']
-           logger.info(f"Started Glue job {job_name} with run ID: {job_run_id}")
-           
-           # Return success response
-           return {
-               'statusCode': 200,
-               'body': json.dumps({
-                   'message': 'ETL pipeline initiated successfully',
-                   'job_name': job_name,
-                   'job_run_id': job_run_id,
-                   'timestamp': datetime.now().isoformat()
-               })
-           }
-           
-       except Exception as e:
-           logger.error(f"Error in ETL pipeline: {str(e)}")
-           return {
-               'statusCode': 500,
-               'body': json.dumps({
-                   'error': str(e),
-                   'timestamp': datetime.now().isoformat()
-               })
-           }
-   
-   def check_job_status(job_name, job_run_id):
-       """
-       Check the status of a Glue job run
-       """
-       try:
-           response = glue_client.get_job_run(
-               JobName=job_name,
-               RunId=job_run_id
-           )
-           
-           job_run = response['JobRun']
-           status = job_run['JobRunState']
-           
-           return {
-               'status': status,
-               'started_on': job_run.get('StartedOn'),
-               'completed_on': job_run.get('CompletedOn'),
-               'execution_time': job_run.get('ExecutionTime'),
-               'error_message': job_run.get('ErrorMessage')
-           }
-           
-       except Exception as e:
-           logger.error(f"Error checking job status: {str(e)}")
-           return {'error': str(e)}
-   EOF
+import json
+import boto3
+import logging
+from datetime import datetime
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Initialize AWS clients
+glue_client = boto3.client('glue')
+s3_client = boto3.client('s3')
+
+def lambda_handler(event, context):
+    """
+    Lambda function to orchestrate ETL pipeline
+    """
+    try:
+        # Extract configuration from event
+        job_name = event.get('job_name')
+        database_name = event.get('database_name')
+        
+        if not job_name:
+            raise ValueError("job_name is required in event")
+        
+        # Start Glue job
+        response = glue_client.start_job_run(
+            JobName=job_name,
+            Arguments={
+                '--database_name': database_name,
+                '--table_prefix': 'raw_data',
+                '--output_path': event.get('output_path', 's3://default-bucket/processed-data')
+            }
+        )
+        
+        job_run_id = response['JobRunId']
+        logger.info(f"Started Glue job {job_name} with run ID: {job_run_id}")
+        
+        # Return success response
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'ETL pipeline initiated successfully',
+                'job_name': job_name,
+                'job_run_id': job_run_id,
+                'timestamp': datetime.now().isoformat()
+            })
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in ETL pipeline: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            })
+        }
+
+def check_job_status(job_name, job_run_id):
+    """
+    Check the status of a Glue job run
+    """
+    try:
+        response = glue_client.get_job_run(
+            JobName=job_name,
+            RunId=job_run_id
+        )
+        
+        job_run = response['JobRun']
+        status = job_run['JobRunState']
+        
+        return {
+            'status': status,
+            'started_on': job_run.get('StartedOn'),
+            'completed_on': job_run.get('CompletedOn'),
+            'execution_time': job_run.get('ExecutionTime'),
+            'error_message': job_run.get('ErrorMessage')
+        }
+        
+    except Exception as e:
+        logger.error(f"Error checking job status: {str(e)}")
+        return {'error': str(e)}
+EOF
    
    # Create deployment package
    zip lambda_function.zip lambda_function.py
    
-   # Create Lambda function
+   # Create Lambda function with current Python runtime
    aws lambda create-function \
        --function-name etl-orchestrator-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE}" \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda_function.zip \
@@ -587,7 +587,7 @@ echo "✅ S3 bucket and directory structure created"
    echo "✅ Lambda function created"
    ```
 
-   The Lambda orchestrator is now deployed and ready to manage ETL pipeline execution. This serverless function provides reliable job triggering, status monitoring, and error handling capabilities, enabling automatic pipeline operations that scale from occasional batch jobs to high-frequency data processing scenarios.
+   The Lambda orchestrator is now deployed using Python 3.12 runtime and ready to manage ETL pipeline execution. This serverless function provides reliable job triggering, status monitoring, and error handling capabilities, enabling automatic pipeline operations that scale from occasional batch jobs to high-frequency data processing scenarios.
 
 8. **Create Glue Workflow for Pipeline Orchestration**:
 
@@ -619,46 +619,45 @@ echo "✅ S3 bucket and directory structure created"
    S3 event notifications enable real-time, event-driven ETL processing by automatically triggering Lambda functions when new data arrives. This pattern transforms traditional batch-oriented pipelines into responsive systems that can process data as soon as it becomes available, reducing latency and enabling near real-time analytics capabilities for time-sensitive business operations.
 
    ```bash
-   # Create S3 event notification configuration
-   cat > s3_notification.json << EOF
-   {
-       "CloudWatchConfiguration": {
-           "Id": "etl-pipeline-notification",
-           "CloudWatchConfiguration": {
-               "LogGroupName": "/aws/s3/${BUCKET_NAME}"
-           }
-       },
-       "LambdaConfigurations": [
-           {
-               "Id": "etl-trigger-notification",
-               "LambdaFunctionArn": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:etl-orchestrator-${RANDOM_SUFFIX}",
-               "Events": ["s3:ObjectCreated:*"],
-               "Filter": {
-                   "Key": {
-                       "FilterRules": [
-                           {
-                               "Name": "prefix",
-                               "Value": "raw-data/"
-                           },
-                           {
-                               "Name": "suffix",
-                               "Value": ".csv"
-                           }
-                       ]
-                   }
-               }
-           }
-       ]
-   }
-   EOF
-   
-   # Grant S3 permission to invoke Lambda
+   # Grant S3 permission to invoke Lambda first
    aws lambda add-permission \
        --function-name etl-orchestrator-${RANDOM_SUFFIX} \
        --principal s3.amazonaws.com \
        --action lambda:InvokeFunction \
        --statement-id s3-trigger-${RANDOM_SUFFIX} \
        --source-arn "arn:aws:s3:::${BUCKET_NAME}"
+   
+   # Create S3 event notification configuration
+   cat > s3_notification.json << EOF
+{
+    "LambdaConfigurations": [
+        {
+            "Id": "etl-trigger-notification",
+            "LambdaFunctionArn": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:etl-orchestrator-${RANDOM_SUFFIX}",
+            "Events": ["s3:ObjectCreated:*"],
+            "Filter": {
+                "Key": {
+                    "FilterRules": [
+                        {
+                            "Name": "prefix",
+                            "Value": "raw-data/"
+                        },
+                        {
+                            "Name": "suffix",
+                            "Value": ".csv"
+                        }
+                    ]
+                }
+            }
+        }
+    ]
+}
+EOF
+   
+   # Apply notification configuration to S3 bucket
+   aws s3api put-bucket-notification-configuration \
+       --bucket ${BUCKET_NAME} \
+       --notification-configuration file://s3_notification.json
    
    echo "✅ S3 event notification configured"
    ```
@@ -681,10 +680,16 @@ echo "✅ S3 bucket and directory structure created"
         response.json
     
     # Display response
-    cat response.json | jq '.'
+    cat response.json
     
-    # Get job run ID from response
-    JOB_RUN_ID=$(cat response.json | jq -r '.body' | jq -r '.job_run_id')
+    # Parse job run ID from response
+    JOB_RUN_ID=$(python3 -c "
+import json
+with open('response.json', 'r') as f:
+    data = json.load(f)
+    body = json.loads(data['body'])
+    print(body['job_run_id'])
+")
     echo "Job Run ID: $JOB_RUN_ID"
     
     # Monitor job status
@@ -702,6 +707,10 @@ echo "✅ S3 bucket and directory structure created"
             break
         elif [ "$JOB_STATUS" = "FAILED" ]; then
             echo "❌ ETL job failed"
+            aws glue get-job-run \
+                --job-name ${JOB_NAME} \
+                --run-id ${JOB_RUN_ID} \
+                --query 'JobRun.ErrorMessage' --output text
             break
         fi
         
@@ -733,7 +742,7 @@ echo "✅ S3 bucket and directory structure created"
 2. **Test data quality and transformations**:
 
    ```bash
-   # Create test query using Athena (if available)
+   # Create Athena query to validate processed data (if Athena is available)
    aws athena start-query-execution \
        --query-string "SELECT * FROM ${GLUE_DATABASE}.daily_sales LIMIT 10;" \
        --result-configuration "OutputLocation=s3://${BUCKET_NAME}/query-results/" \
@@ -764,6 +773,10 @@ echo "✅ S3 bucket and directory structure created"
 1. **Delete Glue resources**:
 
    ```bash
+   # Delete Glue trigger first
+   aws glue delete-trigger \
+       --name "start-etl-trigger-${RANDOM_SUFFIX}"
+   
    # Delete Glue job
    aws glue delete-job --job-name ${JOB_NAME}
    
@@ -773,7 +786,7 @@ echo "✅ S3 bucket and directory structure created"
    # Delete workflow
    aws glue delete-workflow --name ${WORKFLOW_NAME}
    
-   # Delete database
+   # Delete database and tables
    aws glue delete-database --name ${GLUE_DATABASE}
    
    echo "✅ Glue resources deleted"
@@ -792,7 +805,16 @@ echo "✅ S3 bucket and directory structure created"
 3. **Delete IAM roles and policies**:
 
    ```bash
-   # Detach and delete policies from Glue role
+   # Detach policies from Lambda role
+   aws iam detach-role-policy \
+       --role-name ${LAMBDA_ROLE} \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   
+   aws iam detach-role-policy \
+       --role-name ${LAMBDA_ROLE} \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/LambdaGlueAccessPolicy-${RANDOM_SUFFIX}
+   
+   # Detach policies from Glue role
    aws iam detach-role-policy \
        --role-name ${GLUE_ROLE} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
@@ -827,36 +849,36 @@ echo "✅ S3 bucket and directory structure created"
    # Clean up local files
    rm -f sales_data.csv customer_data.csv glue_etl_script.py
    rm -f lambda_function.py lambda_function.zip
-   rm -f s3_notification.json response.json
+   rm -f s3_notification.json response.json invalid_data.csv
    
    echo "✅ S3 bucket and local files cleaned up"
    ```
 
 ## Discussion
 
-This serverless ETL pipeline architecture demonstrates the power of combining AWS Glue and Lambda for scalable data processing workflows. AWS Glue provides the computational power for complex transformations using Apache Spark, while Lambda handles orchestration, monitoring, and lightweight processing tasks. This separation of concerns allows for optimal resource utilization and cost efficiency.
+This serverless ETL pipeline architecture demonstrates the power of combining AWS Glue and Lambda for scalable data processing workflows. AWS Glue provides the computational power for complex transformations using Apache Spark, while Lambda handles orchestration, monitoring, and lightweight processing tasks. This separation of concerns allows for optimal resource utilization and cost efficiency, particularly with AWS Glue 5.0's 32% performance improvement over previous versions.
 
-The solution leverages several key AWS services working together seamlessly. AWS Glue Data Catalog automatically discovers and catalogs data schemas, making them available for processing without manual intervention. The serverless nature means you only pay for actual compute time used, making it highly cost-effective for variable workloads. CloudWatch integration provides comprehensive monitoring and logging capabilities, essential for production ETL pipelines.
+The solution leverages several key AWS services working together seamlessly. AWS Glue Data Catalog automatically discovers and catalogs data schemas, making them available for processing without manual intervention. The serverless nature means you only pay for actual compute time used, making it highly cost-effective for variable workloads. CloudWatch integration provides comprehensive monitoring and logging capabilities, essential for production ETL pipelines. The updated AWS Glue 5.0 runtime includes Apache Spark 3.5, Python 3.11, and Java 17, providing significant performance enhancements.
 
-The architecture supports both batch and event-driven processing patterns. The scheduled triggers enable regular batch processing, while S3 event notifications allow for real-time processing as new data arrives. This flexibility is crucial for modern data architectures that need to handle both historical data processing and real-time streaming requirements. The built-in error handling and retry mechanisms ensure robust pipeline operations.
+The architecture supports both batch and event-driven processing patterns. The scheduled triggers enable regular batch processing, while S3 event notifications allow for real-time processing as new data arrives. This flexibility is crucial for modern data architectures that need to handle both historical data processing and real-time streaming requirements. The built-in error handling and retry mechanisms ensure robust pipeline operations. For production deployments, consider implementing AWS Glue job bookmarks for incremental processing and additional monitoring with custom CloudWatch metrics.
 
-Performance optimization is achieved through Glue's automatic scaling and Lambda's event-driven execution model. The solution can handle data volumes from gigabytes to petabytes without infrastructure changes. Security is maintained through IAM roles with least-privilege access, and data encryption is available at rest and in transit. For production deployments, consider implementing additional monitoring with custom CloudWatch metrics and alerts.
+Performance optimization is achieved through Glue's automatic scaling and Lambda's event-driven execution model. The solution can handle data volumes from gigabytes to petabytes without infrastructure changes. Security is maintained through IAM roles with least-privilege access, following [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles, and data encryption is available at rest and in transit. The Lambda function uses the current Python 3.12 runtime, ensuring long-term support until 2028.
 
-> **Tip**: Use AWS Glue job bookmarks to process only new or changed data in incremental ETL workflows, significantly reducing processing time and costs.
+> **Tip**: Use AWS Glue job bookmarks to process only new or changed data in incremental ETL workflows, significantly reducing processing time and costs. AWS Glue 5.0 also supports requirements.txt for additional Python libraries, making dependency management easier.
 
 ## Challenge
 
 Extend this serverless ETL pipeline by implementing these advanced features:
 
-1. **Data Quality Monitoring**: Add AWS Glue DataBrew or custom validation rules to detect and handle data quality issues, including duplicate detection, schema validation, and data profiling with automated alerts.
+1. **Data Quality Monitoring**: Add AWS Glue DataBrew or custom validation rules to detect and handle data quality issues, including duplicate detection, schema validation, and data profiling with automated alerts using Amazon SNS.
 
-2. **Multi-format Data Processing**: Extend the pipeline to handle JSON, Avro, and streaming data from Kinesis, implementing format-specific transformation logic and schema evolution support.
+2. **Multi-format Data Processing**: Extend the pipeline to handle JSON, Avro, and streaming data from Kinesis, implementing format-specific transformation logic and schema evolution support using AWS Glue 5.0's enhanced open table format capabilities.
 
-3. **Advanced Orchestration**: Implement AWS Step Functions to create complex workflow dependencies, parallel processing branches, and conditional logic based on data characteristics or processing results.
+3. **Advanced Orchestration**: Implement AWS Step Functions to create complex workflow dependencies, parallel processing branches, and conditional logic based on data characteristics or processing results, integrating with the existing Lambda orchestrator.
 
-4. **Real-time Processing**: Add Amazon Kinesis Data Analytics or AWS Glue streaming jobs to process real-time data streams alongside batch processing, creating a hybrid lambda architecture.
+4. **Real-time Processing**: Add Amazon Kinesis Data Analytics or AWS Glue streaming jobs to process real-time data streams alongside batch processing, creating a hybrid lambda architecture that leverages both real-time and batch processing patterns.
 
-5. **Cost Optimization**: Implement intelligent resource allocation using AWS Glue's auto-scaling features, Spot instances for development environments, and data lifecycle management with S3 storage classes and archiving strategies.
+5. **Cost Optimization and Performance**: Implement intelligent resource allocation using AWS Glue 5.0's auto-scaling features, leverage G.1X workers with enhanced storage, and implement data lifecycle management with S3 storage classes and archiving strategies to optimize both performance and costs.
 
 ## Infrastructure Code
 

@@ -1,0 +1,736 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Simple File Organization with S3 and Lambda - Automated file organization system 
+  that uses S3 event notifications to trigger Lambda functions for organizing uploaded 
+  files by type into structured folders. This serverless solution provides instant, 
+  scalable file management without manual intervention.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Configuration"
+        Parameters:
+          - BucketName
+          - LambdaFunctionName
+          - Environment
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+          - LambdaRuntime
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - EnableVersioning
+          - EnableEncryption
+          - StorageClass
+      - Label:
+          default: "Monitoring and Logging"
+        Parameters:
+          - LogRetentionInDays
+          - EnableDetailedMonitoring
+    ParameterLabels:
+      BucketName:
+        default: "S3 Bucket Name"
+      LambdaFunctionName:
+        default: "Lambda Function Name"
+      Environment:
+        default: "Environment Tag"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      LambdaRuntime:
+        default: "Lambda Runtime Version"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      EnableEncryption:
+        default: "Enable S3 Server-Side Encryption"
+      StorageClass:
+        default: "Default S3 Storage Class"
+      LogRetentionInDays:
+        default: "CloudWatch Log Retention"
+      EnableDetailedMonitoring:
+        default: "Enable Detailed CloudWatch Monitoring"
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: >
+      Name for the S3 bucket where files will be uploaded and organized. 
+      Must be globally unique and follow S3 naming conventions.
+    Default: !Sub 'file-organizer-${AWS::AccountId}-${AWS::Region}'
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: >
+      Bucket name must contain only lowercase letters, numbers, and hyphens. 
+      Must start and end with a letter or number.
+    MinLength: 3
+    MaxLength: 63
+
+  LambdaFunctionName:
+    Type: String
+    Description: Name for the Lambda function that will organize files
+    Default: 'file-organizer-function'
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: Function name must contain only letters, numbers, hyphens, and underscores
+    MinLength: 1
+    MaxLength: 64
+
+  Environment:
+    Type: String
+    Description: Environment tag for resource organization and cost tracking
+    Default: 'development'
+    AllowedValues:
+      - development
+      - staging
+      - production
+    ConstraintDescription: Must be development, staging, or production
+
+  LambdaTimeout:
+    Type: Number
+    Description: Lambda function timeout in seconds
+    Default: 60
+    MinValue: 3
+    MaxValue: 900
+    ConstraintDescription: Must be between 3 and 900 seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Description: Lambda function memory allocation in MB
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 1536, 2048, 3008]
+    ConstraintDescription: Must be a valid Lambda memory size
+
+  LambdaRuntime:
+    Type: String
+    Description: Python runtime version for Lambda function
+    Default: 'python3.12'
+    AllowedValues:
+      - python3.9
+      - python3.10
+      - python3.11
+      - python3.12
+    ConstraintDescription: Must be a supported Python runtime version
+
+  EnableVersioning:
+    Type: String
+    Description: Enable S3 bucket versioning for file safety and recovery
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableEncryption:
+    Type: String
+    Description: Enable S3 server-side encryption with AES-256
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  StorageClass:
+    Type: String
+    Description: Default storage class for organized files
+    Default: 'STANDARD'
+    AllowedValues:
+      - STANDARD
+      - STANDARD_IA
+      - ONEZONE_IA
+      - INTELLIGENT_TIERING
+    ConstraintDescription: Must be a valid S3 storage class
+
+  LogRetentionInDays:
+    Type: Number
+    Description: CloudWatch log retention period in days
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    ConstraintDescription: Must be a valid CloudWatch log retention period
+
+  EnableDetailedMonitoring:
+    Type: String
+    Description: Enable detailed CloudWatch monitoring for Lambda function
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  EnableVersioningCondition: !Equals [!Ref EnableVersioning, 'true']
+  EnableEncryptionCondition: !Equals [!Ref EnableEncryption, 'true']
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, 'production']
+
+Resources:
+  # S3 Bucket for file storage and organization
+  FileOrganizerBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: !If [EnableVersioningCondition, 'Enabled', 'Suspended']
+      BucketEncryption:
+        !If
+          - EnableEncryptionCondition
+          - ServerSideEncryptionConfiguration:
+              - ServerSideEncryptionByDefault:
+                  SSEAlgorithm: AES256
+                BucketKeyEnabled: true
+          - !Ref AWS::NoValue
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt FileOrganizerFunction.Arn
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            TransitionInDays: 90
+            StorageClass: GLACIER
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-file-organizer-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Automated File Organization'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # CloudWatch Log Group for Lambda function
+  FileOrganizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunctionName}'
+      RetentionInDays: !Ref LogRetentionInDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # IAM Role for Lambda execution
+  FileOrganizerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref AWS::Region
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3FileOrganizationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource: !Sub '${FileOrganizerBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt FileOrganizerBucket.Arn
+                Condition:
+                  StringEquals:
+                    's3:prefix': ['images/', 'documents/', 'videos/', 'other/']
+        - !If
+          - EnableDetailedMonitoringCondition
+          - PolicyName: CloudWatchDetailedMonitoring
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - cloudwatch:PutMetricData
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      'cloudwatch:namespace': 'AWS/Lambda'
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # Lambda function for file organization
+  FileOrganizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt FileOrganizerLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: !If [IsProductionEnvironment, 100, 10]
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref FileOrganizerBucket
+          LOG_LEVEL: !If [IsProductionEnvironment, 'INFO', 'DEBUG']
+          STORAGE_CLASS: !Ref StorageClass
+      DeadLetterQueue:
+        TargetArn: !GetAtt FileOrganizerDLQ.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from urllib.parse import unquote_plus
+          from typing import Dict, List
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          # Initialize AWS clients
+          s3_client = boto3.client('s3')
+
+          def lambda_handler(event: Dict, context) -> Dict:
+              """
+              Lambda handler for organizing uploaded files by type.
+              
+              Args:
+                  event: S3 event notification
+                  context: Lambda runtime context
+                  
+              Returns:
+                  Dict: Processing results
+              """
+              processed_files = []
+              failed_files = []
+              
+              try:
+                  # Process each S3 event record
+                  for record in event.get('Records', []):
+                      try:
+                          result = process_s3_record(record)
+                          if result['success']:
+                              processed_files.append(result)
+                          else:
+                              failed_files.append(result)
+                      except Exception as e:
+                          logger.error(f"Error processing record: {str(e)}")
+                          failed_files.append({
+                              'success': False,
+                              'error': str(e),
+                              'record': record
+                          })
+                  
+                  # Log summary
+                  logger.info(f"Processed {len(processed_files)} files successfully, {len(failed_files)} failed")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': {
+                          'processed': len(processed_files),
+                          'failed': len(failed_files),
+                          'details': {
+                              'successful': processed_files,
+                              'failed': failed_files
+                          }
+                      }
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Critical error in lambda_handler: {str(e)}")
+                  raise e
+
+          def process_s3_record(record: Dict) -> Dict:
+              """
+              Process individual S3 event record.
+              
+              Args:
+                  record: Individual S3 event record
+                  
+              Returns:
+                  Dict: Processing result
+              """
+              bucket = record['s3']['bucket']['name']
+              key = unquote_plus(record['s3']['object']['key'])
+              
+              logger.debug(f"Processing file: {key} in bucket: {bucket}")
+              
+              # Skip if file is already organized
+              if is_already_organized(key):
+                  logger.info(f"File {key} is already organized, skipping")
+                  return {'success': True, 'action': 'skipped', 'file': key, 'reason': 'already_organized'}
+              
+              # Skip folder placeholder files
+              if key.endswith('/.gitkeep') or key.endswith('/'):
+                  logger.info(f"Skipping folder placeholder: {key}")
+                  return {'success': True, 'action': 'skipped', 'file': key, 'reason': 'placeholder_file'}
+              
+              # Determine target folder
+              folder = get_folder_for_file(key)
+              new_key = f"{folder}/{key}"
+              
+              # Move file to organized location
+              try:
+                  move_s3_object(bucket, key, new_key)
+                  logger.info(f"Successfully moved {key} to {new_key}")
+                  return {
+                      'success': True,
+                      'action': 'moved',
+                      'source': key,
+                      'destination': new_key,
+                      'folder': folder
+                  }
+              except Exception as e:
+                  logger.error(f"Failed to move {key}: {str(e)}")
+                  return {
+                      'success': False,
+                      'action': 'move_failed',
+                      'file': key,
+                      'error': str(e)
+                  }
+
+          def is_already_organized(key: str) -> bool:
+              """Check if file is already in an organized folder."""
+              organized_folders = ['images', 'documents', 'videos', 'other']
+              if '/' in key:
+                  first_part = key.split('/')[0]
+                  return first_part in organized_folders
+              return False
+
+          def get_folder_for_file(filename: str) -> str:
+              """
+              Determine target folder based on file extension.
+              
+              Args:
+                  filename: Name of the file
+                  
+              Returns:
+                  str: Target folder name
+              """
+              # Extract file extension
+              extension = filename.lower().split('.')[-1] if '.' in filename else ''
+              
+              # Define file type mappings
+              file_type_mapping = {
+                  'images': [
+                      'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff', 'tif',
+                      'svg', 'webp', 'ico', 'psd', 'ai', 'eps', 'raw',
+                      'cr2', 'nef', 'orf', 'sr2', 'heic', 'heif'
+                  ],
+                  'documents': [
+                      'pdf', 'doc', 'docx', 'txt', 'rtf', 'odt', 'pages',
+                      'xls', 'xlsx', 'ods', 'numbers', 'ppt', 'pptx',
+                      'odp', 'keynote', 'csv', 'tsv', 'json', 'xml',
+                      'html', 'htm', 'md', 'tex', 'epub', 'mobi'
+                  ],
+                  'videos': [
+                      'mp4', 'avi', 'mov', 'wmv', 'flv', 'webm', 'mkv',
+                      'm4v', '3gp', 'ogv', 'mts', 'm2ts', 'ts', 'vob',
+                      'asf', 'rm', 'rmvb', 'divx', 'xvid', 'f4v'
+                  ]
+              }
+              
+              # Find matching folder
+              for folder, extensions in file_type_mapping.items():
+                  if extension in extensions:
+                      return folder
+              
+              # Default to 'other' for unrecognized extensions
+              return 'other'
+
+          def move_s3_object(bucket: str, source_key: str, dest_key: str) -> None:
+              """
+              Move S3 object by copying to new location and deleting original.
+              
+              Args:
+                  bucket: S3 bucket name
+                  source_key: Source object key
+                  dest_key: Destination object key
+              """
+              storage_class = os.environ.get('STORAGE_CLASS', 'STANDARD')
+              
+              # Copy object to new location
+              copy_source = {'Bucket': bucket, 'Key': source_key}
+              s3_client.copy_object(
+                  CopySource=copy_source,
+                  Bucket=bucket,
+                  Key=dest_key,
+                  StorageClass=storage_class,
+                  MetadataDirective='COPY'
+              )
+              
+              # Delete original object
+              s3_client.delete_object(Bucket=bucket, Key=source_key)
+              
+              logger.debug(f"Moved {source_key} to {dest_key} with storage class {storage_class}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-file-organizer-function'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Automated File Organization'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # Dead Letter Queue for failed Lambda invocations
+  FileOrganizerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-file-organizer-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-dlq'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # Lambda permission for S3 to invoke the function
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FileOrganizerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt FileOrganizerBucket.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  # CloudWatch Alarm for Lambda errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-lambda-errors'
+      AlarmDescription: 'Monitor Lambda function errors for file organization'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FileOrganizerFunction
+      AlarmActions:
+        - !Ref FileOrganizerSNSTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Lambda duration
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProductionEnvironment
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-lambda-duration'
+      AlarmDescription: 'Monitor Lambda function duration for performance'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FileOrganizerFunction
+      AlarmActions:
+        - !Ref FileOrganizerSNSTopic
+      TreatMissingData: notBreaching
+
+  # SNS Topic for CloudWatch alarms
+  FileOrganizerSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alerts'
+      DisplayName: 'File Organizer Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-sns-topic'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # Custom Resource to create folder structure
+  FolderStructureCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt FolderCreatorFunction.Arn
+      BucketName: !Ref FileOrganizerBucket
+
+  # Lambda function to create folder structure
+  FolderCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-folder-creator'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt FolderCreatorRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          s3_client = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              try:
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  
+                  if event['RequestType'] == 'Create':
+                      create_folder_structure(bucket_name)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  elif event['RequestType'] == 'Delete':
+                      # Cleanup is handled by S3 bucket deletion
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+          def create_folder_structure(bucket_name):
+              folders = [
+                  ('images/', 'Images will be automatically organized here'),
+                  ('documents/', 'Documents will be automatically organized here'),
+                  ('videos/', 'Videos will be automatically organized here'),
+                  ('other/', 'Other files will be automatically organized here')
+              ]
+              
+              for folder, description in folders:
+                  key = f"{folder}.gitkeep"
+                  s3_client.put_object(
+                      Bucket=bucket_name,
+                      Key=key,
+                      Body=description.encode('utf-8'),
+                      ContentType='text/plain'
+                  )
+                  logger.info(f"Created folder: {folder}")
+
+  # IAM Role for folder creator function
+  FolderCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3FolderCreationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${FileOrganizerBucket}/*'
+
+Outputs:
+  BucketName:
+    Description: 'Name of the S3 bucket for file organization'
+    Value: !Ref FileOrganizerBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  BucketArn:
+    Description: 'ARN of the S3 bucket'
+    Value: !GetAtt FileOrganizerBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  BucketDomainName:
+    Description: 'Domain name of the S3 bucket'
+    Value: !GetAtt FileOrganizerBucket.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketDomainName'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function that organizes files'
+    Value: !Ref FileOrganizerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt FileOrganizerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt FileOrganizerLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRoleArn'
+
+  CloudWatchLogGroup:
+    Description: 'CloudWatch Log Group for Lambda function'
+    Value: !Ref FileOrganizerLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  SNSTopicArn:
+    Description: 'SNS Topic ARN for alerts and notifications'
+    Value: !Ref FileOrganizerSNSTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  DeadLetterQueueUrl:
+    Description: 'URL of the Dead Letter Queue for failed invocations'
+    Value: !Ref FileOrganizerDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQUrl'
+
+  UploadCommand:
+    Description: 'Sample AWS CLI command to upload a test file'
+    Value: !Sub 'aws s3 cp your-file.jpg s3://${FileOrganizerBucket}/'
+
+  TestCommands:
+    Description: 'Commands to test the file organization system'
+    Value: !Sub |
+      # Upload test files:
+      echo "Test image" > test.jpg && aws s3 cp test.jpg s3://${FileOrganizerBucket}/
+      echo "Test document" > test.pdf && aws s3 cp test.pdf s3://${FileOrganizerBucket}/
+      
+      # Check organization after upload:
+      aws s3 ls s3://${FileOrganizerBucket}/ --recursive
+
+  MonitoringDashboard:
+    Description: 'CloudWatch Dashboard URL for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-file-organizer'

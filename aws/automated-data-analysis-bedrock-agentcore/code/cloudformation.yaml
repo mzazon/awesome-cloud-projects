@@ -1,0 +1,1030 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated Data Analysis with Bedrock AgentCore Runtime
+  Creates a serverless data analysis pipeline that automatically processes datasets
+  uploaded to S3 using AWS Bedrock AgentCore with Code Interpreter capabilities.
+  
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'DataAnalysisAutomation'
+    Description: 'Name prefix for all resources created by this stack'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    MaxLength: 30
+    
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'test'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment name for resource tagging and naming'
+    
+  DatasetPrefix:
+    Type: String
+    Default: 'datasets/'
+    Description: 'S3 prefix for dataset uploads that trigger analysis'
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds (60-900)'
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: 'Lambda function memory allocation in MB'
+    
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable S3 bucket versioning for data protection'
+    
+  RetentionPeriod:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 2555
+    Description: 'CloudWatch Logs retention period in days'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, 'true']
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - DatasetPrefix
+          - EnableVersioning
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - RetentionPeriod
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      DatasetPrefix:
+        default: "Dataset S3 Prefix"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory (MB)"
+      RetentionPeriod:
+        default: "Log Retention (days)"
+
+Resources:
+  # S3 Bucket for Input Datasets
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-input-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, 'Enabled', 'Suspended']
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              TransitionInDays: 30
+              StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              TransitionInDays: 90
+              StorageClass: GLACIER
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt DataAnalysisOrchestrator.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref DatasetPrefix
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-bucket-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'DataAnalysisInput'
+        - Key: CostCenter
+          Value: !Ref ProjectName
+
+  # S3 Bucket for Analysis Results
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-results-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, 'Enabled', 'Suspended']
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              TransitionInDays: 30
+              StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              TransitionInDays: 90
+              StorageClass: GLACIER
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-results-bucket-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'DataAnalysisResults'
+        - Key: CostCenter
+          Value: !Ref ProjectName
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref AWS::Region
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAgentCoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:CreateCodeInterpreter'
+                  - 'bedrock-agentcore:StartCodeInterpreterSession'
+                  - 'bedrock-agentcore:InvokeCodeInterpreter'
+                  - 'bedrock-agentcore:StopCodeInterpreterSession'
+                  - 'bedrock-agentcore:DeleteCodeInterpreter'
+                  - 'bedrock-agentcore:ListCodeInterpreters'
+                  - 'bedrock-agentcore:GetCodeInterpreter'
+                  - 'bedrock-agentcore:GetCodeInterpreterSession'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref AWS::Region
+        - PolicyName: S3DataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource:
+                  - !Sub '${DataBucket}/*'
+                  - !Sub '${ResultsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource:
+                  - !Ref DataBucket
+                  - !Ref ResultsBucket
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': !Sub '${ProjectName}/DataAnalysis'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'LambdaExecution'
+
+  # CloudWatch Log Group for Lambda
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-orchestrator-${Environment}'
+      RetentionInDays: !Ref RetentionPeriod
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'LambdaLogging'
+
+  # Lambda Function for Data Analysis Orchestration
+  DataAnalysisOrchestrator:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-orchestrator-${Environment}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: !If [IsProduction, 10, 5]
+      Environment:
+        Variables:
+          RESULTS_BUCKET_NAME: !Ref ResultsBucket
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+      DeadLetterQueue:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          import time
+          from urllib.parse import unquote_plus
+          from typing import Dict, Any, Optional
+          
+          # Configure logging
+          logger = logging.getLogger()
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger.setLevel(getattr(logging, log_level))
+          
+          # Initialize AWS clients with error handling
+          try:
+              s3 = boto3.client('s3')
+              bedrock_agentcore = boto3.client('bedrock-agentcore')
+              cloudwatch = boto3.client('cloudwatch')
+          except Exception as e:
+              logger.error(f"Failed to initialize AWS clients: {str(e)}")
+              raise
+          
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Orchestrates automated data analysis using Bedrock AgentCore
+              
+              Args:
+                  event: S3 event notification
+                  context: Lambda context object
+                  
+              Returns:
+                  Dict containing status and processing results
+              """
+              try:
+                  logger.info(f"Processing event: {json.dumps(event, default=str)}")
+                  
+                  processed_files = []
+                  
+                  # Process each S3 record in the event
+                  for record in event.get('Records', []):
+                      if record.get('eventSource') != 'aws:s3':
+                          logger.warning(f"Skipping non-S3 event: {record.get('eventSource')}")
+                          continue
+                      
+                      bucket_name = record['s3']['bucket']['name']
+                      object_key = unquote_plus(record['s3']['object']['key'])
+                      
+                      logger.info(f"Processing file: {object_key} from bucket: {bucket_name}")
+                      
+                      try:
+                          # Process the individual file
+                          result = process_data_file(bucket_name, object_key, context)
+                          processed_files.append(result)
+                          
+                          # Send custom CloudWatch metric
+                          send_metric('FileProcessed', 1, 'Count')
+                          
+                      except Exception as file_error:
+                          logger.error(f"Error processing file {object_key}: {str(file_error)}")
+                          send_metric('ProcessingError', 1, 'Count')
+                          processed_files.append({
+                              'file': object_key,
+                              'status': 'error',
+                              'error': str(file_error)
+                          })
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Analysis processing completed',
+                          'processed_files': processed_files,
+                          'total_files': len(processed_files)
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Critical error in lambda_handler: {str(e)}")
+                  send_metric('CriticalError', 1, 'Count')
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Internal processing error',
+                          'message': str(e)
+                      })
+                  }
+          
+          def process_data_file(bucket_name: str, object_key: str, context: Any) -> Dict[str, Any]:
+              """
+              Process individual data file using Bedrock AgentCore
+              
+              Args:
+                  bucket_name: S3 bucket name
+                  object_key: S3 object key
+                  context: Lambda context
+                  
+              Returns:
+                  Dict containing processing results
+              """
+              session_id = None
+              
+              try:
+                  # Determine file type and generate appropriate analysis code
+                  file_extension = object_key.split('.')[-1].lower()
+                  analysis_code = generate_analysis_code(file_extension, bucket_name, object_key)
+                  
+                  logger.info(f"Generated analysis code for {file_extension} file")
+                  
+                  # Create AgentCore session with timeout handling
+                  session_response = bedrock_agentcore.start_code_interpreter_session(
+                      codeInterpreterIdentifier='aws.codeinterpreter.v1',
+                      name=f'DataAnalysis-{int(time.time())}-{context.aws_request_id[:8]}',
+                      sessionTimeoutSeconds=min(900, context.get_remaining_time_in_millis() // 1000 - 30)
+                  )
+                  session_id = session_response['sessionId']
+                  
+                  logger.info(f"Started AgentCore session: {session_id}")
+                  
+                  # Execute the analysis code
+                  execution_response = bedrock_agentcore.invoke_code_interpreter(
+                      codeInterpreterIdentifier='aws.codeinterpreter.v1',
+                      sessionId=session_id,
+                      name='executeDataAnalysis',
+                      arguments={
+                          'language': 'python',
+                          'code': analysis_code
+                      }
+                  )
+                  
+                  logger.info(f"Analysis execution completed for {object_key}")
+                  
+                  # Store comprehensive results
+                  results_key = f"analysis-results/{object_key.replace('.', '_')}_analysis_{int(time.time())}.json"
+                  result_metadata = {
+                      'source_file': object_key,
+                      'source_bucket': bucket_name,
+                      'session_id': session_id,
+                      'analysis_timestamp': time.time(),
+                      'request_id': context.aws_request_id,
+                      'execution_status': 'completed',
+                      'file_type': file_extension,
+                      'execution_response': execution_response,
+                      'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                      'project_name': os.environ.get('PROJECT_NAME', 'unknown')
+                  }
+                  
+                  # Upload results to S3
+                  s3.put_object(
+                      Bucket=os.environ['RESULTS_BUCKET_NAME'],
+                      Key=results_key,
+                      Body=json.dumps(result_metadata, indent=2, default=str),
+                      ContentType='application/json',
+                      Metadata={
+                          'source-file': object_key,
+                          'analysis-type': file_extension,
+                          'session-id': session_id
+                      }
+                  )
+                  
+                  return {
+                      'file': object_key,
+                      'status': 'completed',
+                      'session_id': session_id,
+                      'results_location': f"s3://{os.environ['RESULTS_BUCKET_NAME']}/{results_key}"
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing file {object_key}: {str(e)}")
+                  return {
+                      'file': object_key,
+                      'status': 'error',
+                      'error': str(e),
+                      'session_id': session_id
+                  }
+                  
+              finally:
+                  # Always clean up AgentCore session
+                  if session_id:
+                      try:
+                          bedrock_agentcore.stop_code_interpreter_session(
+                              codeInterpreterIdentifier='aws.codeinterpreter.v1',
+                              sessionId=session_id
+                          )
+                          logger.info(f"Cleaned up session: {session_id}")
+                      except Exception as cleanup_error:
+                          logger.warning(f"Failed to cleanup session {session_id}: {str(cleanup_error)}")
+          
+          def generate_analysis_code(file_type: str, bucket_name: str, object_key: str) -> str:
+              """
+              Generate appropriate analysis code based on file type
+              
+              Args:
+                  file_type: File extension (csv, json, etc.)
+                  bucket_name: S3 bucket name
+                  object_key: S3 object key
+                  
+              Returns:
+                  String containing Python code for analysis
+              """
+              base_code = f"""
+          import pandas as pd
+          import matplotlib.pyplot as plt
+          import seaborn as sns
+          import boto3
+          import io
+          import json
+          import numpy as np
+          from datetime import datetime
+          
+          # Configure matplotlib for non-interactive backend
+          plt.switch_backend('Agg')
+          
+          # Download the file from S3
+          s3 = boto3.client('s3')
+          print(f"Downloading file: {object_key} from bucket: {bucket_name}")
+          obj = s3.get_object(Bucket='{bucket_name}', Key='{object_key}')
+          """
+              
+              if file_type in ['csv']:
+                  analysis_code = base_code + """
+          # Read and analyze CSV file
+          try:
+              df = pd.read_csv(io.BytesIO(obj['Body'].read()))
+              
+              print("=" * 60)
+              print("AUTOMATED DATA ANALYSIS REPORT")
+              print("=" * 60)
+              print(f"Analysis Timestamp: {datetime.now().isoformat()}")
+              print(f"Dataset: {object_key}")
+              print("=" * 60)
+              
+              # Dataset Overview
+              print("\\n📊 DATASET OVERVIEW")
+              print("-" * 30)
+              print(f"Shape: {df.shape[0]:,} rows × {df.shape[1]:,} columns")
+              print(f"Memory Usage: {df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
+              print(f"Columns: {list(df.columns)}")
+              
+              # Data Types Analysis
+              print("\\n🔍 DATA TYPES ANALYSIS")
+              print("-" * 30)
+              type_counts = df.dtypes.value_counts()
+              for dtype, count in type_counts.items():
+                  print(f"{dtype}: {count} columns")
+              
+              # Missing Values Analysis
+              print("\\n❌ MISSING VALUES ANALYSIS")
+              print("-" * 30)
+              missing_data = df.isnull().sum()
+              missing_percent = (missing_data / len(df)) * 100
+              missing_df = pd.DataFrame({
+                  'Missing Count': missing_data,
+                  'Missing Percentage': missing_percent
+              }).sort_values('Missing Count', ascending=False)
+              
+              if missing_data.sum() > 0:
+                  print(missing_df[missing_df['Missing Count'] > 0])
+              else:
+                  print("✅ No missing values found!")
+              
+              # Statistical Summary
+              print("\\n📈 STATISTICAL SUMMARY")
+              print("-" * 30)
+              numeric_cols = df.select_dtypes(include=[np.number]).columns
+              if len(numeric_cols) > 0:
+                  print(df[numeric_cols].describe())
+                  
+                  # Generate visualizations
+                  print("\\n📊 GENERATING VISUALIZATIONS")
+                  print("-" * 30)
+                  
+                  # Create subplot layout
+                  n_cols = min(len(numeric_cols), 4)
+                  n_rows = (len(numeric_cols) + n_cols - 1) // n_cols
+                  
+                  plt.figure(figsize=(16, 4 * n_rows))
+                  
+                  for i, col in enumerate(numeric_cols[:8], 1):  # Limit to 8 columns
+                      plt.subplot(n_rows, n_cols, i)
+                      
+                      # Create histogram with statistics
+                      data = df[col].dropna()
+                      plt.hist(data, bins=min(30, len(data.unique())), alpha=0.7, color='skyblue', edgecolor='black')
+                      plt.title(f'Distribution of {col}\\nMean: {data.mean():.2f}, Std: {data.std():.2f}')
+                      plt.xlabel(col)
+                      plt.ylabel('Frequency')
+                      plt.grid(True, alpha=0.3)
+                  
+                  plt.tight_layout()
+                  plt.savefig('/tmp/data_analysis_distributions.png', dpi=150, bbox_inches='tight')
+                  print("✅ Distribution plots saved")
+                  
+                  # Correlation analysis for numeric columns
+                  if len(numeric_cols) > 1:
+                      plt.figure(figsize=(12, 10))
+                      correlation_matrix = df[numeric_cols].corr()
+                      sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', center=0,
+                                square=True, fmt='.2f', cbar_kws={"shrink": .8})
+                      plt.title('Correlation Matrix of Numeric Variables')
+                      plt.tight_layout()
+                      plt.savefig('/tmp/correlation_matrix.png', dpi=150, bbox_inches='tight')
+                      print("✅ Correlation matrix saved")
+              
+              # Categorical Analysis
+              categorical_cols = df.select_dtypes(include=['object', 'category']).columns
+              if len(categorical_cols) > 0:
+                  print("\\n🏷️ CATEGORICAL ANALYSIS")
+                  print("-" * 30)
+                  for col in categorical_cols[:5]:  # Limit to 5 columns
+                      unique_count = df[col].nunique()
+                      print(f"\\n{col}:")
+                      print(f"  Unique values: {unique_count}")
+                      if unique_count <= 20:
+                          value_counts = df[col].value_counts().head(10)
+                          print(f"  Top values: {dict(value_counts)}")
+              
+              # Data Quality Insights
+              print("\\n🎯 DATA QUALITY INSIGHTS")
+              print("-" * 30)
+              total_cells = df.shape[0] * df.shape[1]
+              missing_cells = df.isnull().sum().sum()
+              completeness = ((total_cells - missing_cells) / total_cells) * 100
+              print(f"Data Completeness: {completeness:.2f}%")
+              
+              # Duplicate analysis
+              duplicate_count = df.duplicated().sum()
+              print(f"Duplicate Rows: {duplicate_count} ({(duplicate_count/len(df)*100):.2f}%)")
+              
+              print("\\n" + "=" * 60)
+              print("ANALYSIS COMPLETED SUCCESSFULLY!")
+              print("=" * 60)
+              
+          except Exception as e:
+              print(f"Error analyzing CSV file: {str(e)}")
+              import traceback
+              traceback.print_exc()
+          """
+              
+              elif file_type in ['json']:
+                  analysis_code = base_code + """
+          # Read and analyze JSON file
+          try:
+              data = json.loads(obj['Body'].read().decode('utf-8'))
+              
+              print("=" * 60)
+              print("JSON DATA ANALYSIS REPORT")
+              print("=" * 60)
+              print(f"Analysis Timestamp: {datetime.now().isoformat()}")
+              print(f"Dataset: {object_key}")
+              print("=" * 60)
+              
+              print("\\n🔍 JSON STRUCTURE ANALYSIS")
+              print("-" * 30)
+              print(f"Root data type: {type(data).__name__}")
+              
+              if isinstance(data, dict):
+                  print(f"Dictionary with {len(data)} keys")
+                  print(f"Keys: {list(data.keys())[:10]}{'...' if len(data) > 10 else ''}")
+                  
+                  # Analyze nested structure
+                  for key, value in list(data.items())[:5]:
+                      print(f"  {key}: {type(value).__name__}")
+                      if isinstance(value, (list, dict)):
+                          if isinstance(value, list) and len(value) > 0:
+                              print(f"    List length: {len(value)}, First item type: {type(value[0]).__name__}")
+                          elif isinstance(value, dict):
+                              print(f"    Dict with {len(value)} keys")
+              
+              elif isinstance(data, list):
+                  print(f"List with {len(data)} items")
+                  if len(data) > 0:
+                      print(f"First item type: {type(data[0]).__name__}")
+                      if isinstance(data[0], dict):
+                          print(f"Sample keys from first item: {list(data[0].keys())[:10]}")
+                      
+                      # Try to convert to DataFrame if it's a list of dicts
+                      if isinstance(data[0], dict):
+                          try:
+                              df = pd.DataFrame(data)
+                              print(f"\\n📊 CONVERTED TO DATAFRAME")
+                              print(f"Shape: {df.shape}")
+                              print(f"Columns: {list(df.columns)[:10]}")
+                              
+                              # Basic statistics for converted DataFrame
+                              numeric_cols = df.select_dtypes(include=[np.number]).columns
+                              if len(numeric_cols) > 0:
+                                  print("\\nNumeric columns summary:")
+                                  print(df[numeric_cols].describe())
+                          except Exception as conv_error:
+                              print(f"Could not convert to DataFrame: {conv_error}")
+              
+              # Memory usage estimation
+              import sys
+              size_bytes = sys.getsizeof(json.dumps(data))
+              print(f"\\n💾 MEMORY USAGE")
+              print(f"Estimated size: {size_bytes / 1024**2:.2f} MB")
+              
+              print("\\n" + "=" * 60)
+              print("JSON ANALYSIS COMPLETED!")
+              print("=" * 60)
+              
+          except Exception as e:
+              print(f"Error analyzing JSON file: {str(e)}")
+              import traceback
+              traceback.print_exc()
+          """
+              
+              elif file_type in ['xlsx', 'xls']:
+                  analysis_code = base_code + """
+          # Read and analyze Excel file
+          try:
+              # Read Excel file
+              xl_file = pd.ExcelFile(io.BytesIO(obj['Body'].read()))
+              
+              print("=" * 60)
+              print("EXCEL FILE ANALYSIS REPORT")
+              print("=" * 60)
+              print(f"Analysis Timestamp: {datetime.now().isoformat()}")
+              print(f"Dataset: {object_key}")
+              print("=" * 60)
+              
+              print(f"\\n📊 EXCEL FILE OVERVIEW")
+              print("-" * 30)
+              print(f"Number of sheets: {len(xl_file.sheet_names)}")
+              print(f"Sheet names: {xl_file.sheet_names}")
+              
+              # Analyze each sheet
+              for sheet_name in xl_file.sheet_names[:3]:  # Limit to first 3 sheets
+                  print(f"\\n📋 ANALYZING SHEET: {sheet_name}")
+                  print("-" * 40)
+                  
+                  df = pd.read_excel(xl_file, sheet_name=sheet_name)
+                  print(f"Shape: {df.shape}")
+                  print(f"Columns: {list(df.columns)}")
+                  
+                  # Basic statistics
+                  numeric_cols = df.select_dtypes(include=[np.number]).columns
+                  if len(numeric_cols) > 0:
+                      print("Numeric columns summary:")
+                      print(df[numeric_cols].describe())
+              
+              print("\\n" + "=" * 60)
+              print("EXCEL ANALYSIS COMPLETED!")
+              print("=" * 60)
+              
+          except Exception as e:
+              print(f"Error analyzing Excel file: {str(e)}")
+              import traceback
+              traceback.print_exc()
+          """
+              
+              else:
+                  analysis_code = base_code + """
+          # Generic file analysis
+          try:
+              print("=" * 60)
+              print("GENERIC FILE ANALYSIS REPORT")
+              print("=" * 60)
+              print(f"Analysis Timestamp: {datetime.now().isoformat()}")
+              print(f"Dataset: {object_key}")
+              print("=" * 60)
+              
+              print("\\n📁 FILE PROPERTIES")
+              print("-" * 30)
+              print(f"File size: {obj['ContentLength']:,} bytes ({obj['ContentLength'] / 1024**2:.2f} MB)")
+              print(f"Content type: {obj.get('ContentType', 'Unknown')}")
+              print(f"Last modified: {obj.get('LastModified', 'Unknown')}")
+              print(f"File extension: {object_key.split('.')[-1] if '.' in object_key else 'None'}")
+              
+              # Try to read first few lines as text
+              try:
+                  content = obj['Body'].read(1024).decode('utf-8', errors='ignore')
+                  print("\\n📄 FIRST 1024 CHARACTERS:")
+                  print("-" * 30)
+                  print(content)
+              except Exception as read_error:
+                  print(f"Could not read file content as text: {read_error}")
+              
+              print("\\n" + "=" * 60)
+              print("GENERIC ANALYSIS COMPLETED!")
+              print("=" * 60)
+              
+          except Exception as e:
+              print(f"Error in generic file analysis: {str(e)}")
+              import traceback
+              traceback.print_exc()
+          """
+              
+              return analysis_code
+          
+          def send_metric(metric_name: str, value: float, unit: str) -> None:
+              """
+              Send custom CloudWatch metric
+              
+              Args:
+                  metric_name: Name of the metric
+                  value: Metric value
+                  unit: Metric unit
+              """
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace=f"{os.environ.get('PROJECT_NAME', 'DataAnalysis')}/Automation",
+                      MetricData=[
+                          {
+                              'MetricName': metric_name,
+                              'Value': value,
+                              'Unit': unit,
+                              'Dimensions': [
+                                  {
+                                      'Name': 'Environment',
+                                      'Value': os.environ.get('ENVIRONMENT', 'unknown')
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  logger.warning(f"Failed to send CloudWatch metric {metric_name}: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-orchestrator-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'DataAnalysisOrchestration'
+
+  # Lambda Permission for S3 to Invoke Function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataAnalysisOrchestrator
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${DataBucket}'
+      SourceAccount: !Ref AWS::AccountId
+
+  # Dead Letter Queue for Failed Lambda Executions
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 60
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dlq-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'ErrorHandling'
+
+  # CloudWatch Dashboard for Monitoring
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-monitoring-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${DataAnalysisOrchestrator}"],
+                  [".", "Duration", ".", "."],
+                  [".", "Errors", ".", "."],
+                  [".", "Throttles", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${ProjectName}/Automation", "FileProcessed", "Environment", "${Environment}"],
+                  [".", "ProcessingError", ".", "."],
+                  [".", "CriticalError", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Data Analysis Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${LambdaLogGroup}'\n| fields @timestamp, @message\n| filter @message like /Processing file/\n| sort @timestamp desc\n| limit 50",
+                "region": "${AWS::Region}",
+                "title": "Recent Analysis Activities",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for Monitoring
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-error-rate-${Environment}'
+      AlarmDescription: 'Alarm when Lambda function error rate is high'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataAnalysisOrchestrator
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-error-alarm-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 Bucket Policy for Cross-Account Access (if needed)
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${DataBucket}/*'
+              - !Ref DataBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  ResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ResultsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${ResultsBucket}/*'
+              - !Ref ResultsBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+Outputs:
+  DataBucketName:
+    Description: 'Name of the S3 bucket for input datasets'
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucket'
+
+  ResultsBucketName:
+    Description: 'Name of the S3 bucket for analysis results'
+    Value: !Ref ResultsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ResultsBucket'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function for data analysis orchestration'
+    Value: !GetAtt DataAnalysisOrchestrator.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaArn'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function for data analysis orchestration'
+    Value: !Ref DataAnalysisOrchestrator
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaName'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-monitoring-${Environment}'
+
+  DataUploadInstructions:
+    Description: 'Instructions for uploading data files'
+    Value: !Sub 'Upload files to s3://${DataBucket}/${DatasetPrefix} to trigger automatic analysis'
+
+  LogGroupName:
+    Description: 'CloudWatch Log Group for Lambda function logs'
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  IAMRoleArn:
+    Description: 'ARN of the IAM role used by Lambda function'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRole'
+
+  DeadLetterQueueURL:
+    Description: 'URL of the Dead Letter Queue for failed executions'
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQ'
+
+  StackInfo:
+    Description: 'Stack deployment information'
+    Value: !Sub |
+      Stack: ${AWS::StackName}
+      Region: ${AWS::Region}
+      Environment: ${Environment}
+      Project: ${ProjectName}
+      Created: ${AWS::CurrentTime}

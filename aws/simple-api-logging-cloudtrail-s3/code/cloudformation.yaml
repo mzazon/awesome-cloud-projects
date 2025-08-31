@@ -1,0 +1,588 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Simple API Logging with CloudTrail and S3
+  Creates a comprehensive audit logging solution that captures all AWS API calls
+  and stores them securely in S3 with real-time monitoring through CloudWatch.
+  
+  This template implements security best practices including encryption,
+  access controls, and automated alerting for root account usage.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Naming Configuration"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+      - Label:
+          default: "CloudTrail Configuration"
+        Parameters:
+          - EnableMultiRegionTrail
+          - IncludeGlobalServiceEvents
+          - EnableLogFileValidation
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - S3BucketRetentionDays
+          - CloudWatchLogsRetentionDays
+          - EnableS3LifecyclePolicy
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableRootAccountMonitoring
+          - NotificationEmail
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - S3EncryptionType
+          - KMSKeyId
+    ParameterLabels:
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+      Environment:
+        default: "Environment Name"
+      EnableMultiRegionTrail:
+        default: "Enable Multi-Region Trail"
+      IncludeGlobalServiceEvents:
+        default: "Include Global Service Events"
+      EnableLogFileValidation:
+        default: "Enable Log File Validation"
+      S3BucketRetentionDays:
+        default: "S3 Log Retention (Days)"
+      CloudWatchLogsRetentionDays:
+        default: "CloudWatch Logs Retention (Days)"
+      EnableS3LifecyclePolicy:
+        default: "Enable S3 Lifecycle Policy"
+      EnableRootAccountMonitoring:
+        default: "Enable Root Account Monitoring"
+      NotificationEmail:
+        default: "Email for Alerts"
+      S3EncryptionType:
+        default: "S3 Encryption Type"
+      KMSKeyId:
+        default: "KMS Key ID (if using KMS)"
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: cloudtrail-logging
+    Description: Prefix for all resource names to ensure uniqueness
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: ^[a-z][a-z0-9-]*$
+    ConstraintDescription: Must start with lowercase letter and contain only lowercase letters, numbers, and hyphens
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name for resource tagging
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: Must be one of dev, test, staging, or prod
+
+  EnableMultiRegionTrail:
+    Type: String
+    Default: 'true'
+    Description: Enable logging for all AWS regions
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+
+  IncludeGlobalServiceEvents:
+    Type: String
+    Default: 'true'
+    Description: Include events from global services like IAM, CloudFront
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+
+  EnableLogFileValidation:
+    Type: String
+    Default: 'true'
+    Description: Enable log file integrity validation
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+
+  S3BucketRetentionDays:
+    Type: Number
+    Default: 2555
+    Description: Number of days to retain CloudTrail logs in S3 (default is 7 years for compliance)
+    MinValue: 1
+    MaxValue: 2555
+    ConstraintDescription: Must be between 1 and 2555 days
+
+  CloudWatchLogsRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Number of days to retain logs in CloudWatch Logs
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    ConstraintDescription: Must be a valid CloudWatch Logs retention period
+
+  EnableS3LifecyclePolicy:
+    Type: String
+    Default: 'true'
+    Description: Enable S3 lifecycle policy for cost optimization
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+
+  EnableRootAccountMonitoring:
+    Type: String
+    Default: 'true'
+    Description: Enable CloudWatch alarm for root account usage
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for security alerts (optional)
+    AllowedPattern: ^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address or empty
+
+  S3EncryptionType:
+    Type: String
+    Default: AES256
+    Description: S3 server-side encryption type
+    AllowedValues:
+      - AES256
+      - aws:kms
+    ConstraintDescription: Must be AES256 or aws:kms
+
+  KMSKeyId:
+    Type: String
+    Default: ''
+    Description: KMS Key ID for S3 encryption (required if using aws:kms encryption)
+    AllowedPattern: ^$|^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$|^arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$
+    ConstraintDescription: Must be a valid KMS Key ID or ARN
+
+Conditions:
+  # Enable multi-region trail
+  IsMultiRegionTrail: !Equals [!Ref EnableMultiRegionTrail, 'true']
+  
+  # Include global service events
+  IncludeGlobalEvents: !Equals [!Ref IncludeGlobalServiceEvents, 'true']
+  
+  # Enable log file validation
+  ValidateLogFiles: !Equals [!Ref EnableLogFileValidation, 'true']
+  
+  # Enable S3 lifecycle policy
+  UseS3LifecyclePolicy: !Equals [!Ref EnableS3LifecyclePolicy, 'true']
+  
+  # Enable root account monitoring
+  MonitorRootAccount: !Equals [!Ref EnableRootAccountMonitoring, 'true']
+  
+  # Email notification provided
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  
+  # Use KMS encryption
+  UseKMSEncryption: !Equals [!Ref S3EncryptionType, 'aws:kms']
+  
+  # KMS Key ID provided
+  HasKMSKeyId: !Not [!Equals [!Ref KMSKeyId, '']]
+  
+  # KMS encryption with key ID
+  UseKMSWithKey: !And [!Condition UseKMSEncryption, !Condition HasKMSKeyId]
+  
+  # Enable email subscription
+  CreateEmailSubscription: !And [!Condition MonitorRootAccount, !Condition HasNotificationEmail]
+
+Resources:
+  # S3 Bucket for CloudTrail Logs
+  CloudTrailLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ResourcePrefix}-logs-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !Ref S3EncryptionType
+              KMSMasterKeyID: !If [UseKMSWithKey, !Ref KMSKeyId, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [UseKMSEncryption, true, !Ref 'AWS::NoValue']
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        !If
+          - UseS3LifecyclePolicy
+          - Rules:
+              - Id: CloudTrailLogLifecycle
+                Status: Enabled
+                ExpirationInDays: !Ref S3BucketRetentionDays
+                Transitions:
+                  - TransitionInDays: 30
+                    StorageClass: STANDARD_IA
+                  - TransitionInDays: 90
+                    StorageClass: GLACIER
+                  - TransitionInDays: 365
+                    StorageClass: DEEP_ARCHIVE
+                NoncurrentVersionExpirationInDays: 30
+          - !Ref 'AWS::NoValue'
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref CloudWatchLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-cloudtrail-logs"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CloudTrail Audit Logging
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # S3 Bucket Policy for CloudTrail
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailLogsBucket.Arn
+            Condition:
+              StringEquals:
+                'aws:SourceArn': !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ResourcePrefix}-trail"
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${CloudTrailLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                'aws:SourceArn': !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ResourcePrefix}-trail"
+
+  # CloudWatch Log Group for CloudTrail
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/cloudtrail/${ResourcePrefix}-trail"
+      RetentionInDays: !Ref CloudWatchLogsRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-cloudtrail-logs"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CloudTrail Real-time Logging
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # IAM Role for CloudTrail to write to CloudWatch Logs
+  CloudTrailLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-CloudTrailLogsRole-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailLogsRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AWSCloudTrailCreateLogStream
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                Resource: !Sub "${CloudWatchLogGroup.Arn}:log-stream:*"
+              - Sid: AWSCloudTrailPutLogEvents
+                Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: !Sub "${CloudWatchLogGroup.Arn}:log-stream:*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-cloudtrail-logs-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CloudTrail CloudWatch Logs Integration
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudTrail Trail
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${ResourcePrefix}-trail"
+      S3BucketName: !Ref CloudTrailLogsBucket
+      S3KeyPrefix: !Sub "AWSLogs/${AWS::AccountId}/CloudTrail"
+      IncludeGlobalServiceEvents: !Condition IncludeGlobalEvents
+      IsMultiRegionTrail: !Condition IsMultiRegionTrail
+      EnableLogFileValidation: !Condition ValidateLogFiles
+      CloudWatchLogsLogGroupArn: !Sub "${CloudWatchLogGroup.Arn}:*"
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogRole.Arn
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources: []
+      InsightSelectors:
+        - InsightType: ApiCallRateInsight
+      IsLogging: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-cloudtrail"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: AWS API Audit Logging
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # SNS Topic for Alerts
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Condition: MonitorRootAccount
+    Properties:
+      TopicName: !Sub "${ResourcePrefix}-security-alerts"
+      DisplayName: CloudTrail Security Alerts
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-security-alerts"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Security Alert Notifications
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # SNS Topic Policy
+  SecurityAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: MonitorRootAccount
+    Properties:
+      Topics:
+        - !Ref SecurityAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - SNS:Publish
+            Resource: !Ref SecurityAlertsTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # Email Subscription for SNS Topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailSubscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref SecurityAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Metric Filter for Root Account Usage
+  RootAccountUsageMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: MonitorRootAccount
+    Properties:
+      LogGroupName: !Ref CloudWatchLogGroup
+      FilterName: RootAccountUsage
+      FilterPattern: '{ $.userIdentity.type = "Root" && $.userIdentity.invokedBy NOT EXISTS && $.eventType != "AwsServiceEvent" }'
+      MetricTransformations:
+        - MetricNamespace: CloudTrailMetrics
+          MetricName: RootAccountUsageCount
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # CloudWatch Alarm for Root Account Usage
+  RootAccountUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: MonitorRootAccount
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-RootAccountUsage"
+      AlarmDescription: Alert when AWS root account is used
+      MetricName: RootAccountUsageCount
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-root-account-alarm"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Root Account Security Monitoring
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Additional Metric Filter for Failed Console Logins
+  FailedConsoleLoginsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: MonitorRootAccount
+    Properties:
+      LogGroupName: !Ref CloudWatchLogGroup
+      FilterName: FailedConsoleLogins
+      FilterPattern: '{ ($.eventName = ConsoleLogin) && ($.errorMessage EXISTS) }'
+      MetricTransformations:
+        - MetricNamespace: CloudTrailMetrics
+          MetricName: FailedConsoleLoginsCount
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # CloudWatch Alarm for Failed Console Logins
+  FailedConsoleLoginsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: MonitorRootAccount
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-FailedConsoleLogins"
+      AlarmDescription: Alert on multiple failed console login attempts
+      MetricName: FailedConsoleLoginsCount
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-failed-logins-alarm"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Failed Login Security Monitoring
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  # CloudTrail Outputs
+  CloudTrailArn:
+    Description: ARN of the CloudTrail trail
+    Value: !GetAtt CloudTrail.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailArn"
+
+  CloudTrailName:
+    Description: Name of the CloudTrail trail
+    Value: !Ref CloudTrail
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailName"
+
+  # S3 Bucket Outputs
+  S3BucketName:
+    Description: Name of the S3 bucket storing CloudTrail logs
+    Value: !Ref CloudTrailLogsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-S3BucketName"
+
+  S3BucketArn:
+    Description: ARN of the S3 bucket storing CloudTrail logs
+    Value: !GetAtt CloudTrailLogsBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-S3BucketArn"
+
+  # CloudWatch Outputs
+  CloudWatchLogGroupName:
+    Description: Name of the CloudWatch log group
+    Value: !Ref CloudWatchLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroupName"
+
+  CloudWatchLogGroupArn:
+    Description: ARN of the CloudWatch log group
+    Value: !GetAtt CloudWatchLogGroup.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroupArn"
+
+  # SNS Topic Output
+  SNSTopicArn:
+    Condition: MonitorRootAccount
+    Description: ARN of the SNS topic for security alerts
+    Value: !Ref SecurityAlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopicArn"
+
+  # IAM Role Output
+  CloudTrailRoleArn:
+    Description: ARN of the CloudTrail IAM role for CloudWatch Logs
+    Value: !GetAtt CloudTrailLogRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailRoleArn"
+
+  # Monitoring Outputs
+  RootAccountAlarmName:
+    Condition: MonitorRootAccount
+    Description: Name of the root account usage alarm
+    Value: !Ref RootAccountUsageAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-RootAccountAlarmName"
+
+  FailedLoginsAlarmName:
+    Condition: MonitorRootAccount
+    Description: Name of the failed console logins alarm
+    Value: !Ref FailedConsoleLoginsAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-FailedLoginsAlarmName"
+
+  # Deployment Information
+  StackRegion:
+    Description: AWS region where the stack is deployed
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub "${AWS::StackName}-Region"
+
+  DeploymentDate:
+    Description: Date when the stack was deployed
+    Value: !Sub "${AWS::Region}-${AWS::AccountId}-${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-DeploymentInfo"
+
+  # Usage Instructions
+  ValidationCommands:
+    Description: Commands to validate the CloudTrail deployment
+    Value: !Sub |
+      # Check CloudTrail status
+      aws cloudtrail get-trail-status --name ${CloudTrail} --region ${AWS::Region}
+      
+      # List recent events
+      aws cloudtrail lookup-events --lookup-attributes AttributeKey=EventName,AttributeValue=DescribeTrails --region ${AWS::Region}
+      
+      # Check S3 bucket contents
+      aws s3 ls s3://${CloudTrailLogsBucket}/AWSLogs/${AWS::AccountId}/CloudTrail/ --region ${AWS::Region}
+      
+      # Check CloudWatch log streams
+      aws logs describe-log-streams --log-group-name ${CloudWatchLogGroup} --region ${AWS::Region}

@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: s3,lambda,sqs,sns
 estimated-time: 60 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: s3,lambda,sqs,sns
 recipe-generator-version: 1.3
@@ -237,7 +237,7 @@ echo "✅ Created S3 bucket: ${BUCKET_NAME}"
    
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.13 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler file-processor.lambda_handler \
        --zip-file fileb://function.zip \
@@ -576,13 +576,13 @@ echo "✅ Created S3 bucket: ${BUCKET_NAME}"
 
 ## Discussion
 
-S3 event notifications provide a powerful foundation for building event-driven architectures that can scale automatically with your workload. The key architectural decision involves choosing the right destination for each use case: Lambda for immediate processing and low-latency workflows, SQS for reliable batch processing and decoupling, and SNS for fan-out patterns where multiple subscribers need the same event data.
+S3 event notifications provide a powerful foundation for building event-driven architectures that can scale automatically with your workload. The key architectural decision involves choosing the right destination for each use case: Lambda for immediate processing and low-latency workflows, SQS for reliable batch processing and decoupling, and SNS for fan-out patterns where multiple subscribers need the same event data. This design follows the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles for operational excellence and reliability.
 
-Event filtering using prefixes and suffixes allows you to create sophisticated routing rules without complex application logic. This approach reduces costs by only triggering processing for relevant files and enables different workflows for different file types or business processes. The at-least-once delivery guarantee ensures reliability, but your processing logic should be idempotent to handle potential duplicate events.
+Event filtering using prefixes and suffixes allows you to create sophisticated routing rules without complex application logic. This approach reduces costs by only triggering processing for relevant files and enables different workflows for different file types or business processes. The at-least-once delivery guarantee ensures reliability, but your processing logic should be idempotent to handle potential duplicate events, as documented in the [S3 Event Notifications User Guide](https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html).
 
-Cost optimization becomes critical at scale, as each S3 event generates charges for the destination service. Consider using S3 Storage Classes and Lifecycle policies to automatically transition files to cheaper storage tiers after processing. Monitor CloudWatch metrics to identify bottlenecks and adjust Lambda concurrency limits or SQS visibility timeouts based on your processing requirements.
+Cost optimization becomes critical at scale, as each S3 event generates charges for the destination service. Consider using S3 Storage Classes and Lifecycle policies to automatically transition files to cheaper storage tiers after processing. Monitor CloudWatch metrics to identify bottlenecks and adjust Lambda concurrency limits or SQS visibility timeouts based on your processing requirements. The [AWS Lambda performance optimization guide](https://docs.aws.amazon.com/lambda/latest/dg/best-practices.html) provides comprehensive strategies for optimizing serverless workloads.
 
-Security considerations include implementing least-privilege IAM policies, encrypting sensitive data in transit and at rest, and using VPC endpoints for private communication between services. For production deployments, consider using dead letter queues for failed processing attempts and implementing comprehensive logging and monitoring with AWS X-Ray for distributed tracing.
+Security considerations include implementing least-privilege IAM policies, encrypting sensitive data in transit and at rest, and using VPC endpoints for private communication between services. For production deployments, consider using dead letter queues for failed processing attempts and implementing comprehensive logging and monitoring with AWS X-Ray for distributed tracing, as recommended in the [AWS Lambda security best practices](https://docs.aws.amazon.com/lambda/latest/dg/lambda-security.html).
 
 > **Tip**: Use S3 Transfer Acceleration for faster uploads from distant geographic locations, and enable S3 Event Notifications for bucket-level operations to monitor administrative actions.
 

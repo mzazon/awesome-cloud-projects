@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Dataform, Cloud Tasks, Cloud Monitoring, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: 2025-07-17
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-pipeline, automation, monitoring, error-recovery, dataform, cloud-tasks
 recipe-generator-version: 1.3
@@ -75,7 +75,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with billing enabled and appropriate permissions for Dataform, Cloud Tasks, Cloud Functions, and Cloud Monitoring
-2. gcloud CLI v2 installed and configured (or Google Cloud Shell)
+2. gcloud CLI v400.0.0+ installed and configured (or Google Cloud Shell)
 3. Basic understanding of data pipeline concepts, BigQuery, and serverless architectures
 4. Familiarity with JavaScript/Node.js for Cloud Functions development
 5. Estimated cost: $5-15 per month for small to medium workloads (varies based on pipeline frequency and data volume)
@@ -325,17 +325,16 @@ echo "✅ Required APIs enabled successfully"
      "version": "1.0.0",
      "dependencies": {
        "@google-cloud/tasks": "^5.0.0",
-       "@google-cloud/logging": "^10.0.0"
+       "@google-cloud/logging": "^11.0.0"
      }
    }
    EOF
    
    # Deploy the controller function with appropriate configuration
    gcloud functions deploy ${CONTROLLER_FUNCTION} \
-       --gen2 \
        --source=./functions/controller \
        --entry-point=handlePipelineAlert \
-       --runtime=nodejs18 \
+       --runtime=nodejs20 \
        --trigger=http \
        --allow-unauthenticated \
        --region=${REGION} \
@@ -346,8 +345,7 @@ echo "✅ Required APIs enabled successfully"
    # Store function URL for later use
    CONTROLLER_URL=$(gcloud functions describe ${CONTROLLER_FUNCTION} \
        --region=${REGION} \
-       --gen2 \
-       --format="value(serviceConfig.uri)")
+       --format="value(httpsTrigger.url)")
    
    echo "✅ Pipeline controller function deployed at: ${CONTROLLER_URL}"
    ```
@@ -505,9 +503,9 @@ echo "✅ Required APIs enabled successfully"
      "name": "recovery-worker",
      "version": "1.0.0",
      "dependencies": {
-       "@google-cloud/dataform": "^2.0.0",
-       "@google-cloud/pubsub": "^4.0.0",
-       "@google-cloud/logging": "^10.0.0"
+       "@google-cloud/dataform": "^3.0.0",
+       "@google-cloud/pubsub": "^4.5.0",
+       "@google-cloud/logging": "^11.0.0"
      }
    }
    EOF
@@ -517,10 +515,9 @@ echo "✅ Required APIs enabled successfully"
    
    # Deploy recovery worker function
    gcloud functions deploy ${WORKER_FUNCTION} \
-       --gen2 \
        --source=./functions/worker \
        --entry-point=executeRecovery \
-       --runtime=nodejs18 \
+       --runtime=nodejs20 \
        --trigger=http \
        --allow-unauthenticated \
        --region=${REGION} \
@@ -531,15 +528,13 @@ echo "✅ Required APIs enabled successfully"
    # Get worker function URL and update controller configuration
    WORKER_URL=$(gcloud functions describe ${WORKER_FUNCTION} \
        --region=${REGION} \
-       --gen2 \
-       --format="value(serviceConfig.uri)")
+       --format="value(httpsTrigger.url)")
    
    # Update controller function with worker URL
    gcloud functions deploy ${CONTROLLER_FUNCTION} \
-       --gen2 \
        --source=./functions/controller \
        --entry-point=handlePipelineAlert \
-       --runtime=nodejs18 \
+       --runtime=nodejs20 \
        --trigger=http \
        --allow-unauthenticated \
        --region=${REGION} \
@@ -692,18 +687,17 @@ echo "✅ Required APIs enabled successfully"
      "name": "notification-handler",
      "version": "1.0.0",
      "dependencies": {
-       "@google-cloud/logging": "^10.0.0",
-       "nodemailer": "^6.8.0"
+       "@google-cloud/logging": "^11.0.0",
+       "nodemailer": "^6.9.0"
      }
    }
    EOF
    
    # Deploy notification handler with Pub/Sub trigger
    gcloud functions deploy ${NOTIFY_FUNCTION} \
-       --gen2 \
        --source=./functions/notifications \
        --entry-point=handleNotification \
-       --runtime=nodejs18 \
+       --runtime=nodejs20 \
        --trigger-topic=pipeline-notifications \
        --region=${REGION} \
        --memory=256MB \
@@ -726,7 +720,8 @@ echo "✅ Required APIs enabled successfully"
    gcloud tasks queues describe ${TASK_QUEUE} --location=${REGION}
    
    # Confirm Cloud Functions deployment
-   gcloud functions list --filter="name:${CONTROLLER_FUNCTION} OR name:${WORKER_FUNCTION} OR name:${NOTIFY_FUNCTION}"
+   gcloud functions list \
+       --filter="name:${CONTROLLER_FUNCTION} OR name:${WORKER_FUNCTION} OR name:${NOTIFY_FUNCTION}"
    ```
 
    Expected output: All resources should show "ACTIVE" or "READY" status with proper configuration.
@@ -845,7 +840,7 @@ Extend this solution by implementing these enhancements:
 
 4. **Cost-Aware Recovery**: Implement intelligent cost analysis that considers compute costs, data transfer fees, and business impact when determining recovery strategies, potentially delaying non-critical pipeline recovery during peak pricing periods.
 
-5. **Real-Time Dashboard**: Create a comprehensive monitoring dashboard using Cloud Monitoring and Data Studio that provides real-time visibility into pipeline health, recovery actions, and system performance metrics with predictive analytics capabilities.
+5. **Real-Time Dashboard**: Create a comprehensive monitoring dashboard using Cloud Monitoring and Looker Studio that provides real-time visibility into pipeline health, recovery actions, and system performance metrics with predictive analytics capabilities.
 
 ## Infrastructure Code
 

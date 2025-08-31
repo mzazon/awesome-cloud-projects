@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: glue, lake-formation, cloudtrail, iam
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-governance, compliance, analytics, pii-detection
 recipe-generator-version: 1.3
 ---
 
 # Data Catalog Governance with AWS Glue
-
 
 ## Problem
 
@@ -179,8 +178,6 @@ echo "✅ Environment prepared with buckets and sample data"
    ```
 
    The crawler role now has the minimum required permissions to read S3 data and write metadata to the Data Catalog. This security configuration enables automated data discovery while maintaining strict access controls and audit trails for compliance requirements.
-
-   > **Note**: Follow the [principle of least privilege](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege) when configuring IAM permissions for production environments.
 
 3. **Create PII Classifier for Data Classification**:
 
@@ -345,14 +342,7 @@ echo "✅ Environment prepared with buckets and sample data"
    # Apply PII detection transform
    pii_transform = DetectPII.apply(
        frame=datasource,
-       detection_threshold=0.5,
-       sample_fraction=1.0,
-       actions_map={
-           "ssn": "DETECT",
-           "email": "DETECT",
-           "phone": "DETECT",
-           "address": "DETECT"
-       },
+       entity_types_to_detect=["EMAIL", "SSN", "PHONE", "ADDRESS"],
        transformation_ctx="pii_transform"
    )
    
@@ -454,18 +444,45 @@ echo "✅ Environment prepared with buckets and sample data"
     Lake Formation's permission model enables granular access control that goes beyond traditional IAM policies, allowing organizations to implement sophisticated governance strategies based on data classification, user roles, and business context. By granting specific permissions to defined principals, you create a scalable access control framework that automatically enforces governance policies across all analytics services. This centralized approach ensures consistent security controls while maintaining the flexibility to adapt to changing organizational requirements.
 
     ```bash
-    # Grant table permissions to data analysts
+    # Get table name for permissions configuration
     TABLE_NAME=$(aws glue get-tables \
         --database-name ${DATABASE_NAME} \
         --query 'TableList[0].Name' --output text)
     
-    if [ "$TABLE_NAME" != "None" ]; then
+    # Create IAM role for data analysts
+    cat > data-analyst-trust-policy.json << 'EOF'
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {
+                    "AWS": "arn:aws:iam::${AWS_ACCOUNT_ID}:root"
+                },
+                "Action": "sts:AssumeRole"
+            }
+        ]
+    }
+    EOF
+    
+    # Replace placeholder with actual account ID
+    sed -i.bak "s/\${AWS_ACCOUNT_ID}/${AWS_ACCOUNT_ID}/g" data-analyst-trust-policy.json
+    
+    aws iam create-role \
+        --role-name DataAnalystGovernanceRole \
+        --assume-role-policy-document file://data-analyst-trust-policy.json
+    
+    # Attach the policy to the role
+    aws iam attach-role-policy \
+        --role-name DataAnalystGovernanceRole \
+        --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DataAnalystGovernancePolicy
+    
+    if [ "$TABLE_NAME" != "None" ] && [ -n "$TABLE_NAME" ]; then
         # Grant select permissions on table
         aws lakeformation grant-permissions \
             --principal DataLakePrincipalIdentifier=arn:aws:iam::${AWS_ACCOUNT_ID}:role/DataAnalystGovernanceRole \
-            --resource Table='{DatabaseName='${DATABASE_NAME}',Name='${TABLE_NAME}'}' \
-            --permissions SELECT \
-            --permissions-with-grant-option SELECT
+            --resource Table="{DatabaseName='${DATABASE_NAME}',Name='${TABLE_NAME}'}" \
+            --permissions SELECT
         
         echo "✅ Granted table permissions to data analysts"
     else
@@ -481,17 +498,19 @@ echo "✅ Environment prepared with buckets and sample data"
 
     ```bash
     # Check table schema with column classifications
-    aws glue get-table \
-        --database-name ${DATABASE_NAME} \
-        --name ${TABLE_NAME} \
-        --query 'Table.StorageDescriptor.Columns[*].[Name,Type,Parameters]' \
-        --output table
-    
-    # List Lake Formation permissions
-    aws lakeformation list-permissions \
-        --resource Table='{DatabaseName='${DATABASE_NAME}',Name='${TABLE_NAME}'}' \
-        --query 'PrincipalResourcePermissions[*].[Principal,Permissions]' \
-        --output table
+    if [ "$TABLE_NAME" != "None" ] && [ -n "$TABLE_NAME" ]; then
+        aws glue get-table \
+            --database-name ${DATABASE_NAME} \
+            --name ${TABLE_NAME} \
+            --query 'Table.StorageDescriptor.Columns[*].[Name,Type,Parameters]' \
+            --output table
+        
+        # List Lake Formation permissions
+        aws lakeformation list-permissions \
+            --resource Table="{DatabaseName='${DATABASE_NAME}',Name='${TABLE_NAME}'}" \
+            --query 'PrincipalResourcePermissions[*].[Principal,Permissions]' \
+            --output table
+    fi
     
     echo "✅ Verified data classification and access controls"
     ```
@@ -516,11 +535,17 @@ echo "✅ Environment prepared with buckets and sample data"
 2. **Test PII Detection Results**:
 
    ```bash
-   # Check for PII classification in table metadata
-   aws glue get-table --database-name ${DATABASE_NAME} \
-       --name ${TABLE_NAME} \
-       --query 'Table.StorageDescriptor.Columns[?contains(Name, `ssn`) || contains(Name, `email`) || contains(Name, `phone`)].[Name,Type,Parameters]' \
-       --output table
+   # Get table name and check for PII classification in table metadata
+   TABLE_NAME=$(aws glue get-tables \
+       --database-name ${DATABASE_NAME} \
+       --query 'TableList[0].Name' --output text)
+       
+   if [ "$TABLE_NAME" != "None" ] && [ -n "$TABLE_NAME" ]; then
+       aws glue get-table --database-name ${DATABASE_NAME} \
+           --name ${TABLE_NAME} \
+           --query 'Table.StorageDescriptor.Columns[?contains(Name, `ssn`) || contains(Name, `email`) || contains(Name, `phone`)].[Name,Type,Parameters]' \
+           --output table
+   fi
    ```
 
    Expected output: Columns containing PII data types should be identified
@@ -571,11 +596,18 @@ echo "✅ Environment prepared with buckets and sample data"
 2. **Remove Lake Formation configurations**:
 
    ```bash
+   # Get table name for cleanup
+   TABLE_NAME=$(aws glue get-tables \
+       --database-name ${DATABASE_NAME} \
+       --query 'TableList[0].Name' --output text 2>/dev/null)
+   
    # Revoke Lake Formation permissions
-   aws lakeformation revoke-permissions \
-       --principal DataLakePrincipalIdentifier=arn:aws:iam::${AWS_ACCOUNT_ID}:role/DataAnalystGovernanceRole \
-       --resource Table='{DatabaseName='${DATABASE_NAME}',Name='${TABLE_NAME}'}' \
-       --permissions SELECT 2>/dev/null || true
+   if [ "$TABLE_NAME" != "None" ] && [ -n "$TABLE_NAME" ]; then
+       aws lakeformation revoke-permissions \
+           --principal DataLakePrincipalIdentifier=arn:aws:iam::${AWS_ACCOUNT_ID}:role/DataAnalystGovernanceRole \
+           --resource Table="{DatabaseName='${DATABASE_NAME}',Name='${TABLE_NAME}'}" \
+           --permissions SELECT 2>/dev/null || true
+   fi
    
    # Deregister S3 location
    aws lakeformation deregister-resource \
@@ -588,13 +620,13 @@ echo "✅ Environment prepared with buckets and sample data"
 
    ```bash
    # Delete crawler
-   aws glue delete-crawler --name ${CRAWLER_NAME}
+   aws glue delete-crawler --name ${CRAWLER_NAME} 2>/dev/null || true
    
    # Delete classifier
-   aws glue delete-classifier --name ${CLASSIFIER_NAME}
+   aws glue delete-classifier --name ${CLASSIFIER_NAME} 2>/dev/null || true
    
    # Delete database and tables
-   aws glue delete-database --name ${DATABASE_NAME}
+   aws glue delete-database --name ${DATABASE_NAME} 2>/dev/null || true
    
    echo "✅ Deleted Glue resources"
    ```
@@ -602,21 +634,29 @@ echo "✅ Environment prepared with buckets and sample data"
 4. **Remove IAM roles and policies**:
 
    ```bash
-   # Detach and delete IAM policies
+   # Detach and delete IAM policies for crawler role
    aws iam detach-role-policy \
        --role-name GlueGovernanceCrawlerRole \
-       --policy-arn arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole 2>/dev/null || true
    
    aws iam detach-role-policy \
        --role-name GlueGovernanceCrawlerRole \
-       --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+       --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess 2>/dev/null || true
    
-   # Delete IAM role
-   aws iam delete-role --role-name GlueGovernanceCrawlerRole
+   # Delete crawler IAM role
+   aws iam delete-role --role-name GlueGovernanceCrawlerRole 2>/dev/null || true
+   
+   # Detach and delete IAM policies for analyst role
+   aws iam detach-role-policy \
+       --role-name DataAnalystGovernanceRole \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DataAnalystGovernancePolicy 2>/dev/null || true
+   
+   # Delete analyst IAM role
+   aws iam delete-role --role-name DataAnalystGovernanceRole 2>/dev/null || true
    
    # Delete custom policy
    aws iam delete-policy \
-       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DataAnalystGovernancePolicy
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DataAnalystGovernancePolicy 2>/dev/null || true
    
    echo "✅ Removed IAM roles and policies"
    ```
@@ -625,14 +665,15 @@ echo "✅ Environment prepared with buckets and sample data"
 
    ```bash
    # Empty and delete S3 buckets
-   aws s3 rm s3://${GOVERNANCE_BUCKET} --recursive
-   aws s3 rb s3://${GOVERNANCE_BUCKET}
+   aws s3 rm s3://${GOVERNANCE_BUCKET} --recursive 2>/dev/null || true
+   aws s3 rb s3://${GOVERNANCE_BUCKET} 2>/dev/null || true
    
-   aws s3 rm s3://${AUDIT_BUCKET} --recursive
-   aws s3 rb s3://${AUDIT_BUCKET}
+   aws s3 rm s3://${AUDIT_BUCKET} --recursive 2>/dev/null || true
+   aws s3 rb s3://${AUDIT_BUCKET} 2>/dev/null || true
    
    # Clean up local files
    rm -f glue-trust-policy.json data-analyst-policy.json
+   rm -f data-analyst-trust-policy.json data-analyst-trust-policy.json.bak
    rm -f pii-detection-script.py governance-dashboard.json
    
    echo "✅ Cleaned up S3 buckets and local files"
@@ -643,7 +684,7 @@ echo "✅ Environment prepared with buckets and sample data"
    ```bash
    # Delete CloudWatch dashboard
    aws cloudwatch delete-dashboards \
-       --dashboard-names DataGovernanceDashboard
+       --dashboard-names DataGovernanceDashboard 2>/dev/null || true
    
    echo "✅ Removed CloudWatch dashboard"
    ```

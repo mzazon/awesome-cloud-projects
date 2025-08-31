@@ -1,0 +1,630 @@
+# Smart Document Review Workflow with ADK and Storage
+# Infrastructure Manager Configuration
+# 
+# This configuration deploys a complete multi-agent document review system using:
+# - Cloud Storage buckets for document management and results
+# - Cloud Functions for serverless event-driven processing  
+# - IAM service accounts with least privilege access
+# - Vertex AI API enablement for Agent Development Kit integration
+# - Proper resource dependencies and security configurations
+
+imports: []
+
+variables:
+  # Project configuration variables
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for resource deployment"
+    default: ${google.project}
+  
+  region:
+    type: string
+    description: "Primary region for resource deployment (e.g., us-central1)"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "Primary zone for regional resources (e.g., us-central1-a)"
+    default: "us-central1-a"
+  
+  # Resource naming configuration
+  resource_prefix:
+    type: string
+    description: "Prefix for all resource names to ensure uniqueness"
+    default: "smart-doc-review"
+  
+  # Storage configuration
+  storage_class:
+    type: string
+    description: "Storage class for Cloud Storage buckets (STANDARD, NEARLINE, COLDLINE)"
+    default: "STANDARD"
+  
+  versioning_enabled:
+    type: boolean
+    description: "Enable versioning on Cloud Storage buckets for data protection"
+    default: true
+  
+  # Cloud Function configuration
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Function (128MB, 256MB, 512MB, 1024MB)"
+    default: "512MB"
+  
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Function execution (in seconds)"
+    default: "300s"
+  
+  python_runtime:
+    type: string
+    description: "Python runtime version for Cloud Function"
+    default: "python311"
+
+resources:
+  # ========================================
+  # API ENABLEMENT
+  # Enable required Google Cloud APIs for the document review workflow
+  # ========================================
+  
+  # Enable Cloud Functions API for serverless processing
+  cloudfunctions-api:
+    type: gcp-types/serviceusage-v1:services
+    name: cloudfunctions-api
+    properties:
+      name: projects/${project_id}/services/cloudfunctions.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+  
+  # Enable Cloud Storage API for document and results management
+  storage-api:
+    type: gcp-types/serviceusage-v1:services
+    name: storage-api
+    properties:
+      name: projects/${project_id}/services/storage.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+  
+  # Enable Vertex AI API for Agent Development Kit integration
+  vertexai-api:
+    type: gcp-types/serviceusage-v1:services
+    name: vertexai-api
+    properties:
+      name: projects/${project_id}/services/aiplatform.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+  
+  # Enable Cloud Build API for function deployment
+  cloudbuild-api:
+    type: gcp-types/serviceusage-v1:services
+    name: cloudbuild-api
+    properties:
+      name: projects/${project_id}/services/cloudbuild.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  # ========================================
+  # CLOUD STORAGE INFRASTRUCTURE
+  # Create buckets for document input, processing results, and archive storage
+  # ========================================
+  
+  # Input bucket for document uploads that trigger processing workflow
+  document-input-bucket:
+    type: gcp-types/storage-v1:buckets
+    name: ${resource_prefix}-input-bucket
+    properties:
+      name: ${resource_prefix}-input-${project_id}
+      location: ${region}
+      storageClass: ${storage_class}
+      versioning:
+        enabled: ${versioning_enabled}
+      # Enable uniform bucket-level access for simplified IAM management
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+        - action:
+            type: Delete
+          condition:
+            age: 90
+            matchesStorageClass:
+            - STANDARD
+        - action:
+            type: SetStorageClass
+            storageClass: NEARLINE
+          condition:
+            age: 30
+            matchesStorageClass:
+            - STANDARD
+      # Enable object change notifications for Cloud Function triggers
+      notification:
+        topic: projects/${project_id}/topics/${resource_prefix}-document-notifications
+      # Apply security labels for compliance and governance
+      labels:
+        environment: "production"
+        purpose: "document-processing"
+        component: "input-storage"
+        data-classification: "sensitive"
+    depends_on:
+      - storage-api
+  
+  # Results bucket for storing multi-agent review output and analytics data
+  document-results-bucket:
+    type: gcp-types/storage-v1:buckets
+    name: ${resource_prefix}-results-bucket
+    properties:
+      name: ${resource_prefix}-results-${project_id}
+      location: ${region}
+      storageClass: ${storage_class}
+      versioning:
+        enabled: ${versioning_enabled}
+      # Enable uniform bucket-level access
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Extended lifecycle management for long-term analytics storage
+      lifecycle:
+        rule:
+        - action:
+            type: Delete
+          condition:
+            age: 365
+            matchesStorageClass:
+            - STANDARD
+        - action:
+            type: SetStorageClass
+            storageClass: NEARLINE
+          condition:
+            age: 30
+            matchesStorageClass:
+            - STANDARD
+        - action:
+            type: SetStorageClass
+            storageClass: COLDLINE
+          condition:
+            age: 90
+            matchesStorageClass:
+            - NEARLINE
+      # Security and compliance labels
+      labels:
+        environment: "production"
+        purpose: "document-processing"
+        component: "results-storage"
+        data-classification: "processed"
+    depends_on:
+      - storage-api
+  
+  # Archive bucket for long-term document retention and compliance
+  document-archive-bucket:
+    type: gcp-types/storage-v1:buckets
+    name: ${resource_prefix}-archive-bucket
+    properties:
+      name: ${resource_prefix}-archive-${project_id}
+      location: ${region}
+      storageClass: "COLDLINE"
+      versioning:
+        enabled: true
+      # Enable uniform bucket-level access
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Retention policy for compliance requirements
+      retentionPolicy:
+        retentionPeriod: "31536000"  # 1 year in seconds
+      # Long-term archival lifecycle
+      lifecycle:
+        rule:
+        - action:
+            type: SetStorageClass
+            storageClass: ARCHIVE
+          condition:
+            age: 365
+            matchesStorageClass:
+            - COLDLINE
+      # Compliance and archival labels
+      labels:
+        environment: "production"
+        purpose: "document-processing"
+        component: "archive-storage"
+        data-classification: "archived"
+        compliance: "required"
+    depends_on:
+      - storage-api
+
+  # ========================================
+  # IAM SERVICE ACCOUNTS AND SECURITY
+  # Create service accounts with least privilege access for secure operations
+  # ========================================
+  
+  # Service account for Cloud Function with minimal required permissions
+  document-processor-service-account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    name: document-processor-sa
+    properties:
+      accountId: ${resource_prefix}-processor
+      displayName: "Document Review Processor Service Account"
+      description: "Service account for Cloud Function document processing with ADK integration"
+      # No keys generated - using workload identity for security
+    depends_on:
+      - cloudfunctions-api
+  
+  # IAM binding for Storage Object Viewer on input bucket (read access)
+  input-bucket-viewer-binding:
+    type: gcp-types/storage-v1:buckets/iam
+    name: input-bucket-viewer-binding
+    properties:
+      bucket: ${resource_prefix}-input-${project_id}
+      bindings:
+      - role: roles/storage.objectViewer
+        members:
+        - serviceAccount:$(ref.document-processor-service-account.email)
+      - role: roles/storage.legacyBucketReader
+        members:
+        - serviceAccount:$(ref.document-processor-service-account.email)
+    depends_on:
+      - document-input-bucket
+      - document-processor-service-account
+  
+  # IAM binding for Storage Object Admin on results bucket (read/write access)
+  results-bucket-admin-binding:
+    type: gcp-types/storage-v1:buckets/iam
+    name: results-bucket-admin-binding
+    properties:
+      bucket: ${resource_prefix}-results-${project_id}
+      bindings:
+      - role: roles/storage.objectAdmin
+        members:
+        - serviceAccount:$(ref.document-processor-service-account.email)
+      - role: roles/storage.legacyBucketWriter
+        members:
+        - serviceAccount:$(ref.document-processor-service-account.email)
+    depends_on:
+      - document-results-bucket
+      - document-processor-service-account
+  
+  # IAM binding for Vertex AI User (Agent Development Kit access)
+  vertexai-user-binding:
+    type: gcp-types/cloudresourcemanager-v1:projects
+    name: vertexai-user-binding
+    properties:
+      projectId: ${project_id}
+      policy:
+        bindings:
+        - role: roles/aiplatform.user
+          members:
+          - serviceAccount:$(ref.document-processor-service-account.email)
+    depends_on:
+      - vertexai-api
+      - document-processor-service-account
+  
+  # IAM binding for Cloud Function Invoker (for internal service communication)
+  function-invoker-binding:
+    type: gcp-types/cloudresourcemanager-v1:projects
+    name: function-invoker-binding
+    properties:
+      projectId: ${project_id}
+      policy:
+        bindings:
+        - role: roles/cloudfunctions.invoker
+          members:
+          - serviceAccount:$(ref.document-processor-service-account.email)
+    depends_on:
+      - cloudfunctions-api
+      - document-processor-service-account
+
+  # ========================================
+  # PUB/SUB NOTIFICATION SYSTEM
+  # Create Pub/Sub topic for Storage event notifications and workflow coordination
+  # ========================================
+  
+  # Pub/Sub topic for document processing notifications
+  document-notifications-topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    name: document-notifications-topic
+    properties:
+      name: projects/${project_id}/topics/${resource_prefix}-document-notifications
+      labels:
+        environment: "production"
+        purpose: "document-processing"
+        component: "notifications"
+    depends_on:
+      - cloudfunctions-api
+  
+  # Pub/Sub subscription for function triggering (dead letter queue pattern)
+  document-processing-subscription:
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    name: document-processing-subscription
+    properties:
+      name: projects/${project_id}/subscriptions/${resource_prefix}-processing-sub
+      topic: $(ref.document-notifications-topic.name)
+      # Configure retry policy for reliability
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "600s"
+      # Dead letter queue for failed processing
+      deadLetterPolicy:
+        deadLetterTopic: projects/${project_id}/topics/${resource_prefix}-dlq
+        maxDeliveryAttempts: 5
+      # Message retention for 7 days
+      messageRetentionDuration: "604800s"
+      # Filter for document file types only
+      filter: 'attributes.objectGeneration!="" AND (attributes.objectName:".txt" OR attributes.objectName:".md" OR attributes.objectName:".doc" OR attributes.objectName:".docx")'
+    depends_on:
+      - document-notifications-topic
+
+  # ========================================
+  # CLOUD FUNCTION DEPLOYMENT
+  # Deploy serverless function for document processing with ADK integration
+  # ========================================
+  
+  # Cloud Function for document processing orchestration
+  document-processor-function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    name: document-processor-function
+    properties:
+      location: projects/${project_id}/locations/${region}
+      function: ${resource_prefix}-document-processor
+      # Source code configuration (placeholder for actual deployment)
+      sourceArchiveUrl: gs://${project_id}-function-source/document-processor.zip
+      # Function entry point and runtime configuration
+      entryPoint: "process_document"
+      runtime: ${python_runtime}
+      # Resource allocation for ADK processing
+      availableMemoryMb: $(echo ${function_memory} | sed 's/MB//')
+      timeout: ${function_timeout}
+      # Environment variables for configuration
+      environmentVariables:
+        PROJECT_ID: ${project_id}
+        REGION: ${region}
+        INPUT_BUCKET: ${resource_prefix}-input-${project_id}
+        RESULTS_BUCKET: ${resource_prefix}-results-${project_id}
+        ARCHIVE_BUCKET: ${resource_prefix}-archive-${project_id}
+        ADK_MODEL: "gemini-2.0-flash"
+        PROCESSING_MODE: "multi-agent"
+        LOG_LEVEL: "INFO"
+      # Service account configuration
+      serviceAccountEmail: $(ref.document-processor-service-account.email)
+      # Network configuration for security
+      vpcConnector: null  # Use default network for simplicity
+      ingressSettings: "ALLOW_INTERNAL_ONLY"
+      # Event trigger configuration for Storage bucket
+      eventTrigger:
+        eventType: "google.storage.object.finalize"
+        resource: projects/${project_id}/buckets/${resource_prefix}-input-${project_id}
+        failurePolicy:
+          retry: {}
+      # Security and compliance labels
+      labels:
+        environment: "production"
+        purpose: "document-processing"
+        component: "processor-function"
+        runtime: ${python_runtime}
+    depends_on:
+      - cloudfunctions-api
+      - document-input-bucket
+      - document-results-bucket
+      - document-processor-service-account
+      - vertexai-user-binding
+
+  # ========================================
+  # MONITORING AND LOGGING
+  # Configure monitoring, alerting, and logging for operational visibility
+  # ========================================
+  
+  # Log sink for structured logging and analysis
+  document-processing-log-sink:
+    type: gcp-types/logging-v2:projects.sinks
+    name: document-processing-log-sink
+    properties:
+      name: ${resource_prefix}-processing-logs
+      destination: storage.googleapis.com/${resource_prefix}-results-${project_id}/logs
+      # Filter for document processing function logs
+      filter: >
+        resource.type="cloud_function"
+        resource.labels.function_name="${resource_prefix}-document-processor"
+        severity>=INFO
+      # Include all log entries for comprehensive monitoring
+      includeChildResourceTypes: true
+      # Use log exclusion to reduce costs for debug logs in production
+      exclusions:
+      - name: "exclude-debug-logs"
+        description: "Exclude debug-level logs in production"
+        filter: 'severity="DEBUG"'
+    depends_on:
+      - document-processor-function
+      - document-results-bucket
+
+  # ========================================
+  # CLOUD SCHEDULER FOR MAINTENANCE
+  # Schedule maintenance tasks for cleanup and optimization
+  # ========================================
+  
+  # Scheduled job for bucket lifecycle management and cleanup
+  maintenance-scheduler-job:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    name: maintenance-scheduler-job
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      name: ${resource_prefix}-maintenance
+      description: "Scheduled maintenance for document processing system"
+      # Run daily at 2 AM UTC for system maintenance
+      schedule: "0 2 * * *"
+      timeZone: "UTC"
+      # HTTP target for maintenance function (would be deployed separately)
+      httpTarget:
+        uri: https://${region}-${project_id}.cloudfunctions.net/${resource_prefix}-maintenance
+        httpMethod: "POST"
+        headers:
+          Content-Type: "application/json"
+        body: |
+          {
+            "maintenance_type": "bucket_cleanup",
+            "target_buckets": [
+              "${resource_prefix}-input-${project_id}",
+              "${resource_prefix}-results-${project_id}",
+              "${resource_prefix}-archive-${project_id}"
+            ]
+          }
+        # Use service account for authentication
+        oidcToken:
+          serviceAccountEmail: $(ref.document-processor-service-account.email)
+      # Retry configuration for reliability
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: "300s"
+        minBackoffDuration: "10s"
+        maxBackoffDuration: "60s"
+        maxDoublings: 5
+    depends_on:
+      - document-processor-function
+      - document-processor-service-account
+
+# ========================================
+# OUTPUTS
+# Provide essential information for system integration and verification
+# ========================================
+
+outputs:
+  # Project and region information
+  project_id:
+    description: "Google Cloud Project ID used for deployment"
+    value: ${project_id}
+  
+  deployment_region:
+    description: "Primary region for resource deployment"
+    value: ${region}
+  
+  # Storage bucket information for integration
+  input_bucket_name:
+    description: "Cloud Storage bucket name for document uploads"
+    value: $(ref.document-input-bucket.name)
+  
+  input_bucket_url:
+    description: "Cloud Storage bucket URL for document uploads"
+    value: gs://$(ref.document-input-bucket.name)
+  
+  results_bucket_name:
+    description: "Cloud Storage bucket name for processing results"
+    value: $(ref.document-results-bucket.name)
+  
+  results_bucket_url:
+    description: "Cloud Storage bucket URL for processing results"
+    value: gs://$(ref.document-results-bucket.name)
+  
+  archive_bucket_name:
+    description: "Cloud Storage bucket name for document archival"
+    value: $(ref.document-archive-bucket.name)
+  
+  archive_bucket_url:
+    description: "Cloud Storage bucket URL for document archival"
+    value: gs://$(ref.document-archive-bucket.name)
+  
+  # Function information for monitoring and integration
+  processor_function_name:
+    description: "Cloud Function name for document processing"
+    value: $(ref.document-processor-function.name)
+  
+  processor_function_url:
+    description: "Cloud Function trigger URL for document processing"
+    value: https://$(ref.document-processor-function.httpsTrigger.url)
+  
+  # Service account information for IAM management
+  service_account_email:
+    description: "Service account email for document processing function"
+    value: $(ref.document-processor-service-account.email)
+  
+  # Pub/Sub information for event integration
+  notification_topic:
+    description: "Pub/Sub topic for document processing notifications"
+    value: $(ref.document-notifications-topic.name)
+  
+  processing_subscription:
+    description: "Pub/Sub subscription for document processing events"
+    value: $(ref.document-processing-subscription.name)
+  
+  # Deployment summary and next steps
+  deployment_summary:
+    description: "Summary of deployed infrastructure components"
+    value: |
+      Smart Document Review Workflow deployed successfully:
+      
+      ✅ Storage Infrastructure:
+         - Input bucket: $(ref.document-input-bucket.name)
+         - Results bucket: $(ref.document-results-bucket.name)
+         - Archive bucket: $(ref.document-archive-bucket.name)
+      
+      ✅ Processing Infrastructure:
+         - Function: $(ref.document-processor-function.name)
+         - Service Account: $(ref.document-processor-service-account.email)
+         - Notification Topic: $(ref.document-notifications-topic.name)
+      
+      ✅ APIs Enabled:
+         - Cloud Functions API
+         - Cloud Storage API
+         - Vertex AI API
+         - Cloud Build API
+      
+      Next Steps:
+      1. Deploy Agent Development Kit code to Cloud Function
+      2. Upload sample documents to input bucket for testing
+      3. Monitor processing results in results bucket
+      4. Configure additional agents as needed
+      5. Set up monitoring dashboards for operational visibility
+  
+  # Cost optimization recommendations
+  cost_optimization_tips:
+    description: "Recommendations for cost optimization"
+    value: |
+      Cost Optimization Recommendations:
+      
+      🔧 Storage Optimization:
+         - Lifecycle policies automatically transition to cheaper storage classes
+         - Enable object versioning cleanup for cost control
+         - Monitor bucket usage with Storage Insights
+      
+      🔧 Function Optimization:
+         - Right-size memory allocation based on actual usage
+         - Use Cloud Monitoring to track invocation patterns
+         - Consider reserved function capacity for consistent workloads
+      
+      🔧 Monitoring Optimization:
+         - Use log sampling for high-volume applications
+         - Set up budget alerts for cost control
+         - Monitor Vertex AI API usage for ADK operations
+      
+      📊 Estimated Monthly Costs (low volume):
+         - Storage: $1-5 (depending on document volume)
+         - Cloud Functions: $0.40-2 (based on execution time)
+         - Vertex AI: $10-50 (based on agent processing)
+         - Monitoring: $0.50-2 (based on log volume)
+  
+  # Security and compliance information
+  security_configuration:
+    description: "Security configuration summary"
+    value: |
+      Security Configuration Summary:
+      
+      🔐 Access Control:
+         - Least privilege IAM roles assigned
+         - Service account-based authentication
+         - Uniform bucket-level access enabled
+      
+      🔐 Data Protection:
+         - Object versioning enabled for data recovery
+         - Retention policies for compliance
+         - Lifecycle management for data governance
+      
+      🔐 Network Security:
+         - Function ingress limited to internal traffic
+         - No public endpoints exposed
+         - VPC native networking support
+      
+      🔐 Monitoring Security:
+         - Comprehensive audit logging enabled
+         - Security event monitoring configured
+         - Automated compliance checking

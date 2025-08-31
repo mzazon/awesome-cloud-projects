@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Carbon Optimization, Azure Advisor, Azure Monitor, Azure Automation
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: sustainability, carbon-optimization, advisor, automation, workload-optimization, monitoring, cost-optimization, environmental-impact
 recipe-generator-version: 1.3
@@ -92,6 +92,9 @@ graph TB
 ## Preparation
 
 ```bash
+# Generate unique suffix for resource names first
+RANDOM_SUFFIX=$(openssl rand -hex 3)
+
 # Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-carbon-optimization-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
@@ -99,9 +102,6 @@ export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 export AUTOMATION_ACCOUNT="aa-carbon-opt-${RANDOM_SUFFIX}"
 export WORKSPACE_NAME="law-carbon-opt-${RANDOM_SUFFIX}"
 export WORKBOOK_NAME="carbon-optimization-dashboard"
-
-# Generate unique suffix for resource names
-RANDOM_SUFFIX=$(openssl rand -hex 3)
 
 # Create resource group with sustainability tags
 az group create \
@@ -141,10 +141,14 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
        --role "Carbon Optimization Reader" \
        --scope "/subscriptions/${SUBSCRIPTION_ID}"
    
-   # Verify carbon optimization access
+   # Wait for role assignment to propagate
+   echo "Waiting for role assignment to propagate..."
+   sleep 30
+   
+   # Verify carbon optimization access with REST API
    az rest --method GET \
-       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/providers/Microsoft.Sustainability/carbonEmissions?api-version=2023-11-01-preview" \
-       --query "value[0].properties.carbonEmissions" \
+       --url "https://management.azure.com/providers/Microsoft.Carbon/carbonEmissionReports?api-version=2025-04-01" \
+       --query "value" \
        --output table
    
    echo "✅ Carbon Optimization access configured"
@@ -202,35 +206,60 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
        [string]$WorkspaceId
    )
    
-   # Connect using managed identity
-   Connect-AzAccount -Identity
-   Select-AzSubscription -SubscriptionId $SubscriptionId
-   
-   # Get carbon emissions data
-   $carbonEndpoint = "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.Sustainability/carbonEmissions?api-version=2023-11-01-preview"
-   $carbonData = Invoke-AzRestMethod -Uri $carbonEndpoint -Method GET
-   
-   # Get Azure Advisor recommendations
-   $advisorRecommendations = Get-AzAdvisorRecommendation | Where-Object { $_.Category -eq "Cost" -or $_.Category -eq "Performance" }
-   
-   # Process carbon optimization opportunities
-   foreach ($recommendation in $advisorRecommendations) {
-       $carbonImpact = @{
-           RecommendationId = $recommendation.RecommendationId
-           ResourceId = $recommendation.ResourceId
-           ImpactedValue = $recommendation.ImpactedValue
-           Category = $recommendation.Category
-           CarbonSavingsEstimate = [math]::Round(($recommendation.ImpactedValue * 0.4), 2)
-           OptimizationAction = $recommendation.ShortDescription
-           Timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+   try {
+       # Connect using managed identity
+       Connect-AzAccount -Identity
+       Select-AzSubscription -SubscriptionId $SubscriptionId
+       
+       # Get carbon emissions data using REST API
+       $carbonEndpoint = "https://management.azure.com/providers/Microsoft.Carbon/carbonEmissionReports?api-version=2025-04-01"
+       $headers = @{
+           'Authorization' = "Bearer $((Get-AzAccessToken).Token)"
+           'Content-Type' = 'application/json'
        }
        
-       # Send to Log Analytics
-       $json = $carbonImpact | ConvertTo-Json -Depth 10
-       Send-AzOperationalInsightsDataCollector -WorkspaceId $WorkspaceId -WorkspaceKey $WorkspaceKey -CustomLogName "CarbonOptimization" -JsonMessage $json
+       $carbonData = Invoke-RestMethod -Uri $carbonEndpoint -Headers $headers -Method GET
+       
+       # Get Azure Advisor recommendations
+       $advisorRecommendations = Get-AzAdvisorRecommendation | Where-Object { 
+           $_.Category -eq "Cost" -or $_.Category -eq "Performance" -or $_.Category -eq "OperationalExcellence" 
+       }
+       
+       # Process carbon optimization opportunities
+       $processedCount = 0
+       foreach ($recommendation in $advisorRecommendations) {
+           $carbonImpact = @{
+               RecommendationId = $recommendation.RecommendationId
+               ResourceId = $recommendation.ResourceId
+               ImpactedValue = $recommendation.ImpactedValue
+               Category = $recommendation.Category
+               CarbonSavingsEstimate = [math]::Round(($recommendation.ImpactedValue * 0.4), 2)
+               OptimizationAction = $recommendation.ShortDescription.DisplayName
+               Timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+               SubscriptionId = $SubscriptionId
+           }
+           
+           # Convert to JSON and send to Log Analytics
+           $json = $carbonImpact | ConvertTo-Json -Depth 10 -Compress
+           
+           # Use REST API to send data to Log Analytics
+           $logEndpoint = "https://${WorkspaceId}.ods.opinsights.azure.com/api/logs?api-version=2016-04-01"
+           
+           try {
+               Invoke-RestMethod -Uri $logEndpoint -Method POST -Body $json -Headers $headers -ContentType "application/json"
+               $processedCount++
+           }
+           catch {
+               Write-Warning "Failed to send data to Log Analytics: $($_.Exception.Message)"
+           }
+       }
+       
+       Write-Output "Carbon optimization analysis completed. Processed $processedCount recommendations."
    }
-   
-   Write-Output "Carbon optimization analysis completed. Processed $($advisorRecommendations.Count) recommendations."
+   catch {
+       Write-Error "Error in carbon monitoring runbook: $($_.Exception.Message)"
+       throw
+   }
    EOF
    
    # Import the runbook
@@ -277,40 +306,57 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
        [string]$OptimizationAction
    )
    
-   # Connect using managed identity
-   Connect-AzAccount -Identity
-   Select-AzSubscription -SubscriptionId $SubscriptionId
-   
-   # Parse resource information
-   $resourceInfo = Get-AzResource -ResourceId $ResourceId
-   
-   # Apply optimization based on recommendation type
-   switch ($OptimizationAction) {
-       "Shutdown idle virtual machine" {
-           if ($resourceInfo.ResourceType -eq "Microsoft.Compute/virtualMachines") {
-               $vm = Get-AzVM -ResourceGroupName $resourceInfo.ResourceGroupName -Name $resourceInfo.ResourceName
-               if ($vm.PowerState -eq "VM running") {
-                   Stop-AzVM -ResourceGroupName $resourceInfo.ResourceGroupName -Name $resourceInfo.ResourceName -Force
-                   Write-Output "Virtual machine $($resourceInfo.ResourceName) stopped for carbon optimization"
+   try {
+       # Connect using managed identity
+       Connect-AzAccount -Identity
+       Select-AzSubscription -SubscriptionId $SubscriptionId
+       
+       # Parse resource information
+       $resourceInfo = Get-AzResource -ResourceId $ResourceId -ErrorAction SilentlyContinue
+       
+       if (-not $resourceInfo) {
+           Write-Warning "Resource not found: $ResourceId"
+           return
+       }
+       
+       # Apply optimization based on recommendation type
+       switch -Wildcard ($OptimizationAction) {
+           "*idle virtual machine*" {
+               if ($resourceInfo.ResourceType -eq "Microsoft.Compute/virtualMachines") {
+                   $vm = Get-AzVM -ResourceGroupName $resourceInfo.ResourceGroupName -Name $resourceInfo.ResourceName -Status
+                   $isRunning = $vm.Statuses | Where-Object { $_.Code -eq "PowerState/running" }
+                   
+                   if ($isRunning -and -not $vm.Tags.ContainsKey("DoNotStop")) {
+                       Stop-AzVM -ResourceGroupName $resourceInfo.ResourceGroupName -Name $resourceInfo.ResourceName -Force
+                       Write-Output "Virtual machine $($resourceInfo.ResourceName) stopped for carbon optimization"
+                   }
+                   else {
+                       Write-Output "Virtual machine $($resourceInfo.ResourceName) cannot be stopped (protected or already stopped)"
+                   }
                }
            }
-       }
-       "Rightsize virtual machine" {
-           if ($resourceInfo.ResourceType -eq "Microsoft.Compute/virtualMachines") {
-               # Implement VM resizing logic based on utilization patterns
-               Write-Output "Rightsizing recommendation logged for $($resourceInfo.ResourceName)"
+           "*rightsize*" {
+               if ($resourceInfo.ResourceType -eq "Microsoft.Compute/virtualMachines") {
+                   Write-Output "Rightsizing recommendation logged for $($resourceInfo.ResourceName). Manual review required."
+               }
+           }
+           "*unused storage*" {
+               if ($resourceInfo.ResourceType -eq "Microsoft.Storage/storageAccounts") {
+                   Write-Output "Storage cleanup recommendation logged for $($resourceInfo.ResourceName). Manual review required."
+               }
+           }
+           default {
+               Write-Output "Unhandled optimization action: $OptimizationAction for resource $ResourceId"
            }
        }
-       "Delete unused storage" {
-           if ($resourceInfo.ResourceType -eq "Microsoft.Storage/storageAccounts") {
-               # Implement storage cleanup logic with safety checks
-               Write-Output "Storage cleanup recommendation logged for $($resourceInfo.ResourceName)"
-           }
-       }
+       
+       # Log optimization action
+       Write-Output "Optimization action completed: $OptimizationAction for resource $ResourceId"
    }
-   
-   # Log optimization action
-   Write-Output "Optimization action completed: $OptimizationAction for resource $ResourceId"
+   catch {
+       Write-Error "Error in remediation runbook: $($_.Exception.Message)"
+       throw
+   }
    EOF
    
    # Import the remediation runbook
@@ -351,16 +397,17 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
        --name "DailyCarbonMonitoring" \
        --frequency "Day" \
        --interval 1 \
-       --start-time "$(date -u -d '+1 day' '+%Y-%m-%dT06:00:00Z')" \
+       --start-time "$(date -u -d '+1 hour' '+%Y-%m-%dT%H:00:00Z')" \
        --description "Daily carbon optimization monitoring"
    
-   # Link runbook to schedule
+   # Link runbook to schedule with proper parameters
    az automation job-schedule create \
        --resource-group ${RESOURCE_GROUP} \
        --automation-account-name ${AUTOMATION_ACCOUNT} \
        --runbook-name "CarbonOptimizationMonitoring" \
        --schedule-name "DailyCarbonMonitoring" \
-       --parameters "SubscriptionId=${SUBSCRIPTION_ID}" "WorkspaceId=${WORKSPACE_ID}"
+       --parameters "SubscriptionId=${SUBSCRIPTION_ID}" \
+                   "WorkspaceId=${WORKSPACE_ID}"
    
    echo "✅ Scheduled monitoring job configured"
    ```
@@ -380,16 +427,16 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
            {
                "type": 1,
                "content": {
-                   "json": "# Carbon Optimization Dashboard\n\nThis workbook provides comprehensive insights into your Azure carbon footprint and optimization opportunities."
+                   "json": "# Carbon Optimization Dashboard\n\nThis workbook provides comprehensive insights into your Azure carbon footprint and optimization opportunities based on Azure Advisor recommendations and automated analysis."
                }
            },
            {
                "type": 3,
                "content": {
                    "version": "KqlItem/1.0",
-                   "query": "CarbonOptimization_CL\n| where TimeGenerated >= ago(30d)\n| summarize TotalCarbonSavings = sum(CarbonSavingsEstimate_d) by bin(TimeGenerated, 1d)\n| render timechart",
+                   "query": "AdvisorRecommendation\n| where TimeGenerated >= ago(30d)\n| where Category in (\"Cost\", \"Performance\", \"OperationalExcellence\")\n| extend CarbonImpact = ImpactedValue * 0.4\n| summarize TotalCarbonSavings = sum(CarbonImpact) by bin(TimeGenerated, 1d)\n| render timechart",
                    "size": 0,
-                   "title": "Carbon Savings Trend (30 Days)",
+                   "title": "Estimated Carbon Savings Opportunities (30 Days)",
                    "queryType": 0,
                    "resourceType": "microsoft.operationalinsights/workspaces"
                }
@@ -398,7 +445,7 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
                "type": 3,
                "content": {
                    "version": "KqlItem/1.0",
-                   "query": "CarbonOptimization_CL\n| where TimeGenerated >= ago(7d)\n| summarize Count = count() by Category_s\n| render piechart",
+                   "query": "AdvisorRecommendation\n| where TimeGenerated >= ago(7d)\n| where Category in (\"Cost\", \"Performance\", \"OperationalExcellence\")\n| summarize Count = count() by Category\n| render piechart",
                    "size": 0,
                    "title": "Optimization Opportunities by Category",
                    "queryType": 0,
@@ -409,15 +456,25 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
    }
    EOF
    
-   # Deploy the workbook
-   az monitor workbook create \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${WORKBOOK_NAME} \
-       --display-name "Carbon Optimization Dashboard" \
-       --description "Comprehensive carbon optimization monitoring and insights" \
-       --category workbook \
-       --template-data @carbon-optimization-workbook.json \
-       --location ${LOCATION}
+   # Import the workbook using Azure REST API since az monitor workbook create is not available
+   WORKBOOK_RESOURCE_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/workbooks/${WORKBOOK_NAME}"
+   
+   cat > workbook-payload.json << EOF
+   {
+       "kind": "shared",
+       "location": "${LOCATION}",
+       "properties": {
+           "displayName": "Carbon Optimization Dashboard",
+           "serializedData": "$(cat carbon-optimization-workbook.json | jq -c . | sed 's/"/\\"/g')",
+           "category": "workbook",
+           "description": "Comprehensive carbon optimization monitoring and insights"
+       }
+   }
+   EOF
+   
+   az rest --method PUT \
+       --url "https://management.azure.com${WORKBOOK_RESOURCE_ID}?api-version=2021-03-08" \
+       --body @workbook-payload.json
    
    echo "✅ Carbon optimization workbook deployed"
    ```
@@ -434,25 +491,43 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
        --resource-group ${RESOURCE_GROUP} \
        --name "CarbonOptimizationAlerts" \
        --short-name "CarbonOpt" \
-       --action email "admin@company.com" \
-       --action webhook "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
-   
-   # Create alert rule for high carbon impact
-   az monitor metrics alert create \
-       --resource-group ${RESOURCE_GROUP} \
-       --name "HighCarbonImpactAlert" \
-       --scopes "/subscriptions/${SUBSCRIPTION_ID}" \
-       --condition "avg Platform.CarbonEmissions > 100" \
-       --description "Alert when carbon emissions exceed threshold" \
-       --evaluation-frequency 5m \
-       --window-size 15m \
-       --severity 2 \
-       --action "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/actionGroups/CarbonOptimizationAlerts"
+       --action email "admin@company.com" "CarbonAlert"
    
    # Create log alert for optimization opportunities
-   az monitor log-analytics query \
-       --workspace ${WORKSPACE_ID} \
-       --analytics-query "CarbonOptimization_CL | where CarbonSavingsEstimate_d > 50 | count"
+   cat > alert-rule.json << EOF
+   {
+       "location": "${LOCATION}",
+       "properties": {
+           "description": "Alert when carbon optimization opportunities exceed threshold",
+           "severity": 2,
+           "enabled": true,
+           "scopes": [
+               "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${WORKSPACE_NAME}"
+           ],
+           "evaluationFrequency": "PT5M",
+           "windowSize": "PT15M",
+           "criteria": {
+               "allOf": [
+                   {
+                       "query": "AdvisorRecommendation | where TimeGenerated >= ago(15m) and Category in ('Cost', 'Performance') | summarize Count = count() | where Count > 10",
+                       "timeAggregation": "Count",
+                       "operator": "GreaterThan",
+                       "threshold": 0
+                   }
+               ]
+           },
+           "actions": [
+               {
+                   "actionGroupId": "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/microsoft.insights/actionGroups/CarbonOptimizationAlerts"
+               }
+           ]
+       }
+   }
+   EOF
+   
+   az rest --method PUT \
+       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/scheduledQueryRules/HighCarbonImpactAlert?api-version=2021-08-01" \
+       --body @alert-rule.json
    
    echo "✅ Carbon optimization alerts configured"
    ```
@@ -466,8 +541,8 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
    ```bash
    # Test carbon optimization API access
    az rest --method GET \
-       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/providers/Microsoft.Sustainability/carbonEmissions?api-version=2023-11-01-preview" \
-       --query "value[0].properties.carbonEmissions" \
+       --url "https://management.azure.com/providers/Microsoft.Carbon/carbonEmissionReports?api-version=2025-04-01" \
+       --query "value" \
        --output table
    
    # Check Carbon Optimization Reader role assignment
@@ -477,7 +552,7 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
        --query "[?roleDefinitionName=='Carbon Optimization Reader']"
    ```
 
-   Expected output: Carbon emissions data showing resource-level environmental impact metrics.
+   Expected output: Carbon emissions report data showing access to carbon optimization APIs.
 
 2. **Test Automation Account Functionality**:
 
@@ -494,7 +569,8 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
        --resource-group ${RESOURCE_GROUP} \
        --automation-account-name ${AUTOMATION_ACCOUNT} \
        --name "CarbonOptimizationMonitoring" \
-       --parameters "SubscriptionId=${SUBSCRIPTION_ID}" "WorkspaceId=${WORKSPACE_ID}"
+       --parameters "SubscriptionId=${SUBSCRIPTION_ID}" \
+                   "WorkspaceId=${WORKSPACE_ID}"
    
    # Check runbook job status
    az automation job list \
@@ -508,19 +584,19 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
 3. **Validate Monitoring and Alerting**:
 
    ```bash
-   # Check Log Analytics workspace data ingestion
-   az monitor log-analytics query \
-       --workspace ${WORKSPACE_ID} \
-       --analytics-query "CarbonOptimization_CL | take 10" \
-       --output table
+   # Check Log Analytics workspace connection
+   az monitor log-analytics workspace show \
+       --resource-group ${RESOURCE_GROUP} \
+       --workspace-name ${WORKSPACE_NAME} \
+       --query "{name:name, customerId:customerId, provisioningState:provisioningState}"
    
    # Verify alert rules are active
-   az monitor metrics alert list \
-       --resource-group ${RESOURCE_GROUP} \
-       --query "[].{name:name, enabled:enabled, condition:criteria.allOf[0].criterionType}"
+   az rest --method GET \
+       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/scheduledQueryRules?api-version=2021-08-01" \
+       --query "value[].{name:name, enabled:properties.enabled}"
    ```
 
-   Expected output: Carbon optimization data flowing into Log Analytics with active alert rules.
+   Expected output: Log Analytics workspace accessible with active alert rules configured.
 
 ## Cleanup
 
@@ -528,9 +604,8 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
 
    ```bash
    # Delete alert rules
-   az monitor metrics alert delete \
-       --resource-group ${RESOURCE_GROUP} \
-       --name "HighCarbonImpactAlert"
+   az rest --method DELETE \
+       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/scheduledQueryRules/HighCarbonImpactAlert?api-version=2021-08-01"
    
    # Delete action group
    az monitor action-group delete \
@@ -550,9 +625,8 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
        --yes
    
    # Delete workbook
-   az monitor workbook delete \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${WORKBOOK_NAME}
+   az rest --method DELETE \
+       --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/workbooks/${WORKBOOK_NAME}?api-version=2021-03-08"
    
    echo "✅ Automation resources cleaned up"
    ```
@@ -578,29 +652,29 @@ echo "   Log Analytics Workspace: ${WORKSPACE_NAME}"
 
 ## Discussion
 
-Azure Carbon Optimization represents a significant advancement in cloud sustainability, providing granular visibility into the environmental impact of cloud workloads. By integrating carbon emissions data with Azure Advisor recommendations and Azure Automation capabilities, organizations can achieve continuous optimization that balances performance, cost, and environmental responsibility. This solution follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/sustainability/) sustainability pillar principles, emphasizing efficient resource utilization and environmental stewardship.
+Azure Carbon Optimization represents a significant advancement in cloud sustainability, providing granular visibility into the environmental impact of cloud workloads. By integrating carbon emissions data with Azure Advisor recommendations and Azure Automation capabilities, organizations can achieve continuous optimization that balances performance, cost, and environmental responsibility. This solution follows the [Azure Well-Architected Framework sustainability pillar](https://learn.microsoft.com/en-us/azure/architecture/framework/sustainability/) principles, emphasizing efficient resource utilization and environmental stewardship.
 
-The integration of Azure Carbon Optimization with Azure Advisor creates a powerful feedback loop where cost optimization recommendations are evaluated for their environmental impact. This dual optimization approach ensures that sustainability initiatives don't compromise operational efficiency, and cost optimization efforts contribute to environmental goals. The [Azure Carbon Optimization documentation](https://learn.microsoft.com/en-us/azure/carbon-optimization/overview) provides comprehensive guidance on interpreting emissions data and implementing optimization strategies.
+The integration of Azure Carbon Optimization with Azure Advisor creates a powerful feedback loop where cost optimization recommendations are evaluated for their environmental impact. This dual optimization approach ensures that sustainability initiatives don't compromise operational efficiency, and cost optimization efforts contribute to environmental goals. The [Azure Carbon Optimization service](https://learn.microsoft.com/en-us/azure/carbon-optimization/overview) provides comprehensive guidance on interpreting emissions data and implementing optimization strategies at no additional cost.
 
 Azure Automation provides the orchestration layer that transforms insights into action, enabling automated responses to carbon optimization opportunities. The managed identity authentication ensures secure automation without storing credentials, following Azure security best practices. For comprehensive automation guidance, refer to the [Azure Automation documentation](https://learn.microsoft.com/en-us/azure/automation/automation-intro) and [Azure Automation runbook best practices](https://learn.microsoft.com/en-us/azure/automation/automation-runbook-best-practices).
 
 The monitoring and alerting capabilities provided by Azure Monitor ensure continuous visibility into environmental performance, enabling proactive management of carbon emissions. The workbook visualization helps stakeholders understand the impact of optimization efforts and make data-driven decisions about sustainability initiatives. For advanced monitoring scenarios, explore the [Azure Monitor documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/) and [Azure Monitor workbook templates](https://learn.microsoft.com/en-us/azure/azure-monitor/visualize/workbooks-overview).
 
-> **Tip**: Configure carbon optimization thresholds based on your organization's sustainability goals. The [Microsoft sustainability commitment](https://www.microsoft.com/corporate-responsibility/sustainability) provides context for enterprise-level environmental initiatives and can guide your optimization targets.
+> **Tip**: Configure carbon optimization thresholds based on your organization's sustainability goals and regulatory requirements. The [Microsoft sustainability commitment](https://www.microsoft.com/corporate-responsibility/sustainability) provides context for enterprise-level environmental initiatives and can guide your optimization targets.
 
 ## Challenge
 
 Extend this solution by implementing these advanced sustainability features:
 
-1. **Multi-Cloud Carbon Tracking**: Integrate carbon optimization data from other cloud providers to create a unified environmental dashboard using Azure Monitor and custom data connectors.
+1. **Multi-Cloud Carbon Tracking**: Integrate carbon optimization data from other cloud providers to create a unified environmental dashboard using Azure Monitor and custom data connectors with Power BI.
 
-2. **Predictive Carbon Analytics**: Implement machine learning models using Azure Machine Learning to predict future carbon emissions based on workload patterns and seasonal variations.
+2. **Predictive Carbon Analytics**: Implement machine learning models using Azure Machine Learning to predict future carbon emissions based on workload patterns, seasonal variations, and resource utilization trends.
 
-3. **Automated Sustainability Reporting**: Create automated reports for sustainability compliance using Azure Logic Apps and Power BI to generate executive dashboards and regulatory reports.
+3. **Automated Sustainability Reporting**: Create automated reports for sustainability compliance using Azure Logic Apps and Power BI to generate executive dashboards and regulatory reports that align with ESG frameworks.
 
-4. **Carbon-Aware Scheduling**: Develop intelligent workload scheduling that considers regional carbon intensity data to run compute-intensive tasks during periods of lower grid carbon emissions.
+4. **Carbon-Aware Scheduling**: Develop intelligent workload scheduling that considers regional carbon intensity data to run compute-intensive tasks during periods of lower grid carbon emissions using Azure Batch and regional availability.
 
-5. **Sustainable Architecture Recommendations**: Build a recommendation engine that suggests carbon-optimized Azure architecture patterns based on workload characteristics and business requirements.
+5. **Sustainable Architecture Recommendations**: Build a recommendation engine that suggests carbon-optimized Azure architecture patterns based on workload characteristics, business requirements, and real-time emissions data.
 
 ## Infrastructure Code
 

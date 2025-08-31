@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure AI Foundry, Azure Container Registry, Azure Event Grid, Azure Key Vault
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ai, machine-learning, multi-modal, containerization, workflow-automation, event-driven
 recipe-generator-version: 1.3
@@ -90,7 +90,7 @@ graph TB
 2. Azure CLI v2.61.0 or later installed and configured
 3. Docker Desktop installed for container image creation
 4. Basic understanding of AI/ML concepts, containerization, and event-driven architectures
-5. Python 3.9+ for developing custom AI model containers
+5. Python 3.11+ for developing custom AI model containers
 6. Estimated cost: $50-100 for the initial setup and testing (varies based on AI model usage)
 
 > **Note**: Azure AI Foundry includes consumption-based pricing for model inference. Review the [Azure AI pricing guide](https://azure.microsoft.com/en-us/pricing/details/ai-foundry/) to understand costs before proceeding.
@@ -180,7 +180,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    # Enable system-assigned managed identity for ACR
    az acr identity assign \
        --name ${CONTAINER_REGISTRY} \
-       --identities [system]
+       --identities [system] \
+       --resource-group ${RESOURCE_GROUP}
 
    # Get ACR login server for later use
    ACR_LOGIN_SERVER=$(az acr show \
@@ -221,40 +222,48 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
    The AI Foundry Hub provides shared infrastructure and governance policies, while the Project offers an isolated workspace for developing and deploying multi-modal content generation workflows. This separation enables different teams to work independently while sharing common resources and security configurations.
 
-4. **Deploy Multi-Modal AI Models in Azure AI Foundry**:
+4. **Deploy Azure AI Services for Multi-Modal AI Models**:
 
-   Azure AI Foundry's model catalog provides access to state-of-the-art multi-modal models through standardized APIs. Deploying GPT-4o for text generation, DALL-E 3 for image creation, and speech synthesis models creates the foundation for comprehensive content generation workflows that can produce coordinated multi-media outputs with consistent branding and messaging.
+   Azure AI Services provides the foundation for multi-modal content generation through managed AI models accessible via standardized APIs. Creating an AI Services resource enables access to GPT-4o for text generation, DALL-E 3 for image creation, and speech synthesis models, providing the core AI capabilities needed for comprehensive content generation workflows.
 
    ```bash
-   # Deploy GPT-4o model for text generation
-   az ml online-deployment create \
-       --name gpt4o-text-deployment \
-       --workspace-name ${AI_FOUNDRY_PROJECT} \
+   # Create Azure AI Services resource
+   AI_SERVICES_NAME="ais-content-${RANDOM_SUFFIX}"
+   
+   az cognitiveservices account create \
+       --name ${AI_SERVICES_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --model azureml://registries/azureml/models/gpt-4o/versions/2024-08-06 \
-       --instance-type Standard_NC6s_v3 \
-       --instance-count 1
+       --location ${LOCATION} \
+       --kind AIServices \
+       --sku S0 \
+       --custom-domain ${AI_SERVICES_NAME}
 
-   # Deploy DALL-E 3 model for image generation
-   az ml online-deployment create \
-       --name dalle3-image-deployment \
-       --workspace-name ${AI_FOUNDRY_PROJECT} \
+   # Get AI Services endpoint and key
+   AI_SERVICES_ENDPOINT=$(az cognitiveservices account show \
+       --name ${AI_SERVICES_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --model azureml://registries/azureml/models/dall-e-3/versions/latest \
-       --instance-type Standard_NC12s_v3 \
-       --instance-count 1
+       --query properties.endpoint --output tsv)
 
-   # Get deployment endpoints for later configuration
-   TEXT_ENDPOINT=$(az ml online-endpoint show \
-       --name gpt4o-text-deployment \
-       --workspace-name ${AI_FOUNDRY_PROJECT} \
+   AI_SERVICES_KEY=$(az cognitiveservices account keys list \
+       --name ${AI_SERVICES_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query properties.scoringUri --output tsv)
+       --query key1 --output tsv)
 
-   echo "✅ Multi-modal AI models deployed successfully"
+   # Store AI Services credentials in Key Vault
+   az keyvault secret set \
+       --vault-name ${KEY_VAULT_NAME} \
+       --name "ai-services-endpoint" \
+       --value ${AI_SERVICES_ENDPOINT}
+
+   az keyvault secret set \
+       --vault-name ${KEY_VAULT_NAME} \
+       --name "ai-services-key" \
+       --value ${AI_SERVICES_KEY}
+
+   echo "✅ Azure AI Services deployed: ${AI_SERVICES_NAME}"
    ```
 
-   These model deployments provide managed endpoints with automatic scaling, built-in monitoring, and enterprise security. The GPT-4o model handles complex text generation tasks including content planning and copywriting, while DALL-E 3 creates high-quality images based on text descriptions, enabling coordinated multi-modal content creation.
+   The AI Services resource provides unified access to multiple AI models through a single endpoint, simplifying authentication and management. This approach enables seamless switching between different AI models while maintaining consistent security and monitoring across all content generation operations.
 
 5. **Create Event Grid Topic for Workflow Orchestration**:
 
@@ -305,7 +314,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    
    # Create Dockerfile for custom AI model
    cat > custom-ai-model/Dockerfile << 'EOF'
-   FROM python:3.9-slim
+   FROM python:3.11-slim
    
    WORKDIR /app
    
@@ -386,7 +395,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --storage-account ${STORAGE_ACCOUNT} \
        --consumption-plan-location ${LOCATION} \
        --runtime python \
-       --runtime-version 3.9 \
+       --runtime-version 3.11 \
        --functions-version 4
 
    # Configure Function App settings with AI endpoints
@@ -394,7 +403,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --name ${FUNCTION_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --settings \
-           "AI_FOUNDRY_ENDPOINT=${TEXT_ENDPOINT}" \
+           "AI_SERVICES_ENDPOINT=${AI_SERVICES_ENDPOINT}" \
            "STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=${STORAGE_ACCOUNT};AccountKey=$(az storage account keys list --account-name ${STORAGE_ACCOUNT} --resource-group ${RESOURCE_GROUP} --query '[0].value' --output tsv);EndpointSuffix=core.windows.net" \
            "KEY_VAULT_URL=https://${KEY_VAULT_NAME}.vault.azure.net/"
 
@@ -408,11 +417,11 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Content generation workflow function configured"
    ```
 
-   The Function App is now configured to receive Event Grid events and orchestrate multi-modal content generation using AI Foundry models. This serverless architecture ensures automatic scaling and cost-effective processing of content generation requests while maintaining enterprise security through Key Vault integration.
+   The Function App is now configured to receive Event Grid events and orchestrate multi-modal content generation using Azure AI Services. This serverless architecture ensures automatic scaling and cost-effective processing of content generation requests while maintaining enterprise security through Key Vault integration.
 
 8. **Implement Multi-Modal Content Coordination Logic**:
 
-   The content coordination logic ensures that generated text, images, and audio maintain thematic consistency and brand alignment across different modalities. This orchestration layer uses Azure AI Foundry's unified SDK to coordinate between different AI models, managing dependencies between content types and ensuring coherent multi-modal outputs that meet business requirements and quality standards.
+   The content coordination logic ensures that generated text, images, and audio maintain thematic consistency and brand alignment across different modalities. This orchestration layer uses Azure AI Services' unified API to coordinate between different AI models, managing dependencies between content types and ensuring coherent multi-modal outputs that meet business requirements and quality standards.
 
    ```bash
    # Create content coordination configuration
@@ -485,20 +494,19 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
 ## Validation & Testing
 
-1. **Verify Azure AI Foundry Model Deployments**:
+1. **Verify Azure AI Services Deployment**:
 
    ```bash
-   # Check AI Foundry model endpoint status
-   az ml online-endpoint show \
-       --name gpt4o-text-deployment \
-       --workspace-name ${AI_FOUNDRY_PROJECT} \
+   # Check AI Services resource status
+   az cognitiveservices account show \
+       --name ${AI_SERVICES_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query '{name:name,state:properties.provisioningState,scoring_uri:properties.scoringUri}'
+       --query '{name:name,kind:kind,location:location,provisioningState:properties.provisioningState}'
 
-   # Test model endpoint connectivity
-   curl -X POST ${TEXT_ENDPOINT}/v1/chat/completions \
+   # Test AI Services endpoint connectivity
+   curl -X POST "${AI_SERVICES_ENDPOINT}/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-01" \
        -H "Content-Type: application/json" \
-       -H "Authorization: Bearer $(az account get-access-token --query accessToken --output tsv)" \
+       -H "api-key: ${AI_SERVICES_KEY}" \
        -d '{"messages":[{"role":"user","content":"Generate a brief product description for a smart home device."}],"max_tokens":100}'
    ```
 
@@ -575,22 +583,25 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Event Grid resources deleted"
    ```
 
-2. **Remove AI Foundry Deployments and Workspace**:
+2. **Remove AI Services and Function App**:
 
    ```bash
-   # Delete AI model deployments
-   az ml online-deployment delete \
-       --name gpt4o-text-deployment \
-       --workspace-name ${AI_FOUNDRY_PROJECT} \
-       --resource-group ${RESOURCE_GROUP} \
-       --yes
+   # Delete Function App
+   az functionapp delete \
+       --name ${FUNCTION_APP_NAME} \
+       --resource-group ${RESOURCE_GROUP}
 
-   az ml online-deployment delete \
-       --name dalle3-image-deployment \
-       --workspace-name ${AI_FOUNDRY_PROJECT} \
-       --resource-group ${RESOURCE_GROUP} \
-       --yes
+   # Delete AI Services resource
+   az cognitiveservices account delete \
+       --name ${AI_SERVICES_NAME} \
+       --resource-group ${RESOURCE_GROUP}
 
+   echo "✅ AI Services and Function App deleted"
+   ```
+
+3. **Remove AI Foundry Workspace and Container Registry**:
+
+   ```bash
    # Delete AI Foundry Project and Hub
    az ml workspace delete \
        --name ${AI_FOUNDRY_PROJECT} \
@@ -602,24 +613,13 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --resource-group ${RESOURCE_GROUP} \
        --yes
 
-   echo "✅ AI Foundry resources deleted"
-   ```
-
-3. **Remove Container Registry and Function App**:
-
-   ```bash
-   # Delete Function App
-   az functionapp delete \
-       --name ${FUNCTION_APP_NAME} \
-       --resource-group ${RESOURCE_GROUP}
-
    # Delete Container Registry
    az acr delete \
        --name ${CONTAINER_REGISTRY} \
        --resource-group ${RESOURCE_GROUP} \
        --yes
 
-   echo "✅ Container and compute resources deleted"
+   echo "✅ AI Foundry and Container Registry deleted"
    ```
 
 4. **Remove Storage and Security Resources**:

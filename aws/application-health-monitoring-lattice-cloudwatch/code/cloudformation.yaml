@@ -1,0 +1,1046 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Application Health Monitoring with VPC Lattice and CloudWatch
+  This template creates a complete health monitoring system using VPC Lattice service metrics,
+  CloudWatch alarms, and Lambda functions for automated remediation and notifications.
+
+Parameters:
+  # Network Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where VPC Lattice resources will be deployed
+    ConstraintDescription: Must be a valid VPC ID
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs for target group configuration (minimum 2 subnets)
+    ConstraintDescription: Must specify at least 2 subnet IDs from different AZs
+
+  # Service Configuration
+  ServiceNetworkName:
+    Type: String
+    Default: health-monitor-network
+    Description: Name for the VPC Lattice service network
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    MinLength: 3
+    MaxLength: 40
+    ConstraintDescription: Must be 3-40 characters, alphanumeric and hyphens only
+
+  ServiceName:
+    Type: String
+    Default: demo-service
+    Description: Name for the VPC Lattice service
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    MinLength: 3
+    MaxLength: 40
+    ConstraintDescription: Must be 3-40 characters, alphanumeric and hyphens only
+
+  TargetGroupName:
+    Type: String
+    Default: demo-targets
+    Description: Name for the VPC Lattice target group
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    MinLength: 3
+    MaxLength: 40
+    ConstraintDescription: Must be 3-40 characters, alphanumeric and hyphens only
+
+  # Health Check Configuration
+  HealthCheckPath:
+    Type: String
+    Default: /health
+    Description: Health check path for target group
+    AllowedPattern: ^/.*$
+    ConstraintDescription: Must start with forward slash
+
+  HealthCheckIntervalSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 300
+    Description: Health check interval in seconds
+
+  HealthCheckTimeoutSeconds:
+    Type: Number
+    Default: 5
+    MinValue: 2
+    MaxValue: 120
+    Description: Health check timeout in seconds
+
+  HealthyThresholdCount:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 10
+    Description: Number of consecutive successful health checks before considering target healthy
+
+  UnhealthyThresholdCount:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 10
+    Description: Number of consecutive failed health checks before considering target unhealthy
+
+  # Monitoring Configuration
+  HighErrorRateThreshold:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+    Description: Threshold for 5XX error count alarm
+
+  TimeoutThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: Threshold for request timeout count alarm
+
+  ResponseTimeThreshold:
+    Type: Number
+    Default: 2000
+    MinValue: 100
+    MaxValue: 30000
+    Description: Threshold for average response time alarm (milliseconds)
+
+  AlarmEvaluationPeriods:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 5
+    Description: Number of periods to evaluate for alarms
+
+  MetricPeriod:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 3600
+    Description: CloudWatch metric period in seconds
+
+  # Notification Configuration
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Email address for health monitoring notifications (optional)
+    AllowedPattern: ^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address or empty
+
+  # Lambda Configuration
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 3008
+    Description: Lambda function memory size in MB
+
+  # Tagging
+  Environment:
+    Type: String
+    Default: demo
+    AllowedValues: [dev, test, staging, prod, demo]
+    Description: Environment name for resource tagging
+
+  Project:
+    Type: String
+    Default: health-monitoring
+    Description: Project name for resource tagging
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    MinLength: 3
+    MaxLength: 30
+
+Conditions:
+  # Condition to create email subscription if email is provided
+  CreateEmailSubscription: !Not [!Equals [!Ref NotificationEmail, ""]]
+
+  # Condition for production environment specific configurations
+  IsProduction: !Equals [!Ref Environment, "prod"]
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+      - Label:
+          default: "Service Configuration"
+        Parameters:
+          - ServiceNetworkName
+          - ServiceName
+          - TargetGroupName
+      - Label:
+          default: "Health Check Configuration"
+        Parameters:
+          - HealthCheckPath
+          - HealthCheckIntervalSeconds
+          - HealthCheckTimeoutSeconds
+          - HealthyThresholdCount
+          - UnhealthyThresholdCount
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - HighErrorRateThreshold
+          - TimeoutThreshold
+          - ResponseTimeThreshold
+          - AlarmEvaluationPeriods
+          - MetricPeriod
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "Tagging"
+        Parameters:
+          - Environment
+          - Project
+    ParameterLabels:
+      VpcId:
+        default: "VPC ID"
+      SubnetIds:
+        default: "Subnet IDs"
+      ServiceNetworkName:
+        default: "Service Network Name"
+      ServiceName:
+        default: "Service Name"
+      TargetGroupName:
+        default: "Target Group Name"
+      HealthCheckPath:
+        default: "Health Check Path"
+      NotificationEmail:
+        default: "Notification Email"
+
+Resources:
+  # VPC Lattice Service Network
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub "${ServiceNetworkName}-${AWS::StackName}"
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub "${ServiceNetworkName}-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: health-monitoring
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # VPC Association with Service Network
+  ServiceNetworkVpcAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      VpcIdentifier: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub "${ServiceNetworkName}-vpc-association"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # Target Group for Backend Services
+  TargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: !Sub "${TargetGroupName}-${AWS::StackName}"
+      Type: INSTANCE
+      Protocol: HTTP
+      Port: 80
+      VpcIdentifier: !Ref VpcId
+      HealthCheck:
+        Enabled: true
+        Protocol: HTTP
+        Port: 80
+        Path: !Ref HealthCheckPath
+        HealthCheckIntervalSeconds: !Ref HealthCheckIntervalSeconds
+        HealthCheckTimeoutSeconds: !Ref HealthCheckTimeoutSeconds
+        HealthyThresholdCount: !Ref HealthyThresholdCount
+        UnhealthyThresholdCount: !Ref UnhealthyThresholdCount
+        Matcher:
+          HttpCode: "200"
+      Tags:
+        - Key: Name
+          Value: !Sub "${TargetGroupName}-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: health-monitoring
+
+  # VPC Lattice Service
+  LatticeService:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Sub "${ServiceName}-${AWS::StackName}"
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub "${ServiceName}-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: health-monitoring
+
+  # Service Association with Service Network
+  ServiceNetworkServiceAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      ServiceIdentifier: !Ref LatticeService
+      Tags:
+        - Key: Name
+          Value: !Sub "${ServiceName}-service-association"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # HTTP Listener for the Service
+  HttpListener:
+    Type: AWS::VpcLattice::Listener
+    Properties:
+      ServiceIdentifier: !Ref LatticeService
+      Name: http-listener
+      Protocol: HTTP
+      Port: 80
+      DefaultAction:
+        Type: FORWARD
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref TargetGroup
+              Weight: 100
+      Tags:
+        - Key: Name
+          Value: !Sub "${ServiceName}-http-listener"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # SNS Topic for Health Notifications
+  HealthAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${Project}-health-alerts-${AWS::StackName}"
+      DisplayName: Application Health Alerts
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub "${Project}-health-alerts"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: health-monitoring
+
+  # SNS Topic Policy for CloudWatch Alarms
+  HealthAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref HealthAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref HealthAlertsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # Email Subscription (conditional)
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailSubscription
+    Properties:
+      TopicArn: !Ref HealthAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "HealthRemediationRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: HealthRemediationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - vpc-lattice:GetService
+                  - vpc-lattice:GetTargetGroup
+                  - vpc-lattice:ListTargets
+                  - vpc-lattice:RegisterTargets
+                  - vpc-lattice:DeregisterTargets
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:GetMetricData
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref HealthAlertsTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "HealthRemediationRole-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # Lambda Function for Auto-Remediation
+  HealthRemediationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Project}-health-remediation-${AWS::StackName}"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref HealthAlertsTopic
+          SERVICE_ID: !Ref LatticeService
+          TARGET_GROUP_ID: !Ref TargetGroup
+          LOG_LEVEL: INFO
+      Description: Auto-remediation function for VPC Lattice health monitoring
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime, timedelta
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+          # Initialize AWS clients
+          sns = boto3.client('sns')
+          vpc_lattice = boto3.client('vpc-lattice')
+          cloudwatch = boto3.client('cloudwatch')
+          ec2 = boto3.client('ec2')
+
+          def lambda_handler(event, context):
+              """
+              Auto-remediation function for VPC Lattice health issues
+              Processes CloudWatch alarm notifications and triggers appropriate remediation actions
+              """
+              try:
+                  logger.info(f"Processing event: {json.dumps(event, default=str)}")
+                  
+                  # Parse SNS message from CloudWatch alarm
+                  if 'Records' in event and event['Records']:
+                      sns_message = json.loads(event['Records'][0]['Sns']['Message'])
+                      alarm_name = sns_message.get('AlarmName', 'Unknown')
+                      alarm_state = sns_message.get('NewStateValue', 'Unknown')
+                      alarm_reason = sns_message.get('NewStateReason', 'No reason provided')
+                      
+                      logger.info(f"Processing alarm: {alarm_name}, State: {alarm_state}")
+                      
+                      if alarm_state == 'ALARM':
+                          # Determine remediation action based on alarm type
+                          if '5XX' in alarm_name or 'Error' in alarm_name:
+                              remediate_error_rate(sns_message)
+                          elif 'Timeout' in alarm_name:
+                              remediate_timeouts(sns_message)
+                          elif 'ResponseTime' in alarm_name:
+                              remediate_performance(sns_message)
+                          else:
+                              remediate_generic(sns_message)
+                      elif alarm_state == 'OK':
+                          send_recovery_notification(sns_message)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed alarm notification',
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing alarm: {str(e)}", exc_info=True)
+                  
+                  # Send error notification
+                  send_notification(
+                      "🚨 Health Remediation Error",
+                      f"Error processing health alarm:\n"
+                      f"Error: {str(e)}\n"
+                      f"Event: {json.dumps(event, default=str)[:500]}...\n"
+                      f"Time: {datetime.utcnow().isoformat()}"
+                  )
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                  }
+
+          def remediate_error_rate(alarm_data):
+              """Handle high error rate alarms with detailed analysis"""
+              logger.info("Implementing error rate remediation")
+              
+              try:
+                  # Get current target health status
+                  target_health = get_target_health()
+                  unhealthy_targets = [t for t in target_health if t['status'] != 'HEALTHY']
+                  
+                  # Get recent error metrics
+                  error_metrics = get_recent_error_metrics()
+                  
+                  remediation_actions = []
+                  
+                  if unhealthy_targets:
+                      remediation_actions.append(f"Found {len(unhealthy_targets)} unhealthy targets")
+                      # In production, you could automatically deregister unhealthy targets
+                      # deregister_unhealthy_targets(unhealthy_targets)
+                  
+                  if error_metrics.get('5xx_rate', 0) > 10:
+                      remediation_actions.append("High 5XX error rate detected - investigating backend services")
+                  
+                  remediation_actions.append("Triggered health check validation")
+                  
+                  send_notification(
+                      "🚨 High Error Rate Detected - Remediation Started",
+                      f"Alarm: {alarm_data['AlarmName']}\n"
+                      f"Error Rate: {error_metrics.get('5xx_rate', 'Unknown')}%\n"
+                      f"Unhealthy Targets: {len(unhealthy_targets)}\n"
+                      f"Actions Taken:\n" + "\n".join([f"• {action}" for action in remediation_actions]) + "\n"
+                      f"Time: {alarm_data.get('StateChangeTime', datetime.utcnow().isoformat())}"
+                  )
+                  
+              except Exception as e:
+                  logger.error(f"Error in error rate remediation: {str(e)}")
+
+          def remediate_timeouts(alarm_data):
+              """Handle timeout alarms with capacity analysis"""
+              logger.info("Implementing timeout remediation")
+              
+              try:
+                  # Get current capacity metrics
+                  capacity_metrics = get_capacity_metrics()
+                  target_count = capacity_metrics.get('healthy_target_count', 0)
+                  
+                  remediation_actions = []
+                  
+                  if target_count < 2:
+                      remediation_actions.append("Low target capacity detected - consider scaling")
+                  
+                  remediation_actions.append("Analyzing request queue depth")
+                  remediation_actions.append("Checking backend service capacity")
+                  
+                  send_notification(
+                      "⏰ Request Timeouts Detected - Remediation Started",
+                      f"Alarm: {alarm_data['AlarmName']}\n"
+                      f"Healthy Targets: {target_count}\n"
+                      f"Actions Taken:\n" + "\n".join([f"• {action}" for action in remediation_actions]) + "\n"
+                      f"Recommendation: Review target capacity and backend performance\n"
+                      f"Time: {alarm_data.get('StateChangeTime', datetime.utcnow().isoformat())}"
+                  )
+                  
+              except Exception as e:
+                  logger.error(f"Error in timeout remediation: {str(e)}")
+
+          def remediate_performance(alarm_data):
+              """Handle performance degradation alarms"""
+              logger.info("Implementing performance remediation")
+              
+              try:
+                  # Get performance metrics
+                  perf_metrics = get_performance_metrics()
+                  
+                  remediation_actions = [
+                      "Analyzing response time patterns",
+                      "Checking backend service health",
+                      "Reviewing target group distribution"
+                  ]
+                  
+                  send_notification(
+                      "📉 Performance Degradation Detected - Remediation Started",
+                      f"Alarm: {alarm_data['AlarmName']}\n"
+                      f"Avg Response Time: {perf_metrics.get('avg_response_time', 'Unknown')}ms\n"
+                      f"Actions Taken:\n" + "\n".join([f"• {action}" for action in remediation_actions]) + "\n"
+                      f"Recommendation: Monitor backend services and consider scaling\n"
+                      f"Time: {alarm_data.get('StateChangeTime', datetime.utcnow().isoformat())}"
+                  )
+                  
+              except Exception as e:
+                  logger.error(f"Error in performance remediation: {str(e)}")
+
+          def remediate_generic(alarm_data):
+              """Handle generic health alarms"""
+              logger.info("Implementing generic remediation")
+              
+              send_notification(
+                  "⚠️ Health Issue Detected - Investigation Started",
+                  f"Alarm: {alarm_data['AlarmName']}\n"
+                  f"Reason: {alarm_data.get('NewStateReason', 'Unknown')}\n"
+                  f"Action: Investigating service health metrics\n"
+                  f"Time: {alarm_data.get('StateChangeTime', datetime.utcnow().isoformat())}"
+              )
+
+          def send_recovery_notification(alarm_data):
+              """Send notification when alarm recovers"""
+              logger.info("Service health recovered")
+              
+              send_notification(
+                  "✅ Service Health Recovered",
+                  f"Alarm: {alarm_data['AlarmName']}\n"
+                  f"Status: Service health has returned to normal\n"
+                  f"Time: {alarm_data.get('StateChangeTime', datetime.utcnow().isoformat())}"
+              )
+
+          def get_target_health():
+              """Get current target health status"""
+              try:
+                  target_group_id = os.environ.get('TARGET_GROUP_ID')
+                  if target_group_id:
+                      response = vpc_lattice.list_targets(
+                          targetGroupIdentifier=target_group_id
+                      )
+                      return response.get('items', [])
+              except Exception as e:
+                  logger.error(f"Error getting target health: {str(e)}")
+              return []
+
+          def get_recent_error_metrics():
+              """Get recent error rate metrics"""
+              try:
+                  # Implementation would query CloudWatch for recent 5XX metrics
+                  # This is a placeholder for demonstration
+                  return {
+                      '5xx_rate': 5.2,
+                      'total_requests': 1000
+                  }
+              except Exception as e:
+                  logger.error(f"Error getting error metrics: {str(e)}")
+              return {}
+
+          def get_capacity_metrics():
+              """Get current capacity metrics"""
+              try:
+                  target_health = get_target_health()
+                  healthy_count = len([t for t in target_health if t.get('status') == 'HEALTHY'])
+                  return {
+                      'healthy_target_count': healthy_count,
+                      'total_target_count': len(target_health)
+                  }
+              except Exception as e:
+                  logger.error(f"Error getting capacity metrics: {str(e)}")
+              return {'healthy_target_count': 0}
+
+          def get_performance_metrics():
+              """Get current performance metrics"""
+              try:
+                  # Implementation would query CloudWatch for response time metrics
+                  # This is a placeholder for demonstration
+                  return {
+                      'avg_response_time': 1500
+                  }
+              except Exception as e:
+                  logger.error(f"Error getting performance metrics: {str(e)}")
+              return {}
+
+          def send_notification(subject, message):
+              """Send SNS notification with error handling"""
+              try:
+                  sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+                  if sns_topic_arn:
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=subject,
+                          Message=message
+                      )
+                      logger.info("Notification sent successfully")
+                  else:
+                      logger.warning("SNS topic ARN not configured")
+              except Exception as e:
+                  logger.error(f"Failed to send notification: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub "${Project}-health-remediation"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: health-monitoring
+
+  # Lambda Permission for SNS to invoke the function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HealthRemediationFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref HealthAlertsTopic
+
+  # SNS Subscription for Lambda Function
+  LambdaSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref HealthAlertsTopic
+      Protocol: lambda
+      Endpoint: !GetAtt HealthRemediationFunction.Arn
+
+  # CloudWatch Alarm for High 5XX Error Rate
+  High5XXErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "VPCLattice-${ServiceName}-High5XXRate-${AWS::StackName}"
+      AlarmDescription: High 5XX error rate detected in VPC Lattice service
+      MetricName: HTTPCode_5XX_Count
+      Namespace: AWS/VpcLattice
+      Statistic: Sum
+      Period: !Ref MetricPeriod
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref HighErrorRateThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Service
+          Value: !Ref LatticeService
+      AlarmActions:
+        - !Ref HealthAlertsTopic
+      OKActions:
+        - !Ref HealthAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "VPCLattice-${ServiceName}-High5XXRate"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: AlarmType
+          Value: ErrorRate
+
+  # CloudWatch Alarm for Request Timeouts
+  RequestTimeoutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "VPCLattice-${ServiceName}-RequestTimeouts-${AWS::StackName}"
+      AlarmDescription: High request timeout rate detected in VPC Lattice service
+      MetricName: RequestTimeoutCount
+      Namespace: AWS/VpcLattice
+      Statistic: Sum
+      Period: !Ref MetricPeriod
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref TimeoutThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Service
+          Value: !Ref LatticeService
+      AlarmActions:
+        - !Ref HealthAlertsTopic
+      OKActions:
+        - !Ref HealthAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "VPCLattice-${ServiceName}-RequestTimeouts"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: AlarmType
+          Value: Timeout
+
+  # CloudWatch Alarm for High Response Time
+  HighResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "VPCLattice-${ServiceName}-HighResponseTime-${AWS::StackName}"
+      AlarmDescription: High response time detected in VPC Lattice service
+      MetricName: RequestTime
+      Namespace: AWS/VpcLattice
+      Statistic: Average
+      Period: !Ref MetricPeriod
+      EvaluationPeriods: 3  # Use 3 periods for response time to avoid false positives
+      Threshold: !Ref ResponseTimeThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Service
+          Value: !Ref LatticeService
+      AlarmActions:
+        - !Ref HealthAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "VPCLattice-${ServiceName}-HighResponseTime"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: AlarmType
+          Value: Performance
+
+  # CloudWatch Dashboard
+  HealthMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "VPCLattice-Health-${ServiceName}-${AWS::StackName}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/VpcLattice", "HTTPCode_2XX_Count", "Service", "${LatticeService}"],
+                  [".", "HTTPCode_4XX_Count", ".", "."],
+                  [".", "HTTPCode_5XX_Count", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "HTTP Response Codes",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/VpcLattice", "RequestTime", "Service", "${LatticeService}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Request Response Time (ms)",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/VpcLattice", "TotalRequestCount", "Service", "${LatticeService}"],
+                  [".", "RequestTimeoutCount", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Request Volume and Timeouts",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/VpcLattice", "HealthyTargetCount", "TargetGroup", "${TargetGroup}"],
+                  [".", "UnHealthyTargetCount", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Target Group Health",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Log Group for Lambda Function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${HealthRemediationFunction}"
+      RetentionInDays: !If [IsProduction, 30, 14]
+      Tags:
+        - Key: Name
+          Value: !Sub "${Project}-lambda-logs"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+Outputs:
+  # VPC Lattice Resources
+  ServiceNetworkId:
+    Description: VPC Lattice Service Network ID
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceNetworkId"
+
+  ServiceNetworkArn:
+    Description: VPC Lattice Service Network ARN
+    Value: !GetAtt ServiceNetwork.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceNetworkArn"
+
+  ServiceId:
+    Description: VPC Lattice Service ID
+    Value: !Ref LatticeService
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceId"
+
+  ServiceArn:
+    Description: VPC Lattice Service ARN
+    Value: !GetAtt LatticeService.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceArn"
+
+  ServiceDomainName:
+    Description: VPC Lattice Service Domain Name
+    Value: !GetAtt LatticeService.DnsEntry.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceDomainName"
+
+  TargetGroupId:
+    Description: VPC Lattice Target Group ID
+    Value: !Ref TargetGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetGroupId"
+
+  TargetGroupArn:
+    Description: VPC Lattice Target Group ARN
+    Value: !GetAtt TargetGroup.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetGroupArn"
+
+  # Monitoring Resources
+  SNSTopicArn:
+    Description: SNS Topic ARN for health notifications
+    Value: !Ref HealthAlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopicArn"
+
+  LambdaFunctionArn:
+    Description: Lambda Function ARN for auto-remediation
+    Value: !GetAtt HealthRemediationFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunctionArn"
+
+  LambdaFunctionName:
+    Description: Lambda Function Name for auto-remediation
+    Value: !Ref HealthRemediationFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunctionName"
+
+  # CloudWatch Resources
+  DashboardURL:
+    Description: CloudWatch Dashboard URL for health monitoring
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${HealthMonitoringDashboard}"
+    Export:
+      Name: !Sub "${AWS::StackName}-DashboardURL"
+
+  High5XXAlarmName:
+    Description: CloudWatch Alarm Name for 5XX errors
+    Value: !Ref High5XXErrorAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-High5XXAlarmName"
+
+  TimeoutAlarmName:
+    Description: CloudWatch Alarm Name for request timeouts
+    Value: !Ref RequestTimeoutAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-TimeoutAlarmName"
+
+  ResponseTimeAlarmName:
+    Description: CloudWatch Alarm Name for high response time
+    Value: !Ref HighResponseTimeAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-ResponseTimeAlarmName"
+
+  # Operational Information
+  HealthCheckEndpoint:
+    Description: Health check endpoint path
+    Value: !Ref HealthCheckPath
+    Export:
+      Name: !Sub "${AWS::StackName}-HealthCheckEndpoint"
+
+  MonitoringNamespace:
+    Description: CloudWatch namespace for VPC Lattice metrics
+    Value: "AWS/VpcLattice"
+    Export:
+      Name: !Sub "${AWS::StackName}-MonitoringNamespace"
+
+  # Instructions for Next Steps
+  NextSteps:
+    Description: Instructions for completing the setup
+    Value: !Sub |
+      1. Register targets with the target group: ${TargetGroup}
+      2. Subscribe to SNS notifications: ${HealthAlertsTopic}
+      3. View the monitoring dashboard: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${HealthMonitoringDashboard}
+      4. Test the health monitoring by generating traffic to the service

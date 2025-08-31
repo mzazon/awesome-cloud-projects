@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure Lighthouse, Azure Automanage, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: lighthouse, automanage, governance, msp, multi-tenant, cross-tenant
 recipe-generator-version: 1.3
@@ -127,7 +127,7 @@ echo "✅ MSP tenant environment configured"
 
 1. **Create Azure Lighthouse Delegation Template**:
 
-   Azure Lighthouse uses Azure Resource Manager templates to define the delegation relationship between service provider and customer tenants. The template specifies which users or groups in the MSP tenant will have access to customer resources and what permissions they'll have. This delegation model ensures secure, audit-able access while maintaining proper separation of concerns.
+   Azure Lighthouse uses Azure Resource Manager templates to define the delegation relationship between service provider and customer tenants. The template specifies which users or groups in the MSP tenant will have access to customer resources and what permissions they'll have. This delegation model ensures secure, auditable access while maintaining proper separation of concerns.
 
    ```bash
    # Create the ARM template for Lighthouse delegation
@@ -222,11 +222,11 @@ echo "✅ MSP tenant environment configured"
    # Replace with actual MSP team member object IDs
    MSP_ADMIN_GROUP_ID=$(az ad group show \
        --group "MSP-Administrators" \
-       --query objectId --output tsv)
+       --query id --output tsv)
    
    MSP_ENGINEER_GROUP_ID=$(az ad group show \
        --group "MSP-Engineers" \
-       --query objectId --output tsv)
+       --query id --output tsv)
    
    # Create authorization parameters file
    cat > lighthouse-parameters.json << EOF
@@ -350,23 +350,18 @@ echo "✅ MSP tenant environment configured"
        --query id --output tsv)
    
    # Create custom Automanage configuration profile
-   cat > automanage-profile.json << EOF
+   cat > automanage-configuration.json << EOF
    {
-       "location": "${LOCATION}",
-       "properties": {
-           "configuration": {
-               "Antimalware/Enable": "true",
-               "AzureSecurityCenter/Enable": "true",
-               "Backup/Enable": "true",
-               "BootDiagnostics/Enable": "true",
-               "ChangeTrackingAndInventory/Enable": "true",
-               "GuestConfiguration/Enable": "true",
-               "LogAnalytics/Enable": "true",
-               "LogAnalytics/WorkspaceId": "${WORKSPACE_ID}",
-               "UpdateManagement/Enable": "true",
-               "VMInsights/Enable": "true"
-           }
-       }
+       "Antimalware/Enable": "true",
+       "AzureSecurityCenter/Enable": "true",
+       "Backup/Enable": "true",
+       "BootDiagnostics/Enable": "true",
+       "ChangeTrackingAndInventory/Enable": "true",
+       "GuestConfiguration/Enable": "true",
+       "LogAnalytics/Enable": "true",
+       "LogAnalytics/WorkspaceId": "${WORKSPACE_ID}",
+       "UpdateManagement/Enable": "true",
+       "VMInsights/Enable": "true"
    }
    EOF
    
@@ -374,7 +369,8 @@ echo "✅ MSP tenant environment configured"
    az automanage configuration-profile create \
        --resource-group ${MSP_RESOURCE_GROUP} \
        --configuration-profile-name ${AUTOMANAGE_PROFILE_NAME} \
-       --body @automanage-profile.json
+       --location ${LOCATION} \
+       --configuration @automanage-configuration.json
    
    echo "✅ Automanage configuration profile created"
    ```
@@ -439,12 +435,15 @@ echo "✅ MSP tenant environment configured"
    az login --tenant ${MSP_TENANT_ID}
    az account set --subscription ${MSP_SUBSCRIPTION_ID}
    
+   # Get configuration profile resource ID
+   PROFILE_RESOURCE_ID="/subscriptions/${MSP_SUBSCRIPTION_ID}/resourceGroups/${MSP_RESOURCE_GROUP}/providers/Microsoft.Automanage/configurationProfiles/${AUTOMANAGE_PROFILE_NAME}"
+   
    # Enable Automanage on customer VMs using cross-tenant access
    az automanage configuration-profile-assignment create \
        --resource-group ${CUSTOMER_RESOURCE_GROUP} \
        --vm-name ${VM_NAME} \
        --configuration-profile-assignment-name "default" \
-       --configuration-profile ${AUTOMANAGE_PROFILE_NAME} \
+       --configuration-profile ${PROFILE_RESOURCE_ID} \
        --subscription ${CUSTOMER_SUBSCRIPTION_ID}
    
    # Verify Automanage assignment

@@ -6,10 +6,10 @@ difficulty: 400
 subject: aws
 services: CloudFront, S3, Lambda, WAF
 estimated-time: 200 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cloudfront, cdn, content-delivery, lambda-edge, advanced-networking
 recipe-generator-version: 1.3
@@ -114,10 +114,13 @@ export CLOUDFRONT_FUNCTION_NAME="cdn-request-processor-${RANDOM_SUFFIX}"
 aws s3 mb s3://${S3_BUCKET_NAME} --region ${AWS_REGION}
 
 # Create sample content for testing
-mkdir -p /tmp/cdn-content
-echo '<html><body><h1>Main Site</h1><p>Version: 1.0</p></body></html>' > /tmp/cdn-content/index.html
-echo '<html><body><h1>API Documentation</h1><p>Version: 2.0</p></body></html>' > /tmp/cdn-content/api/index.html
-echo '{"message": "Hello from API", "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)'"}' > /tmp/cdn-content/api/status.json
+mkdir -p /tmp/cdn-content/api
+echo '<html><body><h1>Main Site</h1><p>Version: 1.0</p></body></html>' \
+    > /tmp/cdn-content/index.html
+echo '<html><body><h1>API Documentation</h1><p>Version: 2.0</p></body></html>' \
+    > /tmp/cdn-content/api/index.html
+echo '{"message": "Hello from API", "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)'"}' \
+    > /tmp/cdn-content/api/status.json
 
 # Upload content to S3
 aws s3 cp /tmp/cdn-content s3://${S3_BUCKET_NAME}/ --recursive
@@ -129,7 +132,7 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
 
 1. **Create CloudFront Function for Request Processing**:
 
-   CloudFront Functions execute at the edge for lightweight request/response processing with sub-millisecond execution times. They're ideal for cache key normalization, header manipulation, and simple redirects without the overhead of Lambda@Edge.
+   CloudFront Functions execute at the edge for lightweight request/response processing with sub-millisecond execution times. They're ideal for cache key normalization, header manipulation, and simple redirects without the overhead of Lambda@Edge. This function removes tracking parameters to improve cache hit ratios and handles basic URL redirects, demonstrating edge-based request processing.
 
    ```bash
    # Create CloudFront Function for header manipulation
@@ -185,11 +188,11 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    echo "✅ CloudFront Function created and published"
    ```
 
-   The function removes tracking parameters to improve cache hit ratios and handles URL redirects. Publishing makes the function available for association with distribution behaviors.
+   The function uses the cloudfront-js-2.0 runtime for enhanced capabilities and removes tracking parameters to improve cache hit ratios. Publishing makes the function available for association with distribution behaviors, enabling edge-based request processing.
 
 2. **Create Lambda@Edge Function for Advanced Processing**:
 
-   Lambda@Edge functions run at edge locations and provide full programming language capabilities for complex request/response processing. They're perfect for security header injection, content personalization, and API integrations that require more processing power than CloudFront Functions. For additional implementation examples, see the [Lambda@Edge example functions documentation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/lambda-examples.html).
+   Lambda@Edge functions run at edge locations and provide full programming language capabilities for complex request/response processing. They're perfect for security header injection, content personalization, and API integrations that require more processing power than CloudFront Functions. This implementation demonstrates comprehensive security header injection for enhanced protection.
 
    ```bash
    # Create Lambda@Edge function for response manipulation
@@ -304,7 +307,7 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    aws lambda create-function \
        --region us-east-1 \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime nodejs18.x \
+       --runtime nodejs20.x \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_FUNCTION_NAME}-role \
        --handler index.handler \
        --zip-file fileb:///tmp/lambda-edge/lambda-edge.zip \
@@ -322,11 +325,11 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    echo "✅ Lambda@Edge function created with ARN: ${LAMBDA_ARN}"
    ```
 
-   Lambda@Edge functions must be created in us-east-1 and require a published version (not $LATEST) for CloudFront association. The function adds comprehensive security headers to all responses, improving the security posture of delivered content.
+   Lambda@Edge functions must be created in us-east-1 and require a published version (not $LATEST) for CloudFront association. The function uses nodejs20.x runtime and adds comprehensive security headers to all responses, improving the security posture of delivered content. For additional implementation examples, see the [Lambda@Edge example functions documentation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/lambda-examples.html).
 
 3. **Create WAF Web ACL for Security**:
 
-   AWS WAF provides application-layer protection by filtering malicious requests before they reach your origins. The Web ACL combines managed rule sets for common vulnerabilities with custom rate limiting to protect against various attack vectors. For detailed information about WAF integration patterns, see the [AWS WAF with CloudFront documentation](https://docs.aws.amazon.com/waf/latest/developerguide/cloudfront-features.html).
+   AWS WAF provides application-layer protection by filtering malicious requests before they reach your origins. The Web ACL combines managed rule sets for common vulnerabilities with custom rate limiting to protect against various attack vectors. This configuration implements enterprise-grade security controls at the edge, protecting against OWASP Top 10 vulnerabilities and sophisticated attack patterns.
 
    ```bash
    # Create WAF Web ACL with comprehensive rules
@@ -402,7 +405,8 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    EOF
    
    # Replace placeholder with actual name
-   sed -i.bak "s/WAF_WEB_ACL_NAME_PLACEHOLDER/${WAF_WEBACL_NAME}/g" /tmp/waf-webacl.json
+   sed -i.bak "s/WAF_WEB_ACL_NAME_PLACEHOLDER/${WAF_WEBACL_NAME}/g" \
+       /tmp/waf-webacl.json
    
    # Create WAF Web ACL
    WAF_WEBACL_ID=$(aws wafv2 create-web-acl \
@@ -414,11 +418,11 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    echo "✅ WAF Web ACL created with ID: ${WAF_WEBACL_ID}"
    ```
 
-   The Web ACL includes managed rule sets for common vulnerabilities (OWASP Top 10), known bad inputs, and a rate-limiting rule set to 2000 requests per IP per 5-minute window. These rules provide comprehensive protection against most web application attacks.
+   The Web ACL includes managed rule sets for common vulnerabilities (OWASP Top 10), known bad inputs, and a rate-limiting rule set to 2000 requests per IP per 5-minute window. These rules provide comprehensive protection against most web application attacks. For detailed information about WAF integration patterns, see the [AWS WAF with CloudFront documentation](https://docs.aws.amazon.com/waf/latest/developerguide/cloudfront-features.html).
 
 4. **Create Origin Access Control for S3**:
 
-   Origin Access Control (OAC) secures S3 origins by ensuring only CloudFront can access bucket content. OAC supports all S3 features including SSE-KMS encryption and is the recommended replacement for the legacy Origin Access Identity (OAI). For comprehensive guidance on S3 access restrictions, see the [CloudFront S3 origin access control documentation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html).
+   Origin Access Control (OAC) secures S3 origins by ensuring only CloudFront can access bucket content. OAC supports all S3 features including SSE-KMS encryption and is the recommended replacement for the legacy Origin Access Identity (OAI). This implementation provides enhanced security for S3 content delivery through CloudFront.
 
    ```bash
    # Create Origin Access Control
@@ -436,7 +440,8 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    EOF
    
    # Replace placeholder
-   sed -i.bak "s/OAC_NAME_PLACEHOLDER/${CDN_PROJECT_NAME}-oac/g" /tmp/oac-config.json
+   sed -i.bak "s/OAC_NAME_PLACEHOLDER/${CDN_PROJECT_NAME}-oac/g" \
+       /tmp/oac-config.json
    
    # Create OAC
    OAC_ID=$(aws cloudfront create-origin-access-control \
@@ -448,11 +453,11 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    echo "✅ Origin Access Control created with ID: ${OAC_ID}"
    ```
 
-   The OAC uses AWS SigV4 signing for secure authentication with S3, providing better security than the legacy OAI approach. This ensures that direct access to S3 bucket URLs is blocked while maintaining CloudFront access.
+   The OAC uses AWS SigV4 signing for secure authentication with S3, providing better security than the legacy OAI approach. This ensures that direct access to S3 bucket URLs is blocked while maintaining CloudFront access. For comprehensive guidance on S3 access restrictions, see the [CloudFront S3 origin access control documentation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html).
 
 5. **Create Advanced CloudFront Distribution**:
 
-   This step creates a sophisticated CloudFront distribution with multiple origins, custom cache behaviors, and integrated edge functions. The distribution demonstrates advanced CDN patterns including origin failover, content-based routing, and security integration.
+   This step creates a sophisticated CloudFront distribution with multiple origins, custom cache behaviors, and integrated edge functions. The distribution demonstrates advanced CDN patterns including origin failover, content-based routing, and security integration. The configuration enables HTTP/2 and HTTP/3 support for optimal performance.
 
    ```bash
    # Get CloudFront Function ARN
@@ -498,8 +503,8 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
                        "HTTPSPort": 443,
                        "OriginProtocolPolicy": "https-only",
                        "OriginSslProtocols": {
-                           "Quantity": 3,
-                           "Items": ["TLSv1.2", "TLSv1.1", "TLSv1"]
+                           "Quantity": 1,
+                           "Items": ["TLSv1.2"]
                        },
                        "OriginReadTimeout": 30,
                        "OriginKeepaliveTimeout": 5
@@ -674,12 +679,18 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    EOF
    
    # Replace placeholders
-   sed -i.bak "s/CALLER_REF_PLACEHOLDER/${CDN_PROJECT_NAME}-$(date +%s)/g" /tmp/distribution-config.json
-   sed -i.bak "s/S3_BUCKET_PLACEHOLDER/${S3_BUCKET_NAME}/g" /tmp/distribution-config.json
-   sed -i.bak "s/OAC_ID_PLACEHOLDER/${OAC_ID}/g" /tmp/distribution-config.json
-   sed -i.bak "s|LAMBDA_ARN_PLACEHOLDER|${LAMBDA_ARN}|g" /tmp/distribution-config.json
-   sed -i.bak "s|CLOUDFRONT_FUNCTION_ARN_PLACEHOLDER|${CLOUDFRONT_FUNCTION_ARN}|g" /tmp/distribution-config.json
-   sed -i.bak "s|WAF_WEBACL_ARN_PLACEHOLDER|${WAF_WEBACL_ARN}|g" /tmp/distribution-config.json
+   sed -i.bak "s/CALLER_REF_PLACEHOLDER/${CDN_PROJECT_NAME}-$(date +%s)/g" \
+       /tmp/distribution-config.json
+   sed -i.bak "s/S3_BUCKET_PLACEHOLDER/${S3_BUCKET_NAME}/g" \
+       /tmp/distribution-config.json
+   sed -i.bak "s/OAC_ID_PLACEHOLDER/${OAC_ID}/g" \
+       /tmp/distribution-config.json
+   sed -i.bak "s|LAMBDA_ARN_PLACEHOLDER|${LAMBDA_ARN}|g" \
+       /tmp/distribution-config.json
+   sed -i.bak "s|CLOUDFRONT_FUNCTION_ARN_PLACEHOLDER|${CLOUDFRONT_FUNCTION_ARN}|g" \
+       /tmp/distribution-config.json
+   sed -i.bak "s|WAF_WEBACL_ARN_PLACEHOLDER|${WAF_WEBACL_ARN}|g" \
+       /tmp/distribution-config.json
    
    # Create CloudFront distribution
    DISTRIBUTION_OUTPUT=$(aws cloudfront create-distribution \
@@ -694,9 +705,11 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    echo "✅ Distribution domain: ${DISTRIBUTION_DOMAIN}"
    ```
 
+   The distribution uses TLSv1.2 as the minimum SSL protocol for security, enables HTTP/2 and HTTP/3 for performance, and configures multiple cache behaviors for different content types. The configuration integrates both CloudFront Functions and Lambda@Edge for comprehensive edge processing capabilities.
+
 6. **Configure S3 Bucket Policy for OAC**:
 
-   Securing S3 origins requires implementing a bucket policy that restricts access exclusively to CloudFront through the Origin Access Control (OAC). This security pattern ensures that content can only be accessed through CloudFront's global edge network, preventing direct access to S3 URLs and maintaining consistent security controls across all content delivery. The policy uses AWS IAM conditions to verify the CloudFront distribution's identity before granting access to bucket objects.
+   Securing S3 origins requires implementing a bucket policy that restricts access exclusively to CloudFront through the Origin Access Control (OAC). This security pattern ensures that content can only be accessed through CloudFront's global edge network, preventing direct access to S3 URLs and maintaining consistent security controls across all content delivery.
 
    ```bash
    # Create S3 bucket policy to allow CloudFront access
@@ -723,9 +736,12 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    EOF
    
    # Replace placeholders
-   sed -i.bak "s/S3_BUCKET_PLACEHOLDER/${S3_BUCKET_NAME}/g" /tmp/s3-policy.json
-   sed -i.bak "s/AWS_ACCOUNT_ID_PLACEHOLDER/${AWS_ACCOUNT_ID}/g" /tmp/s3-policy.json
-   sed -i.bak "s/DISTRIBUTION_ID_PLACEHOLDER/${DISTRIBUTION_ID}/g" /tmp/s3-policy.json
+   sed -i.bak "s/S3_BUCKET_PLACEHOLDER/${S3_BUCKET_NAME}/g" \
+       /tmp/s3-policy.json
+   sed -i.bak "s/AWS_ACCOUNT_ID_PLACEHOLDER/${AWS_ACCOUNT_ID}/g" \
+       /tmp/s3-policy.json
+   sed -i.bak "s/DISTRIBUTION_ID_PLACEHOLDER/${DISTRIBUTION_ID}/g" \
+       /tmp/s3-policy.json
    
    # Apply bucket policy
    aws s3api put-bucket-policy \
@@ -735,11 +751,11 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    echo "✅ S3 bucket policy configured for CloudFront access"
    ```
 
-   The bucket policy is now active and enforces that only the specific CloudFront distribution can access S3 objects. This security implementation follows the principle of least privilege by restricting access to a single, verified CloudFront distribution through the AWS:SourceArn condition. This prevents unauthorized access attempts while maintaining the performance benefits of edge caching and global content distribution.
+   The policy uses AWS IAM conditions to verify the CloudFront distribution's identity before granting access to bucket objects. This security implementation follows the principle of least privilege by restricting access to a single, verified CloudFront distribution through the AWS:SourceArn condition.
 
 7. **Enable Real-time Logs and Monitoring**:
 
-   Real-time logging provides immediate visibility into CloudFront performance and security events by streaming detailed request data to Amazon Kinesis Data Streams. This operational capability enables rapid detection of anomalies, performance bottlenecks, and security incidents across the global edge network. The integration with CloudWatch enhances monitoring capabilities by providing persistent storage and analysis of log data, supporting compliance requirements and operational troubleshooting.
+   Real-time logging provides immediate visibility into CloudFront performance and security events by streaming detailed request data to Amazon Kinesis Data Streams. This operational capability enables rapid detection of anomalies, performance bottlenecks, and security incidents across the global edge network.
 
    ```bash
    # Create CloudWatch log group for real-time logs
@@ -809,16 +825,17 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    aws cloudfront create-realtime-log-config \
        --name "realtime-logs-${RANDOM_SUFFIX}" \
        --end-points StreamType=Kinesis,StreamArn=${KINESIS_STREAM_ARN},RoleArn=${REALTIME_LOGS_ROLE_ARN} \
-       --fields timestamp c-ip sc-status cs-method cs-uri-stem cs-uri-query cs-referer cs-user-agent
+       --fields timestamp c-ip sc-status cs-method cs-uri-stem \
+           cs-uri-query cs-referer cs-user-agent
    
    echo "✅ Real-time logging configured"
    ```
 
-   Real-time logging is now streaming CloudFront request data to Kinesis, providing immediate access to detailed performance and security metrics. This monitoring foundation enables advanced analytics, automated alerting, and real-time decision making for traffic management and security response. The configuration captures essential request details including timestamps, client IPs, response codes, and user agents, supporting comprehensive operational visibility across the global edge network.
+   The configuration captures essential request details including timestamps, client IPs, response codes, and user agents, supporting comprehensive operational visibility across the global edge network. Real-time logging enables advanced analytics, automated alerting, and real-time decision making for traffic management and security response.
 
 8. **Create Custom Monitoring Dashboard**:
 
-   CloudWatch dashboards provide centralized visualization of CloudFront performance metrics, enabling operations teams to monitor traffic patterns, error rates, cache performance, and security events in real-time. This operational dashboard consolidates key performance indicators from multiple AWS services, including CloudFront distribution metrics, WAF security statistics, and cache hit ratios, providing comprehensive visibility into the CDN's operational health and performance characteristics.
+   CloudWatch dashboards provide centralized visualization of CloudFront performance metrics, enabling operations teams to monitor traffic patterns, error rates, cache performance, and security events in real-time. This operational dashboard consolidates key performance indicators from multiple AWS services.
 
    ```bash
    # Create CloudWatch dashboard
@@ -899,8 +916,10 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    EOF
    
    # Replace placeholders
-   sed -i.bak "s/DISTRIBUTION_ID_PLACEHOLDER/${DISTRIBUTION_ID}/g" /tmp/dashboard-config.json
-   sed -i.bak "s/WAF_WEBACL_NAME_PLACEHOLDER/${WAF_WEBACL_NAME}/g" /tmp/dashboard-config.json
+   sed -i.bak "s/DISTRIBUTION_ID_PLACEHOLDER/${DISTRIBUTION_ID}/g" \
+       /tmp/dashboard-config.json
+   sed -i.bak "s/WAF_WEBACL_NAME_PLACEHOLDER/${WAF_WEBACL_NAME}/g" \
+       /tmp/dashboard-config.json
    
    # Create dashboard
    aws cloudwatch put-dashboard \
@@ -910,11 +929,11 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    echo "✅ CloudWatch dashboard created"
    ```
 
-   The dashboard is now active and provides real-time visibility into CloudFront performance and security metrics. This centralized monitoring solution enables proactive identification of performance issues, security threats, and optimization opportunities across the global edge network. The dashboard widgets display critical metrics including request volumes, error rates, cache hit ratios, and WAF security events, supporting data-driven decision making for CDN optimization and incident response.
+   The dashboard widgets display critical metrics including request volumes, error rates, cache hit ratios, and WAF security events, supporting data-driven decision making for CDN optimization and incident response.
 
 9. **Configure CloudFront KeyValueStore for Dynamic Content**:
 
-   CloudFront KeyValueStore provides a low-latency, globally distributed data store that enables dynamic configuration changes without requiring distribution updates. This capability supports advanced use cases including feature flags, A/B testing, maintenance mode controls, and real-time content personalization. The KeyValueStore integrates seamlessly with CloudFront Functions, allowing edge logic to access configuration data with minimal latency impact on request processing.
+   CloudFront KeyValueStore provides a low-latency, globally distributed data store that enables dynamic configuration changes without requiring distribution updates. This capability supports advanced use cases including feature flags, A/B testing, maintenance mode controls, and real-time content personalization.
 
    ```bash
    # Create KeyValueStore for dynamic configuration
@@ -955,11 +974,11 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    echo "✅ CloudFront KeyValueStore configured with ID: ${KVS_ID}"
    ```
 
-   The KeyValueStore is now populated with initial configuration data and ready for dynamic content management. This distributed storage solution enables real-time updates to edge behavior without requiring CloudFront distribution modifications or deployments. The configured key-value pairs support operational scenarios including maintenance mode activation, feature flag management, and redirect rule updates, providing operational flexibility while maintaining edge performance characteristics.
+   The KeyValueStore integrates seamlessly with CloudFront Functions, allowing edge logic to access configuration data with minimal latency impact on request processing. For comprehensive information about KeyValueStore capabilities, refer to the [CloudFront KeyValueStore documentation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/kvs-with-functions.html).
 
 10. **Test and Validate Distribution**:
 
-    Comprehensive testing validates that the CloudFront distribution properly handles multiple content types, implements security controls, and delivers content with expected performance characteristics. This validation process verifies edge function execution, cache behavior configuration, security header injection, and WAF protection across different request patterns. Testing multiple paths and user agents ensures the distribution behaves correctly under various client scenarios and content access patterns.
+    Comprehensive testing validates that the CloudFront distribution properly handles multiple content types, implements security controls, and delivers content with expected performance characteristics. This validation process verifies edge function execution, cache behavior configuration, security header injection, and WAF protection.
 
     ```bash
     # Wait for distribution to be deployed
@@ -993,7 +1012,7 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
     echo "✅ Distribution URL: https://${DISTRIBUTION_DOMAIN}"
     ```
 
-    The distribution is now fully deployed and operationally validated across multiple test scenarios. This comprehensive testing confirms that edge functions are executing correctly, cache behaviors are routing traffic appropriately, security headers are being injected, and WAF protection is active. The distribution is ready for production traffic and can handle the complex routing, security, and performance requirements of a sophisticated content delivery network.
+    Testing multiple paths and user agents ensures the distribution behaves correctly under various client scenarios and content access patterns. The distribution is ready for production traffic and can handle complex routing, security, and performance requirements.
 
 ## Validation & Testing
 
@@ -1015,7 +1034,8 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    curl -v https://${DISTRIBUTION_DOMAIN}/?utm_source=test&utm_medium=email
    
    # Test Lambda@Edge (response processing)
-   curl -I https://${DISTRIBUTION_DOMAIN}/ | grep -E "X-Content-Type-Options|X-Frame-Options"
+   curl -I https://${DISTRIBUTION_DOMAIN}/ | \
+       grep -E "X-Content-Type-Options|X-Frame-Options"
    ```
 
    Expected output: Security headers should be present
@@ -1025,7 +1045,8 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    ```bash
    # Test rate limiting (may need multiple requests)
    for i in {1..10}; do
-       curl -s -o /dev/null -w "%{http_code}\n" https://${DISTRIBUTION_DOMAIN}/
+       curl -s -o /dev/null -w "%{http_code}\n" \
+           https://${DISTRIBUTION_DOMAIN}/
    done
    
    # Check WAF metrics
@@ -1042,7 +1063,7 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    ```bash
    # Test cache hit/miss
    curl -s -I https://${DISTRIBUTION_DOMAIN}/ | grep -i x-cache
-   curl -s -I https://${DISTRIBUTION_DOMAIN}/ | grep -i x-cache  # Second request should show cache hit
+   curl -s -I https://${DISTRIBUTION_DOMAIN}/ | grep -i x-cache
    
    # Test different cache behaviors
    curl -s -I https://${DISTRIBUTION_DOMAIN}/api/status | grep -i cache
@@ -1218,6 +1239,9 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
    rm -f /tmp/cloudfront-function.js /tmp/waf-webacl.json
    rm -f /tmp/oac-config.json /tmp/distribution-config.json
    rm -f /tmp/s3-policy.json /tmp/dashboard-config.json
+   rm -f /tmp/realtime-logs-trust-policy.json
+   rm -f /tmp/realtime-logs-policy.json
+   rm -f /tmp/lambda-edge-trust-policy.json
    rm -f /tmp/*.json.bak
    
    echo "✅ Local files cleaned up"
@@ -1227,11 +1251,11 @@ echo "✅ Environment prepared with bucket: ${S3_BUCKET_NAME}"
 
 This advanced CloudFront architecture demonstrates sophisticated content delivery capabilities that go far beyond basic CDN functionality. The solution integrates multiple AWS services to create a comprehensive edge computing platform that handles content transformation, security, and monitoring at scale.
 
-The architecture leverages CloudFront Functions for lightweight, high-performance operations like cache key normalization and header manipulation, while Lambda@Edge handles more complex processing that requires additional computing resources and third-party integrations. This dual-function approach optimizes both performance and cost, as CloudFront Functions execute in sub-millisecond timeframes with minimal overhead, while Lambda@Edge provides full programming language support for complex business logic. For detailed guidance on choosing between these edge computing options, see the [AWS documentation on differences between CloudFront Functions and Lambda@Edge](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/edge-functions-choosing.html). The integration of AWS WAF provides enterprise-grade security with managed rule sets, rate limiting, and geo-blocking capabilities, protecting against common web exploits and DDoS attacks.
+The architecture leverages CloudFront Functions for lightweight, high-performance operations like cache key normalization and header manipulation, while Lambda@Edge handles more complex processing that requires additional computing resources and third-party integrations. This dual-function approach optimizes both performance and cost, as CloudFront Functions execute in sub-millisecond timeframes with minimal overhead, while Lambda@Edge provides full programming language support for complex business logic. For detailed guidance on choosing between these edge computing options, see the [AWS documentation on differences between CloudFront Functions and Lambda@Edge](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/edge-functions-choosing.html).
 
-The monitoring and logging implementation provides comprehensive visibility into CDN performance and security events. Real-time logs stream to Kinesis for immediate analysis, while CloudWatch dashboards provide operational insights into traffic patterns, error rates, and cache performance. The KeyValueStore integration enables dynamic configuration changes without requiring distribution updates, supporting use cases like feature flags, A/B testing, and emergency traffic routing. For comprehensive information about KeyValueStore capabilities, refer to the [CloudFront KeyValueStore documentation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/kvs-with-functions.html). This architecture pattern is particularly valuable for large-scale applications requiring global content delivery with advanced security, performance optimization, and operational visibility.
+The monitoring and logging implementation provides comprehensive visibility into CDN performance and security events. Real-time logs stream to Kinesis for immediate analysis, while CloudWatch dashboards provide operational insights into traffic patterns, error rates, and cache performance. The KeyValueStore integration enables dynamic configuration changes without requiring distribution updates, supporting use cases like feature flags, A/B testing, and emergency traffic routing. The integration of AWS WAF provides enterprise-grade security with managed rule sets, rate limiting, and geo-blocking capabilities, protecting against common web exploits and DDoS attacks. For additional security integration patterns, see the [AWS WAF with CloudFront documentation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/distribution-web-awswaf.html) and the [guide to restricting S3 access](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html).
 
-The solution addresses common enterprise challenges including content personalization, security compliance, performance optimization, and operational monitoring. By implementing multiple origins with different cache behaviors, organizations can optimize content delivery based on content type and user requirements while maintaining security and performance standards across all touchpoints. For additional security integration patterns, see the [AWS WAF with CloudFront documentation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/distribution-web-awswaf.html) and the [guide to restricting S3 access](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html).
+The solution addresses common enterprise challenges including content personalization, security compliance, performance optimization, and operational monitoring. By implementing multiple origins with different cache behaviors, organizations can optimize content delivery based on content type and user requirements while maintaining security and performance standards across all touchpoints. This architecture pattern is particularly valuable for large-scale applications requiring global content delivery with advanced security, performance optimization, and operational visibility.
 
 > **Tip**: Monitor cache hit ratios closely and adjust cache policies based on content types and user access patterns to maximize performance and reduce origin load.
 

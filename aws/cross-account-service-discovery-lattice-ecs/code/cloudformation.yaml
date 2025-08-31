@@ -1,0 +1,707 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cross-Account Service Discovery with VPC Lattice and ECS - Creates a producer service with VPC Lattice integration for cross-account service discovery'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+      - Label:
+          default: "Service Configuration"
+        Parameters:
+          - ServiceName
+          - DesiredCount
+          - ContainerImage
+          - ContainerPort
+      - Label:
+          default: "VPC Lattice Configuration"
+        Parameters:
+          - ServiceNetworkName
+          - LatticeServiceName
+          - TargetGroupName
+      - Label:
+          default: "Cross-Account Sharing"
+        Parameters:
+          - ConsumerAccountId
+          - EnableResourceSharing
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - CreateDashboard
+          - LogRetentionDays
+    ParameterLabels:
+      VpcId:
+        default: "VPC ID"
+      SubnetIds:
+        default: "Subnet IDs"
+      ServiceName:
+        default: "ECS Service Name"
+      DesiredCount:
+        default: "Desired Task Count"
+      ContainerImage:
+        default: "Container Image"
+      ContainerPort:
+        default: "Container Port"
+      ServiceNetworkName:
+        default: "Service Network Name"
+      LatticeServiceName:
+        default: "Lattice Service Name"
+      TargetGroupName:
+        default: "Target Group Name"
+      ConsumerAccountId:
+        default: "Consumer Account ID"
+      EnableResourceSharing:
+        default: "Enable Resource Sharing"
+      CreateDashboard:
+        default: "Create CloudWatch Dashboard"
+      LogRetentionDays:
+        default: "Log Retention Days"
+
+Parameters:
+  # Network Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC where ECS services will be deployed'
+    
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'Subnets for ECS service deployment (recommend public subnets for this demo)'
+    
+  # Service Configuration
+  ServiceName:
+    Type: String
+    Default: 'producer-service'
+    Description: 'Name for the ECS service'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Desired number of ECS tasks to run'
+    
+  ContainerImage:
+    Type: String
+    Default: 'nginx:latest'
+    Description: 'Container image to deploy (default: nginx for demo purposes)'
+    
+  ContainerPort:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 65535
+    Description: 'Port that the container listens on'
+    
+  # VPC Lattice Configuration
+  ServiceNetworkName:
+    Type: String
+    Default: 'cross-account-network'
+    Description: 'Name for the VPC Lattice service network'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    
+  LatticeServiceName:
+    Type: String
+    Default: 'producer-lattice-service'
+    Description: 'Name for the VPC Lattice service'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    
+  TargetGroupName:
+    Type: String
+    Default: 'producer-targets'
+    Description: 'Name for the VPC Lattice target group'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    
+  # Cross-Account Sharing
+  ConsumerAccountId:
+    Type: String
+    Description: 'AWS Account ID that will consume the service (leave empty to skip sharing)'
+    Default: ''
+    AllowedPattern: '^$|^[0-9]{12}$'
+    ConstraintDescription: 'Must be a valid 12-digit AWS Account ID or empty'
+    
+  EnableResourceSharing:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable AWS RAM resource sharing for cross-account access'
+    
+  # Monitoring Configuration
+  CreateDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Create CloudWatch dashboard for monitoring'
+    
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'Number of days to retain CloudWatch logs'
+
+Conditions:
+  # Determine if resource sharing should be enabled
+  ShouldShareResources: !And
+    - !Equals [!Ref EnableResourceSharing, 'true']
+    - !Not [!Equals [!Ref ConsumerAccountId, '']]
+    
+  # Determine if dashboard should be created
+  ShouldCreateDashboard: !Equals [!Ref CreateDashboard, 'true']
+
+Resources:
+  # ==========================================
+  # IAM Roles and Policies
+  # ==========================================
+  
+  # ECS Task Execution Role
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ServiceName}-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceName}-task-execution-role'
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # ECS Task Role (for application permissions)
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ServiceName}-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: VpcLatticeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - vpc-lattice:GetService
+                  - vpc-lattice:GetTargetGroup
+                  - vpc-lattice:ListTargets
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceName}-task-role'
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # EventBridge Logs Role
+  EventBridgeLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ServiceName}-eventbridge-logs-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${VpcLatticeEventsLogGroup.Arn}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceName}-eventbridge-logs-role'
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # ==========================================
+  # CloudWatch Log Groups
+  # ==========================================
+  
+  # ECS Task Log Group
+  EcsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ServiceName}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceName}-ecs-logs'
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # VPC Lattice Events Log Group
+  VpcLatticeEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/aws/events/vpc-lattice'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: 'vpc-lattice-events-logs'
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # ==========================================
+  # VPC Lattice Resources
+  # ==========================================
+  
+  # VPC Lattice Service Network
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Ref ServiceNetworkName
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Ref ServiceNetworkName
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # VPC Lattice Service
+  LatticeService:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Ref LatticeServiceName
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Ref LatticeServiceName
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # VPC Lattice Target Group
+  TargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: !Ref TargetGroupName
+      Type: IP
+      Protocol: HTTP
+      Port: !Ref ContainerPort
+      VpcIdentifier: !Ref VpcId
+      HealthCheck:
+        Enabled: true
+        Protocol: HTTP
+        Path: '/'
+        TimeoutSeconds: 5
+        IntervalSeconds: 30
+        HealthyThresholdCount: 2
+        UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: !Ref TargetGroupName
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # VPC Lattice Listener
+  ServiceListener:
+    Type: AWS::VpcLattice::Listener
+    Properties:
+      ServiceIdentifier: !Ref LatticeService
+      Name: http-listener
+      Protocol: HTTP
+      Port: !Ref ContainerPort
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref TargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${LatticeServiceName}-listener'
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # Service Network Service Association
+  ServiceNetworkServiceAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      ServiceIdentifier: !Ref LatticeService
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceNetworkName}-${LatticeServiceName}-association'
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # Service Network VPC Association
+  ServiceNetworkVpcAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      VpcIdentifier: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceNetworkName}-vpc-association'
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # ==========================================
+  # AWS RAM Resource Share (Conditional)
+  # ==========================================
+  
+  ResourceShare:
+    Type: AWS::RAM::ResourceShare
+    Condition: ShouldShareResources
+    Properties:
+      Name: !Sub '${ServiceNetworkName}-share'
+      ResourceArns:
+        - !Ref ServiceNetwork
+      Principals:
+        - !Ref ConsumerAccountId
+      AllowExternalPrincipals: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceNetworkName}-share'
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # ==========================================
+  # ECS Resources
+  # ==========================================
+  
+  # ECS Cluster
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ServiceName}-cluster'
+      CapacityProviders:
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceName}-cluster'
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # ECS Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ServiceName}-task'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !Ref EcsTaskExecutionRole
+      TaskRoleArn: !Ref EcsTaskRole
+      ContainerDefinitions:
+        - Name: !Sub '${ServiceName}-container'
+          Image: !Ref ContainerImage
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref EcsLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub 'curl -f http://localhost:${ContainerPort}/ || exit 1'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceName}-task'
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # Security Group for ECS Tasks
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ServiceName}-ecs-sg'
+      GroupDescription: 'Security group for ECS tasks with VPC Lattice integration'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          CidrIp: 0.0.0.0/0
+          Description: 'Allow HTTP traffic from VPC Lattice'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceName}-ecs-sg'
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # ECS Service
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ServiceListener
+      - TargetGroup
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref EcsSecurityGroup
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - TargetGroupArn: !Ref TargetGroup
+          ContainerName: !Sub '${ServiceName}-container'
+          ContainerPort: !Ref ContainerPort
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      Tags:
+        - Key: Name
+          Value: !Ref ServiceName
+        - Key: Recipe
+          Value: 'cross-account-service-discovery-lattice-ecs'
+
+  # ==========================================
+  # EventBridge Resources
+  # ==========================================
+  
+  # EventBridge Rule for VPC Lattice Events
+  VpcLatticeEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ServiceName}-vpc-lattice-events'
+      Description: 'Capture VPC Lattice service discovery events'
+      EventPattern:
+        source:
+          - aws.vpc-lattice
+        detail-type:
+          - VPC Lattice Service Network State Change
+          - VPC Lattice Service State Change
+      State: ENABLED
+      Targets:
+        - Arn: !Sub '${VpcLatticeEventsLogGroup.Arn}'
+          Id: '1'
+          RoleArn: !GetAtt EventBridgeLogsRole.Arn
+
+  # ==========================================
+  # CloudWatch Dashboard (Conditional)
+  # ==========================================
+  
+  ServiceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: ShouldCreateDashboard
+    Properties:
+      DashboardName: !Sub '${ServiceName}-cross-account-discovery'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/VpcLattice", "ActiveConnectionCount", "ServiceName", "${LatticeService}"],
+                  [".", "NewConnectionCount", ".", "."],
+                  [".", "ProcessedBytes", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "VPC Lattice Service Metrics",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ECS", "CPUUtilization", "ServiceName", "${ServiceName}", "ClusterName", "${EcsCluster}"],
+                  [".", "MemoryUtilization", ".", ".", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "ECS Service Metrics",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${VpcLatticeEventsLogGroup}'\n| fields @timestamp, source, detail-type, detail\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "VPC Lattice Events",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # VPC Lattice Outputs
+  ServiceNetworkArn:
+    Description: 'ARN of the VPC Lattice Service Network'
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetworkArn'
+
+  ServiceNetworkId:
+    Description: 'ID of the VPC Lattice Service Network'
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetworkId'
+
+  LatticeServiceArn:
+    Description: 'ARN of the VPC Lattice Service'
+    Value: !Ref LatticeService
+    Export:
+      Name: !Sub '${AWS::StackName}-LatticeServiceArn'
+
+  LatticeServiceId:
+    Description: 'ID of the VPC Lattice Service'
+    Value: !Ref LatticeService
+    Export:
+      Name: !Sub '${AWS::StackName}-LatticeServiceId'
+
+  TargetGroupArn:
+    Description: 'ARN of the VPC Lattice Target Group'
+    Value: !Ref TargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-TargetGroupArn'
+
+  ServiceListenerArn:
+    Description: 'ARN of the VPC Lattice Service Listener'
+    Value: !Ref ServiceListener
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceListenerArn'
+
+  # ECS Outputs
+  ClusterArn:
+    Description: 'ARN of the ECS Cluster'
+    Value: !GetAtt EcsCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+
+  ClusterName:
+    Description: 'Name of the ECS Cluster'
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  ServiceArn:
+    Description: 'ARN of the ECS Service'
+    Value: !Ref EcsService
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceArn'
+
+  ServiceName:
+    Description: 'Name of the ECS Service'
+    Value: !Ref EcsService
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceName'
+
+  TaskDefinitionArn:
+    Description: 'ARN of the ECS Task Definition'
+    Value: !Ref TaskDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-TaskDefinitionArn'
+
+  # AWS RAM Outputs (Conditional)
+  ResourceShareArn:
+    Condition: ShouldShareResources
+    Description: 'ARN of the AWS RAM Resource Share'
+    Value: !Ref ResourceShare
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceShareArn'
+
+  # Monitoring Outputs
+  EcsLogGroupName:
+    Description: 'Name of the ECS CloudWatch Log Group'
+    Value: !Ref EcsLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EcsLogGroupName'
+
+  VpcLatticeEventsLogGroupName:
+    Description: 'Name of the VPC Lattice Events CloudWatch Log Group'
+    Value: !Ref VpcLatticeEventsLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcLatticeEventsLogGroupName'
+
+  DashboardUrl:
+    Condition: ShouldCreateDashboard
+    Description: 'URL to the CloudWatch Dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ServiceDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardUrl'
+
+  # Verification Commands
+  ServiceDiscoveryEndpoint:
+    Description: 'VPC Lattice service endpoint for cross-account discovery'
+    Value: !Sub 'https://${LatticeService}-${ServiceNetwork}.${AWS::Region}.vpc-lattice-svcs.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceDiscoveryEndpoint'
+
+  ValidationCommands:
+    Description: 'AWS CLI commands to validate the deployment'
+    Value: !Sub |
+      # Verify VPC Lattice Service Network
+      aws vpc-lattice get-service-network --service-network-identifier ${ServiceNetwork}
+      
+      # Check ECS Service Status
+      aws ecs describe-services --cluster ${EcsCluster} --services ${EcsService}
+      
+      # Verify Target Group Health
+      aws vpc-lattice list-targets --target-group-identifier ${TargetGroup}
+      
+      # Check EventBridge Rule
+      aws events describe-rule --name ${VpcLatticeEventsRule}
+    Export:
+      Name: !Sub '${AWS::StackName}-ValidationCommands'

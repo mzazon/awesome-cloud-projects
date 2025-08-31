@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Translator, Azure AI Document Intelligence, Azure Logic Apps, Azure Blob Storage
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-24
 passed-qa: null
 tags: translation, localization, document-intelligence, workflow-automation, multi-language, content-management
 recipe-generator-version: 1.3
@@ -85,9 +85,15 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for consistent resource naming
-export RESOURCE_GROUP="rg-localization-workflow"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-localization-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
+export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
+
+# Generate unique suffix for resource names
+RANDOM_SUFFIX=$(openssl rand -hex 3)
+
+# Set unique resource names
 export STORAGE_ACCOUNT="st$(openssl rand -hex 6)"
 export TRANSLATOR_NAME="translator-$(openssl rand -hex 4)"
 export DOC_INTELLIGENCE_NAME="doc-intel-$(openssl rand -hex 4)"
@@ -97,18 +103,18 @@ export LOGIC_APP_NAME="logic-localization-$(openssl rand -hex 4)"
 az group create \
     --name ${RESOURCE_GROUP} \
     --location ${LOCATION} \
-    --tags project=localization environment=demo
+    --tags purpose=localization environment=demo
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
-# Create storage account with hierarchical namespace for document management
+# Create storage account for document management
 az storage account create \
     --name ${STORAGE_ACCOUNT} \
     --resource-group ${RESOURCE_GROUP} \
     --location ${LOCATION} \
     --sku Standard_LRS \
     --kind StorageV2 \
-    --enable-hierarchical-namespace false
+    --tags purpose=localization environment=demo
 
 echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
@@ -133,7 +139,7 @@ export STORAGE_KEY=$(az storage account keys list \
        --location ${LOCATION} \
        --kind TextTranslation \
        --sku S1 \
-       --custom-domain ${TRANSLATOR_NAME}
+       --yes
    
    # Get Translator service key and endpoint
    export TRANSLATOR_KEY=$(az cognitiveservices account keys list \
@@ -163,7 +169,7 @@ export STORAGE_KEY=$(az storage account keys list \
        --location ${LOCATION} \
        --kind FormRecognizer \
        --sku S0 \
-       --custom-domain ${DOC_INTELLIGENCE_NAME}
+       --yes
    
    # Get Document Intelligence credentials
    export DOC_INTEL_KEY=$(az cognitiveservices account keys list \
@@ -224,45 +230,29 @@ export STORAGE_KEY=$(az storage account keys list \
    Azure Logic Apps provides visual workflow orchestration that connects Azure services without requiring complex code. The Logic App will detect new documents, coordinate AI services for text extraction and translation, and manage the complete localization process with built-in error handling and monitoring capabilities.
 
    ```bash
+   # Create basic workflow definition file
+   cat > basic-workflow-definition.json << 'EOF'
+   {
+     "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+     "contentVersion": "1.0.0.0",
+     "parameters": {},
+     "triggers": {},
+     "actions": {},
+     "outputs": {}
+   }
+   EOF
+   
    # Create Logic App resource
    az logic workflow create \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --definition '{
-         "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-         "contentVersion": "1.0.0.0",
-         "parameters": {},
-         "triggers": {
-           "When_a_blob_is_added_or_modified": {
-             "type": "ApiConnection",
-             "inputs": {
-               "host": {
-                 "connection": {
-                   "name": "@parameters('\''$connections'\'')['\''azureblob'\'']['\''connectionId'\'']"
-                 }
-               },
-               "method": "get",
-               "path": "/datasets/default/triggers/batch/onupdatedfile",
-               "queries": {
-                 "folderId": "source-documents",
-                 "maxFileCount": 10
-               }
-             },
-             "recurrence": {
-               "frequency": "Minute",
-               "interval": 5
-             }
-           }
-         },
-         "actions": {},
-         "outputs": {}
-       }'
+       --definition @basic-workflow-definition.json
    
    echo "✅ Logic App created: ${LOGIC_APP_NAME}"
    ```
 
-   The Logic App foundation is established with a blob trigger that monitors the source container for new documents, providing the orchestration framework for the automated localization workflow.
+   The Logic App foundation is established with basic structure, providing the orchestration framework for the automated localization workflow.
 
 5. **Configure API Connections for Azure Services**:
 
@@ -277,27 +267,11 @@ export STORAGE_KEY=$(az storage account keys list \
        --properties '{
          "displayName": "Azure Blob Storage Connection",
          "api": {
-           "id": "/subscriptions/'$(az account show --query id -o tsv)'/providers/Microsoft.Web/locations/'${LOCATION}'/managedApis/azureblob"
+           "id": "/subscriptions/'${SUBSCRIPTION_ID}'/providers/Microsoft.Web/locations/'${LOCATION}'/managedApis/azureblob"
          },
          "parameterValues": {
            "accountName": "'${STORAGE_ACCOUNT}'",
            "accessKey": "'${STORAGE_KEY}'"
-         }
-       }'
-   
-   # Create API connection for Cognitive Services
-   az resource create \
-       --resource-group ${RESOURCE_GROUP} \
-       --resource-type Microsoft.Web/connections \
-       --name cognitiveservices-connection \
-       --properties '{
-         "displayName": "Cognitive Services Connection",
-         "api": {
-           "id": "/subscriptions/'$(az account show --query id -o tsv)'/providers/Microsoft.Web/locations/'${LOCATION}'/managedApis/cognitiveservicestextanalytics"
-         },
-         "parameterValues": {
-           "apiKey": "'${DOC_INTEL_KEY}'",
-           "siteUrl": "'${DOC_INTEL_ENDPOINT}'"
          }
        }'
    
@@ -320,6 +294,22 @@ export STORAGE_KEY=$(az storage account keys list \
        "$connections": {
          "defaultValue": {},
          "type": "Object"
+       },
+       "documentIntelligenceEndpoint": {
+         "defaultValue": "",
+         "type": "String"
+       },
+       "documentIntelligenceKey": {
+         "defaultValue": "",
+         "type": "String"
+       },
+       "translatorEndpoint": {
+         "defaultValue": "",
+         "type": "String"
+       },
+       "translatorKey": {
+         "defaultValue": "",
+         "type": "String"
        }
      },
      "triggers": {
@@ -349,37 +339,58 @@ export STORAGE_KEY=$(az storage account keys list \
          "type": "Http",
          "inputs": {
            "method": "POST",
-           "uri": "@{parameters('documentIntelligenceEndpoint')}/formrecognizer/v2.1/layout/analyze",
+           "uri": "@{parameters('documentIntelligenceEndpoint')}/formrecognizer/documentModels/prebuilt-layout:analyze?api-version=2023-07-31",
            "headers": {
              "Ocp-Apim-Subscription-Key": "@{parameters('documentIntelligenceKey')}",
              "Content-Type": "application/json"
            },
            "body": {
-             "source": "@{triggerBody()['Path']}"
+             "urlSource": "@{triggerBody()['Path']}"
            }
+         }
+       },
+       "Wait_for_Analysis": {
+         "type": "Wait",
+         "inputs": {
+           "interval": {
+             "count": 30,
+             "unit": "Second"
+           }
+         },
+         "runAfter": {
+           "Extract_Document_Text": ["Succeeded"]
+         }
+       },
+       "Get_Analysis_Results": {
+         "type": "Http",
+         "inputs": {
+           "method": "GET",
+           "uri": "@{body('Extract_Document_Text')['Operation-Location']}",
+           "headers": {
+             "Ocp-Apim-Subscription-Key": "@{parameters('documentIntelligenceKey')}"
+           }
+         },
+         "runAfter": {
+           "Wait_for_Analysis": ["Succeeded"]
          }
        },
        "Translate_Extracted_Text": {
          "type": "Http",
          "inputs": {
            "method": "POST",
-           "uri": "@{parameters('translatorEndpoint')}/translate",
+           "uri": "@{parameters('translatorEndpoint')}/translate?api-version=3.0&to=es&to=fr&to=de&to=it&to=pt",
            "headers": {
              "Ocp-Apim-Subscription-Key": "@{parameters('translatorKey')}",
              "Content-Type": "application/json"
            },
            "body": [
              {
-               "text": "@{body('Extract_Document_Text')['analyzeResult']['readResults'][0]['lines']}"
+               "text": "@{body('Get_Analysis_Results')['analyzeResult']['content']}"
              }
-           ],
-           "queries": {
-             "api-version": "3.0",
-             "to": "es,fr,de,it,pt"
-           }
+           ]
          },
          "runAfter": {
-           "Extract_Document_Text": ["Succeeded"]
+           "Get_Analysis_Results": ["Succeeded"]
          }
        },
        "Create_Localized_Documents": {
@@ -423,16 +434,17 @@ export STORAGE_KEY=$(az storage account keys list \
 
    ```bash
    # Update Logic App with complete workflow definition
-   az logic workflow update \
+   az logic workflow create \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
        --definition @workflow-definition.json \
        --parameters '{
          "$connections": {
            "azureblob": {
-             "connectionId": "/subscriptions/'$(az account show --query id -o tsv)'/resourceGroups/'${RESOURCE_GROUP}'/providers/Microsoft.Web/connections/azureblob-connection",
+             "connectionId": "/subscriptions/'${SUBSCRIPTION_ID}'/resourceGroups/'${RESOURCE_GROUP}'/providers/Microsoft.Web/connections/azureblob-connection",
              "connectionName": "azureblob",
-             "id": "/subscriptions/'$(az account show --query id -o tsv)'/providers/Microsoft.Web/locations/'${LOCATION}'/managedApis/azureblob"
+             "id": "/subscriptions/'${SUBSCRIPTION_ID}'/providers/Microsoft.Web/locations/'${LOCATION}'/managedApis/azureblob"
            }
          },
          "documentIntelligenceEndpoint": "'${DOC_INTEL_ENDPOINT}'",
@@ -440,11 +452,6 @@ export STORAGE_KEY=$(az storage account keys list \
          "translatorEndpoint": "'${TRANSLATOR_ENDPOINT}'",
          "translatorKey": "'${TRANSLATOR_KEY}'"
        }'
-   
-   # Enable the Logic App workflow
-   az logic workflow enable \
-       --name ${LOGIC_APP_NAME} \
-       --resource-group ${RESOURCE_GROUP}
    
    echo "✅ Complete localization workflow deployed and enabled"
    ```
@@ -505,11 +512,11 @@ export STORAGE_KEY=$(az storage account keys list \
 3. **Monitor Logic App execution history**:
 
    ```bash
-   # Check Logic App run history
+   # Check Logic App status
    az logic workflow show \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query '{name:name,state:state,lastExecutionTime:accessEndpoint}' \
+       --query '{name:name,state:state,location:location}' \
        --output table
    
    # View recent workflow runs
@@ -527,18 +534,13 @@ export STORAGE_KEY=$(az storage account keys list \
 1. **Stop Logic App and remove workflow resources**:
 
    ```bash
-   # Disable Logic App workflow
-   az logic workflow disable \
-       --name ${LOGIC_APP_NAME} \
-       --resource-group ${RESOURCE_GROUP}
-   
    # Delete Logic App
    az logic workflow delete \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --yes
    
-   echo "✅ Logic App workflow disabled and deleted"
+   echo "✅ Logic App workflow deleted"
    ```
 
 2. **Remove Azure AI services**:
@@ -584,9 +586,9 @@ export STORAGE_KEY=$(az storage account keys list \
 
 ## Discussion
 
-Azure's AI-powered localization workflow represents a significant advancement in enterprise content management, combining the sophisticated text extraction capabilities of Document Intelligence with the linguistic precision of Azure Translator. This solution addresses the growing need for rapid, accurate multilingual content delivery in global organizations where traditional translation processes create bottlenecks and inconsistencies. The architecture leverages Azure's native integration patterns to create a scalable, cost-effective solution that can process thousands of documents daily while maintaining professional quality standards. For comprehensive guidance on implementing AI-powered workflows, see the [Azure AI Services documentation](https://docs.microsoft.com/en-us/azure/cognitive-services/) and [Logic Apps integration patterns](https://docs.microsoft.com/en-us/azure/logic-apps/logic-apps-architectures-enterprise-integration).
+Azure's AI-powered localization workflow represents a significant advancement in enterprise content management, combining the sophisticated text extraction capabilities of Document Intelligence with the linguistic precision of Azure Translator. This solution addresses the growing need for rapid, accurate multilingual content delivery in global organizations where traditional translation processes create bottlenecks and inconsistencies. The architecture leverages Azure's native integration patterns to create a scalable, cost-effective solution that can process thousands of documents daily while maintaining professional quality standards. For comprehensive guidance on implementing AI-powered workflows, see the [Azure AI services documentation](https://docs.microsoft.com/en-us/azure/ai-services/) and [Logic Apps integration patterns](https://docs.microsoft.com/en-us/azure/logic-apps/logic-apps-architectures-enterprise-integration).
 
-The document processing pipeline utilizes Azure AI Document Intelligence's advanced OCR and layout analysis capabilities to extract text while preserving contextual information such as tables, headings, and formatting structures. This preservation of document hierarchy is crucial for maintaining professional presentation standards across translated versions. The integration with Azure Translator's document translation API ensures that specialized terminology and industry-specific language patterns are handled appropriately, while the batch processing capabilities enable efficient handling of large document volumes. The [Document Intelligence best practices guide](https://docs.microsoft.com/en-us/azure/cognitive-services/form-recognizer/overview) provides detailed recommendations for optimizing extraction accuracy across different document types.
+The document processing pipeline utilizes Azure AI Document Intelligence's advanced OCR and layout analysis capabilities to extract text while preserving contextual information such as tables, headings, and formatting structures. This preservation of document hierarchy is crucial for maintaining professional presentation standards across translated versions. The integration with Azure Translator's document translation API ensures that specialized terminology and industry-specific language patterns are handled appropriately, while the batch processing capabilities enable efficient handling of large document volumes. The [Document Intelligence best practices guide](https://docs.microsoft.com/en-us/azure/ai-services/document-intelligence/overview) provides detailed recommendations for optimizing extraction accuracy across different document types.
 
 From an operational perspective, the Logic Apps orchestration provides enterprise-grade monitoring, error handling, and scalability features that traditional translation workflows lack. The visual workflow designer enables non-technical stakeholders to understand and modify the localization process, while built-in connectors provide seamless integration with existing business systems. Cost optimization is achieved through the consumption-based pricing model, where organizations only pay for actual document processing rather than maintaining dedicated translation infrastructure. The [Azure Logic Apps pricing documentation](https://azure.microsoft.com/en-us/pricing/details/logic-apps/) offers detailed cost modeling guidance for enterprise deployments.
 

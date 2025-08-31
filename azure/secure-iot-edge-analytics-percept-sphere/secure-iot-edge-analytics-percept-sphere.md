@@ -1,21 +1,21 @@
 ---
-title: Secure IoT Edge Analytics with Azure Percept and Sphere
+title: Secure IoT Edge Analytics with Azure Sphere and IoT Edge
 id: a4f8e2d9
 category: iot
 difficulty: 300
 subject: azure
-services: Azure Percept, Azure Sphere, Azure IoT Hub, Azure Stream Analytics
+services: Azure Sphere, Azure IoT Hub, Azure IoT Edge, Azure Stream Analytics
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: iot, edge-computing, security, analytics, artificial-intelligence, machine-learning
 recipe-generator-version: 1.3
 ---
 
-# Secure IoT Edge Analytics with Azure Percept and Sphere
+# Secure IoT Edge Analytics with Azure Sphere and IoT Edge
 
 ## Problem
 
@@ -23,7 +23,7 @@ Manufacturing organizations struggle to implement real-time analytics on industr
 
 ## Solution
 
-Azure Percept and Azure Sphere provide a comprehensive edge-to-cloud IoT analytics platform that combines AI-powered edge inference with hardware-level security. This solution processes sensor data locally using Azure Percept's AI capabilities while leveraging Azure Sphere's secure hardware platform for device protection, then streams aggregated insights to Azure IoT Hub and Stream Analytics for enterprise-wide monitoring and automated response workflows.
+Azure Sphere and Azure IoT Edge provide a comprehensive edge-to-cloud IoT analytics platform that combines AI-powered edge inference with hardware-level security. This solution processes sensor data locally using Azure IoT Edge's containerized analytics capabilities while leveraging Azure Sphere's secure hardware platform for device protection, then streams aggregated insights to Azure IoT Hub and Stream Analytics for enterprise-wide monitoring and automated response workflows.
 
 ## Architecture Diagram
 
@@ -31,7 +31,7 @@ Azure Percept and Azure Sphere provide a comprehensive edge-to-cloud IoT analyti
 graph TB
     subgraph "Edge Layer"
         SPHERE[Azure Sphere Device<br/>Hardware Security]
-        PERCEPT[Azure Percept DK<br/>AI Vision Processing]
+        EDGE[Azure IoT Edge Device<br/>Container Analytics]
         SENSORS[Industrial Sensors]
     end
     
@@ -47,10 +47,11 @@ graph TB
         CLOUD_ANALYTICS[Cloud Analytics<br/>Aggregated Insights]
     end
     
-    SENSORS --> PERCEPT
-    PERCEPT --> EDGE_ANALYTICS
+    SENSORS --> SPHERE
+    SPHERE --> EDGE
+    EDGE --> EDGE_ANALYTICS
     SPHERE --> IOT
-    PERCEPT --> IOT
+    EDGE --> IOT
     EDGE_ANALYTICS --> IOT
     IOT --> STREAM
     STREAM --> STORAGE
@@ -58,7 +59,7 @@ graph TB
     STREAM --> CLOUD_ANALYTICS
     
     style SPHERE fill:#FF6B6B
-    style PERCEPT fill:#4ECDC4
+    style EDGE fill:#4ECDC4
     style IOT fill:#45B7D1
     style STREAM fill:#96CEB4
 ```
@@ -66,13 +67,13 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with IoT Hub and Stream Analytics permissions
-2. Azure Sphere development kit and Azure Percept DK hardware
+2. Azure Sphere development kit and compatible IoT Edge device hardware
 3. Azure CLI v2.50.0 or later installed and configured
 4. Visual Studio Code with Azure IoT Tools extension
 5. Basic understanding of IoT protocols and edge computing concepts
 6. Estimated cost: $150-200 for development resources (excluding hardware)
 
-> **Note**: Azure Sphere provides over 10 years of Microsoft security services included with each device. Review the [Azure Sphere security model](https://docs.microsoft.com/en-us/azure-sphere/concepts/security-model) for comprehensive hardware-level protection details.
+> **Note**: Azure Sphere provides over 10 years of Microsoft security services included with each device. Review the [Azure Sphere security model](https://learn.microsoft.com/en-us/azure-sphere/concepts/security-model) for comprehensive hardware-level protection details.
 
 ## Preparation
 
@@ -84,7 +85,7 @@ export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 export IOT_HUB_NAME="iot-hub-${RANDOM_SUFFIX}"
 export STREAM_JOB_NAME="stream-analytics-${RANDOM_SUFFIX}"
 export STORAGE_ACCOUNT="stiot${RANDOM_SUFFIX}"
-export DEVICE_ID="percept-device-01"
+export EDGE_DEVICE_ID="iot-edge-device-01"
 export SPHERE_DEVICE_ID="sphere-device-01"
 
 # Generate unique suffix for resource names
@@ -138,7 +139,7 @@ echo "✅ Storage account created with Data Lake capabilities"
    echo "✅ IoT Hub created with connection string configured"
    ```
 
-   The IoT Hub now provides secure device connectivity with automatic scaling and built-in security features. This foundation enables secure communication between Azure Sphere devices, Azure Percept modules, and cloud analytics services while maintaining enterprise-grade security standards.
+   The IoT Hub now provides secure device connectivity with automatic scaling and built-in security features. This foundation enables secure communication between Azure Sphere devices, Azure IoT Edge modules, and cloud analytics services while maintaining enterprise-grade security standards.
 
 2. **Configure Azure Sphere Device Security**:
 
@@ -168,27 +169,28 @@ echo "✅ Storage account created with Data Lake capabilities"
 
    The Azure Sphere device now has secure authentication configured with automatic certificate management and device twin capabilities. This provides hardware-level security for your IoT solution while enabling remote device management and configuration updates.
 
-3. **Deploy Azure Percept for Edge AI Processing**:
+3. **Deploy Azure IoT Edge for Container-based Analytics**:
 
-   Azure Percept enables AI inference at the edge, reducing latency and bandwidth requirements for real-time analytics. This step configures the Percept device with custom AI models for processing sensor data locally before sending aggregated insights to the cloud. Edge processing is crucial for time-sensitive industrial applications requiring immediate response to anomalies.
+   Azure IoT Edge enables containerized AI inference at the edge, reducing latency and bandwidth requirements for real-time analytics. This step configures the IoT Edge device with runtime modules for processing sensor data locally before sending aggregated insights to the cloud. Edge processing is crucial for time-sensitive industrial applications requiring immediate response to anomalies.
 
    ```bash
-   # Create Azure Percept device identity
+   # Create Azure IoT Edge device identity
    az iot hub device-identity create \
        --hub-name ${IOT_HUB_NAME} \
-       --device-id ${DEVICE_ID} \
-       --auth-method shared_private_key
+       --device-id ${EDGE_DEVICE_ID} \
+       --auth-method shared_private_key \
+       --edge-enabled
 
    # Get device connection string
    export DEVICE_CONNECTION_STRING=$(az iot hub device-identity connection-string show \
        --hub-name ${IOT_HUB_NAME} \
-       --device-id ${DEVICE_ID} \
+       --device-id ${EDGE_DEVICE_ID} \
        --query connectionString --output tsv)
 
-   # Configure edge modules for Percept
+   # Configure edge modules for IoT Edge with latest runtime
    az iot edge set-modules \
        --hub-name ${IOT_HUB_NAME} \
-       --device-id ${DEVICE_ID} \
+       --device-id ${EDGE_DEVICE_ID} \
        --content '{
          "modulesContent": {
            "$edgeAgent": {
@@ -204,7 +206,7 @@ echo "✅ Storage account created with Data Lake capabilities"
                  "edgeAgent": {
                    "type": "docker",
                    "settings": {
-                     "image": "mcr.microsoft.com/azureiotedge-agent:1.4",
+                     "image": "mcr.microsoft.com/azureiotedge-agent:1.5",
                      "createOptions": "{}"
                    }
                  },
@@ -213,7 +215,7 @@ echo "✅ Storage account created with Data Lake capabilities"
                    "status": "running",
                    "restartPolicy": "always",
                    "settings": {
-                     "image": "mcr.microsoft.com/azureiotedge-hub:1.4",
+                     "image": "mcr.microsoft.com/azureiotedge-hub:1.5",
                      "createOptions": "{\"HostConfig\":{\"PortBindings\":{\"5671/tcp\":[{\"HostPort\":\"5671\"}],\"8883/tcp\":[{\"HostPort\":\"8883\"}],\"443/tcp\":[{\"HostPort\":\"443\"}]}}}"
                    }
                  }
@@ -223,20 +225,20 @@ echo "✅ Storage account created with Data Lake capabilities"
          }
        }'
 
-   echo "✅ Azure Percept configured for edge AI processing"
+   echo "✅ Azure IoT Edge configured with latest runtime for containerized analytics"
    ```
 
-   The Azure Percept device is now configured with IoT Edge runtime and ready for AI model deployment. This edge computing capability enables real-time processing of sensor data with minimal latency while maintaining secure connectivity to the cloud infrastructure.
+   The Azure IoT Edge device is now configured with IoT Edge runtime 1.5 LTS and ready for AI model deployment. This edge computing capability enables real-time processing of sensor data with minimal latency while maintaining secure connectivity to the cloud infrastructure.
 
 4. **Create Stream Analytics Job for Real-time Processing**:
 
-   Azure Stream Analytics provides real-time analytics and complex event processing for streaming data from IoT devices. This managed service enables you to analyze telemetry data, detect anomalies, and trigger automated responses based on business rules. The Stream Analytics job will process data from both Azure Sphere and Azure Percept devices.
+   Azure Stream Analytics provides real-time analytics and complex event processing for streaming data from IoT devices. This managed service enables you to analyze telemetry data, detect anomalies, and trigger automated responses based on business rules. The Stream Analytics job will process data from both Azure Sphere and Azure IoT Edge devices.
 
    ```bash
    # Create Stream Analytics job
    az stream-analytics job create \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${STREAM_JOB_NAME} \
+       --job-name ${STREAM_JOB_NAME} \
        --location ${LOCATION} \
        --output-error-policy "Stop" \
        --out-of-order-policy "Adjust" \
@@ -324,7 +326,7 @@ echo "✅ Storage account created with Data Lake capabilities"
 
 6. **Deploy Stream Analytics Query for Edge Analytics**:
 
-   Stream Analytics queries enable real-time data transformation, aggregation, and anomaly detection using SQL-like syntax. This step implements business logic to process sensor data from both Azure Sphere and Azure Percept devices, detecting anomalies and calculating key performance indicators. The query processes data in real-time and triggers alerts when thresholds are exceeded.
+   Stream Analytics queries enable real-time data transformation, aggregation, and anomaly detection using SQL-like syntax. This step implements business logic to process sensor data from both Azure Sphere and Azure IoT Edge devices, detecting anomalies and calculating key performance indicators. The query processes data in real-time and triggers alerts when thresholds are exceeded.
 
    ```bash
    # Create Stream Analytics transformation query
@@ -345,7 +347,7 @@ echo "✅ Storage account created with Data Lake capabilities"
            AnomalyDetection_SpikeAndDip(vibration, 95, 120, 'spikesanddips')
              OVER(LIMIT DURATION(minute, 2)) AS vibrationAnomaly
          FROM IoTHubInput
-         WHERE deviceId IN ('${DEVICE_ID}', '${SPHERE_DEVICE_ID}')
+         WHERE deviceId IN ('${EDGE_DEVICE_ID}', '${SPHERE_DEVICE_ID}')
        ),
        AggregatedData AS (
          SELECT
@@ -357,7 +359,7 @@ echo "✅ Storage account created with Data Lake capabilities"
            AVG(vibration) AS avgVibration,
            COUNT(*) AS messageCount
          FROM IoTHubInput
-         WHERE deviceId IN ('${DEVICE_ID}', '${SPHERE_DEVICE_ID}')
+         WHERE deviceId IN ('${EDGE_DEVICE_ID}', '${SPHERE_DEVICE_ID}')
          GROUP BY deviceId, TumblingWindow(minute, 5)
        )
        SELECT
@@ -454,7 +456,7 @@ echo "✅ Storage account created with Data Lake capabilities"
    # Check device connection status
    az iot hub device-identity show \
        --hub-name ${IOT_HUB_NAME} \
-       --device-id ${DEVICE_ID} \
+       --device-id ${EDGE_DEVICE_ID} \
        --query '{deviceId:deviceId, status:status, lastActivityTime:lastActivityTime}' \
        --output table
 
@@ -474,8 +476,8 @@ echo "✅ Storage account created with Data Lake capabilities"
    # Send test telemetry data
    az iot device send-d2c-message \
        --hub-name ${IOT_HUB_NAME} \
-       --device-id ${DEVICE_ID} \
-       --data '{"deviceId":"'${DEVICE_ID}'","timestamp":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","temperature":75.5,"humidity":65.2,"vibration":0.8}'
+       --device-id ${EDGE_DEVICE_ID} \
+       --data '{"deviceId":"'${EDGE_DEVICE_ID}'","timestamp":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","temperature":75.5,"humidity":65.2,"vibration":0.8}'
 
    # Check for processed data in storage
    az storage blob list \
@@ -493,8 +495,8 @@ echo "✅ Storage account created with Data Lake capabilities"
    # Send anomalous data to trigger alerts
    az iot device send-d2c-message \
        --hub-name ${IOT_HUB_NAME} \
-       --device-id ${DEVICE_ID} \
-       --data '{"deviceId":"'${DEVICE_ID}'","timestamp":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","temperature":95.0,"humidity":80.0,"vibration":5.2}'
+       --device-id ${EDGE_DEVICE_ID} \
+       --data '{"deviceId":"'${EDGE_DEVICE_ID}'","timestamp":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","temperature":95.0,"humidity":80.0,"vibration":5.2}'
 
    # Check Stream Analytics metrics
    az monitor metrics list \
@@ -552,21 +554,21 @@ echo "✅ Storage account created with Data Lake capabilities"
 
 ## Discussion
 
-Azure Percept and Azure Sphere together provide a comprehensive edge-to-cloud IoT analytics solution that addresses both performance and security requirements for industrial applications. This architecture combines Azure Percept's AI-powered edge inference capabilities with Azure Sphere's hardware-level security features, creating a robust foundation for enterprise IoT deployments. The solution processes sensor data locally to minimize latency while maintaining secure connectivity to cloud analytics services for enterprise-wide insights and automated response workflows. For comprehensive guidance on IoT security best practices, see the [Azure IoT Security Documentation](https://docs.microsoft.com/en-us/azure/iot-fundamentals/iot-security-ground-up).
+Azure IoT Edge and Azure Sphere together provide a comprehensive edge-to-cloud IoT analytics solution that addresses both performance and security requirements for industrial applications. This architecture combines Azure IoT Edge's containerized analytics capabilities with Azure Sphere's hardware-level security features, creating a robust foundation for enterprise IoT deployments. The solution processes sensor data locally to minimize latency while maintaining secure connectivity to cloud analytics services for enterprise-wide insights and automated response workflows. For comprehensive guidance on IoT security best practices, see the [Azure IoT Security Documentation](https://learn.microsoft.com/en-us/azure/iot-fundamentals/iot-security-ground-up).
 
-The integration of Azure Stream Analytics enables real-time processing of telemetry data with built-in anomaly detection and pattern recognition capabilities. This serverless analytics service automatically scales to handle varying data loads while providing SQL-like query capabilities for complex event processing. The combination of edge and cloud analytics creates a tiered processing architecture that optimizes both performance and cost-effectiveness. For detailed Stream Analytics optimization strategies, review the [Stream Analytics Performance Guide](https://docs.microsoft.com/en-us/azure/stream-analytics/stream-analytics-scale-jobs).
+The integration of Azure Stream Analytics enables real-time processing of telemetry data with built-in anomaly detection and pattern recognition capabilities. This serverless analytics service automatically scales to handle varying data loads while providing SQL-like query capabilities for complex event processing. The combination of edge and cloud analytics creates a tiered processing architecture that optimizes both performance and cost-effectiveness. For detailed Stream Analytics optimization strategies, review the [Stream Analytics Performance Guide](https://learn.microsoft.com/en-us/azure/stream-analytics/stream-analytics-scale-jobs).
 
-From a security perspective, Azure Sphere provides hardware-root-of-trust protection with automatic OS updates and certificate-based device authentication, addressing critical security concerns in industrial IoT deployments. The platform includes over 10 years of Microsoft security services, ensuring long-term protection against emerging threats. This hardware-level security combined with Azure's cloud security capabilities creates a comprehensive security framework suitable for critical infrastructure applications. For complete security architecture guidance, see the [Azure Sphere Security Model](https://docs.microsoft.com/en-us/azure-sphere/concepts/security-model).
+From a security perspective, Azure Sphere provides hardware-root-of-trust protection with automatic OS updates and certificate-based device authentication, addressing critical security concerns in industrial IoT deployments. The platform includes over 10 years of Microsoft security services, ensuring long-term protection against emerging threats. This hardware-level security combined with Azure's cloud security capabilities creates a comprehensive security framework suitable for critical infrastructure applications. For complete security architecture guidance, see the [Azure Sphere Security Model](https://learn.microsoft.com/en-us/azure-sphere/concepts/security-model).
 
-The solution's data lake integration enables advanced analytics and machine learning capabilities using historical telemetry data. Azure Storage with hierarchical namespace provides the scalable foundation for big data analytics workflows, while Azure Monitor ensures proactive monitoring and alerting. This comprehensive approach supports both real-time operational needs and long-term strategic analytics initiatives. For cost optimization strategies, reference the [Azure IoT Cost Optimization Guide](https://docs.microsoft.com/en-us/azure/iot-fundamentals/iot-cost-optimization).
+The solution's data lake integration enables advanced analytics and machine learning capabilities using historical telemetry data. Azure Storage with hierarchical namespace provides the scalable foundation for big data analytics workflows, while Azure Monitor ensures proactive monitoring and alerting. This comprehensive approach supports both real-time operational needs and long-term strategic analytics initiatives. Azure IoT Edge 1.5 LTS provides long-term support through November 2026, ensuring stability for production deployments. For cost optimization strategies, reference the [Azure IoT Cost Optimization Guide](https://learn.microsoft.com/en-us/azure/iot-fundamentals/iot-cost-optimization).
 
-> **Tip**: Use Azure Digital Twins to create comprehensive digital representations of your industrial assets, enabling advanced simulation and predictive maintenance capabilities. The [Azure Digital Twins documentation](https://docs.microsoft.com/en-us/azure/digital-twins/) provides detailed guidance on building digital twin solutions that complement your edge analytics implementation.
+> **Tip**: Use Azure Digital Twins to create comprehensive digital representations of your industrial assets, enabling advanced simulation and predictive maintenance capabilities. The [Azure Digital Twins documentation](https://learn.microsoft.com/en-us/azure/digital-twins/) provides detailed guidance on building digital twin solutions that complement your edge analytics implementation.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Custom AI Model Deployment**: Deploy a custom computer vision model to Azure Percept for specialized defect detection, integrating with Azure Machine Learning for continuous model improvement and A/B testing capabilities.
+1. **Custom AI Model Deployment**: Deploy a custom computer vision model to Azure IoT Edge for specialized defect detection, integrating with Azure Machine Learning for continuous model improvement and A/B testing capabilities.
 
 2. **Multi-Site Analytics Orchestration**: Implement a hub-and-spoke architecture with multiple Azure Sphere devices feeding data to a central analytics platform, enabling cross-site correlation and global optimization insights.
 

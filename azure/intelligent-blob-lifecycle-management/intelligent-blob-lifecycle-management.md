@@ -6,10 +6,10 @@ difficulty: 100
 subject: azure
 services: Azure Storage Account, Azure Monitor, Azure Logic Apps
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: storage, lifecycle, cost-optimization, monitoring, automation
 recipe-generator-version: 1.3
@@ -91,14 +91,17 @@ graph TB
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-lifecycle-demo"
+export RESOURCE_GROUP="rg-lifecycle-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
-export STORAGE_ACCOUNT="stlifecycle$(openssl rand -hex 3)"
-export LOGIC_APP_NAME="logic-storage-alerts"
-export WORKSPACE_NAME="law-storage-monitoring"
+export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
+
+# Set resource names with unique suffix
+export STORAGE_ACCOUNT="stlifecycle${RANDOM_SUFFIX}"
+export LOGIC_APP_NAME="logic-storage-alerts-${RANDOM_SUFFIX}"
+export WORKSPACE_NAME="law-storage-monitoring-${RANDOM_SUFFIX}"
 
 # Create resource group for lifecycle management demo
 az group create \
@@ -107,9 +110,6 @@ az group create \
     --tags purpose=lifecycle-demo environment=development
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
-
-# Get subscription ID for monitoring configuration
-SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 echo "Subscription ID: ${SUBSCRIPTION_ID}"
 ```
 
@@ -305,42 +305,8 @@ echo "Subscription ID: ${SUBSCRIPTION_ID}"
        --resource ${STORAGE_ACCOUNT_ID}/blobServices/default \
        --name "BlobStorageMonitoring" \
        --workspace ${WORKSPACE_ID} \
-       --metrics '[
-         {
-           "category": "Transaction",
-           "enabled": true,
-           "retentionPolicy": {
-             "enabled": true,
-             "days": 30
-           }
-         },
-         {
-           "category": "Capacity",
-           "enabled": true,
-           "retentionPolicy": {
-             "enabled": true,
-             "days": 30
-           }
-         }
-       ]' \
-       --logs '[
-         {
-           "category": "StorageRead",
-           "enabled": true,
-           "retentionPolicy": {
-             "enabled": true,
-             "days": 30
-           }
-         },
-         {
-           "category": "StorageWrite",
-           "enabled": true,
-           "retentionPolicy": {
-             "enabled": true,
-             "days": 30
-           }
-         }
-       ]'
+       --metrics '[{"category":"Transaction","enabled":true},{"category":"Capacity","enabled":true}]' \
+       --logs '[{"category":"StorageRead","enabled":true},{"category":"StorageWrite","enabled":true}]'
    
    echo "✅ Storage account diagnostics configured for comprehensive monitoring"
    ```
@@ -392,7 +358,7 @@ echo "Subscription ID: ${SUBSCRIPTION_ID}"
        --evaluation-frequency 5m \
        --window-size 15m \
        --severity 2 \
-       --action-groups "StorageAlertsGroup"
+       --action StorageAlertsGroup
    
    # Create metric alert for transaction costs
    az monitor metrics alert create \
@@ -404,7 +370,7 @@ echo "Subscription ID: ${SUBSCRIPTION_ID}"
        --evaluation-frequency 5m \
        --window-size 15m \
        --severity 3 \
-       --action-groups "StorageAlertsGroup"
+       --action StorageAlertsGroup
    
    echo "✅ Storage cost and capacity alerts configured"
    ```

@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Data Factory, Azure Database Migration Service, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database-migration, workflow-orchestration, apache-airflow, automation, monitoring
 recipe-generator-version: 1.3
@@ -86,7 +86,7 @@ graph TB
 4. Understanding of Apache Airflow DAG concepts and Python programming
 5. Estimated cost: $150-300/month for development environment (varies by migration volume and target services)
 
-> **Note**: This recipe uses Azure Data Factory's Workflow Orchestration Manager for Apache Airflow. Microsoft recommends migrating to Apache Airflow in Microsoft Fabric for new projects, but existing ADF users can continue using this service.
+> **Note**: Azure Database Migration Service (classic) - SQL scenarios are on a deprecation path and will be retired on March 15, 2026. Microsoft recommends using the latest version of Azure Database Migration Service available through Azure Data Studio or Azure Portal. For new Apache Airflow projects, Microsoft recommends using Apache Airflow in Microsoft Fabric as the Workflow Orchestration Manager will be Generally Available only in Microsoft Fabric in Q1 CY2025.
 
 ## Preparation
 
@@ -101,7 +101,7 @@ RANDOM_SUFFIX=$(openssl rand -hex 3)
 
 # Set resource names with unique suffix
 export DATA_FACTORY_NAME="adf-migration-${RANDOM_SUFFIX}"
-export DMS_NAME="dms-migration-${RANDOM_SUFFIX}"
+export DMS_SERVICE_NAME="dms-migration-${RANDOM_SUFFIX}"
 export LOG_ANALYTICS_NAME="law-migration-${RANDOM_SUFFIX}"
 export STORAGE_ACCOUNT_NAME="st${RANDOM_SUFFIX}migration"
 
@@ -165,31 +165,30 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
 
    The Data Factory is now established with a secure managed virtual network that enables private connectivity to on-premises systems and Azure services. This foundation provides the orchestration platform for coordinating complex multi-database migration workflows with built-in security and monitoring capabilities.
 
-2. **Configure Database Migration Service**:
+2. **Configure Azure Database Migration Service**:
 
    Azure Database Migration Service provides a reliable, scalable platform for migrating databases with minimal downtime. The service supports both online and offline migration modes, handles schema and data migration, and provides detailed progress tracking through Azure Monitor integration.
 
    ```bash
-   # Create Database Migration Service
-   az dms create \
+   # Create Database Migration Service using the latest API
+   az datamigration sql-service create \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${DMS_NAME} \
-       --location ${LOCATION} \
-       --sku Standard_4vCores
+       --sql-migration-service-name ${DMS_SERVICE_NAME} \
+       --location ${LOCATION}
    
-   DMS_RESOURCE_ID=$(az dms show \
+   DMS_RESOURCE_ID=$(az datamigration sql-service show \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${DMS_NAME} \
+       --sql-migration-service-name ${DMS_SERVICE_NAME} \
        --query id --output tsv)
    
-   echo "✅ Database Migration Service created: ${DMS_NAME}"
+   echo "✅ Database Migration Service created: ${DMS_SERVICE_NAME}"
    
    # Configure diagnostic settings for DMS monitoring
    az monitor diagnostic-settings create \
        --resource ${DMS_RESOURCE_ID} \
        --name "dms-diagnostics" \
        --workspace ${LOG_ANALYTICS_ID} \
-       --logs '[{"category":"DataMigration","enabled":true}]' \
+       --logs '[{"category":"DatabaseMigrationTableDataCopyLogs","enabled":true},{"category":"DatabaseMigrationTableDataCopyState","enabled":true}]' \
        --metrics '[{"category":"AllMetrics","enabled":true}]'
    
    echo "✅ DMS monitoring configured"
@@ -254,7 +253,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        """Initiate migration for specific database"""
        logging.info(f"Starting migration for {database_name}")
        # Implementation would call Azure CLI or REST API
-       # to start DMS migration
+       # to start DMS migration using az datamigration commands
        return f"Migration started for {database_name}"
    
    def monitor_migration_progress(database_name, **context):
@@ -356,7 +355,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        --name "migration-failure-alert" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes ${DMS_RESOURCE_ID} \
-       --condition "count static.microsoft.datamigration/services.MigrationErrors > 0" \
+       --condition "count static.microsoft.datamigration/sqlmigrationservices.DatabaseMigrationErrors > 0" \
        --window-size 5m \
        --evaluation-frequency 1m \
        --severity 1 \
@@ -368,7 +367,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        --name "long-migration-alert" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes ${DMS_RESOURCE_ID} \
-       --condition "average static.microsoft.datamigration/services.MigrationDuration > 3600" \
+       --condition "average static.microsoft.datamigration/sqlmigrationservices.DatabaseMigrationDuration > 3600" \
        --window-size 15m \
        --evaluation-frequency 5m \
        --severity 2 \
@@ -431,8 +430,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
    The Workflow Orchestration Manager provides a fully managed Apache Airflow environment within Azure Data Factory. This service handles Airflow infrastructure, scaling, security, and monitoring, allowing you to focus on developing migration workflows without managing underlying infrastructure.
 
    ```bash
-   # Create Workflow Orchestration Manager (Note: This is done via Azure portal)
-   # The following shows the expected configuration
+   # Create Workflow Orchestration Manager configuration
+   # Note: This must be completed via Azure portal as CLI support is limited
    cat > airflow_config.json << EOF
    {
        "airflowVersion": "2.6.3",
@@ -504,9 +503,9 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
 
    ```bash
    # Verify DMS service status
-   az dms show \
+   az datamigration sql-service show \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${DMS_NAME} \
+       --sql-migration-service-name ${DMS_SERVICE_NAME} \
        --output table
    
    # Check diagnostic settings
@@ -553,9 +552,9 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
 
    ```bash
    # Delete DMS instance
-   az dms delete \
+   az datamigration sql-service delete \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${DMS_NAME} \
+       --sql-migration-service-name ${DMS_SERVICE_NAME} \
        --yes
    
    echo "✅ Database Migration Service deleted"
@@ -606,13 +605,13 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
 
 ## Discussion
 
-This intelligent database migration orchestration solution demonstrates how Azure's managed services can transform complex, error-prone manual processes into automated, reliable workflows. By combining Azure Data Factory's Workflow Orchestration Manager with Database Migration Service, organizations gain the benefits of Apache Airflow's powerful workflow orchestration without the operational overhead of managing infrastructure. The solution follows Azure Well-Architected Framework principles by implementing proper monitoring, security, and reliability patterns. For comprehensive guidance on migration best practices, see the [Azure Database Migration Guide](https://docs.microsoft.com/en-us/azure/dms/) and [Data Factory Workflow Orchestration documentation](https://docs.microsoft.com/en-us/azure/data-factory/concepts-workflow-orchestration-manager).
+This intelligent database migration orchestration solution demonstrates how Azure's managed services can transform complex, error-prone manual processes into automated, reliable workflows. By combining Azure Data Factory's Workflow Orchestration Manager with the latest Azure Database Migration Service, organizations gain the benefits of Apache Airflow's powerful workflow orchestration without the operational overhead of managing infrastructure. The solution follows Azure Well-Architected Framework principles by implementing proper monitoring, security, and reliability patterns. For comprehensive guidance on migration best practices, see the [Azure Database Migration Guide](https://docs.microsoft.com/en-us/azure/dms/) and [Azure Data Factory Workflow Orchestration documentation](https://learn.microsoft.com/en-us/azure/data-factory/concepts-workflow-orchestration-manager).
 
-The architectural pattern implemented here enables organizations to handle complex migration scenarios involving database dependencies, custom validation logic, and automated rollback capabilities. Apache Airflow's DAG-based approach provides version control for migration processes, enabling testing and collaborative development of migration workflows. This is particularly valuable for large enterprises managing hundreds of databases with complex interdependencies. For detailed Airflow development guidance, refer to the [Apache Airflow documentation](https://airflow.apache.org/docs/apache-airflow/stable/) and [Azure Monitor integration patterns](https://docs.microsoft.com/en-us/azure/azure-monitor/platform/monitoring-solutions).
+The architectural pattern implemented here enables organizations to handle complex migration scenarios involving database dependencies, custom validation logic, and automated rollback capabilities. Apache Airflow's DAG-based approach provides version control for migration processes, enabling testing and collaborative development of migration workflows. This is particularly valuable for large enterprises managing hundreds of databases with complex interdependencies. For detailed Airflow development guidance, refer to the [Apache Airflow documentation](https://airflow.apache.org/docs/apache-airflow/stable/) and [Azure Monitor integration patterns](https://docs.microsoft.com/en-us/azure/azure-monitor/essentials/diagnostic-settings).
 
-From a cost perspective, this solution optimizes expenses through serverless execution models and managed services that scale based on actual usage. The Workflow Orchestration Manager automatically scales Airflow workers based on workload demands, while Database Migration Service charges only for active migration operations. Azure Monitor provides comprehensive observability with pay-per-use pricing for logs and metrics. For cost optimization strategies, review the [Azure Cost Management documentation](https://docs.microsoft.com/en-us/azure/cost-management-billing/) and consider implementing automated resource scheduling for non-production environments.
+From a cost perspective, this solution optimizes expenses through serverless execution models and managed services that scale based on actual usage. The Workflow Orchestration Manager automatically scales Airflow workers based on workload demands, while the new Azure Database Migration Service charges only for active migration operations. Azure Monitor provides comprehensive observability with pay-per-use pricing for logs and metrics. For cost optimization strategies, review the [Azure Cost Management documentation](https://docs.microsoft.com/en-us/azure/cost-management-billing/) and consider implementing automated resource scheduling for non-production environments.
 
-> **Tip**: Use Azure DevOps or GitHub Actions to implement CI/CD pipelines for your Airflow DAGs, enabling automated testing and deployment of migration workflows. This approach ensures migration processes are properly tested before production use and maintains version control for critical migration logic.
+> **Warning**: Azure Database Migration Service (classic) - SQL scenarios are being deprecated on March 15, 2026. Plan to migrate to the latest Azure Database Migration Service available through Azure Data Studio or Azure Portal. Additionally, for new Apache Airflow projects, Microsoft recommends using Apache Airflow in Microsoft Fabric as the Workflow Orchestration Manager will only be Generally Available in Microsoft Fabric in Q1 CY2025.
 
 ## Challenge
 

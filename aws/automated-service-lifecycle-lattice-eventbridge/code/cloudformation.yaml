@@ -1,0 +1,971 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated Service Lifecycle Management with VPC Lattice and EventBridge - Production-ready infrastructure for event-driven microservice lifecycle automation'
+
+# ================================
+# PARAMETERS
+# ================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'service-lifecycle'
+    Description: 'Project name used for resource naming and tagging'
+    AllowedPattern: '^[a-z0-9-]{3,20}$'
+    ConstraintDescription: 'Must be 3-20 characters, lowercase letters, numbers, and hyphens only'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment for the deployment (dev, staging, or prod)'
+
+  ServiceNetworkName:
+    Type: String
+    Default: 'microservices-network'
+    Description: 'Name for the VPC Lattice service network'
+    AllowedPattern: '^[a-zA-Z0-9-]{3,50}$'
+    ConstraintDescription: 'Must be 3-50 characters, letters, numbers, and hyphens only'
+
+  EventBusBusName:
+    Type: String
+    Default: 'service-lifecycle-bus'
+    Description: 'Name for the custom EventBridge bus'
+    AllowedPattern: '^[a-zA-Z0-9-_.]{3,50}$'
+    ConstraintDescription: 'Must be 3-50 characters, letters, numbers, hyphens, underscores, and periods only'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'CloudWatch Logs retention period in days'
+
+  HealthCheckInterval:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 60
+    Description: 'Health check interval in minutes'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 15
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 1536, 2048, 3008]
+    Description: 'Lambda function memory size in MB'
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable detailed CloudWatch monitoring and dashboard creation'
+
+  SNSNotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for SNS notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+# ================================
+# CONDITIONS
+# ================================
+Conditions:
+  CreateDashboard: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  CreateSNSNotifications: !Not [!Equals [!Ref SNSNotificationEmail, '']]
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# ================================
+# RESOURCES
+# ================================
+Resources:
+
+  # ================================
+  # VPC LATTICE RESOURCES
+  # ================================
+  
+  # VPC Lattice Service Network
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub '${ProjectName}-${ServiceNetworkName}-${Environment}'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${ServiceNetworkName}-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: 'Automated service lifecycle management'
+
+  # CloudWatch Log Group for VPC Lattice Access Logs
+  VPCLatticeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vpclattice/${ProjectName}-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpclattice-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # VPC Lattice Access Log Subscription
+  AccessLogSubscription:
+    Type: AWS::VpcLattice::AccessLogSubscription
+    Properties:
+      ResourceIdentifier: !Ref ServiceNetwork
+      DestinationArn: !GetAtt VPCLatticeLogGroup.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-access-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # EVENTBRIDGE RESOURCES
+  # ================================
+  
+  # Custom EventBridge Bus
+  ServiceLifecycleEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-${EventBusBusName}-${Environment}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EventBusBusName}-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Service lifecycle event routing'
+
+  # EventBridge Rule for Health Monitoring
+  HealthMonitoringRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-health-monitoring-${Environment}'
+      Description: 'Routes service health check events to auto-scaling function'
+      EventBusName: !Ref ServiceLifecycleEventBus
+      EventPattern:
+        source: ['vpc-lattice.health-monitor']
+        detail-type: ['Service Health Check']
+        detail:
+          healthStatus: ['unhealthy', 'healthy']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AutoScalerFunction.Arn
+          Id: 'AutoScalerTarget'
+
+  # EventBridge Rule for Scheduled Health Checks
+  ScheduledHealthCheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-scheduled-health-check-${Environment}'
+      Description: 'Triggers health monitoring function on schedule'
+      ScheduleExpression: !Sub 'rate(${HealthCheckInterval} minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt HealthMonitorFunction.Arn
+          Id: 'HealthMonitorTarget'
+
+  # ================================
+  # IAM RESOURCES
+  # ================================
+  
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-lambda-policy-${Environment}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # VPC Lattice permissions
+              - Effect: Allow
+                Action:
+                  - vpc-lattice:GetService
+                  - vpc-lattice:ListServices
+                  - vpc-lattice:ListTargetGroups
+                  - vpc-lattice:ListTargets
+                  - vpc-lattice:GetServiceNetwork
+                  - vpc-lattice:GetTargetGroup
+                  - vpc-lattice:GetTarget
+                Resource: '*'
+              # CloudWatch permissions
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              # EventBridge permissions
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt ServiceLifecycleEventBus.Arn
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+              # SNS permissions (conditional)
+              - !If
+                - CreateSNSNotifications
+                - Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref ServiceNotificationTopic
+                - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # LAMBDA FUNCTIONS
+  # ================================
+  
+  # Health Monitor Lambda Function
+  HealthMonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-health-monitor-${Environment}'
+      Description: 'Monitors VPC Lattice service health and publishes events'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          SERVICE_NETWORK_ID: !Ref ServiceNetwork
+          EVENT_BUS_NAME: !Ref ServiceLifecycleEventBus
+          SNS_TOPIC_ARN: !If [CreateSNSNotifications, !Ref ServiceNotificationTopic, '']
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          def lambda_handler(event, context):
+              lattice = boto3.client('vpc-lattice')
+              cloudwatch = boto3.client('cloudwatch')
+              eventbridge = boto3.client('events')
+              sns = boto3.client('sns') if os.environ.get('SNS_TOPIC_ARN') else None
+              
+              service_network_id = os.environ['SERVICE_NETWORK_ID']
+              event_bus_name = os.environ['EVENT_BUS_NAME']
+              sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+              environment = os.environ.get('ENVIRONMENT', 'dev')
+              project_name = os.environ.get('PROJECT_NAME', 'service-lifecycle')
+              
+              try:
+                  print(f"Starting health check for service network: {service_network_id}")
+                  
+                  # Get service network services
+                  try:
+                      services = lattice.list_services(
+                          serviceNetworkIdentifier=service_network_id
+                      )
+                  except Exception as e:
+                      print(f"Error listing services: {str(e)}")
+                      # If no services are registered yet, create a sample event
+                      services = {'items': []}
+                  
+                  health_events_sent = 0
+                  
+                  for service in services.get('items', []):
+                      service_id = service['id']
+                      service_name = service['name']
+                      
+                      print(f"Checking health for service: {service_name} ({service_id})")
+                      
+                      # Get CloudWatch metrics for service health
+                      end_time = datetime.utcnow()
+                      start_time = end_time - timedelta(minutes=5)
+                      
+                      try:
+                          metrics = cloudwatch.get_metric_statistics(
+                              Namespace='AWS/VpcLattice',
+                              MetricName='RequestCount',
+                              Dimensions=[
+                                  {'Name': 'ServiceId', 'Value': service_id}
+                              ],
+                              StartTime=start_time,
+                              EndTime=end_time,
+                              Period=300,
+                              Statistics=['Sum']
+                          )
+                          
+                          # Determine service health based on metrics
+                          request_count = sum([point['Sum'] for point in metrics['Datapoints']])
+                          health_status = 'healthy' if request_count > 0 else 'unknown'
+                          
+                      except Exception as e:
+                          print(f"Error getting metrics for service {service_id}: {str(e)}")
+                          request_count = 0
+                          health_status = 'unknown'
+                      
+                      # Publish service health event
+                      event_detail = {
+                          'serviceId': service_id,
+                          'serviceName': service_name,
+                          'healthStatus': health_status,
+                          'requestCount': request_count,
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'environment': environment,
+                          'projectName': project_name
+                      }
+                      
+                      try:
+                          eventbridge.put_events(
+                              Entries=[
+                                  {
+                                      'Source': 'vpc-lattice.health-monitor',
+                                      'DetailType': 'Service Health Check',
+                                      'Detail': json.dumps(event_detail),
+                                      'EventBusName': event_bus_name
+                                  }
+                              ]
+                          )
+                          health_events_sent += 1
+                          print(f"Health event sent for service: {service_name}")
+                          
+                          # Send SNS notification for unhealthy services in production
+                          if health_status == 'unhealthy' and environment == 'prod' and sns_topic_arn:
+                              try:
+                                  sns.publish(
+                                      TopicArn=sns_topic_arn,
+                                      Subject=f"Service Health Alert - {service_name}",
+                                      Message=f"Service {service_name} ({service_id}) is unhealthy in {environment} environment.\nRequest count in last 5 minutes: {request_count}\nTimestamp: {event_detail['timestamp']}"
+                                  )
+                                  print(f"SNS notification sent for unhealthy service: {service_name}")
+                              except Exception as e:
+                                  print(f"Error sending SNS notification: {str(e)}")
+                      
+                      except Exception as e:
+                          print(f"Error publishing event for service {service_id}: {str(e)}")
+                  
+                  # If no services are registered, send a monitoring heartbeat event
+                  if not services.get('items'):
+                      print("No services found, sending monitoring heartbeat")
+                      heartbeat_event = {
+                          'serviceNetworkId': service_network_id,
+                          'status': 'monitoring_active',
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'environment': environment,
+                          'projectName': project_name
+                      }
+                      
+                      eventbridge.put_events(
+                          Entries=[
+                              {
+                                  'Source': 'vpc-lattice.health-monitor',
+                                  'DetailType': 'Monitoring Heartbeat',
+                                  'Detail': json.dumps(heartbeat_event),
+                                  'EventBusName': event_bus_name
+                              }
+                          ]
+                      )
+                      health_events_sent += 1
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Health check completed',
+                          'servicesChecked': len(services.get('items', [])),
+                          'eventsPublished': health_events_sent,
+                          'environment': environment
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in health monitoring: {str(e)}")
+                  # Send error notification in production
+                  if environment == 'prod' and sns_topic_arn:
+                      try:
+                          sns.publish(
+                              TopicArn=sns_topic_arn,
+                              Subject=f"Health Monitor Error - {project_name}",
+                              Message=f"Health monitoring function failed in {environment} environment.\nError: {str(e)}\nTimestamp: {datetime.utcnow().isoformat()}"
+                          )
+                      except Exception as sns_error:
+                          print(f"Error sending error notification: {str(sns_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'environment': environment
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-health-monitor-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Auto Scaler Lambda Function
+  AutoScalerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-auto-scaler-${Environment}'
+      Description: 'Responds to health events and implements scaling decisions'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          SERVICE_NETWORK_ID: !Ref ServiceNetwork
+          SNS_TOPIC_ARN: !If [CreateSNSNotifications, !Ref ServiceNotificationTopic, '']
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              lattice = boto3.client('vpc-lattice')
+              ecs = boto3.client('ecs')
+              sns = boto3.client('sns') if os.environ.get('SNS_TOPIC_ARN') else None
+              cloudwatch = boto3.client('cloudwatch')
+              
+              service_network_id = os.environ['SERVICE_NETWORK_ID']
+              sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+              environment = os.environ.get('ENVIRONMENT', 'dev')
+              project_name = os.environ.get('PROJECT_NAME', 'service-lifecycle')
+              
+              try:
+                  print(f"Processing scaling event: {json.dumps(event, default=str)}")
+                  
+                  # Parse EventBridge event
+                  if 'detail' in event:
+                      detail = event['detail'] if isinstance(event['detail'], dict) else json.loads(event['detail'])
+                      
+                      # Handle monitoring heartbeat events
+                      if event.get('detail-type') == 'Monitoring Heartbeat':
+                          print("Received monitoring heartbeat - system is active")
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps({'message': 'Monitoring heartbeat processed'})
+                          }
+                      
+                      # Handle service health check events
+                      if event.get('detail-type') == 'Service Health Check':
+                          service_id = detail.get('serviceId')
+                          service_name = detail.get('serviceName')
+                          health_status = detail.get('healthStatus')
+                          request_count = detail.get('requestCount', 0)
+                          
+                          if not service_id:
+                              print("No service ID found in event")
+                              return {'statusCode': 400, 'body': 'Invalid event format'}
+                          
+                          print(f"Processing scaling for service: {service_name} ({service_id})")
+                          print(f"Health status: {health_status}, Request count: {request_count}")
+                          
+                          # Get target groups for the service
+                          try:
+                              target_groups = lattice.list_target_groups(
+                                  serviceIdentifier=service_id
+                              )
+                          except Exception as e:
+                              print(f"Error listing target groups for service {service_id}: {str(e)}")
+                              target_groups = {'items': []}
+                          
+                          scaling_actions = []
+                          
+                          for tg in target_groups.get('items', []):
+                              tg_id = tg['id']
+                              tg_name = tg.get('name', 'unknown')
+                              
+                              print(f"Evaluating target group: {tg_name} ({tg_id})")
+                              
+                              try:
+                                  # Get current target count
+                                  targets = lattice.list_targets(
+                                      targetGroupIdentifier=tg_id
+                                  )
+                                  current_count = len(targets.get('items', []))
+                                  
+                                  print(f"Current target count: {current_count}")
+                                  
+                                  # Determine scaling action based on health and traffic
+                                  scaling_recommendation = None
+                                  
+                                  if health_status == 'unhealthy' and current_count < 5:
+                                      scaling_recommendation = 'scale_up'
+                                      reason = f"Service unhealthy with {current_count} targets"
+                                  elif health_status == 'healthy' and request_count < 10 and current_count > 1:
+                                      scaling_recommendation = 'scale_down'
+                                      reason = f"Low traffic ({request_count} requests) with {current_count} targets"
+                                  elif health_status == 'unknown':
+                                      scaling_recommendation = 'monitor'
+                                      reason = f"Health status unknown, monitoring required"
+                                  else:
+                                      scaling_recommendation = 'no_action'
+                                      reason = f"No scaling needed (health: {health_status}, requests: {request_count}, targets: {current_count})"
+                                  
+                                  scaling_action = {
+                                      'targetGroupId': tg_id,
+                                      'targetGroupName': tg_name,
+                                      'currentTargets': current_count,
+                                      'recommendation': scaling_recommendation,
+                                      'reason': reason,
+                                      'timestamp': datetime.utcnow().isoformat()
+                                  }
+                                  
+                                  scaling_actions.append(scaling_action)
+                                  print(f"Scaling recommendation for {tg_name}: {scaling_recommendation} - {reason}")
+                                  
+                                  # Put custom metric for scaling decisions
+                                  try:
+                                      cloudwatch.put_metric_data(
+                                          Namespace=f'{project_name}/ServiceLifecycle',
+                                          MetricData=[
+                                              {
+                                                  'MetricName': 'ScalingDecisions',
+                                                  'Dimensions': [
+                                                      {'Name': 'ServiceName', 'Value': service_name or 'unknown'},
+                                                      {'Name': 'TargetGroup', 'Value': tg_name},
+                                                      {'Name': 'Environment', 'Value': environment},
+                                                      {'Name': 'Action', 'Value': scaling_recommendation}
+                                                  ],
+                                                  'Value': 1,
+                                                  'Unit': 'Count',
+                                                  'Timestamp': datetime.utcnow()
+                                              }
+                                          ]
+                                      )
+                                  except Exception as e:
+                                      print(f"Error publishing CloudWatch metric: {str(e)}")
+                                  
+                                  # Send notification for scaling actions in production
+                                  if scaling_recommendation in ['scale_up', 'scale_down'] and environment == 'prod' and sns_topic_arn:
+                                      try:
+                                          sns.publish(
+                                              TopicArn=sns_topic_arn,
+                                              Subject=f"Scaling Action Required - {service_name}",
+                                              Message=f"Service: {service_name}\nTarget Group: {tg_name}\nAction: {scaling_recommendation}\nReason: {reason}\nEnvironment: {environment}\nTimestamp: {scaling_action['timestamp']}"
+                                          )
+                                          print(f"SNS notification sent for scaling action: {scaling_recommendation}")
+                                      except Exception as e:
+                                          print(f"Error sending SNS notification: {str(e)}")
+                              
+                              except Exception as e:
+                                  print(f"Error processing target group {tg_id}: {str(e)}")
+                                  scaling_actions.append({
+                                      'targetGroupId': tg_id,
+                                      'error': str(e),
+                                      'timestamp': datetime.utcnow().isoformat()
+                                  })
+                          
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps({
+                                  'message': 'Scaling evaluation completed',
+                                  'serviceId': service_id,
+                                  'serviceName': service_name,
+                                  'scalingActions': scaling_actions,
+                                  'environment': environment
+                              })
+                          }
+                  
+                  # Handle direct invocation
+                  print("Direct invocation - no scaling action taken")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Auto-scaler function is healthy'})
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in auto-scaling: {str(e)}")
+                  # Send error notification in production
+                  if environment == 'prod' and sns_topic_arn:
+                      try:
+                          sns.publish(
+                              TopicArn=sns_topic_arn,
+                              Subject=f"Auto Scaler Error - {project_name}",
+                              Message=f"Auto-scaling function failed in {environment} environment.\nError: {str(e)}\nEvent: {json.dumps(event, default=str)}\nTimestamp: {datetime.utcnow().isoformat()}"
+                          )
+                      except Exception as sns_error:
+                          print(f"Error sending error notification: {str(sns_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'environment': environment
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-auto-scaler-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # LAMBDA PERMISSIONS
+  # ================================
+  
+  # Permission for EventBridge to invoke Health Monitor
+  HealthMonitorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HealthMonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledHealthCheckRule.Arn
+
+  # Permission for EventBridge to invoke Auto Scaler
+  AutoScalerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AutoScalerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HealthMonitoringRule.Arn
+
+  # ================================
+  # SNS RESOURCES (CONDITIONAL)
+  # ================================
+  
+  # SNS Topic for Notifications
+  ServiceNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSNotifications
+    Properties:
+      TopicName: !Sub '${ProjectName}-service-notifications-${Environment}'
+      DisplayName: !Sub 'Service Lifecycle Notifications - ${Environment}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-service-notifications-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Subscription
+  ServiceNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateSNSNotifications
+    Properties:
+      TopicArn: !Ref ServiceNotificationTopic
+      Protocol: email
+      Endpoint: !Ref SNSNotificationEmail
+
+  # ================================
+  # CLOUDWATCH DASHBOARD (CONDITIONAL)
+  # ================================
+  
+  # CloudWatch Dashboard
+  ServiceLifecycleDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-service-lifecycle-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/VpcLattice", "RequestCount", "ServiceNetworkId", "${ServiceNetwork}" ],
+                  [ ".", "ResponseTime", ".", "." ],
+                  [ ".", "TargetResponseTime", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "VPC Lattice Service Network Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${HealthMonitorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Health Monitor Function Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${AutoScalerFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Auto Scaler Function Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/ServiceLifecycle", "ScalingDecisions", "Environment", "${Environment}", "Action", "scale_up" ],
+                  [ "...", "scale_down" ],
+                  [ "...", "no_action" ],
+                  [ "...", "monitor" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Scaling Decisions",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${HealthMonitorFunction}' | fields @timestamp, @message\n| filter @message like /Health check completed/ or @message like /Error/\n| sort @timestamp desc\n| limit 50",
+                "region": "${AWS::Region}",
+                "title": "Health Monitor Activity",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # ================================
+  # CLOUDWATCH ALARMS
+  # ================================
+  
+  # Alarm for Health Monitor Function Errors
+  HealthMonitorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-health-monitor-errors-${Environment}'
+      AlarmDescription: 'Health monitor function error rate is too high'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref HealthMonitorFunction
+      AlarmActions:
+        - !If [CreateSNSNotifications, !Ref ServiceNotificationTopic, !Ref 'AWS::NoValue']
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-health-monitor-errors-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Alarm for Auto Scaler Function Errors
+  AutoScalerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-auto-scaler-errors-${Environment}'
+      AlarmDescription: 'Auto scaler function error rate is too high'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AutoScalerFunction
+      AlarmActions:
+        - !If [CreateSNSNotifications, !Ref ServiceNotificationTopic, !Ref 'AWS::NoValue']
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-auto-scaler-errors-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ================================
+# OUTPUTS
+# ================================
+Outputs:
+  ServiceNetworkId:
+    Description: 'VPC Lattice Service Network ID'
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetworkId'
+
+  ServiceNetworkArn:
+    Description: 'VPC Lattice Service Network ARN'
+    Value: !GetAtt ServiceNetwork.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetworkArn'
+
+  ServiceNetworkDnsEntry:
+    Description: 'VPC Lattice Service Network DNS Entry'
+    Value: !GetAtt ServiceNetwork.DnsEntry
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetworkDnsEntry'
+
+  EventBusName:
+    Description: 'Custom EventBridge Bus Name'
+    Value: !Ref ServiceLifecycleEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBusName'
+
+  EventBusArn:
+    Description: 'Custom EventBridge Bus ARN'
+    Value: !GetAtt ServiceLifecycleEventBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBusArn'
+
+  HealthMonitorFunctionName:
+    Description: 'Health Monitor Lambda Function Name'
+    Value: !Ref HealthMonitorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthMonitorFunction'
+
+  HealthMonitorFunctionArn:
+    Description: 'Health Monitor Lambda Function ARN'
+    Value: !GetAtt HealthMonitorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthMonitorFunctionArn'
+
+  AutoScalerFunctionName:
+    Description: 'Auto Scaler Lambda Function Name'
+    Value: !Ref AutoScalerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoScalerFunction'
+
+  AutoScalerFunctionArn:
+    Description: 'Auto Scaler Lambda Function ARN'
+    Value: !GetAtt AutoScalerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoScalerFunctionArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'Lambda Execution Role ARN'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  VPCLatticeLogGroupName:
+    Description: 'VPC Lattice Access Logs CloudWatch Log Group Name'
+    Value: !Ref VPCLatticeLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCLatticeLogGroup'
+
+  SNSTopicArn:
+    Description: 'SNS Topic ARN for notifications'
+    Value: !If [CreateSNSNotifications, !Ref ServiceNotificationTopic, 'Not created']
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  DashboardURL:
+    Description: 'CloudWatch Dashboard URL'
+    Value: !If 
+      - CreateDashboard
+      - !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-service-lifecycle-${Environment}'
+      - 'Dashboard not created'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  DeploymentCommands:
+    Description: 'Next steps for testing the deployment'
+    Value: !Sub |
+      1. Test health monitoring: aws lambda invoke --function-name ${HealthMonitorFunction} --payload '{}' response.json
+      2. View logs: aws logs filter-log-events --log-group-name /aws/lambda/${HealthMonitorFunction}
+      3. Monitor EventBridge: aws events list-rules --event-bus-name ${ServiceLifecycleEventBus}
+      4. View dashboard: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-service-lifecycle-${Environment}

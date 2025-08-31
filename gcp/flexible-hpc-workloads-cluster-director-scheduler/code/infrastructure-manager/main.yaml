@@ -1,0 +1,509 @@
+# Google Cloud Infrastructure Manager Configuration
+# Recipe: Flexible HPC Workloads with Cluster Toolkit and Dynamic Scheduler
+# This configuration deploys a complete HPC environment with dynamic scaling capabilities
+
+# Deployment metadata and configuration
+info:
+  title: "Flexible HPC Workloads Infrastructure"
+  author: "Cloud Recipe Generator"
+  description: "Complete HPC environment with Cluster Toolkit and Cloud Batch integration"
+  version: "1.0"
+
+# Input parameters for customizable deployment
+inputs:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    varType: string
+    required: true
+  
+  - name: region
+    description: "Primary deployment region"
+    varType: string
+    defaultValue: "us-central1"
+  
+  - name: zone
+    description: "Primary deployment zone"
+    varType: string
+    defaultValue: "us-central1-a"
+  
+  - name: cluster_name_prefix
+    description: "Prefix for cluster resource names"
+    varType: string
+    defaultValue: "hpc-cluster"
+  
+  - name: storage_bucket_name
+    description: "Name for HPC data storage bucket"
+    varType: string
+    required: true
+  
+  - name: enable_spot_instances
+    description: "Enable spot instances for cost optimization"
+    varType: bool
+    defaultValue: true
+  
+  - name: cpu_node_count
+    description: "Number of CPU compute nodes"
+    varType: integer
+    defaultValue: 2
+    
+  - name: gpu_node_count
+    description: "Number of GPU compute nodes"
+    varType: integer
+    defaultValue: 1
+
+# Resource definitions following Google Cloud best practices
+resources:
+  # ============================
+  # STORAGE INFRASTRUCTURE
+  # ============================
+  
+  # High-performance storage bucket for HPC data
+  - name: hpc-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    metadata:
+      dependsOn: []
+    properties:
+      project: $(ref.project_id.value)
+      name: $(ref.storage_bucket_name.value)
+      location: $(ref.region.value)
+      storageClass: "STANDARD"
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: "SetStorageClass"
+              storageClass: "NEARLINE"
+            condition:
+              age: 30
+          - action:
+              type: "SetStorageClass"
+              storageClass: "COLDLINE"
+            condition:
+              age: 90
+      uniformBucketLevelAccess:
+        enabled: true
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        purpose: "hpc-data"
+        environment: "production"
+        managed-by: "infrastructure-manager"
+
+  # ============================
+  # NETWORKING INFRASTRUCTURE
+  # ============================
+  
+  # VPC network for HPC cluster with optimized settings
+  - name: hpc-vpc-network
+    type: gcp-types/compute-v1:networks
+    properties:
+      project: $(ref.project_id.value)
+      name: $(ref.cluster_name_prefix.value)-vpc
+      description: "VPC network for HPC cluster with high-performance networking"
+      autoCreateSubnetworks: false
+      mtu: 8896  # Jumbo frames for better network performance
+      routingConfig:
+        routingMode: "REGIONAL"
+
+  # Subnet for compute nodes with optimized IP range
+  - name: hpc-compute-subnet
+    type: gcp-types/compute-v1:subnetworks
+    metadata:
+      dependsOn:
+        - hpc-vpc-network
+    properties:
+      project: $(ref.project_id.value)
+      region: $(ref.region.value)
+      name: $(ref.cluster_name_prefix.value)-compute-subnet
+      description: "Subnet for HPC compute nodes"
+      network: $(ref.hpc-vpc-network.selfLink)
+      ipCidrRange: "10.0.1.0/24"
+      enableFlowLogs: true
+      logConfig:
+        enable: true
+        flowSampling: 0.1
+        aggregationInterval: "INTERVAL_5_SEC"
+      privateIpGoogleAccess: true
+
+  # Firewall rules for HPC cluster communication
+  - name: hpc-firewall-internal
+    type: gcp-types/compute-v1:firewalls
+    metadata:
+      dependsOn:
+        - hpc-vpc-network
+    properties:
+      project: $(ref.project_id.value)
+      name: $(ref.cluster_name_prefix.value)-firewall-internal
+      description: "Allow internal communication within HPC cluster"
+      network: $(ref.hpc-vpc-network.selfLink)
+      direction: "INGRESS"
+      priority: 1000
+      sourceRanges:
+        - "10.0.1.0/24"
+      allowed:
+        - IPProtocol: "tcp"
+          ports: ["0-65535"]
+        - IPProtocol: "udp"
+          ports: ["0-65535"]
+        - IPProtocol: "icmp"
+      targetTags:
+        - "hpc-compute"
+
+  # Firewall for SSH access to compute nodes
+  - name: hpc-firewall-ssh
+    type: gcp-types/compute-v1:firewalls
+    metadata:
+      dependsOn:
+        - hpc-vpc-network
+    properties:
+      project: $(ref.project_id.value)
+      name: $(ref.cluster_name_prefix.value)-firewall-ssh
+      description: "Allow SSH access to HPC compute nodes"
+      network: $(ref.hpc-vpc-network.selfLink)
+      direction: "INGRESS"
+      priority: 1000
+      sourceRanges:
+        - "0.0.0.0/0"  # Restrict this in production environments
+      allowed:
+        - IPProtocol: "tcp"
+          ports: ["22"]
+      targetTags:
+        - "hpc-compute"
+
+  # ============================
+  # COMPUTE INFRASTRUCTURE
+  # ============================
+  
+  # Instance template for CPU-optimized compute nodes
+  - name: hpc-cpu-instance-template
+    type: gcp-types/compute-v1:instanceTemplates
+    metadata:
+      dependsOn:
+        - hpc-compute-subnet
+    properties:
+      project: $(ref.project_id.value)
+      name: $(ref.cluster_name_prefix.value)-cpu-template
+      description: "Instance template for HPC CPU compute nodes"
+      properties:
+        machineType: "c2-standard-16"  # High-performance CPU for HPC workloads
+        tags:
+          items:
+            - "hpc-compute"
+            - "cpu-node"
+        metadata:
+          items:
+            - key: "enable-oslogin"
+              value: "TRUE"
+            - key: "startup-script"
+              value: |
+                #!/bin/bash
+                # Configure HPC node startup
+                apt-get update
+                apt-get install -y build-essential openmpi-bin openmpi-common libopenmpi-dev
+                
+                # Mount Cloud Storage bucket
+                mkdir -p /mnt/hpc-data
+                echo "$(ref.storage_bucket_name.value) /mnt/hpc-data gcsfuse rw,user" >> /etc/fstab
+                
+                # Configure performance optimizations
+                echo 'net.core.rmem_max = 134217728' >> /etc/sysctl.conf
+                echo 'net.core.wmem_max = 134217728' >> /etc/sysctl.conf
+                sysctl -p
+        disks:
+          - boot: true
+            autoDelete: true
+            initializeParams:
+              sourceImage: "projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts"
+              diskType: "pd-ssd"
+              diskSizeGb: 100
+        networkInterfaces:
+          - subnetwork: $(ref.hpc-compute-subnet.selfLink)
+            accessConfigs:
+              - type: "ONE_TO_ONE_NAT"
+                name: "External NAT"
+        serviceAccounts:
+          - email: "default"
+            scopes:
+              - "https://www.googleapis.com/auth/cloud-platform"
+        scheduling:
+          preemptible: $(ref.enable_spot_instances.value)
+          onHostMaintenance: "TERMINATE"
+          automaticRestart: false
+
+  # Instance template for GPU-accelerated compute nodes
+  - name: hpc-gpu-instance-template
+    type: gcp-types/compute-v1:instanceTemplates
+    metadata:
+      dependsOn:
+        - hpc-compute-subnet
+    properties:
+      project: $(ref.project_id.value)
+      name: $(ref.cluster_name_prefix.value)-gpu-template
+      description: "Instance template for HPC GPU compute nodes"
+      properties:
+        machineType: "n1-standard-8"  # Balanced CPU/memory for GPU workloads
+        tags:
+          items:
+            - "hpc-compute"
+            - "gpu-node"
+        metadata:
+          items:
+            - key: "enable-oslogin"
+              value: "TRUE"
+            - key: "startup-script"
+              value: |
+                #!/bin/bash
+                # Configure GPU node startup
+                apt-get update
+                apt-get install -y build-essential openmpi-bin openmpi-common libopenmpi-dev
+                
+                # Install NVIDIA drivers and CUDA
+                curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+                curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+                  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+                  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+                apt-get update
+                apt-get install -y nvidia-driver-470 nvidia-utils-470
+                
+                # Mount Cloud Storage bucket
+                mkdir -p /mnt/hpc-data
+                echo "$(ref.storage_bucket_name.value) /mnt/hpc-data gcsfuse rw,user" >> /etc/fstab
+        disks:
+          - boot: true
+            autoDelete: true
+            initializeParams:
+              sourceImage: "projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts"
+              diskType: "pd-ssd"
+              diskSizeGb: 200
+        guestAccelerators:
+          - acceleratorType: "projects/$(ref.project_id.value)/zones/$(ref.zone.value)/acceleratorTypes/nvidia-tesla-t4"
+            acceleratorCount: 1
+        networkInterfaces:
+          - subnetwork: $(ref.hpc-compute-subnet.selfLink)
+            accessConfigs:
+              - type: "ONE_TO_ONE_NAT"
+                name: "External NAT"
+        serviceAccounts:
+          - email: "default"
+            scopes:
+              - "https://www.googleapis.com/auth/cloud-platform"
+        scheduling:
+          preemptible: $(ref.enable_spot_instances.value)
+          onHostMaintenance: "TERMINATE"
+          automaticRestart: false
+
+  # ============================
+  # MANAGED INSTANCE GROUPS
+  # ============================
+  
+  # Managed instance group for CPU compute nodes
+  - name: hpc-cpu-instance-group
+    type: gcp-types/compute-v1:instanceGroupManagers
+    metadata:
+      dependsOn:
+        - hpc-cpu-instance-template
+    properties:
+      project: $(ref.project_id.value)
+      zone: $(ref.zone.value)
+      name: $(ref.cluster_name_prefix.value)-cpu-group
+      description: "Managed instance group for HPC CPU compute nodes"
+      baseInstanceName: $(ref.cluster_name_prefix.value)-cpu-worker
+      instanceTemplate: $(ref.hpc-cpu-instance-template.selfLink)
+      targetSize: $(ref.cpu_node_count.value)
+      autoHealingPolicies:
+        - healthCheck: $(ref.hpc-health-check.selfLink)
+          initialDelaySec: 300
+
+  # Managed instance group for GPU compute nodes
+  - name: hpc-gpu-instance-group
+    type: gcp-types/compute-v1:instanceGroupManagers
+    metadata:
+      dependsOn:
+        - hpc-gpu-instance-template
+    properties:
+      project: $(ref.project_id.value)
+      zone: $(ref.zone.value)
+      name: $(ref.cluster_name_prefix.value)-gpu-group
+      description: "Managed instance group for HPC GPU compute nodes"
+      baseInstanceName: $(ref.cluster_name_prefix.value)-gpu-worker
+      instanceTemplate: $(ref.hpc-gpu-instance-template.selfLink)
+      targetSize: $(ref.gpu_node_count.value)
+      autoHealingPolicies:
+        - healthCheck: $(ref.hpc-health-check.selfLink)
+          initialDelaySec: 300
+
+  # ============================
+  # HEALTH CHECKS AND MONITORING
+  # ============================
+  
+  # Health check for compute nodes
+  - name: hpc-health-check
+    type: gcp-types/compute-v1:healthChecks
+    properties:
+      project: $(ref.project_id.value)
+      name: $(ref.cluster_name_prefix.value)-health-check
+      description: "Health check for HPC compute nodes"
+      type: "TCP"
+      tcpHealthCheck:
+        port: 22  # SSH port for basic connectivity
+      checkIntervalSec: 30
+      timeoutSec: 10
+      healthyThreshold: 2
+      unhealthyThreshold: 3
+
+  # ============================
+  # CLOUD BATCH CONFIGURATION
+  # ============================
+  
+  # IAM service account for Cloud Batch operations
+  - name: batch-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      project: $(ref.project_id.value)
+      accountId: $(ref.cluster_name_prefix.value)-batch-sa
+      serviceAccount:
+        displayName: "HPC Batch Service Account"
+        description: "Service account for Cloud Batch HPC operations"
+
+  # IAM binding for Batch service account
+  - name: batch-sa-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    metadata:
+      dependsOn:
+        - batch-service-account
+    properties:
+      project: $(ref.project_id.value)
+      role: "roles/batch.agentReporter"
+      member: "serviceAccount:$(ref.batch-service-account.email)"
+
+  # Additional IAM binding for storage access
+  - name: batch-storage-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    metadata:
+      dependsOn:
+        - batch-service-account
+    properties:
+      project: $(ref.project_id.value)
+      role: "roles/storage.objectAdmin"
+      member: "serviceAccount:$(ref.batch-service-account.email)"
+
+  # ============================
+  # MONITORING AND ALERTING
+  # ============================
+  
+  # Notification channel for alerts
+  - name: hpc-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      project: $(ref.project_id.value)
+      type: "email"
+      displayName: "HPC Cluster Alerts"
+      description: "Email notifications for HPC cluster issues"
+      labels:
+        email_address: "admin@example.com"  # Replace with actual email
+      enabled: true
+
+  # Alert policy for high CPU utilization
+  - name: cpu-utilization-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    metadata:
+      dependsOn:
+        - hpc-notification-channel
+    properties:
+      project: $(ref.project_id.value)
+      displayName: "HPC High CPU Utilization"
+      documentation:
+        content: "CPU utilization is consistently high on HPC compute nodes"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "CPU usage above 80%"
+          conditionThreshold:
+            filter: 'resource.type="gce_instance" AND resource.label.instance_name=~"$(ref.cluster_name_prefix.value)-.*"'
+            comparison: "COMPARISON_GT"
+            thresholdValue: 0.8
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: "ALIGN_MEAN"
+                crossSeriesReducer: "REDUCE_MAX"
+                groupByFields:
+                  - "resource.label.instance_name"
+      notificationChannels:
+        - $(ref.hpc-notification-channel.name)
+      alertStrategy:
+        autoClose: "1800s"
+
+  # Alert policy for GPU utilization
+  - name: gpu-utilization-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    metadata:
+      dependsOn:
+        - hpc-notification-channel
+    properties:
+      project: $(ref.project_id.value)
+      displayName: "HPC Low GPU Utilization"
+      documentation:
+        content: "GPU utilization is consistently low, indicating potential resource waste"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "GPU usage below 20%"
+          conditionThreshold:
+            filter: 'resource.type="gce_instance" AND metric.type="compute.googleapis.com/instance/accelerator/utilization"'
+            comparison: "COMPARISON_LT"
+            thresholdValue: 0.2
+            duration: "600s"
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: "ALIGN_MEAN"
+                crossSeriesReducer: "REDUCE_MEAN"
+                groupByFields:
+                  - "resource.label.instance_name"
+      notificationChannels:
+        - $(ref.hpc-notification-channel.name)
+      alertStrategy:
+        autoClose: "3600s"
+
+# Output values for verification and integration
+outputs:
+  - name: storage_bucket_url
+    description: "URL of the HPC data storage bucket"
+    value: "gs://$(ref.storage_bucket_name.value)"
+
+  - name: vpc_network_name
+    description: "Name of the HPC VPC network"
+    value: $(ref.hpc-vpc-network.name)
+
+  - name: compute_subnet_name
+    description: "Name of the compute subnet"
+    value: $(ref.hpc-compute-subnet.name)
+
+  - name: cpu_instance_group_name
+    description: "Name of the CPU compute instance group"
+    value: $(ref.hpc-cpu-instance-group.name)
+
+  - name: gpu_instance_group_name
+    description: "Name of the GPU compute instance group"
+    value: $(ref.hpc-gpu-instance-group.name)
+
+  - name: batch_service_account_email
+    description: "Email of the Cloud Batch service account"
+    value: $(ref.batch-service-account.email)
+
+  - name: cluster_zone
+    description: "Deployment zone for the HPC cluster"
+    value: $(ref.zone.value)
+
+  - name: deployment_region
+    description: "Deployment region for the HPC cluster"
+    value: $(ref.region.value)
+
+# Deployment configuration and metadata
+metadata:
+  version: "1.0"
+  labels:
+    purpose: "hpc-cluster"
+    environment: "production"
+    managed-by: "infrastructure-manager"
+    recipe: "flexible-hpc-workloads-cluster-director-scheduler"

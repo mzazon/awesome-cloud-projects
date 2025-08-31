@@ -4,12 +4,12 @@ id: f7a9c8e1
 category: analytics
 difficulty: 200
 subject: gcp
-services: Smart Analytics Hub, Cloud Carbon Footprint, Looker Studio, Cloud Functions
+services: BigQuery, Cloud Carbon Footprint, Looker Studio, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: sustainability, carbon-footprint, analytics, intelligent-monitoring, environmental-impact
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Organizations increasingly face regulatory requirements and stakeholder pressure
 
 ## Solution
 
-Build an intelligent sustainability monitoring system that leverages Google Cloud's Carbon Footprint API to collect emissions data, Smart Analytics Hub for data sharing and collaboration, and Cloud Functions for automated analysis. The solution provides real-time carbon emissions tracking, intelligent pattern recognition for optimization opportunities, and automated recommendations through Looker Studio dashboards that enable teams to reduce their environmental impact while maintaining operational excellence.
+Build an intelligent sustainability monitoring system that leverages Google Cloud's Carbon Footprint API to collect emissions data, BigQuery Analytics Hub for data sharing and collaboration, and Cloud Functions for automated analysis. The solution provides real-time carbon emissions tracking, intelligent pattern recognition for optimization opportunities, and automated recommendations through Looker Studio dashboards that enable teams to reduce their environmental impact while maintaining operational excellence.
 
 ## Architecture Diagram
 
@@ -41,7 +41,7 @@ graph TB
     end
     
     subgraph "Analytics & Intelligence"
-        SAH[Smart Analytics Hub]
+        ANALYTICS_HUB[Analytics Hub]
         ML_MODEL[ML Model - Pattern Detection]
     end
     
@@ -60,8 +60,8 @@ graph TB
     BQ_EXPORT --> CF_FUNC
     CF_FUNC --> BQ_DATASET
     BQ_DATASET --> BQ_VIEWS
-    BQ_VIEWS --> SAH
-    SAH --> ML_MODEL
+    BQ_VIEWS --> ANALYTICS_HUB
+    ANALYTICS_HUB --> ML_MODEL
     ML_MODEL --> LOOKER
     BQ_VIEWS --> LOOKER
     LOOKER --> ALERT_FUNC
@@ -70,14 +70,14 @@ graph TB
     REC_FUNC --> STORAGE
     
     style CF fill:#4285F4
-    style SAH fill:#34A853
+    style ANALYTICS_HUB fill:#34A853
     style LOOKER fill:#EA4335
     style ML_MODEL fill:#FF9900
 ```
 
 ## Prerequisites
 
-1. Google Cloud account with billing enabled and appropriate permissions
+1. Google Cloud account with billing enabled and Carbon Footprint Viewer role
 2. Google Cloud CLI installed and configured (or Cloud Shell)
 3. Basic knowledge of BigQuery, Cloud Functions, and data analytics
 4. Existing Google Cloud infrastructure with resource usage for carbon footprint analysis
@@ -141,13 +141,13 @@ echo "✅ Environment variables configured"
 
    ```bash
    # Set up Carbon Footprint data transfer to BigQuery
-   # Note: This uses the BigQuery Data Transfer Service API
-   gcloud transfer-config create \
-       --data-source=61cede5a-0000-2440-ad42-883d24f8f7b8 \
-       --display-name="Carbon Footprint Export" \
-       --destination-dataset=${DATASET_NAME} \
-       --params="billing_accounts=${BILLING_ACCOUNT_ID}" \
-       --location=${REGION}
+   # Using the BigQuery Data Transfer Service with the Carbon Footprint data source
+   bq mk \
+       --transfer_config \
+       --target_dataset=${DATASET_NAME} \
+       --display_name="Carbon Footprint Export" \
+       --params='{"billing_accounts":"'${BILLING_ACCOUNT_ID}'"}' \
+       --data_source='61cede5a-0000-2440-ad42-883d24f8f7b8'
    
    echo "✅ Carbon Footprint export configured"
    ```
@@ -221,7 +221,7 @@ def process_carbon_data(event, context):
         location_based_carbon_emissions_kgCO2e,
         market_based_carbon_emissions_kgCO2e,
         carbon_model_version
-    FROM `{project_id}.{dataset_id}.carbon_footprint_dataset`
+    FROM `{project_id}.{dataset_id}.carbon_footprint`
     WHERE month >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 MONTH)
     ORDER BY month DESC, location_based_carbon_emissions_kgCO2e DESC
     """
@@ -252,13 +252,13 @@ def process_carbon_data(event, context):
                 
                 publisher.publish(topic_path, json.dumps(alert_data).encode('utf-8'))
         
-        # Create aggregated views for Smart Analytics Hub
+        # Create aggregated views for Analytics Hub
         create_analytical_views(client, project_id, dataset_id)
         
     return {'status': 'success', 'processed_rows': len(results)}
 
 def create_analytical_views(client, project_id, dataset_id):
-    """Create analytical views for Smart Analytics Hub sharing"""
+    """Create analytical views for Analytics Hub sharing"""
     
     # Monthly emissions trend view
     monthly_view_query = f"""
@@ -269,7 +269,7 @@ def create_analytical_views(client, project_id, dataset_id):
         SUM(market_based_carbon_emissions_kgCO2e) as total_market_emissions,
         COUNT(DISTINCT project_id) as active_projects,
         COUNT(DISTINCT service) as active_services
-    FROM `{project_id}.{dataset_id}.carbon_footprint_dataset`
+    FROM `{project_id}.{dataset_id}.carbon_footprint`
     GROUP BY month
     ORDER BY month DESC
     """
@@ -284,7 +284,7 @@ def create_analytical_views(client, project_id, dataset_id):
         MAX(location_based_carbon_emissions_kgCO2e) as peak_emissions,
         COUNT(*) as measurement_count,
         STDDEV(location_based_carbon_emissions_kgCO2e) as emissions_variability
-    FROM `{project_id}.{dataset_id}.carbon_footprint_dataset`
+    FROM `{project_id}.{dataset_id}.carbon_footprint`
     WHERE month >= DATE_SUB(CURRENT_DATE(), INTERVAL 12 MONTH)
     GROUP BY service, region
     HAVING avg_monthly_emissions > 0
@@ -308,7 +308,7 @@ EOF
    ```bash
    # Deploy the data processing function
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python39 \
+       --runtime python311 \
        --trigger-topic ${TOPIC_NAME} \
        --source . \
        --entry-point process_carbon_data \
@@ -322,9 +322,9 @@ EOF
 
    The Cloud Function now automatically processes carbon footprint data, creates analytical views, and publishes alerts when significant emissions increases are detected, enabling proactive sustainability management.
 
-5. **Set Up Smart Analytics Hub Data Sharing**:
+5. **Set Up Analytics Hub Data Sharing**:
 
-   Smart Analytics Hub enables secure data sharing and collaboration around sustainability metrics, allowing teams across the organization to access carbon footprint insights while maintaining proper data governance and access controls.
+   BigQuery Analytics Hub enables secure data sharing and collaboration around sustainability metrics, allowing teams across the organization to access carbon footprint insights while maintaining proper data governance and access controls.
 
    ```bash
    # Create data exchange for sustainability analytics
@@ -343,7 +343,7 @@ EOF
        --source_dataset=${PROJECT_ID}:${DATASET_NAME}.monthly_emissions_trend \
        monthly_emissions_listing
    
-   echo "✅ Smart Analytics Hub data exchange and listing created"
+   echo "✅ Analytics Hub data exchange and listing created"
    ```
 
 6. **Deploy Recommendation Engine Cloud Function**:
@@ -363,7 +363,7 @@ from google.cloud import storage
 from datetime import datetime, timedelta
 import pandas as pd
 
-def generate_recommendations(event, context):
+def generate_recommendations(request):
     """Generate sustainability recommendations based on carbon data analysis"""
     
     client = bigquery.Client()
@@ -383,7 +383,7 @@ def generate_recommendations(event, context):
             AVG(location_based_carbon_emissions_kgCO2e) as avg_emissions,
             MAX(location_based_carbon_emissions_kgCO2e) as peak_emissions,
             STDDEV(location_based_carbon_emissions_kgCO2e) as emissions_variance
-        FROM `{project_id}.{dataset_id}.carbon_footprint_dataset`
+        FROM `{project_id}.{dataset_id}.carbon_footprint`
         WHERE month >= DATE_SUB(CURRENT_DATE(), INTERVAL 6 MONTH)
         GROUP BY service, region, project_id
     )
@@ -489,7 +489,7 @@ EOF
    ```bash
    # Deploy recommendations engine function
    gcloud functions deploy recommendations-engine \
-       --runtime python39 \
+       --runtime python311 \
        --trigger-http \
        --source . \
        --entry-point generate_recommendations \
@@ -555,7 +555,7 @@ EOF
    bq ls --format=prettyjson ${PROJECT_ID}:${DATASET_NAME}
    
    # List data transfer configurations
-   gcloud transfer configs list --location=${REGION}
+   bq ls --transfer_configs --location=${REGION}
    ```
 
    Expected output: Dataset details and active transfer configuration for Carbon Footprint data.
@@ -573,7 +573,7 @@ EOF
 
    Expected output: Function details and successful execution response from recommendations engine.
 
-3. **Validate Smart Analytics Hub Configuration**:
+3. **Validate Analytics Hub Configuration**:
 
    ```bash
    # List data exchanges
@@ -622,7 +622,7 @@ EOF
 3. **Remove BigQuery Resources**:
 
    ```bash
-   # Delete Smart Analytics Hub resources
+   # Delete Analytics Hub resources
    bq rm --listing --location=${REGION} sustainability_exchange.monthly_emissions_listing
    bq rm --data_exchange --location=${REGION} sustainability_exchange
    
@@ -660,11 +660,11 @@ EOF
 
 ## Discussion
 
-This sustainability intelligence solution demonstrates how Google Cloud's native carbon footprint capabilities can be enhanced with Smart Analytics Hub and intelligent automation to create a comprehensive environmental monitoring system. The architecture leverages several key Google Cloud principles that make it particularly effective for enterprise sustainability initiatives.
+This sustainability intelligence solution demonstrates how Google Cloud's native carbon footprint capabilities can be enhanced with BigQuery Analytics Hub and intelligent automation to create a comprehensive environmental monitoring system. The architecture leverages several key Google Cloud principles that make it particularly effective for enterprise sustainability initiatives.
 
 The Carbon Footprint API provides scientifically rigorous emissions calculations following the GHG Protocol, offering both location-based and market-based reporting that meets various regulatory and voluntary reporting standards. By automating data export to BigQuery, organizations maintain a historical record that enables trend analysis and supports carbon accounting workflows. The dual-reporting capability ensures compatibility with different sustainability frameworks while providing transparency into Google Cloud's renewable energy procurement strategies.
 
-Smart Analytics Hub transforms carbon footprint data from isolated metrics into collaborative intelligence that can be shared across teams while maintaining proper data governance. This democratization of sustainability data enables developers, operations teams, and sustainability officers to make informed decisions about infrastructure choices. The analytical views created through BigQuery provide aggregated insights that support both operational optimization and strategic planning for carbon reduction initiatives.
+BigQuery Analytics Hub transforms carbon footprint data from isolated metrics into collaborative intelligence that can be shared across teams while maintaining proper data governance. This democratization of sustainability data enables developers, operations teams, and sustainability officers to make informed decisions about infrastructure choices. The analytical views created through BigQuery provide aggregated insights that support both operational optimization and strategic planning for carbon reduction initiatives.
 
 The intelligent automation layer, implemented through Cloud Functions and Cloud Scheduler, ensures continuous monitoring and proactive identification of optimization opportunities. Machine learning patterns in the recommendation engine analyze emissions variability and service-level carbon intensity to suggest specific actions like regional migration, auto-scaling implementation, or service architecture changes. This automated intelligence augments human decision-making with data-driven insights that might not be apparent through manual analysis.
 

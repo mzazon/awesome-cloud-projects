@@ -4,14 +4,14 @@ id: 6bfe046d
 category: application integration
 difficulty: 400
 subject: aws
-services: step,functions,lambda,dynamodb,sns
+services: Step Functions, Lambda, DynamoDB, SNS
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: step,functions,lambda,dynamodb,sns
+tags: step functions, lambda, dynamodb, sns, saga pattern, distributed transactions
 recipe-generator-version: 1.3
 ---
 
@@ -92,7 +92,7 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for Step Functions, Lambda, DynamoDB, SNS, and CloudWatch
+1. AWS account with appropriate permissions for Step Functions, Lambda, DynamoDB, SNS, API Gateway, IAM, and CloudWatch
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of distributed systems and transaction management concepts
 4. Familiarity with Amazon States Language (ASL) for Step Functions workflows
@@ -246,6 +246,17 @@ echo "✅ Foundation resources created successfully"
            "sns:Publish"
          ],
          "Resource": "${SAGA_TOPIC_ARN}"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "logs:CreateLogGroup",
+           "logs:CreateLogStream",
+           "logs:PutLogEvents",
+           "logs:DescribeLogGroups",
+           "logs:DescribeLogStreams"
+         ],
+         "Resource": "arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:*"
        }
      ]
    }
@@ -354,7 +365,7 @@ echo "✅ Foundation resources created successfully"
    
    ORDER_FUNCTION_ARN=$(aws lambda create-function \
        --function-name saga-order-service-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler order-service.lambda_handler \
        --zip-file fileb://order-service.zip \
@@ -435,7 +446,7 @@ echo "✅ Foundation resources created successfully"
    
    INVENTORY_FUNCTION_ARN=$(aws lambda create-function \
        --function-name saga-inventory-service-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler inventory-service.lambda_handler \
        --zip-file fileb://inventory-service.zip \
@@ -508,7 +519,7 @@ echo "✅ Foundation resources created successfully"
    
    PAYMENT_FUNCTION_ARN=$(aws lambda create-function \
        --function-name saga-payment-service-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler payment-service.lambda_handler \
        --zip-file fileb://payment-service.zip \
@@ -652,7 +663,7 @@ echo "✅ Foundation resources created successfully"
    
    CANCEL_ORDER_ARN=$(aws lambda create-function \
        --function-name saga-cancel-order-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler cancel-order.lambda_handler \
        --zip-file fileb://cancel-order.zip \
@@ -661,7 +672,7 @@ echo "✅ Foundation resources created successfully"
    
    REVERT_INVENTORY_ARN=$(aws lambda create-function \
        --function-name saga-revert-inventory-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler revert-inventory.lambda_handler \
        --zip-file fileb://revert-inventory.zip \
@@ -670,7 +681,7 @@ echo "✅ Foundation resources created successfully"
    
    REFUND_PAYMENT_ARN=$(aws lambda create-function \
        --function-name saga-refund-payment-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler refund-payment.lambda_handler \
        --zip-file fileb://refund-payment.zip \
@@ -726,7 +737,7 @@ echo "✅ Foundation resources created successfully"
    
    NOTIFICATION_FUNCTION_ARN=$(aws lambda create-function \
        --function-name saga-notification-service-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler notification-service.lambda_handler \
        --zip-file fileb://notification-service.zip \
@@ -1032,14 +1043,28 @@ echo "✅ Foundation resources created successfully"
    # Wait for IAM roles to propagate
    sleep 30
    
-   # Create the Step Functions state machine
+   # Create CloudWatch log group for Step Functions logging
+   aws logs create-log-group \
+       --log-group-name /aws/stepfunctions/saga-logs-${RANDOM_SUFFIX}
+   
+   # Create the Step Functions state machine with proper logging configuration
    SAGA_STATE_MACHINE_ARN=$(aws stepfunctions create-state-machine \
        --name $SAGA_STATE_MACHINE_NAME \
        --definition file://saga-state-machine.json \
        --role-arn $SAGA_ROLE_ARN \
        --type STANDARD \
-       --logging-configuration level=ALL,includeExecutionData=true,destinations=[{cloudWatchLogsLogGroup=saga-logs-${RANDOM_SUFFIX}}] \
-       --tags Key=Environment,Value=Demo \
+       --logging-configuration '{
+         "level": "ALL",
+         "includeExecutionData": true,
+         "destinations": [
+           {
+             "cloudWatchLogsLogGroup": {
+               "logGroupArn": "arn:aws:logs:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':log-group:/aws/stepfunctions/saga-logs-'${RANDOM_SUFFIX}'"
+             }
+           }
+         ]
+       }' \
+       --tags '[{"key": "Environment", "value": "Demo"}]' \
        --output text --query stateMachineArn)
    
    echo "✅ Saga orchestrator state machine created: $SAGA_STATE_MACHINE_ARN"
@@ -1177,7 +1202,7 @@ echo "✅ Foundation resources created successfully"
        }'
    ```
 
-   Expected output: JSON with `executionArn` and `startDate` indicating successful saga initiation.
+   Expected output: JSON response with `executionArn` and `startDate` indicating successful saga initiation.
 
 2. **Monitor Step Functions Execution**:
 
@@ -1305,12 +1330,16 @@ echo "✅ Foundation resources created successfully"
    echo "✅ DynamoDB tables deleted"
    ```
 
-5. **Delete SNS Topic and IAM Roles**:
+5. **Delete SNS Topic, CloudWatch Logs, and IAM Roles**:
 
    ```bash
    # Delete SNS topic
    aws sns delete-topic \
        --topic-arn $SAGA_TOPIC_ARN
+   
+   # Delete CloudWatch log group
+   aws logs delete-log-group \
+       --log-group-name /aws/stepfunctions/saga-logs-${RANDOM_SUFFIX}
    
    # Delete IAM roles
    aws iam delete-role-policy \
@@ -1351,13 +1380,13 @@ The orchestration approach using Step Functions provides several advantages over
 
 The compensation pattern demonstrated here follows industry best practices for saga implementation. Each business transaction has a corresponding compensating action that semantically undoes the operation. The order of compensations is crucial - they execute in reverse order of the original transactions to maintain consistency. The state machine handles both technical failures (network timeouts, service unavailability) and business failures (insufficient inventory, payment declined) with appropriate compensation strategies.
 
-One critical consideration is the idempotency of both business operations and compensating actions. Services must handle duplicate requests gracefully, especially during retry scenarios. The payment service implementation includes randomized failures to simulate real-world conditions where external payment processors may be temporarily unavailable.
+One critical consideration is the idempotency of both business operations and compensating actions. Services must handle duplicate requests gracefully, especially during retry scenarios. The payment service implementation includes randomized failures to simulate real-world conditions where external payment processors may be temporarily unavailable. This realistic failure modeling helps validate the robustness of the saga implementation.
 
 > **Warning**: Saga patterns introduce eventual consistency which may not be suitable for all use cases. Consider the business requirements carefully before implementing sagas in scenarios requiring strong consistency.
 
-Cost optimization opportunities include using Step Functions Express workflows for high-volume, short-duration transactions, and implementing smart retry policies that avoid unnecessary Lambda invocations. The pattern scales horizontally by design, making it suitable for high-throughput e-commerce scenarios.
+Cost optimization opportunities include using Step Functions Express workflows for high-volume, short-duration transactions, and implementing smart retry policies that avoid unnecessary Lambda invocations. The pattern scales horizontally by design, making it suitable for high-throughput e-commerce scenarios. Regular monitoring of execution patterns can reveal optimization opportunities for both cost and performance.
 
-For more information on saga patterns and distributed transactions, refer to the [AWS Prescriptive Guidance on Saga Patterns](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/saga.html) and the [Step Functions Developer Guide](https://docs.aws.amazon.com/step-functions/latest/dg/welcome.html).
+For more information on saga patterns and distributed transactions, refer to the [AWS Prescriptive Guidance on Saga Patterns](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/saga.html) and the [Step Functions Developer Guide](https://docs.aws.amazon.com/step-functions/latest/dg/welcome.html). The [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) provides additional guidance on building reliable, secure, and cost-effective distributed systems.
 
 ## Challenge
 

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Security Command Center, Cloud Workflows, Cloud Functions, Pub/Sub
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: security, compliance, automation, monitoring, workflows
 recipe-generator-version: 1.3
@@ -101,6 +101,14 @@ export TOPIC_NAME="security-findings-${RANDOM_SUFFIX}"
 export WORKFLOW_NAME="security-compliance-workflow-${RANDOM_SUFFIX}"
 export FUNCTION_NAME="security-processor-${RANDOM_SUFFIX}"
 
+# Get organization ID (required for Security Command Center)
+export ORGANIZATION_ID=$(gcloud organizations list \
+    --format="value(name.segment(1))" \
+    --filter="displayName:$(gcloud auth list \
+    --filter=status:ACTIVE \
+    --format="value(account.split('@')[1])")" \
+    --limit=1)
+
 # Create and set the project
 gcloud projects create ${PROJECT_ID} \
     --name="Security Compliance Monitoring"
@@ -118,8 +126,14 @@ gcloud services enable cloudbuild.googleapis.com
 gcloud services enable eventarc.googleapis.com
 gcloud services enable logging.googleapis.com
 gcloud services enable monitoring.googleapis.com
+gcloud services enable run.googleapis.com
+
+# Get project number for IAM binding
+export PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} \
+    --format="value(projectNumber)")
 
 echo "✅ Project configured: ${PROJECT_ID}"
+echo "✅ Organization ID: ${ORGANIZATION_ID}"
 echo "✅ APIs enabled successfully"
 ```
 
@@ -153,13 +167,14 @@ echo "✅ APIs enabled successfully"
    # Create notification configuration for Security Command Center
    gcloud scc notifications create ${TOPIC_NAME}-notification \
        --organization=${ORGANIZATION_ID} \
+       --location=global \
        --pubsub-topic=projects/${PROJECT_ID}/topics/${TOPIC_NAME} \
        --description="Automated security findings notification" \
        --filter='state="ACTIVE"'
    
    # Grant Security Command Center permission to publish to topic
    gcloud pubsub topics add-iam-policy-binding ${TOPIC_NAME} \
-       --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-securitycenter.iam.gserviceaccount.com" \
+       --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-scc-notification.iam.gserviceaccount.com" \
        --role="roles/pubsub.publisher"
    
    echo "✅ Security Command Center notification configured"
@@ -178,81 +193,85 @@ echo "✅ APIs enabled successfully"
    
    # Create function requirements
    cat > requirements.txt << 'EOF'
-   functions-framework==3.5.0
-   google-cloud-workflows==1.14.0
-   google-cloud-logging==3.8.0
-   google-cloud-pubsub==2.18.4
-   EOF
+functions-framework==3.5.0
+google-cloud-workflows==1.14.0
+google-cloud-logging==3.8.0
+google-cloud-pubsub==2.18.4
+EOF
    
    # Create the main function code
    cat > main.py << 'EOF'
-   import functions_framework
-   import json
-   import base64
-   import logging
-   from google.cloud import workflows_v1
-   from google.cloud import logging as cloud_logging
-   
-   # Configure logging
-   cloud_logging.Client().setup_logging()
-   logger = logging.getLogger(__name__)
-   
-   @functions_framework.cloud_event
-   def process_security_finding(cloud_event):
-       """Process security findings and trigger workflows."""
-       try:
-           # Decode Pub/Sub message
-           message_data = base64.b64decode(cloud_event.data["message"]["data"])
-           finding = json.loads(message_data.decode('utf-8'))
-           
-           # Extract finding details
-           finding_id = finding.get('name', 'unknown')
-           severity = finding.get('severity', 'LOW')
-           category = finding.get('category', 'unknown')
-           
-           logger.info(f"Processing finding: {finding_id} with severity: {severity}")
-           
-           # Determine workflow based on severity
-           workflow_name = determine_workflow(severity, category)
-           
-           if workflow_name:
-               # Trigger appropriate workflow
-               trigger_workflow(workflow_name, finding)
-               
-           return 'OK'
-           
-       except Exception as e:
-           logger.error(f"Error processing security finding: {str(e)}")
-           raise
-   
-   def determine_workflow(severity, category):
-       """Determine which workflow to trigger based on finding."""
-       if severity in ['HIGH', 'CRITICAL']:
-           return 'high-severity-workflow'
-       elif severity == 'MEDIUM':
-           return 'medium-severity-workflow'
-       else:
-           return 'low-severity-workflow'
-   
-   def trigger_workflow(workflow_name, finding):
-       """Trigger Cloud Workflow with finding data."""
-       client = workflows_v1.WorkflowsClient()
-       
-       # Prepare workflow input
-       workflow_input = {
-           'finding': finding,
-           'timestamp': finding.get('eventTime', ''),
-           'severity': finding.get('severity', 'LOW')
-       }
-       
-       # Execute workflow
-       execution = client.create_execution(
-           parent=f"projects/{PROJECT_ID}/locations/{REGION}/workflows/{workflow_name}",
-           execution=workflows_v1.Execution(argument=json.dumps(workflow_input))
-       )
-       
-       logger.info(f"Triggered workflow: {workflow_name}")
-   EOF
+import functions_framework
+import json
+import base64
+import logging
+import os
+from google.cloud import workflows_v1
+from google.cloud import logging as cloud_logging
+
+# Configure logging
+cloud_logging.Client().setup_logging()
+logger = logging.getLogger(__name__)
+
+PROJECT_ID = os.environ.get('PROJECT_ID')
+REGION = os.environ.get('REGION')
+
+@functions_framework.cloud_event
+def process_security_finding(cloud_event):
+    """Process security findings and trigger workflows."""
+    try:
+        # Decode Pub/Sub message
+        message_data = base64.b64decode(cloud_event.data["message"]["data"])
+        finding = json.loads(message_data.decode('utf-8'))
+        
+        # Extract finding details
+        finding_id = finding.get('name', 'unknown')
+        severity = finding.get('severity', 'LOW')
+        category = finding.get('category', 'unknown')
+        
+        logger.info(f"Processing finding: {finding_id} with severity: {severity}")
+        
+        # Determine workflow based on severity
+        workflow_name = determine_workflow(severity, category)
+        
+        if workflow_name:
+            # Trigger appropriate workflow
+            trigger_workflow(workflow_name, finding)
+            
+        return 'OK'
+        
+    except Exception as e:
+        logger.error(f"Error processing security finding: {str(e)}")
+        raise
+
+def determine_workflow(severity, category):
+    """Determine which workflow to trigger based on finding."""
+    if severity in ['HIGH', 'CRITICAL']:
+        return 'high-severity-workflow'
+    elif severity == 'MEDIUM':
+        return 'medium-severity-workflow'
+    else:
+        return 'low-severity-workflow'
+
+def trigger_workflow(workflow_name, finding):
+    """Trigger Cloud Workflow with finding data."""
+    client = workflows_v1.WorkflowsClient()
+    
+    # Prepare workflow input
+    workflow_input = {
+        'finding': finding,
+        'timestamp': finding.get('eventTime', ''),
+        'severity': finding.get('severity', 'LOW')
+    }
+    
+    # Execute workflow
+    execution = client.create_execution(
+        parent=f"projects/{PROJECT_ID}/locations/{REGION}/workflows/{workflow_name}",
+        execution=workflows_v1.Execution(argument=json.dumps(workflow_input))
+    )
+    
+    logger.info(f"Triggered workflow: {workflow_name}")
+EOF
    
    # Deploy the function
    gcloud functions deploy ${FUNCTION_NAME} \
@@ -273,125 +292,125 @@ echo "✅ APIs enabled successfully"
 
    The Cloud Function is now deployed and will automatically process security findings from the Pub/Sub topic, providing the initial triage and workflow orchestration capabilities for our security automation system.
 
-4. **Create Remediation Workflows**:
+4. **Create High-Severity Remediation Workflow**:
 
    Cloud Workflows provides serverless orchestration capabilities that enable complex, multi-step security remediation processes. These workflows implement security playbooks that automatically assess threats, execute remediation actions, and escalate issues based on predefined criteria and organizational policies.
 
    ```bash
    # Create high-severity workflow
    cat > high-severity-workflow.yaml << 'EOF'
-   main:
-     params: [input]
-     steps:
-       - init:
-           assign:
-             - finding: ${input.finding}
-             - severity: ${input.severity}
-             - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
-       
-       - log_incident:
-           call: http.post
-           args:
-             url: https://logging.googleapis.com/v2/entries:write
-             auth:
-               type: OAuth2
-             body:
-               entries:
-                 - logName: projects/${project_id}/logs/security-compliance
-                   severity: CRITICAL
-                   jsonPayload:
-                     finding_id: ${finding.name}
-                     severity: ${severity}
-                     action: "high_severity_workflow_triggered"
-       
-       - assess_threat:
-           assign:
-             - requires_immediate_action: ${severity == "CRITICAL"}
-             - requires_escalation: true
-       
-       - immediate_remediation:
-           switch:
-             - condition: ${requires_immediate_action}
-               steps:
-                 - disable_compromised_resource:
-                     call: execute_remediation
-                     args:
-                       action: "disable_resource"
-                       resource: ${finding.resourceName}
-       
-       - notify_security_team:
-           call: send_notification
-           args:
-             severity: ${severity}
-             finding: ${finding}
-             action_taken: "immediate_remediation"
-       
-       - escalate_to_incident_response:
-           switch:
-             - condition: ${requires_escalation}
-               steps:
-                 - create_incident:
-                     call: create_security_incident
-                     args:
-                       finding: ${finding}
-                       severity: ${severity}
-   
-   execute_remediation:
-     params: [action, resource]
-     steps:
-       - log_action:
-           call: http.post
-           args:
-             url: https://logging.googleapis.com/v2/entries:write
-             auth:
-               type: OAuth2
-             body:
-               entries:
-                 - logName: projects/${project_id}/logs/security-actions
-                   severity: INFO
-                   jsonPayload:
-                     action: ${action}
-                     resource: ${resource}
-                     timestamp: ${time.now()}
-   
-   send_notification:
-     params: [severity, finding, action_taken]
-     steps:
-       - send_alert:
-           call: http.post
-           args:
-             url: https://logging.googleapis.com/v2/entries:write
-             auth:
-               type: OAuth2
-             body:
-               entries:
-                 - logName: projects/${project_id}/logs/security-notifications
-                   severity: WARNING
-                   jsonPayload:
-                     alert_type: "security_finding"
-                     severity: ${severity}
-                     finding_id: ${finding.name}
-                     action_taken: ${action_taken}
-   
-   create_security_incident:
-     params: [finding, severity]
-     steps:
-       - log_incident:
-           call: http.post
-           args:
-             url: https://logging.googleapis.com/v2/entries:write
-             auth:
-               type: OAuth2
-             body:
-               entries:
-                 - logName: projects/${project_id}/logs/security-incidents
-                   severity: ERROR
-                   jsonPayload:
-                     incident_type: "security_finding"
-                     severity: ${severity}
-                     finding_id: ${finding.name}
-                     status: "created"
-   EOF
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+          - finding: ${input.finding}
+          - severity: ${input.severity}
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+    
+    - log_incident:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: ${"projects/" + project_id + "/logs/security-compliance"}
+                severity: CRITICAL
+                jsonPayload:
+                  finding_id: ${finding.name}
+                  severity: ${severity}
+                  action: "high_severity_workflow_triggered"
+    
+    - assess_threat:
+        assign:
+          - requires_immediate_action: ${severity == "CRITICAL"}
+          - requires_escalation: true
+    
+    - immediate_remediation:
+        switch:
+          - condition: ${requires_immediate_action}
+            steps:
+              - disable_compromised_resource:
+                  call: execute_remediation
+                  args:
+                    action: "disable_resource"
+                    resource: ${finding.resourceName}
+    
+    - notify_security_team:
+        call: send_notification
+        args:
+          severity: ${severity}
+          finding: ${finding}
+          action_taken: "immediate_remediation"
+    
+    - escalate_to_incident_response:
+        switch:
+          - condition: ${requires_escalation}
+            steps:
+              - create_incident:
+                  call: create_security_incident
+                  args:
+                    finding: ${finding}
+                    severity: ${severity}
+
+execute_remediation:
+  params: [action, resource]
+  steps:
+    - log_action:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: ${"projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT_ID") + "/logs/security-actions"}
+                severity: INFO
+                jsonPayload:
+                  action: ${action}
+                  resource: ${resource}
+                  timestamp: ${time.now()}
+
+send_notification:
+  params: [severity, finding, action_taken]
+  steps:
+    - send_alert:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: ${"projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT_ID") + "/logs/security-notifications"}
+                severity: WARNING
+                jsonPayload:
+                  alert_type: "security_finding"
+                  severity: ${severity}
+                  finding_id: ${finding.name}
+                  action_taken: ${action_taken}
+
+create_security_incident:
+  params: [finding, severity]
+  steps:
+    - log_incident:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: ${"projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT_ID") + "/logs/security-incidents"}
+                severity: ERROR
+                jsonPayload:
+                  incident_type: "security_finding"
+                  severity: ${severity}
+                  finding_id: ${finding.name}
+                  status: "created"
+EOF
    
    # Deploy high-severity workflow
    gcloud workflows deploy high-severity-workflow \
@@ -410,111 +429,111 @@ echo "✅ APIs enabled successfully"
    ```bash
    # Create medium-severity workflow
    cat > medium-severity-workflow.yaml << 'EOF'
-   main:
-     params: [input]
-     steps:
-       - init:
-           assign:
-             - finding: ${input.finding}
-             - severity: ${input.severity}
-             - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
-       
-       - log_finding:
-           call: http.post
-           args:
-             url: https://logging.googleapis.com/v2/entries:write
-             auth:
-               type: OAuth2
-             body:
-               entries:
-                 - logName: projects/${project_id}/logs/security-compliance
-                   severity: WARNING
-                   jsonPayload:
-                     finding_id: ${finding.name}
-                     severity: ${severity}
-                     action: "medium_severity_workflow_triggered"
-       
-       - assess_risk:
-           assign:
-             - requires_notification: true
-             - requires_tracking: true
-       
-       - create_remediation_ticket:
-           call: create_tracking_entry
-           args:
-             finding: ${finding}
-             priority: "medium"
-       
-       - notify_security_team:
-           call: send_notification
-           args:
-             severity: ${severity}
-             finding: ${finding}
-             action_taken: "ticket_created"
-       
-       - schedule_follow_up:
-           call: create_follow_up_task
-           args:
-             finding: ${finding}
-             follow_up_hours: 24
-   
-   create_tracking_entry:
-     params: [finding, priority]
-     steps:
-       - log_tracking:
-           call: http.post
-           args:
-             url: https://logging.googleapis.com/v2/entries:write
-             auth:
-               type: OAuth2
-             body:
-               entries:
-                 - logName: projects/${project_id}/logs/security-tracking
-                   severity: INFO
-                   jsonPayload:
-                     tracking_type: "remediation_ticket"
-                     finding_id: ${finding.name}
-                     priority: ${priority}
-                     status: "created"
-   
-   send_notification:
-     params: [severity, finding, action_taken]
-     steps:
-       - send_alert:
-           call: http.post
-           args:
-             url: https://logging.googleapis.com/v2/entries:write
-             auth:
-               type: OAuth2
-             body:
-               entries:
-                 - logName: projects/${project_id}/logs/security-notifications
-                   severity: INFO
-                   jsonPayload:
-                     alert_type: "security_finding"
-                     severity: ${severity}
-                     finding_id: ${finding.name}
-                     action_taken: ${action_taken}
-   
-   create_follow_up_task:
-     params: [finding, follow_up_hours]
-     steps:
-       - schedule_task:
-           call: http.post
-           args:
-             url: https://logging.googleapis.com/v2/entries:write
-             auth:
-               type: OAuth2
-             body:
-               entries:
-                 - logName: projects/${project_id}/logs/security-tasks
-                   severity: INFO
-                   jsonPayload:
-                     task_type: "follow_up"
-                     finding_id: ${finding.name}
-                     scheduled_hours: ${follow_up_hours}
-                     status: "scheduled"
-   EOF
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+          - finding: ${input.finding}
+          - severity: ${input.severity}
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+    
+    - log_finding:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: ${"projects/" + project_id + "/logs/security-compliance"}
+                severity: WARNING
+                jsonPayload:
+                  finding_id: ${finding.name}
+                  severity: ${severity}
+                  action: "medium_severity_workflow_triggered"
+    
+    - assess_risk:
+        assign:
+          - requires_notification: true
+          - requires_tracking: true
+    
+    - create_remediation_ticket:
+        call: create_tracking_entry
+        args:
+          finding: ${finding}
+          priority: "medium"
+    
+    - notify_security_team:
+        call: send_notification
+        args:
+          severity: ${severity}
+          finding: ${finding}
+          action_taken: "ticket_created"
+    
+    - schedule_follow_up:
+        call: create_follow_up_task
+        args:
+          finding: ${finding}
+          follow_up_hours: 24
+
+create_tracking_entry:
+  params: [finding, priority]
+  steps:
+    - log_tracking:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: ${"projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT_ID") + "/logs/security-tracking"}
+                severity: INFO
+                jsonPayload:
+                  tracking_type: "remediation_ticket"
+                  finding_id: ${finding.name}
+                  priority: ${priority}
+                  status: "created"
+
+send_notification:
+  params: [severity, finding, action_taken]
+  steps:
+    - send_alert:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: ${"projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT_ID") + "/logs/security-notifications"}
+                severity: INFO
+                jsonPayload:
+                  alert_type: "security_finding"
+                  severity: ${severity}
+                  finding_id: ${finding.name}
+                  action_taken: ${action_taken}
+
+create_follow_up_task:
+  params: [finding, follow_up_hours]
+  steps:
+    - schedule_task:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: ${"projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT_ID") + "/logs/security-tasks"}
+                severity: INFO
+                jsonPayload:
+                  task_type: "follow_up"
+                  finding_id: ${finding.name}
+                  scheduled_hours: ${follow_up_hours}
+                  status: "scheduled"
+EOF
    
    # Deploy medium-severity workflow
    gcloud workflows deploy medium-severity-workflow \
@@ -533,102 +552,102 @@ echo "✅ APIs enabled successfully"
    ```bash
    # Create low-severity workflow
    cat > low-severity-workflow.yaml << 'EOF'
-   main:
-     params: [input]
-     steps:
-       - init:
-           assign:
-             - finding: ${input.finding}
-             - severity: ${input.severity}
-             - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
-       
-       - log_finding:
-           call: http.post
-           args:
-             url: https://logging.googleapis.com/v2/entries:write
-             auth:
-               type: OAuth2
-             body:
-               entries:
-                 - logName: projects/${project_id}/logs/security-compliance
-                   severity: INFO
-                   jsonPayload:
-                     finding_id: ${finding.name}
-                     severity: ${severity}
-                     action: "low_severity_workflow_triggered"
-       
-       - assess_finding:
-           assign:
-             - requires_aggregation: true
-             - requires_periodic_review: true
-       
-       - aggregate_for_reporting:
-           call: aggregate_finding
-           args:
-             finding: ${finding}
-             category: "low_severity_findings"
-       
-       - check_threshold:
-           call: check_aggregation_threshold
-           args:
-             category: "low_severity_findings"
-             threshold: 100
-       
-       - conditional_notification:
-           switch:
-             - condition: ${threshold_exceeded}
-               steps:
-                 - notify_trend:
-                     call: send_trend_notification
-                     args:
-                       category: "low_severity_findings"
-                       count: ${finding_count}
-   
-   aggregate_finding:
-     params: [finding, category]
-     steps:
-       - log_aggregation:
-           call: http.post
-           args:
-             url: https://logging.googleapis.com/v2/entries:write
-             auth:
-               type: OAuth2
-             body:
-               entries:
-                 - logName: projects/${project_id}/logs/security-aggregation
-                   severity: INFO
-                   jsonPayload:
-                     aggregation_type: ${category}
-                     finding_id: ${finding.name}
-                     timestamp: ${time.now()}
-   
-   check_aggregation_threshold:
-     params: [category, threshold]
-     steps:
-       - check_count:
-           assign:
-             - threshold_exceeded: false
-             - finding_count: 0
-   
-   send_trend_notification:
-     params: [category, count]
-     steps:
-       - send_alert:
-           call: http.post
-           args:
-             url: https://logging.googleapis.com/v2/entries:write
-             auth:
-               type: OAuth2
-             body:
-               entries:
-                 - logName: projects/${project_id}/logs/security-trends
-                   severity: WARNING
-                   jsonPayload:
-                     alert_type: "trend_notification"
-                     category: ${category}
-                     count: ${count}
-                     message: "Low severity findings threshold exceeded"
-   EOF
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+          - finding: ${input.finding}
+          - severity: ${input.severity}
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+    
+    - log_finding:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: ${"projects/" + project_id + "/logs/security-compliance"}
+                severity: INFO
+                jsonPayload:
+                  finding_id: ${finding.name}
+                  severity: ${severity}
+                  action: "low_severity_workflow_triggered"
+    
+    - assess_finding:
+        assign:
+          - requires_aggregation: true
+          - requires_periodic_review: true
+    
+    - aggregate_for_reporting:
+        call: aggregate_finding
+        args:
+          finding: ${finding}
+          category: "low_severity_findings"
+    
+    - check_threshold:
+        call: check_aggregation_threshold
+        args:
+          category: "low_severity_findings"
+          threshold: 100
+    
+    - conditional_notification:
+        switch:
+          - condition: ${threshold_exceeded}
+            steps:
+              - notify_trend:
+                  call: send_trend_notification
+                  args:
+                    category: "low_severity_findings"
+                    count: ${finding_count}
+
+aggregate_finding:
+  params: [finding, category]
+  steps:
+    - log_aggregation:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: ${"projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT_ID") + "/logs/security-aggregation"}
+                severity: INFO
+                jsonPayload:
+                  aggregation_type: ${category}
+                  finding_id: ${finding.name}
+                  timestamp: ${time.now()}
+
+check_aggregation_threshold:
+  params: [category, threshold]
+  steps:
+    - check_count:
+        assign:
+          - threshold_exceeded: false
+          - finding_count: 0
+
+send_trend_notification:
+  params: [category, count]
+  steps:
+    - send_alert:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: ${"projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT_ID") + "/logs/security-trends"}
+                severity: WARNING
+                jsonPayload:
+                  alert_type: "trend_notification"
+                  category: ${category}
+                  count: ${count}
+                  message: "Low severity findings threshold exceeded"
+EOF
    
    # Deploy low-severity workflow
    gcloud workflows deploy low-severity-workflow \
@@ -648,35 +667,37 @@ echo "✅ APIs enabled successfully"
    # Create log-based metrics for security findings
    gcloud logging metrics create security_findings_processed \
        --description="Count of security findings processed" \
-       --log-filter='resource.type="cloud_function" AND textPayload:"Processing finding"' \
-       --region=${REGION}
+       --log-filter='resource.type="cloud_function" AND jsonPayload.message:"Processing finding"'
    
    # Create metric for workflow executions
    gcloud logging metrics create workflow_executions \
        --description="Count of workflow executions" \
-       --log-filter='resource.type="workflows.googleapis.com/Workflow"' \
-       --region=${REGION}
+       --log-filter='resource.type="workflows.googleapis.com/Workflow"'
    
    # Create alerting policy for high-severity findings
-   cat > alert-policy.yaml << 'EOF'
-   displayName: "High Severity Security Findings Alert"
-   conditions:
-     - displayName: "High severity findings rate"
-       conditionThreshold:
-         filter: 'resource.type="cloud_function" AND textPayload:"high-severity-workflow"'
-         comparison: COMPARISON_GREATER_THAN
-         thresholdValue: 5
-         duration: 300s
-   notificationChannels: []
-   alertStrategy:
-     autoClose: 86400s
-   EOF
+   cat > alert-policy.json << 'EOF'
+{
+  "displayName": "High Severity Security Findings Alert",
+  "conditions": [
+    {
+      "displayName": "High severity findings rate",
+      "conditionThreshold": {
+        "filter": "resource.type=\"cloud_function\" AND jsonPayload.message:\"high-severity-workflow\"",
+        "comparison": "COMPARISON_GREATER_THAN",
+        "thresholdValue": 5,
+        "duration": "300s"
+      }
+    }
+  ],
+  "alertStrategy": {
+    "autoClose": "86400s"
+  }
+}
+EOF
    
-   # Create notification channel (email)
-   gcloud alpha monitoring channels create \
-       --display-name="Security Team Email" \
-       --type=email \
-       --channel-labels=email_address=security-team@company.com
+   # Create the alert policy
+   gcloud alpha monitoring policies create \
+       --policy-from-file=alert-policy.json
    
    echo "✅ Monitoring and alerting configured"
    ```
@@ -690,75 +711,75 @@ echo "✅ APIs enabled successfully"
    ```bash
    # Create custom dashboard configuration
    cat > compliance-dashboard.json << 'EOF'
-   {
-     "displayName": "Security Compliance Dashboard",
-     "mosaicLayout": {
-       "tiles": [
-         {
-           "width": 6,
-           "height": 4,
-           "widget": {
-             "title": "Security Findings by Severity",
-             "scorecard": {
-               "timeSeriesQuery": {
-                 "timeSeriesFilter": {
-                   "filter": "resource.type=\"cloud_function\"",
-                   "aggregation": {
-                     "alignmentPeriod": "3600s",
-                     "perSeriesAligner": "ALIGN_RATE"
-                   }
-                 }
-               }
-             }
-           }
-         },
-         {
-           "width": 6,
-           "height": 4,
-           "xPos": 6,
-           "widget": {
-             "title": "Workflow Execution Success Rate",
-             "scorecard": {
-               "timeSeriesQuery": {
-                 "timeSeriesFilter": {
-                   "filter": "resource.type=\"workflows.googleapis.com/Workflow\"",
-                   "aggregation": {
-                     "alignmentPeriod": "3600s",
-                     "perSeriesAligner": "ALIGN_RATE"
-                   }
-                 }
-               }
-             }
-           }
-         },
-         {
-           "width": 12,
-           "height": 4,
-           "yPos": 4,
-           "widget": {
-             "title": "Security Findings Timeline",
-             "xyChart": {
-               "dataSets": [
-                 {
-                   "timeSeriesQuery": {
-                     "timeSeriesFilter": {
-                       "filter": "resource.type=\"cloud_function\"",
-                       "aggregation": {
-                         "alignmentPeriod": "3600s",
-                         "perSeriesAligner": "ALIGN_RATE"
-                       }
-                     }
-                   },
-                   "plotType": "LINE"
-                 }
-               ]
-             }
-           }
-         }
-       ]
-     }
-   }
-   EOF
+{
+  "displayName": "Security Compliance Dashboard",
+  "mosaicLayout": {
+    "tiles": [
+      {
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Security Findings by Severity",
+          "scorecard": {
+            "timeSeriesQuery": {
+              "timeSeriesFilter": {
+                "filter": "resource.type=\"cloud_function\"",
+                "aggregation": {
+                  "alignmentPeriod": "3600s",
+                  "perSeriesAligner": "ALIGN_RATE"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "width": 6,
+        "height": 4,
+        "xPos": 6,
+        "widget": {
+          "title": "Workflow Execution Success Rate",
+          "scorecard": {
+            "timeSeriesQuery": {
+              "timeSeriesFilter": {
+                "filter": "resource.type=\"workflows.googleapis.com/Workflow\"",
+                "aggregation": {
+                  "alignmentPeriod": "3600s",
+                  "perSeriesAligner": "ALIGN_RATE"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "width": 12,
+        "height": 4,
+        "yPos": 4,
+        "widget": {
+          "title": "Security Findings Timeline",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type=\"cloud_function\"",
+                    "aggregation": {
+                      "alignmentPeriod": "3600s",
+                      "perSeriesAligner": "ALIGN_RATE"
+                    }
+                  }
+                },
+                "plotType": "LINE"
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+EOF
    
    # Create the dashboard
    gcloud monitoring dashboards create \
@@ -776,17 +797,17 @@ echo "✅ APIs enabled successfully"
    ```bash
    # Create a test security finding message
    cat > test-finding.json << 'EOF'
-   {
-     "name": "organizations/123456789/sources/123456789/findings/test-finding-001",
-     "parent": "organizations/123456789/sources/123456789",
-     "resourceName": "//compute.googleapis.com/projects/test-project/zones/us-central1-a/instances/test-instance",
-     "state": "ACTIVE",
-     "category": "MALWARE",
-     "severity": "HIGH",
-     "eventTime": "2025-07-12T10:30:00Z",
-     "createTime": "2025-07-12T10:30:00Z"
-   }
-   EOF
+{
+  "name": "organizations/123456789/sources/123456789/findings/test-finding-001",
+  "parent": "organizations/123456789/sources/123456789",
+  "resourceName": "//compute.googleapis.com/projects/test-project/zones/us-central1-a/instances/test-instance",
+  "state": "ACTIVE",
+  "category": "MALWARE",
+  "severity": "HIGH",
+  "eventTime": "2025-07-23T10:30:00Z",
+  "createTime": "2025-07-23T10:30:00Z"
+}
+EOF
    
    # Publish test message to Pub/Sub topic
    gcloud pubsub topics publish ${TOPIC_NAME} \
@@ -821,7 +842,7 @@ echo "✅ APIs enabled successfully"
    # Manually trigger workflow for testing
    gcloud workflows run high-severity-workflow \
        --location=${REGION} \
-       --data='{"finding":{"name":"test-finding","severity":"HIGH"},"timestamp":"2025-07-12T10:30:00Z","severity":"HIGH"}'
+       --data='{"finding":{"name":"test-finding","severity":"HIGH"},"timestamp":"2025-07-23T10:30:00Z","severity":"HIGH"}'
    
    echo "✅ Workflow execution test completed"
    ```
@@ -861,7 +882,19 @@ echo "✅ APIs enabled successfully"
    echo "✅ Cloud Functions deleted"
    ```
 
-3. **Delete Pub/Sub Resources**:
+3. **Delete Security Command Center Notification**:
+
+   ```bash
+   # Delete the notification configuration
+   gcloud scc notifications delete ${TOPIC_NAME}-notification \
+       --organization=${ORGANIZATION_ID} \
+       --location=global \
+       --quiet
+   
+   echo "✅ Security Command Center notification deleted"
+   ```
+
+4. **Delete Pub/Sub Resources**:
 
    ```bash
    # Delete subscription and topic
@@ -874,7 +907,7 @@ echo "✅ APIs enabled successfully"
    echo "✅ Pub/Sub resources deleted"
    ```
 
-4. **Delete Monitoring Resources**:
+5. **Delete Monitoring Resources**:
 
    ```bash
    # Delete log-based metrics
@@ -887,7 +920,7 @@ echo "✅ APIs enabled successfully"
    echo "✅ Monitoring resources deleted"
    ```
 
-5. **Delete Project**:
+6. **Delete Project**:
 
    ```bash
    # Delete the entire project

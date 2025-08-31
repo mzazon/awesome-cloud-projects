@@ -1,0 +1,549 @@
+# Google Cloud Infrastructure Manager Configuration
+# Voice-Controlled Task Automation with Speech-to-Text and Workflows
+# 
+# This configuration deploys a complete serverless voice automation system
+# including Speech-to-Text API, Cloud Workflows, Cloud Functions, Cloud Tasks,
+# and supporting infrastructure for hands-free business process automation.
+
+metadata:
+  name: voice-controlled-task-automation
+  description: "Serverless voice automation system with Speech-to-Text, Workflows, Functions, and Tasks"
+  version: "1.0"
+  labels:
+    environment: "production"
+    component: "voice-automation"
+    recipe-id: "4f3e2d1c"
+    
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    
+  region:
+    type: string
+    description: "Primary deployment region"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Primary deployment zone"
+    default: "us-central1-a"
+    
+  resource_suffix:
+    type: string
+    description: "Unique suffix for resource names"
+    default: "$(random.hex(3))"
+    
+  bucket_location:
+    type: string
+    description: "Storage bucket location"
+    default: "US"
+    
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Functions"
+    default: "512Mi"
+    
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Functions"
+    default: "60s"
+    
+  max_dispatches_per_second:
+    type: number
+    description: "Maximum task dispatches per second"
+    default: 10
+    
+  max_concurrent_dispatches:
+    type: number
+    description: "Maximum concurrent task dispatches"
+    default: 5
+
+# Main resource deployments
+resources:
+  # Enable required Google Cloud APIs
+  - name: speech-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/$(ref.project-id.projectId)/services/speech.googleapis.com"
+      
+  - name: workflows-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/$(ref.project-id.projectId)/services/workflows.googleapis.com"
+      
+  - name: functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/$(ref.project-id.projectId)/services/cloudfunctions.googleapis.com"
+      
+  - name: cloudtasks-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/$(ref.project-id.projectId)/services/cloudtasks.googleapis.com"
+      
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/$(ref.project-id.projectId)/services/storage.googleapis.com"
+      
+  - name: logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/$(ref.project-id.projectId)/services/logging.googleapis.com"
+      
+  - name: build-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/$(ref.project-id.projectId)/services/cloudbuild.googleapis.com"
+
+  # Project reference for resource naming
+  - name: project-id
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(var.project_id)
+
+  # Cloud Storage bucket for audio files with lifecycle management
+  - name: voice-audio-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: "voice-audio-$(ref.project-id.projectId)-$(var.resource_suffix)"
+      location: $(var.bucket_location)
+      storageClass: STANDARD
+      versioning:
+        enabled: false
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 7  # Delete files older than 7 days for cost optimization
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+    metadata:
+      dependsOn:
+        - storage-api
+
+  # Cloud Tasks queue for asynchronous task processing
+  - name: task-automation-queue
+    type: gcp-types/cloudtasks-v2:projects.locations.queues
+    properties:
+      parent: "projects/$(ref.project-id.projectId)/locations/$(var.region)"
+      name: "task-queue-$(var.resource_suffix)"
+      rateLimits:
+        maxDispatchesPerSecond: $(var.max_dispatches_per_second)
+        maxConcurrentDispatches: $(var.max_concurrent_dispatches)
+      retryConfig:
+        maxAttempts: 3
+        minBackoff: 1s
+        maxBackoff: 10s
+        maxDoublings: 3
+    metadata:
+      dependsOn:
+        - cloudtasks-api
+
+  # IAM Service Account for Cloud Functions
+  - name: voice-function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: "voice-function-sa-$(var.resource_suffix)"
+      displayName: "Voice Processing Function Service Account"
+      description: "Service account for voice processing Cloud Function with Speech-to-Text and Workflows access"
+    metadata:
+      dependsOn:
+        - project-id
+
+  # IAM bindings for Speech-to-Text access
+  - name: speech-client-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project-id.projectId)
+      policy:
+        bindings:
+          - role: "roles/speech.client"
+            members:
+              - "serviceAccount:$(ref.voice-function-service-account.email)"
+    metadata:
+      dependsOn:
+        - voice-function-service-account
+        - speech-api
+
+  # IAM bindings for Workflows access
+  - name: workflows-invoker-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project-id.projectId)
+      policy:
+        bindings:
+          - role: "roles/workflows.invoker"
+            members:
+              - "serviceAccount:$(ref.voice-function-service-account.email)"
+    metadata:
+      dependsOn:
+        - voice-function-service-account
+        - workflows-api
+
+  # IAM bindings for Cloud Storage access
+  - name: storage-object-viewer-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project-id.projectId)
+      policy:
+        bindings:
+          - role: "roles/storage.objectViewer"
+            members:
+              - "serviceAccount:$(ref.voice-function-service-account.email)"
+    metadata:
+      dependsOn:
+        - voice-function-service-account
+
+  # IAM Service Account for Workflows
+  - name: workflows-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: "workflows-sa-$(var.resource_suffix)"
+      displayName: "Task Automation Workflows Service Account"
+      description: "Service account for Workflows with Cloud Tasks and Functions access"
+    metadata:
+      dependsOn:
+        - project-id
+
+  # IAM bindings for Cloud Tasks management by Workflows
+  - name: cloudtasks-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project-id.projectId)
+      policy:
+        bindings:
+          - role: "roles/cloudtasks.admin"
+            members:
+              - "serviceAccount:$(ref.workflows-service-account.email)"
+    metadata:
+      dependsOn:
+        - workflows-service-account
+        - cloudtasks-api
+
+  # IAM bindings for Cloud Functions invocation by Workflows
+  - name: functions-invoker-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project-id.projectId)
+      policy:
+        bindings:
+          - role: "roles/cloudfunctions.invoker"
+            members:
+              - "serviceAccount:$(ref.workflows-service-account.email)"
+    metadata:
+      dependsOn:
+        - workflows-service-account
+
+  # IAM Service Account for Task Processing Function
+  - name: task-processor-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: "task-processor-sa-$(var.resource_suffix)"
+      displayName: "Task Processing Function Service Account"
+      description: "Service account for task processing Cloud Function with logging access"
+    metadata:
+      dependsOn:
+        - project-id
+
+  # IAM bindings for logging access
+  - name: logging-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project-id.projectId)
+      policy:
+        bindings:
+          - role: "roles/logging.logWriter"
+            members:
+              - "serviceAccount:$(ref.task-processor-service-account.email)"
+    metadata:
+      dependsOn:
+        - task-processor-service-account
+        - logging-api
+
+  # Voice Processing Cloud Function
+  - name: voice-processing-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: "projects/$(ref.project-id.projectId)/locations/$(var.region)"
+      name: "voice-processor-$(var.resource_suffix)"
+      description: "Processes voice commands using Speech-to-Text and triggers workflows"
+      sourceArchiveUrl: "gs://$(ref.voice-audio-bucket.name)/voice-function-source.zip"
+      entryPoint: "process_voice_command"
+      runtime: "python311"
+      timeout: $(var.function_timeout)
+      availableMemoryMb: $(var.function_memory)
+      serviceAccountEmail: $(ref.voice-function-service-account.email)
+      httpsTrigger: {}
+      environmentVariables:
+        GCP_PROJECT: $(ref.project-id.projectId)
+        REGION: $(var.region)
+        WORKFLOW_NAME: "task-automation-$(var.resource_suffix)"
+        BUCKET_NAME: $(ref.voice-audio-bucket.name)
+        QUEUE_NAME: "task-queue-$(var.resource_suffix)"
+    metadata:
+      dependsOn:
+        - functions-api
+        - voice-function-service-account
+        - voice-audio-bucket
+        - speech-client-binding
+        - workflows-invoker-binding
+
+  # Task Processing Cloud Function
+  - name: task-processing-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: "projects/$(ref.project-id.projectId)/locations/$(var.region)"
+      name: "task-processor-$(var.resource_suffix)"
+      description: "Processes tasks created by voice commands with business logic execution"
+      sourceArchiveUrl: "gs://$(ref.voice-audio-bucket.name)/task-processor-source.zip"
+      entryPoint: "process_task"
+      runtime: "python311"
+      timeout: "30s"
+      availableMemoryMb: "256Mi"
+      serviceAccountEmail: $(ref.task-processor-service-account.email)
+      httpsTrigger: {}
+      environmentVariables:
+        GCP_PROJECT: $(ref.project-id.projectId)
+        REGION: $(var.region)
+    metadata:
+      dependsOn:
+        - functions-api
+        - task-processor-service-account
+        - voice-audio-bucket
+        - logging-writer-binding
+
+  # Cloud Workflow for task automation orchestration
+  - name: task-automation-workflow
+    type: gcp-types/workflows-v1:projects.locations.workflows
+    properties:
+      parent: "projects/$(ref.project-id.projectId)/locations/$(var.region)"
+      workflowId: "task-automation-$(var.resource_suffix)"
+      description: "Orchestrates voice-triggered task automation with conditional logic"
+      serviceAccount: $(ref.workflows-service-account.email)
+      sourceContents: |
+        # Task Automation Workflow
+        # Processes voice intents and triggers appropriate business automation
+        main:
+          params: [args]
+          steps:
+          - init:
+              assign:
+              - intent: ${args.intent}
+              - action: ${args.action}
+              - parameters: ${args.parameters}
+              - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+              
+          - validate_intent:
+              switch:
+              - condition: ${intent == "create_task"}
+                next: create_task_process
+              - condition: ${intent == "schedule_task"}
+                next: schedule_task_process
+              - condition: ${intent == "generate_report"}
+                next: generate_report_process
+              default:
+                next: unknown_intent_error
+        
+          - create_task_process:
+              steps:
+              - log_task_creation:
+                  call: sys.log
+                  args:
+                    text: ${"Creating task with parameters: " + string(parameters)}
+                    severity: INFO
+                    
+              - enqueue_task:
+                  call: http.post
+                  args:
+                    url: ${"https://cloudtasks.googleapis.com/v2/projects/" + project_id + "/locations/$(var.region)/queues/task-queue-$(var.resource_suffix)/tasks"}
+                    auth:
+                      type: OAuth2
+                    headers:
+                      Content-Type: application/json
+                    body:
+                      task:
+                        httpRequest:
+                          url: ${"https://$(var.region)-" + project_id + ".cloudfunctions.net/task-processor-$(var.resource_suffix)"}
+                          httpMethod: POST
+                          headers:
+                            Content-Type: application/json
+                          body: ${base64.encode(json.encode({
+                            "action": "create_task",
+                            "parameters": parameters
+                          }))}
+                        scheduleTime: ${time.format(time.now())}
+                  result: task_result
+                  
+              - return_success:
+                  return:
+                    status: "success"
+                    message: "Task creation initiated"
+                    task_id: ${task_result.body.name}
+        
+          - schedule_task_process:
+              steps:
+              - log_scheduling:
+                  call: sys.log
+                  args:
+                    text: ${"Scheduling task with parameters: " + string(parameters)}
+                    severity: INFO
+                    
+              - calculate_schedule_time:
+                  assign:
+                  - schedule_time: ${time.format(time.add(time.now(), 3600))}  # 1 hour from now
+                  
+              - enqueue_scheduled_task:
+                  call: http.post
+                  args:
+                    url: ${"https://cloudtasks.googleapis.com/v2/projects/" + project_id + "/locations/$(var.region)/queues/task-queue-$(var.resource_suffix)/tasks"}
+                    auth:
+                      type: OAuth2
+                    headers:
+                      Content-Type: application/json
+                    body:
+                      task:
+                        httpRequest:
+                          url: ${"https://$(var.region)-" + project_id + ".cloudfunctions.net/task-processor-$(var.resource_suffix)"}
+                          httpMethod: POST
+                          headers:
+                            Content-Type: application/json
+                          body: ${base64.encode(json.encode({
+                            "action": "scheduled_task",
+                            "parameters": parameters
+                          }))}
+                        scheduleTime: ${schedule_time}
+                  result: scheduled_result
+                  
+              - return_scheduled:
+                  return:
+                    status: "success"
+                    message: "Task scheduled successfully"
+                    scheduled_time: ${schedule_time}
+                    task_id: ${scheduled_result.body.name}
+        
+          - generate_report_process:
+              steps:
+              - log_report:
+                  call: sys.log
+                  args:
+                    text: "Generating report based on voice command"
+                    severity: INFO
+                    
+              - create_report_task:
+                  call: http.post
+                  args:
+                    url: ${"https://cloudtasks.googleapis.com/v2/projects/" + project_id + "/locations/$(var.region)/queues/task-queue-$(var.resource_suffix)/tasks"}
+                    auth:
+                      type: OAuth2
+                    headers:
+                      Content-Type: application/json
+                    body:
+                      task:
+                        httpRequest:
+                          url: ${"https://$(var.region)-" + project_id + ".cloudfunctions.net/task-processor-$(var.resource_suffix)"}
+                          httpMethod: POST
+                          headers:
+                            Content-Type: application/json
+                          body: ${base64.encode(json.encode({
+                            "action": "generate_report",
+                            "parameters": parameters
+                          }))}
+                  result: report_result
+                  
+              - return_report:
+                  return:
+                    status: "success"
+                    message: "Report generation initiated"
+                    task_id: ${report_result.body.name}
+        
+          - unknown_intent_error:
+              raise:
+                message: ${"Unknown intent: " + intent}
+    metadata:
+      dependsOn:
+        - workflows-api
+        - workflows-service-account
+        - task-automation-queue
+        - cloudtasks-admin-binding
+        - functions-invoker-binding
+
+  # Log sink for structured logging and monitoring
+  - name: voice-automation-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: "projects/$(ref.project-id.projectId)"
+      name: "voice-automation-sink-$(var.resource_suffix)"
+      description: "Centralized logging for voice automation system"
+      destination: "storage.googleapis.com/$(ref.voice-audio-bucket.name)/logs"
+      filter: |
+        resource.type="cloud_function" AND
+        (resource.labels.function_name="voice-processor-$(var.resource_suffix)" OR
+         resource.labels.function_name="task-processor-$(var.resource_suffix)") OR
+        resource.type="workflows.googleapis.com/Workflow" AND
+        resource.labels.workflow_id="task-automation-$(var.resource_suffix)"
+    metadata:
+      dependsOn:
+        - logging-api
+        - voice-audio-bucket
+        - voice-processing-function
+        - task-processing-function
+        - task-automation-workflow
+
+# Output values for validation and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(ref.project-id.projectId)
+    
+  region:
+    description: "Deployment region"
+    value: $(var.region)
+    
+  voice_processing_function_url:
+    description: "HTTP trigger URL for voice processing function"
+    value: "https://$(var.region)-$(ref.project-id.projectId).cloudfunctions.net/voice-processor-$(var.resource_suffix)"
+    
+  task_processing_function_url:
+    description: "HTTP trigger URL for task processing function"
+    value: "https://$(var.region)-$(ref.project-id.projectId).cloudfunctions.net/task-processor-$(var.resource_suffix)"
+    
+  workflow_name:
+    description: "Cloud Workflow name for task automation"
+    value: "task-automation-$(var.resource_suffix)"
+    
+  storage_bucket_name:
+    description: "Cloud Storage bucket for audio files"
+    value: $(ref.voice-audio-bucket.name)
+    
+  task_queue_name:
+    description: "Cloud Tasks queue for asynchronous processing"
+    value: "task-queue-$(var.resource_suffix)"
+    
+  voice_function_service_account:
+    description: "Service account email for voice processing function"
+    value: $(ref.voice-function-service-account.email)
+    
+  workflows_service_account:
+    description: "Service account email for workflows"
+    value: $(ref.workflows-service-account.email)
+    
+  task_processor_service_account:
+    description: "Service account email for task processing function"
+    value: $(ref.task-processor-service-account.email)
+    
+  log_sink_name:
+    description: "Log sink for centralized monitoring"
+    value: "voice-automation-sink-$(var.resource_suffix)"
+
+# Resource labels for organization and cost tracking
+labels:
+  environment: "production"
+  component: "voice-automation"
+  recipe: "voice-controlled-task-automation"
+  version: "1.0"
+  managed-by: "infrastructure-manager"

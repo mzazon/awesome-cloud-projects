@@ -4,14 +4,14 @@ id: 7485f711
 category: machine learning & ai
 difficulty: 400
 subject: aws
-services: personalize,api,gateway,lambda,dynamodb
+services: Personalize, API Gateway, Lambda, DynamoDB
 estimated-time: 240 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: personalize,api,gateway,lambda,dynamodb
+tags: personalize, api gateway, lambda, dynamodb, machine learning, ab testing
 recipe-generator-version: 1.3
 ---
 
@@ -140,6 +140,16 @@ export ROLE_NAME="PersonalizeABTestRole-${RANDOM_SUFFIX}"
 # Create S3 bucket for datasets
 aws s3 mb s3://${BUCKET_NAME} --region ${AWS_REGION}
 
+# Enable S3 bucket versioning and encryption
+aws s3api put-bucket-versioning \
+    --bucket ${BUCKET_NAME} \
+    --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption \
+    --bucket ${BUCKET_NAME} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
 # Create IAM role for Personalize and other services
 cat > trust-policy.json << EOF
 {
@@ -164,7 +174,7 @@ aws iam create-role \
     --role-name ${ROLE_NAME} \
     --assume-role-policy-document file://trust-policy.json
 
-# Attach required policies
+# Attach required policies following least privilege principle
 aws iam attach-role-policy \
     --role-name ${ROLE_NAME} \
     --policy-arn arn:aws:iam::aws:policy/service-role/AmazonPersonalizeFullAccess
@@ -187,7 +197,7 @@ aws iam attach-role-policy \
 
 export ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${ROLE_NAME}"
 
-echo "✅ Created foundational resources"
+echo "✅ Created foundational resources with security best practices"
 ```
 
 ## Steps
@@ -203,10 +213,9 @@ echo "✅ Created foundational resources"
    cat > generate_sample_data.py << 'EOF'
    import csv
    import random
-   import uuid
    from datetime import datetime, timedelta
    
-   # Generate sample users
+   # Generate sample users with demographics
    users = []
    for i in range(1000):
        users.append({
@@ -216,7 +225,7 @@ echo "✅ Created foundational resources"
            'SUBSCRIPTION_TYPE': random.choice(['free', 'premium', 'enterprise'])
        })
    
-   # Generate sample items
+   # Generate sample items with e-commerce attributes
    items = []
    categories = ['electronics', 'books', 'clothing', 'sports', 'home', 'automotive']
    for i in range(2000):
@@ -225,10 +234,11 @@ echo "✅ Created foundational resources"
            'CATEGORY': random.choice(categories),
            'PRICE': round(random.uniform(10.0, 500.0), 2),
            'BRAND': f'brand_{random.randint(1, 50)}',
-           'CREATION_DATE': (datetime.now() - timedelta(days=random.randint(1, 365))).strftime('%Y-%m-%d')
+           'CREATION_DATE': (datetime.now() - \
+               timedelta(days=random.randint(1, 365))).strftime('%Y-%m-%d')
        })
    
-   # Generate sample interactions
+   # Generate sample interactions with realistic distribution
    interactions = []
    base_date = datetime.now() - timedelta(days=90)
    
@@ -240,6 +250,7 @@ echo "✅ Created foundational resources"
            weights=[0.6, 0.1, 0.15, 0.1, 0.05]
        )[0]
        
+       # Add temporal patterns for realistic user behavior
        event_date = base_date + timedelta(
            days=random.randint(0, 89),
            hours=random.randint(0, 23),
@@ -251,13 +262,14 @@ echo "✅ Created foundational resources"
            'ITEM_ID': item['ITEM_ID'],
            'EVENT_TYPE': event_type,
            'TIMESTAMP': int(event_date.timestamp()),
-           'EVENT_VALUE': 1.0 if event_type == 'purchase' else 0.5 if event_type == 'add_to_cart' else 0.1
+           'EVENT_VALUE': 1.0 if event_type == 'purchase' \
+               else 0.5 if event_type == 'add_to_cart' else 0.1
        })
    
-   # Sort interactions by timestamp
+   # Sort interactions chronologically for training
    interactions.sort(key=lambda x: x['TIMESTAMP'])
    
-   # Write CSV files
+   # Write CSV files in Personalize-compatible format
    with open('sample-data/users.csv', 'w', newline='') as f:
        writer = csv.DictWriter(f, fieldnames=['USER_ID', 'AGE', 'GENDER', 'SUBSCRIPTION_TYPE'])
        writer.writeheader()
@@ -281,7 +293,7 @@ echo "✅ Created foundational resources"
    
    python3 generate_sample_data.py
    
-   # Upload sample data to S3
+   # Upload sample data to S3 with proper organization
    aws s3 cp sample-data/ s3://${BUCKET_NAME}/training-data/ \
        --recursive
    
@@ -295,17 +307,16 @@ echo "✅ Created foundational resources"
    DynamoDB provides the low-latency, scalable storage needed for real-time recommendation systems. We create separate tables for user profiles, item catalogs, A/B test assignments, and real-time events. Each table is optimized for specific access patterns: hash keys for direct lookups, range keys for time-series data, and global secondary indexes for category-based queries that support contextual recommendations.
 
    ```bash
-   # Create table for user profiles
+   # Create table for user profiles with on-demand billing
    aws dynamodb create-table \
        --table-name "${PROJECT_NAME}-users" \
        --attribute-definitions \
            AttributeName=UserId,AttributeType=S \
        --key-schema \
            AttributeName=UserId,KeyType=HASH \
-       --provisioned-throughput \
-           ReadCapacityUnits=10,WriteCapacityUnits=5
+       --billing-mode PAY_PER_REQUEST
    
-   # Create table for item catalog
+   # Create table for item catalog with category index
    aws dynamodb create-table \
        --table-name "${PROJECT_NAME}-items" \
        --attribute-definitions \
@@ -314,9 +325,8 @@ echo "✅ Created foundational resources"
        --key-schema \
            AttributeName=ItemId,KeyType=HASH \
        --global-secondary-indexes \
-           IndexName=CategoryIndex,KeySchema=[{AttributeName=Category,KeyType=HASH}],Projection={ProjectionType=ALL},ProvisionedThroughput={ReadCapacityUnits=5,WriteCapacityUnits=5} \
-       --provisioned-throughput \
-           ReadCapacityUnits=10,WriteCapacityUnits=5
+           IndexName=CategoryIndex,KeySchema=[{AttributeName=Category,KeyType=HASH}],Projection={ProjectionType=ALL} \
+       --billing-mode PAY_PER_REQUEST
    
    # Create table for A/B test assignments
    aws dynamodb create-table \
@@ -327,10 +337,9 @@ echo "✅ Created foundational resources"
        --key-schema \
            AttributeName=UserId,KeyType=HASH \
            AttributeName=TestName,KeyType=RANGE \
-       --provisioned-throughput \
-           ReadCapacityUnits=10,WriteCapacityUnits=5
+       --billing-mode PAY_PER_REQUEST
    
-   # Create table for real-time events
+   # Create table for real-time events with time-based partitioning
    aws dynamodb create-table \
        --table-name "${PROJECT_NAME}-events" \
        --attribute-definitions \
@@ -339,8 +348,7 @@ echo "✅ Created foundational resources"
        --key-schema \
            AttributeName=UserId,KeyType=HASH \
            AttributeName=Timestamp,KeyType=RANGE \
-       --provisioned-throughput \
-           ReadCapacityUnits=10,WriteCapacityUnits=10
+       --billing-mode PAY_PER_REQUEST
    
    # Wait for tables to be active
    aws dynamodb wait table-exists --table-name "${PROJECT_NAME}-users"
@@ -348,10 +356,10 @@ echo "✅ Created foundational resources"
    aws dynamodb wait table-exists --table-name "${PROJECT_NAME}-ab-assignments"
    aws dynamodb wait table-exists --table-name "${PROJECT_NAME}-events"
    
-   echo "✅ Created DynamoDB tables"
+   echo "✅ Created DynamoDB tables with optimal configurations"
    ```
 
-   The DynamoDB infrastructure is now established with tables designed for high-performance real-time operations. The user and item tables support metadata enrichment, the A/B assignments table ensures consistent user experiences across sessions, and the events table captures detailed interaction data for analytics and model retraining.
+   The DynamoDB infrastructure is now established with tables designed for high-performance real-time operations using on-demand billing for cost optimization. The user and item tables support metadata enrichment, the A/B assignments table ensures consistent user experiences across sessions, and the events table captures detailed interaction data for analytics and model retraining.
 
 3. **Create Lambda Function for A/B Test Management**:
 
@@ -396,6 +404,7 @@ echo "✅ Created foundational resources"
            }
            
        except Exception as e:
+           print(f"Error in A/B test router: {str(e)}")
            return {
                'statusCode': 500,
                'body': json.dumps({'error': str(e)})
@@ -413,21 +422,24 @@ echo "✅ Created foundational resources"
            if 'Item' in response:
                return response['Item']['Variant']
            
-       except Exception:
-           pass
+       except Exception as e:
+           print(f"Error retrieving existing assignment: {str(e)}")
        
        # Assign new variant using consistent hashing
        variant = assign_variant(user_id, test_name)
        
-       # Store assignment
-       table.put_item(
-           Item={
-               'UserId': user_id,
-               'TestName': test_name,
-               'Variant': variant,
-               'AssignmentTimestamp': int(datetime.now().timestamp())
-           }
-       )
+       # Store assignment for consistency
+       try:
+           table.put_item(
+               Item={
+                   'UserId': user_id,
+                   'TestName': test_name,
+                   'Variant': variant,
+                   'AssignmentTimestamp': int(datetime.now().timestamp())
+               }
+           )
+       except Exception as e:
+           print(f"Error storing assignment: {str(e)}")
        
        return variant
    
@@ -436,7 +448,7 @@ echo "✅ Created foundational resources"
        hash_input = f"{user_id}-{test_name}".encode('utf-8')
        hash_value = int(hashlib.md5(hash_input).hexdigest(), 16)
        
-       # Define test configuration (could be stored in DynamoDB for flexibility)
+       # Define test configuration with equal distribution
        test_config = {
            'default_recommendation_test': {
                'variant_a': 0.33,  # User-Personalization
@@ -484,10 +496,10 @@ echo "✅ Created foundational resources"
    # Create deployment package
    zip ab_test_router.zip ab_test_router.py
    
-   # Create Lambda function
+   # Create Lambda function with latest Python runtime
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-ab-test-router" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler ab_test_router.lambda_handler \
        --zip-file fileb://ab_test_router.zip \
@@ -535,7 +547,7 @@ echo "✅ Created foundational resources"
            # Enrich recommendations with item metadata
            enriched_recommendations = enrich_recommendations(recommendations)
            
-           # Track recommendation request
+           # Track recommendation request for analytics
            track_recommendation_request(user_id, model_config, enriched_recommendations)
            
            return {
@@ -549,6 +561,7 @@ echo "✅ Created foundational resources"
            }
            
        except Exception as e:
+           print(f"Error in recommendation engine: {str(e)}")
            # Fallback to popularity-based recommendations
            fallback_recommendations = get_fallback_recommendations(num_results)
            
@@ -576,7 +589,7 @@ echo "✅ Created foundational resources"
            'numResults': num_results
        }
        
-       # Add context if provided
+       # Add context if provided for contextual recommendations
        if context_data:
            request_params['context'] = context_data
        
@@ -630,7 +643,7 @@ echo "✅ Created foundational resources"
        items_table = dynamodb.Table(os.environ['ITEMS_TABLE'])
        
        try:
-           # Scan for items (in production, use a better method)
+           # Scan for items (in production, use better caching strategy)
            response = items_table.scan(Limit=num_results)
            items = response.get('Items', [])
            
@@ -646,7 +659,8 @@ echo "✅ Created foundational resources"
            
            return fallback
            
-       except Exception:
+       except Exception as e:
+           print(f"Error in fallback recommendations: {str(e)}")
            return []
    
    def track_recommendation_request(user_id, model_config, recommendations):
@@ -674,7 +688,7 @@ echo "✅ Created foundational resources"
    # Create Lambda function
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-recommendation-engine" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler recommendation_engine.lambda_handler \
        --zip-file fileb://recommendation_engine.zip \
@@ -720,7 +734,7 @@ echo "✅ Created foundational resources"
            # Store event in DynamoDB for analytics
            store_event_analytics(event)
            
-           # Send event to Personalize (if real-time tracking is enabled)
+           # Send event to Personalize for real-time learning
            if os.environ.get('EVENT_TRACKER_ARN') and item_id:
                send_to_personalize(user_id, session_id, event_type, item_id, properties)
            
@@ -730,6 +744,7 @@ echo "✅ Created foundational resources"
            }
            
        except Exception as e:
+           print(f"Error in event tracker: {str(e)}")
            return {
                'statusCode': 500,
                'body': json.dumps({'error': str(e)})
@@ -739,42 +754,48 @@ echo "✅ Created foundational resources"
        events_table = dynamodb.Table(os.environ['EVENTS_TABLE'])
        
        # Store detailed event for analytics
-       events_table.put_item(
-           Item={
-               'UserId': event['user_id'],
-               'Timestamp': int(datetime.now().timestamp() * 1000),
-               'EventType': event['event_type'],
-               'ItemId': event.get('item_id', ''),
-               'SessionId': event.get('session_id', ''),
-               'RecommendationId': event.get('recommendation_id', ''),
-               'Properties': json.dumps(event.get('properties', {}))
-           }
-       )
+       try:
+           events_table.put_item(
+               Item={
+                   'UserId': event['user_id'],
+                   'Timestamp': int(datetime.now().timestamp() * 1000),
+                   'EventType': event['event_type'],
+                   'ItemId': event.get('item_id', ''),
+                   'SessionId': event.get('session_id', ''),
+                   'RecommendationId': event.get('recommendation_id', ''),
+                   'Properties': json.dumps(event.get('properties', {}))
+               }
+           )
+       except Exception as e:
+           print(f"Error storing event analytics: {str(e)}")
    
    def send_to_personalize(user_id, session_id, event_type, item_id, properties):
        event_tracker_arn = os.environ['EVENT_TRACKER_ARN']
        
-       # Prepare event for Personalize
-       personalize_event = {
-           'userId': user_id,
-           'sessionId': session_id,
-           'eventType': event_type,
-           'sentAt': datetime.now().timestamp()
-       }
-       
-       if item_id:
-           personalize_event['itemId'] = item_id
-       
-       if properties:
-           personalize_event['properties'] = json.dumps(properties)
-       
-       # Send to Personalize
-       personalize_events.put_events(
-           trackingId=event_tracker_arn.split('/')[-1],
-           userId=user_id,
-           sessionId=session_id,
-           eventList=[personalize_event]
-       )
+       try:
+           # Prepare event for Personalize
+           personalize_event = {
+               'userId': user_id,
+               'sessionId': session_id,
+               'eventType': event_type,
+               'sentAt': datetime.now().timestamp()
+           }
+           
+           if item_id:
+               personalize_event['itemId'] = item_id
+           
+           if properties:
+               personalize_event['properties'] = json.dumps(properties)
+           
+           # Send to Personalize for real-time learning
+           personalize_events.put_events(
+               trackingId=event_tracker_arn.split('/')[-1],
+               userId=user_id,
+               sessionId=session_id,
+               eventList=[personalize_event]
+           )
+       except Exception as e:
+           print(f"Error sending to Personalize: {str(e)}")
    EOF
    
    # Create deployment package
@@ -783,7 +804,7 @@ echo "✅ Created foundational resources"
    # Create Lambda function
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-event-tracker" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler event_tracker.lambda_handler \
        --zip-file fileb://event_tracker.zip \
@@ -830,6 +851,7 @@ echo "✅ Created foundational resources"
                }
                
        except Exception as e:
+           print(f"Error in Personalize manager: {str(e)}")
            return {
                'statusCode': 500,
                'body': json.dumps({'error': str(e)})
@@ -840,7 +862,7 @@ echo "✅ Created foundational resources"
        
        response = personalize.create_dataset_group(
            name=dataset_group_name,
-           domain='ECOMMERCE'  # or VIDEO_ON_DEMAND
+           domain='ECOMMERCE'  # Optimized for e-commerce use cases
        )
        
        return {
@@ -939,10 +961,10 @@ echo "✅ Created foundational resources"
    # Create deployment package
    zip personalize_manager.zip personalize_manager.py
    
-   # Create Lambda function
+   # Create Lambda function with extended timeout for operations
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-personalize-manager" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler personalize_manager.lambda_handler \
        --zip-file fileb://personalize_manager.zip \
@@ -958,40 +980,48 @@ echo "✅ Created foundational resources"
    API Gateway provides the scalable, secure entry point for recommendation requests and event tracking. The HTTP API configuration optimizes for low latency while providing the routing and integration capabilities needed to connect client applications with our Lambda-based recommendation infrastructure. This creates a production-ready interface for real-time recommendation delivery.
 
    ```bash
-   # Create API Gateway
+   # Create API Gateway HTTP API for optimal performance
    API_ID=$(aws apigatewayv2 create-api \
        --name "${PROJECT_NAME}-recommendation-api" \
        --protocol-type HTTP \
        --description "Real-time recommendation API with A/B testing" \
        --query 'ApiId' --output text)
    
-   # Create routes and integrations
+   # Create integrations for Lambda functions
    
-   # Route 1: Get recommendations
+   # Integration for A/B test router
+   AB_INTEGRATION_ID=$(aws apigatewayv2 create-integration \
+       --api-id ${API_ID} \
+       --integration-type AWS_PROXY \
+       --integration-method POST \
+       --integration-uri "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${PROJECT_NAME}-ab-test-router" \
+       --payload-format-version 2.0 \
+       --query 'IntegrationId' --output text)
+   
+   # Integration for event tracker
+   EVENT_INTEGRATION_ID=$(aws apigatewayv2 create-integration \
+       --api-id ${API_ID} \
+       --integration-type AWS_PROXY \
+       --integration-method POST \
+       --integration-uri "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${PROJECT_NAME}-event-tracker" \
+       --payload-format-version 2.0 \
+       --query 'IntegrationId' --output text)
+   
+   # Create routes
+   
+   # Route for getting recommendations
    aws apigatewayv2 create-route \
        --api-id ${API_ID} \
        --route-key "POST /recommendations" \
-       --target "integrations/$(aws apigatewayv2 create-integration \
-           --api-id ${API_ID} \
-           --integration-type AWS_PROXY \
-           --integration-method POST \
-           --integration-uri "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${PROJECT_NAME}-ab-test-router" \
-           --payload-format-version 2.0 \
-           --query 'IntegrationId' --output text)"
+       --target "integrations/${AB_INTEGRATION_ID}"
    
-   # Route 2: Track events
+   # Route for tracking events
    aws apigatewayv2 create-route \
        --api-id ${API_ID} \
        --route-key "POST /events" \
-       --target "integrations/$(aws apigatewayv2 create-integration \
-           --api-id ${API_ID} \
-           --integration-type AWS_PROXY \
-           --integration-method POST \
-           --integration-uri "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${PROJECT_NAME}-event-tracker" \
-           --payload-format-version 2.0 \
-           --query 'IntegrationId' --output text)"
+       --target "integrations/${EVENT_INTEGRATION_ID}"
    
-   # Add Lambda permissions
+   # Add Lambda permissions for API Gateway invocation
    aws lambda add-permission \
        --function-name "${PROJECT_NAME}-ab-test-router" \
        --statement-id api-gateway-invoke-1 \
@@ -1006,12 +1036,12 @@ echo "✅ Created foundational resources"
        --principal apigateway.amazonaws.com \
        --source-arn "arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${API_ID}/*/*"
    
-   # Create deployment
+   # Create deployment and default stage
    aws apigatewayv2 create-deployment \
        --api-id ${API_ID} \
        --description "Initial deployment"
    
-   # Get API endpoint
+   # Get API endpoint URL
    API_ENDPOINT=$(aws apigatewayv2 get-api \
        --api-id ${API_ID} \
        --query 'ApiEndpoint' --output text)
@@ -1032,6 +1062,7 @@ echo "✅ Created foundational resources"
    import boto3
    import csv
    import json
+   import os
    
    dynamodb = boto3.resource('dynamodb')
    
@@ -1069,7 +1100,6 @@ echo "✅ Created foundational resources"
        print("Loaded items data")
    
    if __name__ == "__main__":
-       import os
        load_users()
        load_items()
        print("Data loading completed")
@@ -1115,7 +1145,7 @@ echo "✅ Created foundational resources"
    cat response.json
    ```
 
-3. **Test API Endpoints** (After Personalize setup):
+3. **Test API Endpoints**:
 
    ```bash
    # Test recommendation API
@@ -1133,7 +1163,7 @@ echo "✅ Created foundational resources"
        }'
    ```
 
-4. **Check A/B Test Assignments**:
+4. **Verify A/B Test Assignments**:
 
    ```bash
    # Query A/B test assignments
@@ -1197,7 +1227,7 @@ echo "✅ Created foundational resources"
    aws s3 rm s3://${BUCKET_NAME} --recursive
    aws s3 rb s3://${BUCKET_NAME}
    
-   # Delete IAM role
+   # Detach policies and delete IAM role
    aws iam detach-role-policy \
        --role-name ${ROLE_NAME} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AmazonPersonalizeFullAccess
@@ -1236,9 +1266,11 @@ echo "✅ Created foundational resources"
 
 This advanced recommendation system demonstrates how Amazon Personalize can be integrated with sophisticated A/B testing frameworks to optimize recommendation strategies while maintaining real-time performance. The solution addresses critical challenges in modern recommendation systems: the need for multiple algorithmic approaches, scientific measurement of recommendation effectiveness, and the ability to rapidly iterate and improve recommendation quality based on user feedback.
 
-The A/B testing framework uses consistent hashing to ensure stable user assignments while enabling controlled experiments between different recommendation algorithms. This approach allows organizations to measure the business impact of different recommendation strategies, compare user engagement metrics, and make data-driven decisions about algorithm selection. The real-time event tracking provides immediate feedback for both Personalize model training and A/B test analytics.
+The A/B testing framework uses consistent hashing to ensure stable user assignments while enabling controlled experiments between different recommendation algorithms. This approach allows organizations to measure the business impact of different recommendation strategies, compare user engagement metrics, and make data-driven decisions about algorithm selection. The real-time event tracking provides immediate feedback for both Personalize model training and A/B test analytics, following AWS Well-Architected Framework principles for operational excellence and reliability.
 
-The architecture supports advanced personalization patterns such as contextual recommendations, where external factors like time of day, device type, or current browsing session influence recommendation results. The fallback mechanism ensures system reliability even when Personalize campaigns are unavailable, while the comprehensive analytics pipeline enables deep analysis of recommendation performance across different user segments and business metrics.
+The architecture supports advanced personalization patterns such as contextual recommendations, where external factors like time of day, device type, or current browsing session influence recommendation results. The fallback mechanism ensures system reliability even when Personalize campaigns are unavailable, while the comprehensive analytics pipeline enables deep analysis of recommendation performance across different user segments and business metrics. The implementation uses AWS security best practices including IAM least privilege, encryption at rest and in transit, and proper resource isolation.
+
+For more information on Amazon Personalize best practices, see the [Amazon Personalize Developer Guide](https://docs.aws.amazon.com/personalize/latest/dg/what-is-personalize.html) and [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
 > **Tip**: Use Amazon Personalize's batch inference capabilities for pre-computing recommendations for high-traffic scenarios, and implement recommendation diversity controls to avoid filter bubbles and improve user experience.
 

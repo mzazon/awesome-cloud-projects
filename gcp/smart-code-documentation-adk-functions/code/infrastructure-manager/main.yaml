@@ -1,0 +1,500 @@
+# Infrastructure Manager Configuration for Smart Code Documentation with ADK and Functions
+# This configuration deploys a complete multi-agent documentation system using
+# Google Cloud's Agent Development Kit, Cloud Functions, and Cloud Storage
+
+# Configuration metadata
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: smart-code-documentation-adk-functions
+  title: Smart Code Documentation with Agent Development Kit and Functions
+  description: >
+    Deploy an intelligent multi-agent documentation system using Google Cloud's Agent Development Kit
+    that automatically analyzes code repositories and generates comprehensive documentation
+  version: "1.0"
+  author: "Cloud Recipe Generator"
+  license: "Apache-2.0"
+
+spec:
+  info:
+    source:
+      repo: https://github.com/GoogleCloudPlatform/cloud-foundation-fabric
+      sourceType: git
+    version: "1.0"
+    actuationTool:
+      flavor: Terraform
+      version: ">= 1.3"
+    description:
+      tagline: Intelligent code documentation with multi-agent AI system
+      detailed: >
+        This Infrastructure Manager configuration deploys a serverless multi-agent system
+        that automatically generates comprehensive code documentation using ADK agents.
+        The system includes specialized agents for code analysis, documentation generation,
+        and quality review, all orchestrated through Cloud Functions and triggered by
+        Cloud Storage events.
+
+  # Input variables for customization
+  inputs:
+    - name: project_id
+      description: The GCP project ID where resources will be created
+      varType: string
+      required: true
+    - name: region
+      description: The GCP region for deploying resources
+      varType: string
+      defaultValue: "us-central1"
+    - name: zone
+      description: The GCP zone for regional resources
+      varType: string
+      defaultValue: "us-central1-a"
+    - name: random_suffix
+      description: Random suffix for unique resource names
+      varType: string
+      defaultValue: "adk001"
+    - name: function_memory
+      description: Memory allocation for Cloud Functions
+      varType: string
+      defaultValue: "1024MB"
+    - name: function_timeout
+      description: Timeout for Cloud Functions execution
+      varType: string
+      defaultValue: "540s"
+
+  # Required APIs for the solution
+  requirements:
+    services:
+      - aiplatform.googleapis.com
+      - cloudfunctions.googleapis.com
+      - storage.googleapis.com
+      - cloudbuild.googleapis.com
+      - artifactregistry.googleapis.com
+
+# Terraform configuration
+deploymentSpec:
+  # Provider configuration
+  terraform:
+    required_version: ">= 1.3"
+    required_providers:
+      google:
+        source: "hashicorp/google"
+        version: "~> 5.0"
+      google-beta:
+        source: "hashicorp/google-beta"
+        version: "~> 5.0"
+      archive:
+        source: "hashicorp/archive"
+        version: "~> 2.4"
+      random:
+        source: "hashicorp/random"
+        version: "~> 3.4"
+
+  # Variable definitions
+  variables:
+    project_id:
+      type: string
+      description: "The GCP project ID where resources will be created"
+    region:
+      type: string
+      description: "The GCP region for deploying resources"
+      default: "us-central1"
+    zone:
+      type: string
+      description: "The GCP zone for regional resources"
+      default: "us-central1-a"
+    random_suffix:
+      type: string
+      description: "Random suffix for unique resource names"
+      default: "adk001"
+    function_memory:
+      type: string
+      description: "Memory allocation for Cloud Functions"
+      default: "1024MB"
+    function_timeout:
+      type: string
+      description: "Timeout for Cloud Functions execution"
+      default: "540s"
+
+  # Main infrastructure resources
+  resources:
+    # Enable required APIs
+    - name: enable_apis
+      type: google_project_service
+      properties:
+        for_each:
+          - "aiplatform.googleapis.com"
+          - "cloudfunctions.googleapis.com"
+          - "storage.googleapis.com"
+          - "cloudbuild.googleapis.com"
+          - "artifactregistry.googleapis.com"
+        project: "${var.project_id}"
+        service: "${each.value}"
+        disable_dependent_services: false
+        disable_on_destroy: false
+
+    # Generate random suffix for unique resource names
+    - name: random_suffix
+      type: random_id
+      properties:
+        byte_length: 3
+        keepers:
+          project_id: "${var.project_id}"
+
+    # Cloud Storage bucket for code input (triggers documentation generation)
+    - name: input_bucket
+      type: google_storage_bucket
+      properties:
+        name: "${var.project_id}-code-input-${random_id.random_suffix.hex}"
+        project: "${var.project_id}"
+        location: "${var.region}"
+        storage_class: "STANDARD"
+        uniform_bucket_level_access: true
+        force_destroy: true
+        
+        # Lifecycle management for cost optimization
+        lifecycle_rule:
+          - condition:
+              age: 30
+            action:
+              type: "Delete"
+        
+        # Versioning for code repository history
+        versioning:
+          enabled: true
+        
+        # Encryption at rest
+        encryption:
+          default_kms_key_name: null
+
+        labels:
+          purpose: "adk-code-input"
+          component: "documentation-system"
+          environment: "development"
+
+      depends_on:
+        - google_project_service.enable_apis
+
+    # Cloud Storage bucket for documentation output
+    - name: output_bucket
+      type: google_storage_bucket
+      properties:
+        name: "${var.project_id}-docs-output-${random_id.random_suffix.hex}"
+        project: "${var.project_id}"
+        location: "${var.region}"
+        storage_class: "STANDARD"
+        uniform_bucket_level_access: true
+        force_destroy: true
+        
+        # CORS configuration for web access to documentation
+        cors:
+          - origin: ["*"]
+            method: ["GET", "HEAD"]
+            response_header: ["*"]
+            max_age_seconds: 3600
+        
+        # Lifecycle management
+        lifecycle_rule:
+          - condition:
+              age: 90
+            action:
+              type: "SetStorageClass"
+              storage_class: "NEARLINE"
+          - condition:
+              age: 365
+            action:
+              type: "SetStorageClass"
+              storage_class: "COLDLINE"
+        
+        # Versioning for documentation history
+        versioning:
+          enabled: true
+
+        labels:
+          purpose: "adk-docs-output"
+          component: "documentation-system"
+          environment: "development"
+
+      depends_on:
+        - google_project_service.enable_apis
+
+    # Cloud Storage bucket for temporary processing storage
+    - name: temp_bucket
+      type: google_storage_bucket
+      properties:
+        name: "${var.project_id}-processing-${random_id.random_suffix.hex}"
+        project: "${var.project_id}"
+        location: "${var.region}"
+        storage_class: "STANDARD"
+        uniform_bucket_level_access: true
+        force_destroy: true
+        
+        # Aggressive lifecycle management for temporary data
+        lifecycle_rule:
+          - condition:
+              age: 7
+            action:
+              type: "Delete"
+        
+        labels:
+          purpose: "adk-temp-processing"
+          component: "documentation-system"
+          environment: "development"
+
+      depends_on:
+        - google_project_service.enable_apis
+
+    # Service account for Cloud Functions with minimal required permissions
+    - name: function_service_account
+      type: google_service_account
+      properties:
+        account_id: "adk-docs-function-sa-${random_id.random_suffix.hex}"
+        project: "${var.project_id}"
+        display_name: "ADK Documentation Function Service Account"
+        description: "Service account for ADK-powered documentation generation functions"
+
+      depends_on:
+        - google_project_service.enable_apis
+
+    # IAM binding for Cloud Functions service account - Vertex AI User
+    - name: function_sa_vertexai_binding
+      type: google_project_iam_member
+      properties:
+        project: "${var.project_id}"
+        role: "roles/aiplatform.user"
+        member: "serviceAccount:${google_service_account.function_service_account.email}"
+
+    # IAM binding for Cloud Functions service account - Storage Object Admin
+    - name: function_sa_storage_binding
+      type: google_project_iam_member
+      properties:
+        project: "${var.project_id}"
+        role: "roles/storage.objectAdmin"
+        member: "serviceAccount:${google_service_account.function_service_account.email}"
+
+    # IAM binding for Cloud Functions service account - Cloud Functions Invoker
+    - name: function_sa_invoker_binding
+      type: google_project_iam_member
+      properties:
+        project: "${var.project_id}"
+        role: "roles/cloudfunctions.invoker"
+        member: "serviceAccount:${google_service_account.function_service_account.email}"
+
+    # IAM binding for Cloud Functions service account - Logging Writer
+    - name: function_sa_logging_binding
+      type: google_project_iam_member
+      properties:
+        project: "${var.project_id}"
+        role: "roles/logging.logWriter"
+        member: "serviceAccount:${google_service_account.function_service_account.email}"
+
+    # Archive source code for Cloud Function deployment
+    - name: function_source_archive
+      type: archive_file
+      properties:
+        type: "zip"
+        output_path: "/tmp/adk-function-source.zip"
+        source_dir: "${path.module}/../function-source"
+        excludes:
+          - "*.pyc"
+          - "__pycache__"
+          - ".git"
+          - ".gitignore"
+          - "README.md"
+
+    # Cloud Storage object for function source code
+    - name: function_source_object
+      type: google_storage_bucket_object
+      properties:
+        name: "adk-function-source-${random_id.random_suffix.hex}.zip"
+        bucket: "${google_storage_bucket.temp_bucket.name}"
+        source: "${data.archive_file.function_source_archive.output_path}"
+        content_type: "application/zip"
+
+      depends_on:
+        - google_storage_bucket.temp_bucket
+        - archive_file.function_source_archive
+
+    # Cloud Function for ADK-powered code documentation generation
+    - name: adk_documentation_function
+      type: google_cloudfunctions2_function
+      properties:
+        name: "adk-code-documentation-${random_id.random_suffix.hex}"
+        project: "${var.project_id}"
+        location: "${var.region}"
+        description: "ADK-powered multi-agent system for intelligent code documentation generation"
+
+        # Build configuration
+        build_config:
+          runtime: "python311"
+          entry_point: "process_code_repository"
+          environment_variables:
+            GOOGLE_FUNCTION_TARGET: "process_code_repository"
+          source:
+            storage_source:
+              bucket: "${google_storage_bucket.temp_bucket.name}"
+              object: "${google_storage_bucket_object.function_source_object.name}"
+
+        # Service configuration
+        service_config:
+          max_instance_count: 10
+          min_instance_count: 0
+          available_memory: "${var.function_memory}"
+          timeout_seconds: "${replace(var.function_timeout, "s", "")}"
+          max_instance_request_concurrency: 1
+          available_cpu: "1"
+          
+          # Environment variables for ADK configuration
+          environment_variables:
+            GCP_PROJECT: "${var.project_id}"
+            OUTPUT_BUCKET: "${google_storage_bucket.output_bucket.name}"
+            TEMP_BUCKET: "${google_storage_bucket.temp_bucket.name}"
+            VERTEX_AI_REGION: "${var.region}"
+            ADK_MODEL_NAME: "gemini-1.5-pro"
+            LOG_LEVEL: "INFO"
+
+          # Service account with minimal permissions
+          service_account_email: "${google_service_account.function_service_account.email}"
+
+          # Security and networking
+          ingress_settings: "ALLOW_INTERNAL_ONLY"
+          all_traffic_on_latest_revision: true
+
+        # Event trigger configuration for Cloud Storage
+        event_trigger:
+          trigger_region: "${var.region}"
+          event_type: "google.cloud.storage.object.v1.finalized"
+          event_filters:
+            - attribute: "bucket"
+              value: "${google_storage_bucket.input_bucket.name}"
+          retry_policy: "RETRY_POLICY_RETRY"
+
+        labels:
+          purpose: "adk-documentation"
+          component: "multi-agent-system"
+          environment: "development"
+
+      depends_on:
+        - google_service_account.function_service_account
+        - google_storage_bucket.input_bucket
+        - google_storage_bucket.output_bucket
+        - google_storage_bucket.temp_bucket
+        - google_storage_bucket_object.function_source_object
+        - google_project_iam_member.function_sa_vertexai_binding
+        - google_project_iam_member.function_sa_storage_binding
+        - google_project_iam_member.function_sa_invoker_binding
+        - google_project_iam_member.function_sa_logging_binding
+
+    # Cloud Monitoring alert policy for function errors
+    - name: function_error_alert
+      type: google_monitoring_alert_policy
+      properties:
+        project: "${var.project_id}"
+        display_name: "ADK Documentation Function Errors"
+        documentation:
+          content: "Alert when ADK documentation function experiences errors"
+          mime_type: "text/markdown"
+        
+        conditions:
+          - display_name: "Function execution errors"
+            condition_threshold:
+              filter: >
+                resource.type="cloud_function" AND
+                resource.labels.function_name="${google_cloudfunctions2_function.adk_documentation_function.name}" AND
+                metric.type="logging.googleapis.com/user/error_count"
+              comparison: "COMPARISON_GT"
+              threshold_value: 5
+              duration: "300s"
+              aggregations:
+                - alignment_period: "300s"
+                  per_series_aligner: "ALIGN_RATE"
+                  cross_series_reducer: "REDUCE_SUM"
+
+        alert_strategy:
+          auto_close: "1800s"
+        
+        enabled: true
+        notification_channels: []
+
+      depends_on:
+        - google_cloudfunctions2_function.adk_documentation_function
+
+    # Cloud Storage notification for webhook integration (optional)
+    - name: storage_notification
+      type: google_storage_notification
+      properties:
+        bucket: "${google_storage_bucket.output_bucket.name}"
+        payload_format: "JSON_API_V1"
+        event_types: ["OBJECT_FINALIZE"]
+        custom_attributes:
+          source: "adk-documentation-system"
+          version: "1.0"
+
+      depends_on:
+        - google_storage_bucket.output_bucket
+
+  # Output values for verification and integration
+  outputs:
+    - name: input_bucket_name
+      description: "Name of the Cloud Storage bucket for code input"
+      value: "${google_storage_bucket.input_bucket.name}"
+
+    - name: output_bucket_name
+      description: "Name of the Cloud Storage bucket for documentation output"
+      value: "${google_storage_bucket.output_bucket.name}"
+
+    - name: output_bucket_url
+      description: "URL of the documentation output bucket"
+      value: "gs://${google_storage_bucket.output_bucket.name}"
+
+    - name: temp_bucket_name
+      description: "Name of the Cloud Storage bucket for temporary processing"
+      value: "${google_storage_bucket.temp_bucket.name}"
+
+    - name: function_name
+      description: "Name of the deployed Cloud Function"
+      value: "${google_cloudfunctions2_function.adk_documentation_function.name}"
+
+    - name: function_url
+      description: "HTTP trigger URL of the Cloud Function"
+      value: "${google_cloudfunctions2_function.adk_documentation_function.service_config[0].uri}"
+
+    - name: service_account_email
+      description: "Email of the service account used by the Cloud Function"
+      value: "${google_service_account.function_service_account.email}"
+
+    - name: project_id
+      description: "The GCP project ID where resources were created"
+      value: "${var.project_id}"
+
+    - name: region
+      description: "The GCP region where resources were deployed"
+      value: "${var.region}"
+
+    # Usage instructions output
+    - name: usage_instructions
+      description: "Instructions for using the deployed documentation system"
+      value: |
+        ADK Documentation System Deployed Successfully!
+        
+        To generate documentation for a code repository:
+        1. Zip your code repository: zip -r my-repo.zip ./my-repo/
+        2. Upload to input bucket: gsutil cp my-repo.zip gs://${google_storage_bucket.input_bucket.name}/
+        3. Monitor function logs: gcloud functions logs read ${google_cloudfunctions2_function.adk_documentation_function.name} --gen2 --region ${var.region}
+        4. Download results: gsutil cp -r gs://${google_storage_bucket.output_bucket.name}/my-repo.zip/ ./documentation/
+        
+        The system will automatically:
+        - Analyze your code structure and functionality
+        - Generate comprehensive documentation using ADK agents
+        - Perform quality review and improvements
+        - Store results in markdown and JSON formats
+        
+        For more details, see the recipe documentation.
+
+# Local values for computed expressions
+locals:
+  # Common labels applied to all resources
+  common_labels:
+    purpose: "adk-documentation-system"
+    component: "intelligent-code-analysis"
+    environment: "development"
+    managed-by: "infrastructure-manager"
+    recipe: "smart-code-documentation-adk-functions"

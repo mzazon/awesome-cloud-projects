@@ -1,0 +1,459 @@
+# Infrastructure Manager Configuration for Automated Query Performance Alerts
+# Recipe: Automated Query Performance Alerts with Cloud SQL and Functions
+# This configuration deploys Cloud SQL with Query Insights, Cloud Functions for alert processing,
+# and Cloud Monitoring alert policies for automated database performance monitoring.
+
+imports:
+  - path: https://www.googleapis.com/blueprints/gcp-blueprint-sql/v1/sql.jinja
+
+resources:
+  # Random suffix for unique resource naming
+  - name: random-suffix
+    type: gcp-types/cloudresourcemanager-v1:Project
+    metadata:
+      runtimePolicy:
+        - CREATE
+    properties:
+      name: temp-suffix-generator
+
+  # Enable required APIs for the solution
+  - name: enable-sql-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/sqladmin.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+
+  - name: enable-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/cloudfunctions.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/monitoring.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/logging.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/cloudbuild.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+
+  # Cloud SQL PostgreSQL instance with Query Insights enabled
+  - name: postgres-instance
+    type: gcp-types/sqladmin-v1beta4:instances
+    properties:
+      name: postgres-db-$(ref.random-suffix.projectId)
+      project: $(ref.project-id.projectId)
+      region: $(ref.region)
+      databaseVersion: POSTGRES_15
+      settings:
+        # Enterprise edition enables Query Insights
+        edition: ENTERPRISE
+        tier: db-custom-2-7680
+        
+        # Query Insights configuration for performance monitoring
+        insightsConfig:
+          queryInsightsEnabled: true
+          queryStringLength: 4500
+          recordApplicationTags: true
+          recordClientAddress: true
+        
+        # Storage configuration
+        dataDiskSizeGb: 20
+        dataDiskType: PD_SSD
+        storageAutoResize: true
+        storageAutoResizeLimit: 100
+        
+        # Backup and maintenance configuration
+        backupConfiguration:
+          enabled: true
+          pointInTimeRecoveryEnabled: true
+          transactionLogRetentionDays: 7
+          backupRetentionSettings:
+            retainedBackups: 30
+        
+        maintenanceWindow:
+          day: 6  # Saturday
+          hour: 2  # 2 AM
+        
+        # IP configuration for secure access
+        ipConfiguration:
+          ipv4Enabled: true
+          authorizedNetworks:
+            - name: allow-all-temp
+              value: 0.0.0.0/0  # Note: Restrict in production
+        
+        # Database flags for optimization
+        databaseFlags:
+          - name: log_statement
+            value: "all"
+          - name: log_min_duration_statement
+            value: "1000"  # Log queries taking > 1 second
+    metadata:
+      dependsOn:
+        - enable-sql-api
+
+  # Database for performance testing
+  - name: performance-test-database
+    type: gcp-types/sqladmin-v1beta4:databases
+    properties:
+      project: $(ref.project-id.projectId)
+      instance: $(ref.postgres-instance.name)
+      name: performance_test
+      charset: UTF8
+    metadata:
+      dependsOn:
+        - postgres-instance
+
+  # Database users for monitoring and application access
+  - name: postgres-root-user
+    type: gcp-types/sqladmin-v1beta4:users
+    properties:
+      project: $(ref.project-id.projectId)
+      instance: $(ref.postgres-instance.name)
+      name: postgres
+      password: SecurePassword123!
+    metadata:
+      dependsOn:
+        - postgres-instance
+
+  - name: monitor-user
+    type: gcp-types/sqladmin-v1beta4:users
+    properties:
+      project: $(ref.project-id.projectId)
+      instance: $(ref.postgres-instance.name)
+      name: monitor_user
+      password: MonitorPass456!
+    metadata:
+      dependsOn:
+        - postgres-instance
+
+  # Cloud Storage bucket for function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: query-alert-function-source-$(ref.random-suffix.projectId)
+      project: $(ref.project-id.projectId)
+      location: $(ref.region)
+      storageClass: REGIONAL
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30  # Delete old versions after 30 days
+
+  # Cloud Function for processing query performance alerts
+  - name: query-alert-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project-id.projectId)/locations/$(ref.region)
+      function: query-alert-handler-$(ref.random-suffix.projectId)
+      
+      # Function source code configuration
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/function-source.zip
+      
+      # Runtime configuration
+      runtime: python311
+      entryPoint: process_query_alert
+      timeout: 60s
+      availableMemoryMb: 256
+      
+      # HTTP trigger configuration
+      httpsTrigger:
+        securityLevel: SECURE_OPTIONAL
+      
+      # Environment variables for function
+      environmentVariables:
+        PROJECT_ID: $(ref.project-id.projectId)
+        SQL_INSTANCE: $(ref.postgres-instance.name)
+        LOG_LEVEL: INFO
+      
+      # Service account for function execution
+      serviceAccountEmail: $(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-source-bucket
+        - enable-functions-api
+        - function-service-account
+
+  # Service account for Cloud Function with necessary permissions
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      projectId: $(ref.project-id.projectId)
+      accountId: query-alert-function-sa
+      serviceAccount:
+        displayName: Query Alert Function Service Account
+        description: Service account for Cloud Function processing query alerts
+
+  # IAM bindings for function service account
+  - name: function-monitoring-role
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      member: serviceAccount:$(ref.function-service-account.email)
+      role: roles/monitoring.metricWriter
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  - name: function-logging-role
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      member: serviceAccount:$(ref.function-service-account.email)
+      role: roles/logging.logWriter
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  - name: function-sql-client-role
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      member: serviceAccount:$(ref.function-service-account.email)
+      role: roles/cloudsql.client
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # Cloud Monitoring notification channel for webhook alerts
+  - name: webhook-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: projects/$(ref.project-id.projectId)
+      notificationChannel:
+        type: webhook_tokenauth
+        displayName: Query Alert Webhook
+        description: Webhook notification channel for database query performance alerts
+        labels:
+          url: $(ref.query-alert-function.httpsTrigger.url)
+        enabled: true
+    metadata:
+      dependsOn:
+        - query-alert-function
+        - enable-monitoring-api
+
+  # Cloud Monitoring alert policy for slow database queries
+  - name: slow-query-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project-id.projectId)
+      alertPolicy:
+        displayName: slow-query-alerts-$(ref.random-suffix.projectId)
+        documentation:
+          content: |
+            # Database Query Performance Alert
+            
+            This alert is triggered when database queries exceed performance thresholds.
+            
+            ## Troubleshooting Steps
+            1. Review Query Insights dashboard for detailed query analysis
+            2. Check for missing indexes on frequently queried columns
+            3. Analyze query execution plans for optimization opportunities
+            4. Monitor for lock contention and blocking queries
+            
+            ## Resources
+            - [Query Insights Documentation](https://cloud.google.com/sql/docs/postgres/using-query-insights)
+            - [Query Optimization Guide](https://cloud.google.com/sql/docs/postgres/optimize-performance)
+          mimeType: text/markdown
+        
+        # Alert conditions for query execution time
+        conditions:
+          - displayName: Query execution time > 5 seconds
+            conditionThreshold:
+              filter: >
+                resource.type="cloudsql_database" AND
+                resource.label.database_id="$(ref.project-id.projectId):$(ref.postgres-instance.name)" AND
+                metric.type="cloudsql.googleapis.com/database/query_insights/execution_time"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5.0
+              duration: 60s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_MEAN
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.label.database_id
+        
+        # Notification configuration
+        notificationChannels:
+          - $(ref.webhook-notification-channel.name)
+        
+        # Alert strategy configuration
+        alertStrategy:
+          autoClose: 1800s  # Auto-close after 30 minutes
+        
+        enabled: true
+        
+        # Combine conditions with OR logic
+        combiner: OR
+    metadata:
+      dependsOn:
+        - webhook-notification-channel
+        - postgres-instance
+
+  # Log-based metric for additional monitoring
+  - name: slow-query-log-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/$(ref.project-id.projectId)
+      logMetric:
+        name: slow_query_count
+        description: Count of slow database queries from logs
+        filter: >
+          resource.type="cloudsql_database" AND
+          resource.labels.database_id="$(ref.project-id.projectId):$(ref.postgres-instance.name)" AND
+          (textPayload:"duration:" AND textPayload:"ms" AND
+           (textPayload:"duration: 5" OR textPayload:"duration: 6" OR 
+            textPayload:"duration: 7" OR textPayload:"duration: 8" OR 
+            textPayload:"duration: 9" OR textPayload:"duration: 1"))
+        metricDescriptor:
+          metricKind: GAUGE
+          valueType: INT64
+          displayName: Slow Query Count
+        labelExtractors:
+          database: EXTRACT(resource.labels.database_id)
+    metadata:
+      dependsOn:
+        - enable-logging-api
+        - postgres-instance
+
+# Template properties for customization
+properties:
+  project-id:
+    type: string
+    description: Google Cloud Project ID
+    default: YOUR_PROJECT_ID
+  
+  region:
+    type: string
+    description: Google Cloud region for resource deployment
+    default: us-central1
+  
+  zone:
+    type: string
+    description: Google Cloud zone for resource deployment
+    default: us-central1-a
+  
+  sql-instance-tier:
+    type: string
+    description: Cloud SQL instance machine type
+    default: db-custom-2-7680
+  
+  sql-storage-size:
+    type: integer
+    description: Cloud SQL storage size in GB
+    default: 20
+  
+  alert-threshold-seconds:
+    type: number
+    description: Query execution time threshold in seconds for alerts
+    default: 5.0
+  
+  function-memory:
+    type: integer
+    description: Cloud Function memory allocation in MB
+    default: 256
+  
+  function-timeout:
+    type: string
+    description: Cloud Function timeout duration
+    default: 60s
+
+# Outputs for verification and integration
+outputs:
+  - name: sql-instance-name
+    description: Name of the created Cloud SQL instance
+    value: $(ref.postgres-instance.name)
+  
+  - name: sql-connection-name
+    description: Cloud SQL instance connection name
+    value: $(ref.postgres-instance.connectionName)
+  
+  - name: function-url
+    description: Cloud Function HTTP trigger URL
+    value: $(ref.query-alert-function.httpsTrigger.url)
+  
+  - name: function-name
+    description: Name of the deployed Cloud Function
+    value: $(ref.query-alert-function.name)
+  
+  - name: alert-policy-name
+    description: Name of the monitoring alert policy
+    value: $(ref.slow-query-alert-policy.name)
+  
+  - name: notification-channel-name
+    description: Name of the webhook notification channel
+    value: $(ref.webhook-notification-channel.name)
+  
+  - name: query-insights-dashboard
+    description: URL to access Query Insights dashboard
+    value: https://console.cloud.google.com/sql/instances/$(ref.postgres-instance.name)/insights?project=$(ref.project-id.projectId)
+  
+  - name: monitoring-dashboard
+    description: URL to access Cloud Monitoring dashboard
+    value: https://console.cloud.google.com/monitoring/alerting/policies?project=$(ref.project-id.projectId)
+  
+  - name: database-name
+    description: Name of the performance test database
+    value: $(ref.performance-test-database.name)
+  
+  - name: storage-bucket
+    description: Cloud Storage bucket for function source code
+    value: $(ref.function-source-bucket.name)
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  author: "Recipe Generator v1.3"
+  description: "Infrastructure for automated database query performance monitoring with Cloud SQL Query Insights, Cloud Functions, and Cloud Monitoring"
+  recipe-id: "a1b2c3d4"
+  recipe-name: "automated-query-alerts-sql-functions"
+  last-updated: "2025-07-12"
+  
+  # Deployment notes
+  deployment-notes: |
+    This Infrastructure Manager configuration deploys a complete automated query performance 
+    monitoring solution including:
+    
+    1. Cloud SQL PostgreSQL instance with Query Insights enabled
+    2. Cloud Function for intelligent alert processing
+    3. Cloud Monitoring alert policies with webhook integration
+    4. Required IAM roles and service accounts
+    5. Sample database for testing query performance
+    
+    Prerequisites:
+    - Google Cloud project with billing enabled
+    - Infrastructure Manager API enabled
+    - Appropriate IAM permissions for resource creation
+    
+    Post-deployment steps:
+    1. Upload Cloud Function source code to the created storage bucket
+    2. Create sample database schema and test data
+    3. Execute test queries to validate alert functionality
+    4. Configure additional notification channels as needed
+    
+    Security considerations:
+    - Update authorized networks for Cloud SQL in production
+    - Review and restrict service account permissions
+    - Enable VPC-native networking for enhanced security
+    - Configure SSL/TLS for database connections
+    
+    Cost optimization:
+    - Consider using Cloud SQL Standard edition for non-production workloads
+    - Implement automatic scaling policies for Cloud Functions
+    - Set up budget alerts for cost monitoring
+    - Use committed use discounts for long-term deployments

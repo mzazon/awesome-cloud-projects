@@ -1,0 +1,739 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simple Color Palette Generator with Lambda and S3 - Serverless application for generating harmonious color palettes'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'color-palette-generator'
+    Description: 'Name prefix for all resources'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must start with a letter, contain only lowercase letters, numbers, and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and naming'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: 'Lambda function memory size in MB'
+
+  EnableS3Versioning:
+    Type: String
+    Default: 'Enabled'
+    AllowedValues: ['Enabled', 'Suspended']
+    Description: 'Enable versioning on S3 bucket for palette history'
+
+  S3StorageClass:
+    Type: String
+    Default: 'STANDARD'
+    AllowedValues: ['STANDARD', 'STANDARD_IA', 'ONEZONE_IA']
+    Description: 'S3 storage class for palette files'
+
+  EnableCORS:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CORS headers in Lambda function responses'
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableVersioning: !Equals [!Ref EnableS3Versioning, 'Enabled']
+  EnableCORSHeaders: !Equals [!Ref EnableCORS, 'true']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # -------------------------------------------------------------------------
+  # S3 BUCKET FOR PALETTE STORAGE
+  # -------------------------------------------------------------------------
+  PaletteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-palettes-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !Ref EnableS3Versioning
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: TransitionToIA
+            Status: !If [IsProduction, 'Enabled', 'Disabled']
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-palettes-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Color palette storage'
+
+  # -------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUPS
+  # -------------------------------------------------------------------------
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-generator-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  S3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-palettes-${Environment}'
+      RetentionInDays: !If [IsProduction, 14, 3]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-s3-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -------------------------------------------------------------------------
+  # IAM ROLE FOR LAMBDA EXECUTION
+  # -------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref AWS::Region
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3PaletteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:GetObjectVersion'
+                Resource: !Sub '${PaletteBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetBucketVersioning'
+                Resource: !Ref PaletteBucket
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 
+                  - !GetAtt LambdaLogGroup.Arn
+                  - !Sub '${LambdaLogGroup.Arn}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -------------------------------------------------------------------------
+  # LAMBDA FUNCTION
+  # -------------------------------------------------------------------------
+  ColorPaletteFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-generator-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref PaletteBucket
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          ENABLE_CORS: !Ref EnableCORS
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import colorsys
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          import uuid
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+          
+          # Initialize S3 client
+          s3_client = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              """Main Lambda handler for color palette generation"""
+              logger.info(f"Received event: {json.dumps(event, default=str)}")
+              
+              # Handle preflight CORS requests
+              if event.get('httpMethod') == 'OPTIONS':
+                  return create_cors_response(200, {})
+              
+              try:
+                  # Get configuration from environment
+                  bucket_name = os.environ.get('BUCKET_NAME')
+                  enable_cors = os.environ.get('ENABLE_CORS', 'true').lower() == 'true'
+                  
+                  if not bucket_name:
+                      logger.error("BUCKET_NAME environment variable not set")
+                      return create_response(500, {'error': 'Bucket name not configured'}, enable_cors)
+                  
+                  # Parse query parameters
+                  query_params = event.get('queryStringParameters') or {}
+                  palette_type = query_params.get('type', 'complementary')
+                  palette_size = min(int(query_params.get('size', '5')), 10)  # Limit to 10 colors max
+                  
+                  logger.info(f"Generating {palette_type} palette with {palette_size} colors")
+                  
+                  # Generate color palette
+                  palette = generate_color_palette(palette_type, palette_size)
+                  
+                  # Create palette metadata
+                  palette_id = str(uuid.uuid4())[:8]
+                  s3_key = f"palettes/{datetime.utcnow().strftime('%Y/%m/%d')}/{palette_id}.json"
+                  
+                  palette_data = {
+                      'id': palette_id,
+                      'type': palette_type,
+                      'size': palette_size,
+                      'colors': palette,
+                      'hex_colors': [rgb_to_hex(color) for color in palette],
+                      'css_colors': [f"rgb({color[0]}, {color[1]}, {color[2]})" for color in palette],
+                      'created_at': datetime.utcnow().isoformat(),
+                      'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                      'version': '1.0'
+                  }
+                  
+                  # Store palette in S3
+                  try:
+                      s3_client.put_object(
+                          Bucket=bucket_name,
+                          Key=s3_key,
+                          Body=json.dumps(palette_data, indent=2),
+                          ContentType='application/json',
+                          ServerSideEncryption='AES256',
+                          Metadata={
+                              'palette-type': palette_type,
+                              'palette-size': str(palette_size),
+                              'created-by': 'color-palette-generator'
+                          }
+                      )
+                      logger.info(f"Palette stored successfully: s3://{bucket_name}/{s3_key}")
+                  except Exception as s3_error:
+                      logger.error(f"Failed to store palette in S3: {str(s3_error)}")
+                      return create_response(500, {'error': 'Failed to store palette'}, enable_cors)
+                  
+                  # Add S3 location to response
+                  palette_data['s3_location'] = f"s3://{bucket_name}/{s3_key}"
+                  
+                  logger.info(f"Successfully generated palette {palette_id}")
+                  return create_response(200, palette_data, enable_cors)
+                  
+              except ValueError as ve:
+                  logger.error(f"Validation error: {str(ve)}")
+                  return create_response(400, {'error': f'Invalid request: {str(ve)}'}, enable_cors)
+              except Exception as e:
+                  logger.error(f"Unexpected error: {str(e)}")
+                  return create_response(500, {'error': 'Internal server error'}, enable_cors)
+          
+          def create_response(status_code, body, enable_cors=True):
+              """Create standardized API response"""
+              headers = {'Content-Type': 'application/json'}
+              
+              if enable_cors:
+                  headers.update({
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token',
+                      'Access-Control-Max-Age': '86400'
+                  })
+              
+              return {
+                  'statusCode': status_code,
+                  'headers': headers,
+                  'body': json.dumps(body, default=str)
+              }
+          
+          def create_cors_response(status_code, body):
+              """Create CORS preflight response"""
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token',
+                      'Access-Control-Max-Age': '86400'
+                  },
+                  'body': json.dumps(body)
+              }
+          
+          def generate_color_palette(palette_type, size=5):
+              """Generate color palette based on color theory principles"""
+              if size < 1 or size > 10:
+                  raise ValueError("Palette size must be between 1 and 10")
+              
+              # Generate base color with good saturation and lightness
+              base_hue = random.uniform(0, 1)
+              base_saturation = random.uniform(0.6, 0.9)
+              base_lightness = random.uniform(0.4, 0.8)
+              
+              colors = []
+              
+              try:
+                  if palette_type == 'complementary':
+                      colors = generate_complementary_palette(base_hue, base_saturation, base_lightness, size)
+                  elif palette_type == 'analogous':
+                      colors = generate_analogous_palette(base_hue, base_saturation, base_lightness, size)
+                  elif palette_type == 'triadic':
+                      colors = generate_triadic_palette(base_hue, base_saturation, base_lightness, size)
+                  elif palette_type == 'monochromatic':
+                      colors = generate_monochromatic_palette(base_hue, base_saturation, base_lightness, size)
+                  elif palette_type == 'split-complementary':
+                      colors = generate_split_complementary_palette(base_hue, base_saturation, base_lightness, size)
+                  else:  # Random palette
+                      colors = generate_random_palette(size)
+                  
+                  # Ensure we have the requested number of colors
+                  while len(colors) < size:
+                      colors.append(generate_random_color())
+                  
+                  return colors[:size]  # Trim to exact size
+                  
+              except Exception as e:
+                  logger.error(f"Error generating {palette_type} palette: {str(e)}")
+                  # Fallback to random palette
+                  return generate_random_palette(size)
+          
+          def generate_complementary_palette(base_hue, base_sat, base_light, size):
+              """Generate complementary color palette"""
+              colors = []
+              complement_hue = (base_hue + 0.5) % 1
+              
+              # Add base and complement colors
+              colors.append(hsv_to_rgb(base_hue, base_sat, base_light))
+              if size > 1:
+                  colors.append(hsv_to_rgb(complement_hue, base_sat, base_light))
+              
+              # Add variations
+              for i in range(2, size):
+                  if i % 2 == 0:
+                      # Lighter/darker version of base
+                      variation_light = max(0.1, min(0.9, base_light + random.uniform(-0.3, 0.3)))
+                      variation_sat = max(0.3, min(1.0, base_sat + random.uniform(-0.2, 0.2)))
+                      colors.append(hsv_to_rgb(base_hue, variation_sat, variation_light))
+                  else:
+                      # Lighter/darker version of complement
+                      variation_light = max(0.1, min(0.9, base_light + random.uniform(-0.3, 0.3)))
+                      variation_sat = max(0.3, min(1.0, base_sat + random.uniform(-0.2, 0.2)))
+                      colors.append(hsv_to_rgb(complement_hue, variation_sat, variation_light))
+              
+              return colors
+          
+          def generate_analogous_palette(base_hue, base_sat, base_light, size):
+              """Generate analogous color palette"""
+              colors = []
+              hue_range = 0.12  # 30 degrees on color wheel
+              
+              for i in range(size):
+                  # Spread colors around base hue
+                  hue_offset = (i - size/2) * (hue_range / max(1, size-1))
+                  new_hue = (base_hue + hue_offset) % 1
+                  
+                  # Slight variations in saturation and lightness
+                  new_sat = max(0.3, min(1.0, base_sat + random.uniform(-0.1, 0.1)))
+                  new_light = max(0.2, min(0.9, base_light + random.uniform(-0.2, 0.2)))
+                  
+                  colors.append(hsv_to_rgb(new_hue, new_sat, new_light))
+              
+              return colors
+          
+          def generate_triadic_palette(base_hue, base_sat, base_light, size):
+              """Generate triadic color palette"""
+              colors = []
+              
+              # Three main colors equally spaced
+              for i in range(min(3, size)):
+                  hue = (base_hue + (i * 0.333)) % 1
+                  colors.append(hsv_to_rgb(hue, base_sat, base_light))
+              
+              # Add variations for remaining colors
+              for i in range(3, size):
+                  base_color_idx = i % 3
+                  base_color_hue = (base_hue + (base_color_idx * 0.333)) % 1
+                  
+                  variation_sat = max(0.3, min(1.0, base_sat + random.uniform(-0.3, 0.3)))
+                  variation_light = max(0.2, min(0.9, base_light + random.uniform(-0.3, 0.3)))
+                  
+                  colors.append(hsv_to_rgb(base_color_hue, variation_sat, variation_light))
+              
+              return colors
+          
+          def generate_monochromatic_palette(base_hue, base_sat, base_light, size):
+              """Generate monochromatic color palette"""
+              colors = []
+              
+              for i in range(size):
+                  # Vary saturation and lightness while keeping same hue
+                  sat_variation = base_sat + (i - size/2) * 0.15
+                  light_variation = base_light + (i - size/2) * 0.15
+                  
+                  new_sat = max(0.2, min(1.0, sat_variation))
+                  new_light = max(0.1, min(0.9, light_variation))
+                  
+                  colors.append(hsv_to_rgb(base_hue, new_sat, new_light))
+              
+              return colors
+          
+          def generate_split_complementary_palette(base_hue, base_sat, base_light, size):
+              """Generate split-complementary color palette"""
+              colors = []
+              
+              # Base color
+              colors.append(hsv_to_rgb(base_hue, base_sat, base_light))
+              
+              if size > 1:
+                  # Split-complementary colors (150 degrees apart)
+                  split1_hue = (base_hue + 0.417) % 1  # 150 degrees
+                  colors.append(hsv_to_rgb(split1_hue, base_sat, base_light))
+              
+              if size > 2:
+                  split2_hue = (base_hue - 0.417) % 1  # -150 degrees
+                  colors.append(hsv_to_rgb(split2_hue, base_sat, base_light))
+              
+              # Add variations for remaining colors
+              for i in range(3, size):
+                  base_idx = i % 3
+                  if base_idx == 0:
+                      hue = base_hue
+                  elif base_idx == 1:
+                      hue = (base_hue + 0.417) % 1
+                  else:
+                      hue = (base_hue - 0.417) % 1
+                  
+                  variation_sat = max(0.3, min(1.0, base_sat + random.uniform(-0.2, 0.2)))
+                  variation_light = max(0.2, min(0.9, base_light + random.uniform(-0.2, 0.2)))
+                  
+                  colors.append(hsv_to_rgb(hue, variation_sat, variation_light))
+              
+              return colors
+          
+          def generate_random_palette(size):
+              """Generate random color palette"""
+              colors = []
+              for _ in range(size):
+                  colors.append(generate_random_color())
+              return colors
+          
+          def generate_random_color():
+              """Generate single random color with good saturation"""
+              hue = random.uniform(0, 1)
+              saturation = random.uniform(0.5, 0.9)
+              lightness = random.uniform(0.3, 0.8)
+              return hsv_to_rgb(hue, saturation, lightness)
+          
+          def hsv_to_rgb(h, s, v):
+              """Convert HSV color to RGB with bounds checking"""
+              try:
+                  # Ensure values are in valid range
+                  h = max(0, min(1, h))
+                  s = max(0, min(1, s))
+                  v = max(0, min(1, v))
+                  
+                  r, g, b = colorsys.hsv_to_rgb(h, s, v)
+                  return [int(r * 255), int(g * 255), int(b * 255)]
+              except Exception as e:
+                  logger.error(f"Error converting HSV to RGB: {str(e)}")
+                  # Return a safe default color
+                  return [128, 128, 128]
+          
+          def rgb_to_hex(rgb):
+              """Convert RGB to hex color code"""
+              try:
+                  return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+              except (IndexError, TypeError, ValueError) as e:
+                  logger.error(f"Error converting RGB to hex: {str(e)}")
+                  return "#808080"  # Safe default gray
+      DeadLetterQueue:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-generator-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -------------------------------------------------------------------------
+  # DEAD LETTER QUEUE FOR ERROR HANDLING
+  # -------------------------------------------------------------------------
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dlq-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -------------------------------------------------------------------------
+  # LAMBDA FUNCTION URL
+  # -------------------------------------------------------------------------
+  FunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref ColorPaletteFunction
+      AuthType: NONE
+      Cors:
+        AllowCredentials: false
+        AllowMethods: ['GET', 'POST', 'OPTIONS']
+        AllowOrigins: ['*']
+        AllowHeaders: ['Content-Type', 'X-Amz-Date', 'Authorization', 'X-Api-Key', 'X-Amz-Security-Token']
+        MaxAge: 86400
+
+  # -------------------------------------------------------------------------
+  # LAMBDA FUNCTION PERMISSIONS
+  # -------------------------------------------------------------------------
+  FunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ColorPaletteFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  # -------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS
+  # -------------------------------------------------------------------------
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: 'Lambda function error rate is too high'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ColorPaletteFunction
+      TreatMissingData: notBreaching
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: 'Lambda function duration is too high'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ColorPaletteFunction
+      TreatMissingData: notBreaching
+
+  # -------------------------------------------------------------------------
+  # S3 BUCKET POLICY (OPTIONAL - FOR ADDITIONAL SECURITY)
+  # -------------------------------------------------------------------------
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PaletteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${PaletteBucket}/*'
+              - !Ref PaletteBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+              - 's3:ListBucket'
+            Resource:
+              - !Sub '${PaletteBucket}/*'
+              - !Ref PaletteBucket
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  FunctionUrl:
+    Description: 'HTTP endpoint URL for the color palette generator'
+    Value: !GetAtt FunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionUrl'
+
+  FunctionName:
+    Description: 'Name of the Lambda function'
+    Value: !Ref ColorPaletteFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionName'
+
+  BucketName:
+    Description: 'Name of the S3 bucket storing color palettes'
+    Value: !Ref PaletteBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  BucketArn:
+    Description: 'ARN of the S3 bucket'
+    Value: !GetAtt PaletteBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  LambdaRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRoleArn'
+
+  DeadLetterQueueUrl:
+    Description: 'URL of the dead letter queue'
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueUrl'
+
+  ApiEndpoints:
+    Description: 'Available API endpoints and usage examples'
+    Value: !Sub |
+      Base URL: ${FunctionUrl.FunctionUrl}
+      
+      Available endpoints:
+      - GET /?type=complementary&size=5
+      - GET /?type=analogous&size=5
+      - GET /?type=triadic&size=5
+      - GET /?type=monochromatic&size=5
+      - GET /?type=split-complementary&size=5
+      - GET /?type=random&size=5
+      
+      Example usage:
+      curl "${FunctionUrl.FunctionUrl}?type=complementary&size=5"
+
+  CostEstimate:
+    Description: 'Estimated monthly cost for typical usage'
+    Value: !Sub |
+      Estimated costs (USD/month for typical usage):
+      - Lambda: $0.00-$0.05 (first 1M requests free)
+      - S3: $0.01-$0.10 (first 5GB free)
+      - CloudWatch Logs: $0.00-$0.02
+      - Total: $0.01-$0.17/month
+      
+      Note: Costs may vary based on actual usage patterns.
+
+  SecurityFeatures:
+    Description: 'Security features implemented'
+    Value: |
+      - S3 bucket encryption (AES-256)
+      - IAM least privilege access
+      - HTTPS-only access policy
+      - Private bucket configuration
+      - CloudWatch logging enabled
+      - Dead letter queue for error handling
+
+  MonitoringDashboard:
+    Description: 'CloudWatch monitoring resources'
+    Value: !Sub |
+      Log Groups:
+      - Lambda: /aws/lambda/${ProjectName}-generator-${Environment}
+      - S3: /aws/s3/${ProjectName}-palettes-${Environment}
+      
+      Metrics to monitor:
+      - Lambda: Invocations, Errors, Duration, Throttles
+      - S3: NumberOfObjects, BucketSizeBytes
+      - Cost: AWS Cost Explorer

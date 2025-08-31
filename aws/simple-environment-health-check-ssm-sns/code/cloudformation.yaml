@@ -1,0 +1,517 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Simple Environment Health Check with Systems Manager and SNS
+  Deploys automated environment health monitoring using AWS Systems Manager Compliance
+  to track resource health status with Amazon SNS notifications for real-time alerts.
+  Recipe ID: a3f9b2e8
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableScheduling
+      - Label:
+          default: "Health Check Configuration"
+        Parameters:
+          - HealthCheckInterval
+          - ComplianceType
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+    ParameterLabels:
+      NotificationEmail:
+        default: "Email for Health Notifications"
+      EnableScheduling:
+        default: "Enable Scheduled Health Checks"
+      HealthCheckInterval:
+        default: "Health Check Interval (Minutes)"
+      ComplianceType:
+        default: "Custom Compliance Type"
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+
+# Input Parameters
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive health check notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+    Default: admin@example.com
+
+  EnableScheduling:
+    Type: String
+    Description: Enable scheduled health checks using EventBridge
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  HealthCheckInterval:
+    Type: Number
+    Description: Interval between health checks in minutes
+    Default: 5
+    MinValue: 1
+    MaxValue: 60
+    ConstraintDescription: Must be between 1 and 60 minutes
+
+  ComplianceType:
+    Type: String
+    Description: Custom compliance type for health checks
+    Default: 'Custom:EnvironmentHealth'
+    AllowedPattern: '^Custom:[a-zA-Z0-9]+$'
+    ConstraintDescription: Must start with 'Custom:' followed by alphanumeric characters
+
+  ResourcePrefix:
+    Type: String
+    Description: Prefix for resource names to ensure uniqueness
+    Default: 'env-health'
+    AllowedPattern: '^[a-zA-Z0-9-]{3,20}$'
+    ConstraintDescription: Must be 3-20 characters, alphanumeric and hyphens only
+
+# Conditional Resource Creation
+Conditions:
+  CreateScheduledHealthChecks: !Equals [!Ref EnableScheduling, 'true']
+
+# Resources
+Resources:
+  # SNS Topic for Health Notifications
+  HealthAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-alerts'
+      DisplayName: Environment Health Alerts
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Purpose
+          Value: HealthMonitoring
+        - Key: Environment
+          Value: Production
+        - Key: Recipe
+          Value: simple-environment-health-check-ssm-sns
+
+  # Email Subscription to SNS Topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref HealthAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda Function
+  HealthCheckLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: HealthCheckPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeInstanceInformation
+                  - ssm:PutComplianceItems
+                  - ssm:ListComplianceItems
+                  - ssm:ListComplianceSummaries
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref HealthAlertsTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-health-check:*'
+      Tags:
+        - Key: Purpose
+          Value: HealthMonitoring
+        - Key: Recipe
+          Value: simple-environment-health-check-ssm-sns
+
+  # Lambda Function for Health Checks
+  HealthCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-health-check'
+      Description: 'Automated health check function for environment monitoring'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt HealthCheckLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrencyLimit: 5
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref HealthAlertsTopic
+          COMPLIANCE_TYPE: !Ref ComplianceType
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.getenv('LOG_LEVEL', 'INFO'))
+
+          def lambda_handler(event, context):
+              """
+              Health check function that monitors SSM agent status
+              and updates Systems Manager compliance accordingly.
+              """
+              ssm = boto3.client('ssm')
+              sns = boto3.client('sns')
+              
+              topic_arn = os.getenv('SNS_TOPIC_ARN')
+              compliance_type = os.getenv('COMPLIANCE_TYPE', 'Custom:EnvironmentHealth')
+              
+              try:
+                  # Get all managed instances
+                  response = ssm.describe_instance_information()
+                  
+                  compliance_items = []
+                  non_compliant_instances = []
+                  
+                  for instance in response['InstanceInformationList']:
+                      instance_id = instance['InstanceId']
+                      ping_status = instance['PingStatus']
+                      last_ping_time = instance.get('LastPingDateTime', 'Unknown')
+                      
+                      # Determine compliance status based on ping status
+                      status = 'COMPLIANT' if ping_status == 'Online' else 'NON_COMPLIANT'
+                      severity = 'HIGH' if status == 'NON_COMPLIANT' else 'INFORMATIONAL'
+                      
+                      if status == 'NON_COMPLIANT':
+                          non_compliant_instances.append({
+                              'InstanceId': instance_id,
+                              'PingStatus': ping_status,
+                              'LastPingTime': str(last_ping_time)
+                          })
+                      
+                      # Update compliance with enhanced details
+                      compliance_item = {
+                          'Id': f'HealthCheck-{instance_id}',
+                          'Title': 'InstanceConnectivityCheck',
+                          'Severity': severity,
+                          'Status': status,
+                          'Details': {
+                              'PingStatus': ping_status,
+                              'LastPingTime': str(last_ping_time),
+                              'CheckTime': datetime.utcnow().isoformat() + 'Z'
+                          }
+                      }
+                      
+                      ssm.put_compliance_items(
+                          ResourceId=instance_id,
+                          ResourceType='ManagedInstance',
+                          ComplianceType=compliance_type,
+                          ExecutionSummary={
+                              'ExecutionTime': datetime.utcnow().isoformat() + 'Z'
+                          },
+                          Items=[compliance_item]
+                      )
+                      
+                      compliance_items.append(compliance_item)
+                  
+                  # Log health check results
+                  logger.info(f"Health check completed for {len(compliance_items)} instances")
+                  
+                  # Send notification if there are non-compliant instances
+                  if non_compliant_instances and topic_arn:
+                      message = f"Environment Health Alert: {len(non_compliant_instances)} instances are non-compliant\n\n"
+                      for instance in non_compliant_instances:
+                          message += f"Instance: {instance['InstanceId']}, Status: {instance['PingStatus']}, Last Ping: {instance['LastPingTime']}\n"
+                      
+                      sns.publish(
+                          TopicArn=topic_arn,
+                          Subject='Environment Health Alert',
+                          Message=message
+                      )
+                      
+                      logger.warning(f"Sent alert for {len(non_compliant_instances)} non-compliant instances")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Health check completed successfully',
+                          'total_instances': len(compliance_items),
+                          'non_compliant_instances': len(non_compliant_instances)
+                      })
+                  }
+                  
+              except ClientError as e:
+                  error_message = f"AWS API error: {str(e)}"
+                  logger.error(error_message)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {error_message}')
+                  }
+              except Exception as e:
+                  error_message = f"Unexpected error: {str(e)}"
+                  logger.error(error_message)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {error_message}')
+                  }
+      Tags:
+        - Key: Purpose
+          Value: HealthMonitoring
+        - Key: Recipe
+          Value: simple-environment-health-check-ssm-sns
+
+  # CloudWatch Log Group for Lambda Function
+  HealthCheckLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-health-check'
+      RetentionInDays: 14
+      Tags:
+        - Key: Purpose
+          Value: HealthMonitoring
+        - Key: Recipe
+          Value: simple-environment-health-check-ssm-sns
+
+  # EventBridge Rule for Compliance State Changes
+  ComplianceAlertRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-compliance-alerts'
+      Description: 'Respond to compliance state changes for health monitoring'
+      EventPattern:
+        source:
+          - aws.ssm
+        detail-type:
+          - Configuration Compliance State Change
+        detail:
+          compliance-type:
+            - !Ref ComplianceType
+          compliance-status:
+            - NON_COMPLIANT
+      State: ENABLED
+      Targets:
+        - Arn: !Ref HealthAlertsTopic
+          Id: ComplianceNotificationTarget
+          InputTransformer:
+            InputPathsMap:
+              instance: '$.detail.resource-id'
+              status: '$.detail.compliance-status'
+              time: '$.time'
+            InputTemplate: |
+              Environment Health Alert: Instance <instance> is <status> at <time>. Please investigate immediately.
+
+  # EventBridge Schedule Rule for Periodic Health Checks (Conditional)
+  HealthCheckScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: CreateScheduledHealthChecks
+    Properties:
+      Name: !Sub '${ResourcePrefix}-schedule'
+      Description: !Sub 'Schedule health checks every ${HealthCheckInterval} minutes'
+      ScheduleExpression: !Sub 'rate(${HealthCheckInterval} minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt HealthCheckFunction.Arn
+          Id: HealthCheckScheduleTarget
+          Input: '{"source":"eventbridge-schedule"}'
+
+  # Permission for EventBridge to Invoke Lambda (Conditional)
+  HealthCheckSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateScheduledHealthChecks
+    Properties:
+      FunctionName: !Ref HealthCheckFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HealthCheckScheduleRule.Arn
+
+  # Permission for EventBridge to Publish to SNS
+  EventBridgeSNSPermission:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref HealthAlertsTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Topics:
+        - !Ref HealthAlertsTopic
+
+  # Custom Resource to Create Initial Compliance Baseline
+  InitialComplianceBaseline:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ComplianceBaselineFunction.Arn
+      ComplianceType: !Ref ComplianceType
+
+  # Lambda Function for Initial Compliance Baseline Setup
+  ComplianceBaselineFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-baseline-setup'
+      Description: 'Sets up initial compliance baseline for health monitoring'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ComplianceBaselineLambdaRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              try:
+                  ssm = boto3.client('ssm')
+                  ec2 = boto3.client('ec2')
+                  
+                  if event['RequestType'] == 'Create':
+                      # Get first available running instance
+                      instances = ec2.describe_instances(
+                          Filters=[{'Name': 'state-name', 'Values': ['running']}]
+                      )
+                      
+                      compliance_type = event['ResourceProperties']['ComplianceType']
+                      
+                      for reservation in instances['Reservations']:
+                          for instance in reservation['Instances']:
+                              instance_id = instance['InstanceId']
+                              
+                              # Create initial compliance item
+                              ssm.put_compliance_items(
+                                  ResourceId=instance_id,
+                                  ResourceType='ManagedInstance',
+                                  ComplianceType=compliance_type,
+                                  ExecutionSummary={
+                                      'ExecutionTime': datetime.utcnow().isoformat() + 'Z'
+                                  },
+                                  Items=[{
+                                      'Id': 'InitialHealthCheck',
+                                      'Title': 'EnvironmentHealthStatus',
+                                      'Severity': 'INFORMATIONAL',
+                                      'Status': 'COMPLIANT'
+                                  }]
+                              )
+                              break
+                          break
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  # IAM Role for Compliance Baseline Lambda
+  ComplianceBaselineLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-baseline-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ComplianceBaselinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutComplianceItems
+                  - ec2:DescribeInstances
+                Resource: '*'
+
+# Outputs
+Outputs:
+  SNSTopicArn:
+    Description: ARN of the SNS topic for health notifications
+    Value: !Ref HealthAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  HealthCheckFunctionArn:
+    Description: ARN of the health check Lambda function
+    Value: !GetAtt HealthCheckFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthCheckFunctionArn'
+
+  HealthCheckFunctionName:
+    Description: Name of the health check Lambda function
+    Value: !Ref HealthCheckFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthCheckFunctionName'
+
+  ComplianceAlertRuleArn:
+    Description: ARN of the EventBridge rule for compliance alerts
+    Value: !GetAtt ComplianceAlertRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceAlertRuleArn'
+
+  HealthCheckScheduleRuleArn:
+    Condition: CreateScheduledHealthChecks
+    Description: ARN of the EventBridge schedule rule for health checks
+    Value: !GetAtt HealthCheckScheduleRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthCheckScheduleRuleArn'
+
+  LogGroupName:
+    Description: Name of the CloudWatch log group for the health check function
+    Value: !Ref HealthCheckLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  ComplianceType:
+    Description: Custom compliance type used for health monitoring
+    Value: !Ref ComplianceType
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceType'
+
+  DeploymentRegion:
+    Description: AWS region where the stack was deployed
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentRegion'
+
+  NotificationEmail:
+    Description: Email address configured for health notifications
+    Value: !Ref NotificationEmail
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationEmail'
+
+  HealthCheckInterval:
+    Condition: CreateScheduledHealthChecks
+    Description: Configured health check interval in minutes
+    Value: !Ref HealthCheckInterval
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthCheckInterval'

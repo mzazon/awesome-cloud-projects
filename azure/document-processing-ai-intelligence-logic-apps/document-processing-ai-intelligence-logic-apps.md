@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure AI Document Intelligence, Logic Apps, Azure Storage, Azure Key Vault
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ai, document-processing, automation, serverless
 recipe-generator-version: 1.3
@@ -88,7 +88,7 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables
+# Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-docprocessing-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
@@ -245,7 +245,7 @@ echo "⚡ Logic App: ${LOGIC_APP_NAME}"
        authorization-rule keys list \
        --resource-group ${RESOURCE_GROUP} \
        --namespace-name ${SERVICE_BUS_NAMESPACE} \
-       --name RootManageSharedAccessKey \
+       --authorization-rule-name RootManageSharedAccessKey \
        --query primaryConnectionString --output tsv)
    
    # Store Service Bus connection in Key Vault
@@ -386,7 +386,7 @@ echo "⚡ Logic App: ${LOGIC_APP_NAME}"
              "body": {
                "urlSource": "@{body('When_a_blob_is_added_or_modified')?['Path']}"
              },
-             "path": "/v2.1/prebuilt/invoice/analyze"
+             "path": "/v4.0/prebuilt/invoice/analyze"
            },
            "runAfter": {
              "Get_Document_Intelligence_Key": ["Succeeded"]
@@ -416,9 +416,10 @@ echo "⚡ Logic App: ${LOGIC_APP_NAME}"
    EOF
    
    # Update Logic App with workflow definition
-   az logic workflow update \
+   az logic workflow create \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
        --definition @workflow-definition.json
    
    echo "✅ Document processing workflow configured"
@@ -535,11 +536,11 @@ echo "⚡ Logic App: ${LOGIC_APP_NAME}"
 3. Test Document Intelligence directly:
 
    ```bash
-   # Test Document Intelligence API directly
-   curl -X POST "${DOC_INTELLIGENCE_ENDPOINT}formrecognizer/v2.1/prebuilt/invoice/analyze" \
+   # Test Document Intelligence API directly with latest v4.0 endpoint
+   curl -X POST "${DOC_INTELLIGENCE_ENDPOINT}formrecognizer/documentModels/prebuilt-invoice:analyze?api-version=2024-11-30" \
        -H "Ocp-Apim-Subscription-Key: ${DOC_INTELLIGENCE_KEY}" \
        -H "Content-Type: application/json" \
-       -d '{"source": "https://raw.githubusercontent.com/Azure/azure-sdk-for-python/master/sdk/formrecognizer/azure-ai-formrecognizer/tests/sample_forms/forms/Invoice_1.pdf"}'
+       -d '{"urlSource": "https://raw.githubusercontent.com/Azure/azure-sdk-for-python/master/sdk/formrecognizer/azure-ai-formrecognizer/tests/sample_forms/forms/Invoice_1.pdf"}'
    ```
 
    Expected output: You should receive a 202 Accepted response with an Operation-Location header for checking analysis results.
@@ -584,7 +585,7 @@ Azure AI Document Intelligence combined with Logic Apps creates a powerful serve
 
 The use of managed identities throughout the solution eliminates the need for credential management and reduces security risks. As documented in the [Azure security best practices](https://docs.microsoft.com/en-us/azure/security/fundamentals/identity-management-best-practices), this approach ensures that credentials are never exposed in code or configuration files. The integration with Key Vault provides centralized secret management with full audit trails, meeting compliance requirements for sensitive data handling.
 
-From a performance perspective, Document Intelligence can process documents with sub-second latency for most document types, as detailed in the [Document Intelligence documentation](https://docs.microsoft.com/en-us/azure/ai-services/document-intelligence/concept-model-overview). The service automatically scales to handle concurrent requests, making it suitable for both batch processing and real-time scenarios. Logic Apps' consumption-based pricing ensures cost efficiency, charging only for actual executions rather than idle compute time.
+From a performance perspective, Document Intelligence v4.0 with the latest 2024-11-30 API provides enhanced accuracy and faster processing speeds, as detailed in the [Document Intelligence documentation](https://docs.microsoft.com/en-us/azure/ai-services/document-intelligence/overview). The service automatically scales to handle concurrent requests, making it suitable for both batch processing and real-time scenarios. Logic Apps' consumption-based pricing ensures cost efficiency, charging only for actual executions rather than idle compute time.
 
 > **Tip**: Use Application Insights with your Logic Apps to monitor performance, track custom metrics, and set up alerts for failed document processing. The [monitoring documentation](https://docs.microsoft.com/en-us/azure/logic-apps/monitor-logic-apps) provides comprehensive guidance on implementing observability for production workloads.
 

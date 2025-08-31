@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Cloud Quotas API, Cloud Run GPU, Cloud Monitoring, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: gpu-quotas, intelligent-allocation, automated-scaling, resource-management, ai-inference
 recipe-generator-version: 1.3
@@ -95,6 +95,9 @@ gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
 gcloud config set compute/zone ${ZONE}
 
+# Install beta component if not already available
+gcloud components install beta --quiet
+
 # Enable required Google Cloud APIs
 gcloud services enable cloudquotas.googleapis.com
 gcloud services enable run.googleapis.com
@@ -103,6 +106,7 @@ gcloud services enable monitoring.googleapis.com
 gcloud services enable firestore.googleapis.com
 gcloud services enable storage.googleapis.com
 gcloud services enable cloudscheduler.googleapis.com
+gcloud services enable cloudbuild.googleapis.com
 
 echo "✅ Environment configured for project: ${PROJECT_ID}"
 echo "✅ Region set to: ${REGION}"
@@ -165,27 +169,13 @@ echo "✅ All required APIs enabled"
    Firestore serves as the real-time database for storing GPU usage patterns, quota adjustment history, and workload analytics. This NoSQL database enables the intelligent allocation system to learn from historical usage patterns and make predictive scaling decisions. Firestore's global distribution and strong consistency ensure accurate usage tracking across all regions.
 
    ```bash
-   # Initialize Firestore in Native mode
+   # Initialize Firestore in Native mode for the region
    gcloud firestore databases create \
        --region=${REGION} \
        --type=firestore-native
    
-   # Create initial document structure for usage tracking
-   cat > firestore-init.json << EOF
-   {
-     "quota_history": {
-       "document_id": "gpu_allocations",
-       "fields": {
-         "created_at": {"timestampValue": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"},
-         "allocations": {
-           "arrayValue": {
-             "values": []
-           }
-         }
-       }
-     }
-   }
-   EOF
+   # Wait for database creation to complete
+   sleep 10
    
    echo "✅ Firestore initialized for usage history tracking"
    ```
@@ -203,20 +193,21 @@ echo "✅ All required APIs enabled"
    
    # Create requirements.txt for Python dependencies
    cat > requirements.txt << EOF
-   google-cloud-monitoring==2.16.0
-   google-cloud-quotas==0.8.0
-   google-cloud-firestore==2.13.1
-   google-cloud-storage==2.10.0
+   google-cloud-monitoring==2.21.0
+   google-cloud-quotas==1.1.0
+   google-cloud-firestore==2.16.0
+   google-cloud-storage==2.18.0
    google-cloud-run==0.10.3
    functions-framework==3.5.0
-   numpy==1.24.3
-   scikit-learn==1.3.0
+   numpy==1.26.4
+   scikit-learn==1.4.2
    EOF
    
    # Create the main function code
    cat > main.py << 'EOF'
    import json
    import logging
+   import os
    from datetime import datetime, timedelta
    from typing import Dict, List, Any
    
@@ -235,8 +226,15 @@ echo "✅ All required APIs enabled"
    def analyze_gpu_utilization(request):
        """Main Cloud Function entry point for quota analysis"""
        try:
-           project_id = request.get_json().get('project_id')
-           region = request.get_json().get('region', 'us-central1')
+           request_json = request.get_json(silent=True)
+           if not request_json:
+               return {'status': 'error', 'message': 'No JSON payload provided'}, 400
+           
+           project_id = request_json.get('project_id')
+           region = request_json.get('region', 'us-central1')
+           
+           if not project_id:
+               return {'status': 'error', 'message': 'project_id is required'}, 400
            
            # Initialize clients
            monitoring_client = monitoring_v3.MetricServiceClient()
@@ -257,7 +255,7 @@ echo "✅ All required APIs enabled"
                utilization_data, policies, firestore_client
            )
            
-           # Execute approved recommendations
+           # Execute approved recommendations (simulation mode)
            results = execute_quota_adjustments(
                quotas_client, recommendations, project_id
            )
@@ -328,7 +326,8 @@ echo "✅ All required APIs enabled"
    def load_quota_policies(storage_client, project_id: str) -> Dict:
        """Load quota management policies from Cloud Storage"""
        try:
-           bucket_name = f"{project_id}-quota-policies-{project_id[-6:]}"
+           # Use the environment variable for bucket name consistency
+           bucket_name = os.environ.get('BUCKET_NAME', f"{project_id}-quota-policies")
            bucket = storage_client.bucket(bucket_name)
            blob = bucket.blob('quota-policy.json')
            
@@ -405,7 +404,7 @@ echo "✅ All required APIs enabled"
        
        for rec in recommendations:
            try:
-               # Create quota preference request
+               # Create quota preference request (simulation mode)
                quota_preference = {
                    'service': 'run.googleapis.com',
                    'quota_id': f'GPU-{rec["gpu_family"].upper()}-per-project-region',
@@ -443,6 +442,16 @@ echo "✅ All required APIs enabled"
        """Store allocation history in Firestore"""
        try:
            doc_ref = firestore_client.collection('quota_history').document('gpu_allocations')
+           
+           # Create document if it doesn't exist
+           try:
+               doc_ref.get()
+           except:
+               doc_ref.create({
+                   'created_at': datetime.utcnow().isoformat(),
+                   'allocations': []
+               })
+           
            doc_ref.update({
                'allocations': firestore.ArrayUnion([{
                    'timestamp': datetime.utcnow().isoformat(),
@@ -455,15 +464,17 @@ echo "✅ All required APIs enabled"
            logger.error(f"Failed to store allocation history: {str(e)}")
    EOF
    
-   # Deploy the Cloud Function
+   # Deploy the Cloud Function with environment variables
    gcloud functions deploy ${FUNCTION_NAME} \
+       --gen2 \
        --runtime=python311 \
        --trigger=http \
        --allow-unauthenticated \
        --region=${REGION} \
        --memory=512MB \
        --timeout=540s \
-       --entry-point=analyze_gpu_utilization
+       --entry-point=analyze_gpu_utilization \
+       --set-env-vars="BUCKET_NAME=${BUCKET_NAME}"
    
    cd ..
    
@@ -507,11 +518,11 @@ echo "✅ All required APIs enabled"
    
    # Create requirements.txt for inference service
    cat > requirements.txt << EOF
-   flask==2.3.3
-   google-cloud-monitoring==2.16.0
-   numpy==1.24.3
-   psutil==5.9.6
-   gunicorn==21.2.0
+   flask==3.0.3
+   google-cloud-monitoring==2.21.0
+   numpy==1.26.4
+   psutil==5.9.8
+   gunicorn==22.0.0
    EOF
    
    # Create main application code
@@ -657,13 +668,14 @@ echo "✅ All required APIs enabled"
    # Build and deploy to Cloud Run with GPU
    gcloud builds submit --tag gcr.io/${PROJECT_ID}/${SERVICE_NAME}
    
+   # Deploy with updated GPU configuration
    gcloud run deploy ${SERVICE_NAME} \
        --image gcr.io/${PROJECT_ID}/${SERVICE_NAME} \
        --region=${REGION} \
        --gpu=1 \
        --gpu-type=nvidia-l4 \
-       --memory=4Gi \
-       --cpu=2 \
+       --memory=16Gi \
+       --cpu=4 \
        --min-instances=0 \
        --max-instances=10 \
        --allow-unauthenticated \
@@ -681,11 +693,14 @@ echo "✅ All required APIs enabled"
    Cloud Scheduler provides the automation backbone that triggers periodic quota analysis and adjustment cycles. This managed cron service ensures consistent monitoring of resource utilization patterns and proactive quota management, eliminating the need for manual intervention while maintaining optimal resource allocation across all GPU-enabled services.
 
    ```bash
+   # Get the Cloud Function URL for scheduling
+   FUNCTION_URL="https://${REGION}-${PROJECT_ID}.cloudfunctions.net/${FUNCTION_NAME}"
+   
    # Create Cloud Scheduler job for periodic quota analysis
    gcloud scheduler jobs create http quota-analysis-job \
        --location=${REGION} \
        --schedule="*/15 * * * *" \
-       --uri="https://${REGION}-${PROJECT_ID}.cloudfunctions.net/${FUNCTION_NAME}" \
+       --uri="${FUNCTION_URL}" \
        --http-method=POST \
        --headers="Content-Type=application/json" \
        --message-body="{\"project_id\":\"${PROJECT_ID}\",\"region\":\"${REGION}\"}" \
@@ -695,7 +710,7 @@ echo "✅ All required APIs enabled"
    gcloud scheduler jobs create http peak-analysis-job \
        --location=${REGION} \
        --schedule="0 9-17 * * 1-5" \
-       --uri="https://${REGION}-${PROJECT_ID}.cloudfunctions.net/${FUNCTION_NAME}" \
+       --uri="${FUNCTION_URL}" \
        --http-method=POST \
        --headers="Content-Type=application/json" \
        --message-body="{\"project_id\":\"${PROJECT_ID}\",\"region\":\"${REGION}\",\"analysis_type\":\"peak\"}" \
@@ -808,7 +823,7 @@ echo "✅ All required APIs enabled"
    # Check Cloud Quotas API status and current GPU quotas
    gcloud services list --enabled --filter="name:cloudquotas"
    
-   # List current GPU quota information
+   # List current GPU quota information for Cloud Run
    gcloud beta quotas info list \
        --service=run.googleapis.com \
        --project=${PROJECT_ID} \
@@ -927,7 +942,7 @@ echo "✅ All required APIs enabled"
    
    # Clean up local files
    rm -rf quota-manager-function ai-inference-service
-   rm -f quota-policy.json firestore-init.json dashboard-config.json alert-policy.json
+   rm -f quota-policy.json dashboard-config.json alert-policy.json
    
    echo "✅ Local files and configurations cleaned up"
    echo "⚠️  Remember to manually delete Firestore database if no longer needed"

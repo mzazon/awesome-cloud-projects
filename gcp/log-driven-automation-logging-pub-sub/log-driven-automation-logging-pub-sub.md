@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Logging, Pub/Sub, Cloud Functions, Cloud Monitoring
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-24
 passed-qa: null
 tags: automation, logging, monitoring, incident-response, event-driven
 recipe-generator-version: 1.3
@@ -216,10 +216,10 @@ echo "✅ Region configured: ${REGION}"
      "name": "alert-processor",
      "version": "1.0.0",
      "dependencies": {
-       "@google-cloud/functions-framework": "^3.0.0",
+       "@google-cloud/functions-framework": "^4.0.0",
        "@google-cloud/monitoring": "^4.0.0",
        "@google-cloud/logging": "^11.0.0",
-       "axios": "^1.6.0"
+       "axios": "^1.7.0"
      }
    }
    EOF
@@ -338,7 +338,7 @@ echo "✅ Region configured: ${REGION}"
      "name": "auto-remediation",
      "version": "1.0.0",
      "dependencies": {
-       "@google-cloud/functions-framework": "^3.0.0",
+       "@google-cloud/functions-framework": "^4.0.0",
        "@google-cloud/compute": "^4.0.0",
        "@google-cloud/monitoring": "^4.0.0",
        "@google-cloud/pubsub": "^4.0.0"

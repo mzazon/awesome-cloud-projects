@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: rds,cloudwatch,performance-insights,ec2
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database-performance,parameter-groups,postgresql,performance-tuning
 recipe-generator-version: 1.3
 ---
 
 # Database Performance Tuning with Parameters
-
 
 ## Problem
 
@@ -80,7 +79,7 @@ graph TB
 1. AWS account with RDS, CloudWatch, and Performance Insights permissions
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Understanding of PostgreSQL performance tuning concepts
-4. Existing RDS PostgreSQL instance or willingness to create one
+4. PostgreSQL client (`psql`) installed locally or access to database client
 5. Basic knowledge of SQL query optimization and database monitoring
 6. Estimated cost: $50-100 for testing resources (can be reduced with proper cleanup)
 
@@ -148,13 +147,13 @@ echo "✅ VPC and networking resources created successfully"
 
 1. **Create Baseline Parameter Group and Database Instance**:
 
-   RDS Parameter Groups are essential for database performance tuning as they provide a centralized way to manage database engine configuration settings. Unlike default parameter groups which are read-only, custom parameter groups allow you to modify engine parameters to optimize performance for your specific workload patterns. This foundational step establishes the framework for systematic performance optimization by creating both the parameter group and a test database instance configured with monitoring capabilities. For detailed information about parameter group management, see the [RDS Parameter Groups documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_WorkingWithParamGroups.html).
+   RDS Parameter Groups are essential for database performance tuning as they provide a centralized way to manage database engine configuration settings. Unlike default parameter groups which are read-only, custom parameter groups allow you to modify engine parameters to optimize performance for your specific workload patterns. This foundational step establishes the framework for systematic performance optimization by creating both the parameter group and a test database instance configured with monitoring capabilities.
 
    ```bash
    # Create baseline parameter group from default
    aws rds create-db-parameter-group \
        --db-parameter-group-name $PARAMETER_GROUP_NAME \
-       --db-parameter-group-family postgres15 \
+       --db-parameter-group-family postgres16 \
        --description "Performance tuning parameter group for PostgreSQL"
    
    # Create DB subnet group
@@ -168,7 +167,7 @@ echo "✅ VPC and networking resources created successfully"
        --db-instance-identifier $DB_INSTANCE_ID \
        --db-instance-class db.t3.medium \
        --engine postgres \
-       --engine-version 15.4 \
+       --engine-version 16.6 \
        --master-username dbadmin \
        --master-user-password TuningTest123! \
        --allocated-storage 100 \
@@ -179,7 +178,6 @@ echo "✅ VPC and networking resources created successfully"
        --enable-performance-insights \
        --performance-insights-retention-period 7 \
        --monitoring-interval 60 \
-       --monitoring-role-arn arn:aws:iam::$AWS_ACCOUNT_ID:role/rds-monitoring-role \
        --backup-retention-period 7 \
        --storage-encrypted \
        --copy-tags-to-snapshot
@@ -187,7 +185,7 @@ echo "✅ VPC and networking resources created successfully"
    echo "✅ Database instance creation initiated"
    ```
 
-   The custom parameter group now serves as the foundation for all performance optimizations, while the RDS instance is configured with Performance Insights and enhanced monitoring to provide comprehensive visibility into database performance metrics. The GP3 storage type offers better cost-performance characteristics than GP2, and encryption ensures data security compliance. This configuration establishes a baseline for measuring performance improvements throughout the tuning process.
+   The custom parameter group now serves as the foundation for all performance optimizations, while the RDS instance is configured with Performance Insights and enhanced monitoring to provide comprehensive visibility into database performance metrics. The GP3 storage type offers better cost-performance characteristics than GP2, and encryption ensures data security compliance. This configuration establishes a baseline for measuring performance improvements throughout the tuning process. For detailed information about parameter group management, see the [RDS Parameter Groups documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_WorkingWithParamGroups.html).
 
 2. **Wait for Database Availability and Enable Enhanced Monitoring**:
 
@@ -205,10 +203,11 @@ echo "✅ VPC and networking resources created successfully"
        --query 'DBInstances[0].Endpoint.Address' \
        --output text)
    
-   # Enable Database Insights for advanced monitoring
+   # Enable CloudWatch Logs exports for PostgreSQL
    aws rds modify-db-instance \
        --db-instance-identifier $DB_INSTANCE_ID \
-       --enable-cloudwatch-logs-exports postgresql \
+       --cloudwatch-logs-export-configuration \
+           'LogTypesToEnable=postgresql' \
        --apply-immediately
    
    echo "✅ Database available at: $DB_ENDPOINT"
@@ -295,9 +294,10 @@ echo "✅ VPC and networking resources created successfully"
    CREATE INDEX idx_products_category ON products(category);
    EOF
    
-   # Load test data using psql (assuming psql is available)
+   # Load test data using psql
    echo "Creating test data..."
-   psql -h $DB_ENDPOINT -U dbadmin -d postgres \
+   PGPASSWORD="TuningTest123!" psql -h $DB_ENDPOINT \
+       -U dbadmin -d postgres \
        -f /tmp/create_test_data.sql
    
    echo "✅ Test data created successfully"
@@ -358,7 +358,8 @@ echo "✅ VPC and networking resources created successfully"
    
    # Run baseline performance test
    echo "Running baseline performance test..."
-   psql -h $DB_ENDPOINT -U dbadmin -d postgres \
+   PGPASSWORD="TuningTest123!" psql -h $DB_ENDPOINT \
+       -U dbadmin -d postgres \
        -f /tmp/baseline_test.sql > /tmp/baseline_results.txt
    
    # Capture current parameter values for comparison
@@ -374,14 +375,11 @@ echo "✅ VPC and networking resources created successfully"
 
 5. **Analyze Query Performance and Identify Bottlenecks**:
 
-   Query performance analysis is crucial for identifying specific bottlenecks that parameter tuning can address. This step leverages PostgreSQL's built-in statistics views and the pg_stat_statements extension to analyze query execution patterns, buffer cache hit ratios, and table access methods. Understanding these metrics enables targeted parameter optimization focused on the most impactful areas such as memory allocation, cost parameters, and query planner behavior. The analysis provides the foundation for making informed decisions about which parameters to adjust and by how much.
+   Query performance analysis is crucial for identifying specific bottlenecks that parameter tuning can address. This step leverages PostgreSQL's built-in statistics views to analyze query execution patterns, buffer cache hit ratios, and table access methods. Understanding these metrics enables targeted parameter optimization focused on the most impactful areas such as memory allocation, cost parameters, and query planner behavior. The analysis provides the foundation for making informed decisions about which parameters to adjust and by how much.
 
    ```bash
    # Create performance analysis script
    cat > /tmp/analyze_performance.sql << 'EOF'
-   -- Enable query logging for analysis
-   SELECT pg_reload_conf();
-   
    -- Check current configuration
    SELECT name, setting, unit, short_desc
    FROM pg_settings
@@ -396,19 +394,6 @@ echo "✅ VPC and networking resources created successfully"
        'log_min_duration_statement'
    );
    
-   -- Analyze query performance statistics
-   SELECT 
-       query,
-       calls,
-       total_time,
-       mean_time,
-       rows,
-       100.0 * shared_blks_hit / nullif(shared_blks_hit + shared_blks_read, 0) AS hit_percent
-   FROM pg_stat_statements
-   WHERE calls > 10
-   ORDER BY total_time DESC
-   LIMIT 10;
-   
    -- Check for table and index usage
    SELECT 
        schemaname,
@@ -420,17 +405,26 @@ echo "✅ VPC and networking resources created successfully"
    FROM pg_stat_user_tables
    WHERE schemaname = 'public'
    ORDER BY seq_scan DESC;
+   
+   -- Analyze buffer hit ratios
+   SELECT 
+       'buffer_hit_ratio' as metric,
+       round(
+           (sum(blks_hit) * 100.0 / nullif(sum(blks_hit) + sum(blks_read), 0))::numeric, 2
+       ) as percentage
+   FROM pg_stat_database;
    EOF
    
    # Run performance analysis
    echo "Analyzing current performance..."
-   psql -h $DB_ENDPOINT -U dbadmin -d postgres \
+   PGPASSWORD="TuningTest123!" psql -h $DB_ENDPOINT \
+       -U dbadmin -d postgres \
        -f /tmp/analyze_performance.sql > /tmp/analysis_results.txt
    
    echo "✅ Performance analysis completed"
    ```
 
-   The performance analysis reveals critical insights about query execution patterns, cache hit ratios, and resource utilization that inform parameter tuning decisions. The pg_stat_statements data shows which queries consume the most resources, while buffer cache statistics indicate memory efficiency. Table scan patterns reveal indexing effectiveness and help identify opportunities for memory-related parameter optimization. These metrics guide the selection of optimal parameter values in the next step.
+   The performance analysis reveals critical insights about query execution patterns, cache hit ratios, and resource utilization that inform parameter tuning decisions. Buffer cache statistics indicate memory efficiency, while table scan patterns reveal indexing effectiveness and help identify opportunities for memory-related parameter optimization. These metrics guide the selection of optimal parameter values in the next step.
 
 6. **Configure Optimized Parameters for High-Performance Workload**:
 
@@ -573,20 +567,22 @@ echo "✅ VPC and networking resources created successfully"
        --dashboard-name "Database-Performance-Tuning-${RANDOM_SUFFIX}" \
        --dashboard-body file:///tmp/dashboard.json
    
-   
    echo "✅ CloudWatch dashboard created successfully"
-   
-   > **Tip**: Configure CloudWatch alarms with appropriate thresholds to balance between early warning and false positive alerts. For comprehensive RDS monitoring guidance, see the [Amazon RDS monitoring documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/monitoring-cloudwatch.html).
    ```
 
    The performance monitoring dashboard now provides comprehensive visibility into database performance metrics, enabling real-time assessment of parameter tuning effectiveness. The dashboard displays key indicators that directly correlate with the parameters we've optimized, such as memory utilization reflecting shared_buffers efficiency and connection patterns showing max_connections impact. This monitoring foundation enables data-driven decision making for future parameter adjustments and helps maintain optimal database performance over time.
 
+   > **Tip**: Configure CloudWatch alarms with appropriate thresholds to balance between early warning and false positive alerts. For comprehensive RDS monitoring guidance, see the [Amazon RDS monitoring documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/monitoring-cloudwatch.html).
+
 9. **Run Performance Validation Tests**:
+
+   Performance validation testing demonstrates the effectiveness of parameter tuning by executing the same workload under optimized conditions. This step runs identical queries to those in the baseline test, enabling direct comparison of execution times and resource utilization. The concurrent testing simulates realistic production loads where multiple database connections compete for resources, validating that parameter optimizations improve performance under various concurrency scenarios.
 
    ```bash
    # Run the same queries with optimized parameters
    echo "Running performance validation test..."
-   psql -h $DB_ENDPOINT -U dbadmin -d postgres \
+   PGPASSWORD="TuningTest123!" psql -h $DB_ENDPOINT \
+       -U dbadmin -d postgres \
        -f /tmp/baseline_test.sql > /tmp/optimized_results.txt
    
    # Create additional stress test for concurrent connections
@@ -614,7 +610,8 @@ echo "✅ VPC and networking resources created successfully"
    
    # Run concurrent tests (simulate multiple connections)
    for i in {1..5}; do
-       psql -h $DB_ENDPOINT -U dbadmin -d postgres \
+       PGPASSWORD="TuningTest123!" psql -h $DB_ENDPOINT \
+           -U dbadmin -d postgres \
            -f /tmp/concurrent_test.sql > /tmp/concurrent_test_${i}.txt &
    done
    
@@ -624,7 +621,11 @@ echo "✅ VPC and networking resources created successfully"
    echo "✅ Performance validation tests completed"
    ```
 
+   The validation tests provide concrete evidence of performance improvements achieved through parameter tuning. The concurrent test results demonstrate the database's ability to handle multiple simultaneous connections efficiently, while the identical query comparisons show specific improvements in query execution times. These metrics validate the effectiveness of the optimization efforts and guide future tuning decisions.
+
 10. **Enable Advanced Parameter Tuning for Specific Workloads**:
+
+    Advanced parameter tuning addresses specialized workload requirements beyond basic memory and connection optimization. This step configures parameters for analytical workloads that require complex join operations, parallel query execution, and efficient autovacuum processes. The parallel processing parameters enable PostgreSQL to leverage multiple CPU cores for complex queries, while the genetic query optimizer (GEQO) settings improve planning for queries with many joins. Autovacuum tuning ensures optimal table maintenance without impacting performance.
 
     ```bash
     # Configure additional parameters for analytical workloads
@@ -656,7 +657,11 @@ echo "✅ VPC and networking resources created successfully"
     echo "✅ Advanced parameter tuning completed"
     ```
 
+    The advanced parameter settings optimize PostgreSQL for mixed workloads that combine transactional and analytical queries. The parallel processing configurations enable efficient utilization of multiple CPU cores for complex analytical operations, while the improved join planning parameters help the query optimizer handle complex multi-table queries more effectively.
+
 11. **Create Read Replica with Optimized Parameters**:
+
+    Read replicas provide horizontal scaling for read-heavy workloads while inheriting the same performance optimizations as the primary database. This step creates a read replica that benefits from all the parameter tuning efforts, enabling load distribution across multiple database instances. The replica uses the same parameter group to ensure consistent performance characteristics and monitoring capabilities, supporting read scaling strategies for high-traffic applications.
 
     ```bash
     # Create read replica with same parameter group for read scaling
@@ -682,7 +687,11 @@ echo "✅ VPC and networking resources created successfully"
     echo "✅ Read replica created: $REPLICA_ENDPOINT"
     ```
 
+    The read replica now provides additional read capacity with the same performance optimizations as the primary instance. This configuration enables read load distribution while maintaining consistent query performance across both instances. The replica can handle read-only queries, reducing load on the primary database and improving overall application performance.
+
 12. **Set Up Automated Parameter Monitoring and Alerting**:
+
+    Automated monitoring and alerting ensure that parameter tuning benefits are maintained over time and that performance issues are detected early. CloudWatch alarms provide proactive notification when key metrics exceed optimal thresholds, enabling rapid response to performance degradations. The alert thresholds are configured based on the instance specifications and expected workload patterns, providing early warning without generating false positives.
 
     ```bash
     # Create CloudWatch alarms for database performance
@@ -724,6 +733,8 @@ echo "✅ VPC and networking resources created successfully"
     
     echo "✅ CloudWatch alarms configured"
     ```
+
+    The monitoring and alerting system now provides automated oversight of database performance, ensuring that optimization benefits are maintained and new issues are detected promptly. The alert system enables proactive management of database performance, supporting consistent application performance over time.
 
 ## Validation & Testing
 
@@ -804,7 +815,8 @@ echo "✅ VPC and networking resources created successfully"
    EOF
    
    # Run load test
-   psql -h $DB_ENDPOINT -U dbadmin -d postgres \
+   PGPASSWORD="TuningTest123!" psql -h $DB_ENDPOINT \
+       -U dbadmin -d postgres \
        -f /tmp/load_test.sql > /tmp/load_test_results.txt
    
    echo "Load test completed. Results saved to /tmp/load_test_results.txt"
@@ -813,28 +825,20 @@ echo "✅ VPC and networking resources created successfully"
 4. **Monitor Performance Insights and CloudWatch Metrics**:
 
    ```bash
-   # Get Performance Insights metrics
-   aws pi get-resource-metrics \
-       --service-type RDS \
-       --identifier $(aws rds describe-db-instances \
-           --db-instance-identifier $DB_INSTANCE_ID \
-           --query 'DBInstances[0].DbiResourceId' \
-           --output text) \
-       --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
-       --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
-       --period-in-seconds 300 \
-       --metric-queries '[
-           {
-               "Metric": "db.SQL.Innodb_rows_read.avg",
-               "GroupBy": {"Group": "db.sql_tokenized.statement"}
-           }
-       ]' \
-       --max-results 10
-   
-   # Check CloudWatch metrics
+   # Check CloudWatch metrics for performance validation
    aws cloudwatch get-metric-statistics \
        --namespace AWS/RDS \
        --metric-name CPUUtilization \
+       --dimensions Name=DBInstanceIdentifier,Value=$DB_INSTANCE_ID \
+       --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
+       --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+       --period 300 \
+       --statistics Average,Maximum
+   
+   # Check database connections metric
+   aws cloudwatch get-metric-statistics \
+       --namespace AWS/RDS \
+       --metric-name DatabaseConnections \
        --dimensions Name=DBInstanceIdentifier,Value=$DB_INSTANCE_ID \
        --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
        --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
@@ -928,6 +932,8 @@ This comprehensive database performance tuning implementation demonstrates how t
 The key performance improvements achieved through parameter tuning include increased shared buffer allocation for better cache hit ratios, optimized work memory settings for complex queries, and fine-tuned cost parameters that help the query planner make better execution decisions. The solution also implements advanced monitoring through Performance Insights and CloudWatch to provide continuous visibility into database performance metrics.
 
 Parameter tuning is most effective when combined with proper indexing strategies, query optimization, and workload-specific configurations. The implementation includes both immediate-apply parameters for runtime adjustments and pending-reboot parameters for fundamental memory allocation changes. This approach ensures minimal downtime while maximizing performance improvements. The solution is particularly valuable for OLTP workloads with high concurrency requirements and mixed analytical queries.
+
+> **Warning**: Performance Insights has an announced end-of-life date of November 30, 2025. AWS recommends upgrading to CloudWatch Database Insights Advanced mode before this date. For migration guidance, see the [Database Insights documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_DatabaseInsights.html).
 
 > **Tip**: Always establish a performance baseline before implementing parameter changes and use A/B testing approaches to validate improvements. Monitor parameter changes closely for at least 24-48 hours to ensure stability under various load conditions. For advanced PostgreSQL optimization techniques, refer to the [PostgreSQL memory configuration documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Tuning.concepts.memory.html).
 

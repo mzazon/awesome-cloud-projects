@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: AlloyDB Omni, Cloud Workstations, Cloud Source Repositories, Cloud Build
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: 2025-07-17
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database, development, workstations, postgresql, automation, devops
 recipe-generator-version: 1.3
@@ -87,7 +87,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with appropriate permissions for Compute Engine, Cloud Workstations, Cloud Source Repositories, and Cloud Build
-2. gcloud CLI v2 installed and configured (or Cloud Shell access)
+2. gcloud CLI installed and configured (or Cloud Shell access)
 3. Basic knowledge of PostgreSQL, Git version control, and container technologies
 4. Docker Desktop or container runtime for AlloyDB Omni development
 5. Estimated cost: $50-75 per month for development resources (varies by team size and usage)
@@ -286,7 +286,7 @@ echo "✅ Required APIs enabled"
    version: '3.8'
    services:
      alloydb-omni:
-       image: google/alloydbomni:latest
+       image: google/alloydbomni:16.8.0
        container_name: alloydb-dev
        environment:
          - POSTGRES_DB=development_db

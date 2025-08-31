@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Fleet Engine, Cloud Run Jobs, Cloud Scheduler, Maps Platform
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: fleet-management, logistics, real-time-tracking, route-optimization, serverless-batch-processing
 recipe-generator-version: 1.3
@@ -90,14 +90,13 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for the project
+# Set environment variables for GCP resources
 export PROJECT_ID="fleet-ops-$(date +%s)"
 export REGION="us-central1"
 export ZONE="us-central1-a"
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
-export FLEET_ENGINE_PROJECT_ID="${PROJECT_ID}"
 export ANALYTICS_JOB_NAME="fleet-analytics-${RANDOM_SUFFIX}"
 export BUCKET_NAME="fleet-data-${RANDOM_SUFFIX}"
 export DATASET_NAME="fleet_analytics"
@@ -120,7 +119,8 @@ gcloud services enable \
     firestore.googleapis.com \
     maps-backend.googleapis.com \
     routes.googleapis.com \
-    monitoring.googleapis.com
+    monitoring.googleapis.com \
+    cloudbuild.googleapis.com
 
 echo "✅ Project ${PROJECT_ID} configured and APIs enabled"
 ```
@@ -146,7 +146,7 @@ echo "✅ Project ${PROJECT_ID} configured and APIs enabled"
        --member="serviceAccount:fleet-engine-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/fleetengine.deliveryConsumer"
    
-   # Create and download service account key
+   # Create and download service account key for local development
    gcloud iam service-accounts keys create fleet-engine-key.json \
        --iam-account=fleet-engine-sa@${PROJECT_ID}.iam.gserviceaccount.com
    
@@ -171,9 +171,12 @@ echo "✅ Project ${PROJECT_ID} configured and APIs enabled"
    gsutil versioning set on gs://${BUCKET_NAME}
    
    # Create folder structure for organized data storage
-   echo "Fleet data initialized" | gsutil cp - gs://${BUCKET_NAME}/vehicle-telemetry/README.txt
-   echo "Route histories storage" | gsutil cp - gs://${BUCKET_NAME}/route-histories/README.txt
-   echo "Analytics results storage" | gsutil cp - gs://${BUCKET_NAME}/analytics-results/README.txt
+   echo "Fleet data initialized" | gsutil cp - \
+       gs://${BUCKET_NAME}/vehicle-telemetry/README.txt
+   echo "Route histories storage" | gsutil cp - \
+       gs://${BUCKET_NAME}/route-histories/README.txt
+   echo "Analytics results storage" | gsutil cp - \
+       gs://${BUCKET_NAME}/analytics-results/README.txt
    
    # Set lifecycle policy for cost optimization
    cat > lifecycle-policy.json << EOF
@@ -244,6 +247,7 @@ echo "✅ Project ${PROJECT_ID} configured and APIs enabled"
    ```bash
    # Create Firestore database in Native mode
    gcloud firestore databases create \
+       --database="(default)" \
        --location=${REGION} \
        --type=firestore-native
    
@@ -293,14 +297,14 @@ echo "✅ Project ${PROJECT_ID} configured and APIs enabled"
    mkdir -p fleet-analytics-job
    cd fleet-analytics-job
    
-   # Create Python requirements
+   # Create Python requirements with latest versions
    cat > requirements.txt << EOF
-   google-cloud-bigquery==3.14.1
-   google-cloud-storage==2.10.0
-   google-cloud-firestore==2.13.1
-   pandas==2.1.4
-   numpy==1.24.3
-   scikit-learn==1.3.2
+   google-cloud-bigquery==3.17.2
+   google-cloud-storage==2.13.0
+   google-cloud-firestore==2.14.0
+   pandas==2.2.0
+   numpy==1.26.3
+   scikit-learn==1.4.0
    EOF
    
    # Create the analytics processing script
@@ -348,7 +352,7 @@ echo "✅ Project ${PROJECT_ID} configured and APIs enabled"
                # Generate performance insights
                insights = {
                    'total_vehicles': len(df),
-                   'avg_fleet_speed': df['avg_speed'].mean(),
+                   'avg_fleet_speed': float(df['avg_speed'].mean()) if len(df) > 0 else 0,
                    'vehicles_needing_fuel': len(df[df['min_fuel_level'] < 0.2]),
                    'high_variance_vehicles': len(df[df['speed_variance'] > 10]),
                    'timestamp': datetime.now().isoformat()
@@ -391,7 +395,7 @@ echo "✅ Project ${PROJECT_ID} configured and APIs enabled"
    CMD ["python", "analytics_processor.py"]
    EOF
    
-   # Build and push the container image
+   # Build and push the container image using Cloud Build
    gcloud builds submit --tag gcr.io/${PROJECT_ID}/${ANALYTICS_JOB_NAME}
    
    cd ..
@@ -450,7 +454,9 @@ echo "✅ Project ${PROJECT_ID} configured and APIs enabled"
        --oidc-service-account-email=${FLEET_ENGINE_SA_EMAIL} \
        --oidc-token-audience="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/${ANALYTICS_JOB_NAME}:run" \
        --location=${REGION} \
-       --description="Daily fleet analytics processing"
+       --description="Daily fleet analytics processing" \
+       --max-retry-attempts=3 \
+       --max-retry-duration=300s
    
    # Create additional scheduler job for hourly insights
    gcloud scheduler jobs create http fleet-insights-hourly \
@@ -461,13 +467,9 @@ echo "✅ Project ${PROJECT_ID} configured and APIs enabled"
        --oidc-service-account-email=${FLEET_ENGINE_SA_EMAIL} \
        --oidc-token-audience="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/${ANALYTICS_JOB_NAME}:run" \
        --location=${REGION} \
-       --description="Hourly fleet insights processing"
-   
-   # Set up retry policy for reliability
-   gcloud scheduler jobs update http fleet-analytics-daily \
+       --description="Hourly fleet insights processing" \
        --max-retry-attempts=3 \
-       --max-retry-duration=300s \
-       --location=${REGION}
+       --max-retry-duration=300s
    
    echo "✅ Cloud Scheduler configured for automated analytics processing"
    ```
@@ -518,7 +520,7 @@ echo "✅ Project ${PROJECT_ID} configured and APIs enabled"
                  {
                    "timeSeriesQuery": {
                      "timeSeriesFilter": {
-                       "filter": "resource.type=\"cloud_run_job\" AND resource.label.job_name=\"${ANALYTICS_JOB_NAME}\"",
+                       "filter": "resource.type=\"cloud_run_job\"",
                        "aggregation": {
                          "alignmentPeriod": "300s",
                          "perSeriesAligner": "ALIGN_RATE"
@@ -538,38 +540,17 @@ echo "✅ Project ${PROJECT_ID} configured and APIs enabled"
    # Create the monitoring dashboard
    gcloud monitoring dashboards create --config-from-file=fleet-dashboard.json
    
-   # Create alerting policy for failed analytics jobs
-   cat > alerting-policy.json << 'EOF'
-   {
-     "displayName": "Fleet Analytics Job Failures",
-     "conditions": [
-       {
-         "displayName": "Analytics Job Failure Rate",
-         "conditionThreshold": {
-           "filter": "resource.type=\"cloud_run_job\" AND resource.label.job_name=\"${ANALYTICS_JOB_NAME}\" AND metric.type=\"run.googleapis.com/job/completed_execution_count\"",
-           "comparison": "COMPARISON_GREATER_THAN",
-           "thresholdValue": 0,
-           "duration": "300s",
-           "aggregations": [
-             {
-               "alignmentPeriod": "300s",
-               "perSeriesAligner": "ALIGN_RATE"
-             }
-           ]
-         }
-       }
-     ],
-     "combiner": "OR",
-     "enabled": true
-   }
-   EOF
-   
-   gcloud alpha monitoring policies create --policy-from-file=alerting-policy.json
+   # Create notification channel for alerting (email)
+   gcloud alpha monitoring channels create \
+       --display-name="Fleet Operations Team" \
+       --description="Email notifications for fleet operations" \
+       --type=email \
+       --channel-labels=email_address=fleet-ops@example.com
    
    echo "✅ Monitoring and alerting configured for fleet operations"
    ```
 
-   The monitoring system now provides comprehensive visibility into fleet operations and system performance. Dashboards and alerts enable proactive management of the fleet management platform, ensuring high availability and optimal performance.
+   The monitoring system now provides comprehensive visibility into fleet operations and system performance. Dashboards enable proactive management of the fleet management platform, ensuring high availability and optimal performance.
 
 ## Validation & Testing
 
@@ -694,6 +675,14 @@ echo "✅ Project ${PROJECT_ID} configured and APIs enabled"
    gcloud projects remove-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:${FLEET_ENGINE_SA_EMAIL}" \
        --role="roles/fleetengine.deliveryFleetReader"
+   
+   gcloud projects remove-iam-policy-binding ${PROJECT_ID} \
+       --member="serviceAccount:${FLEET_ENGINE_SA_EMAIL}" \
+       --role="roles/bigquery.dataEditor"
+   
+   gcloud projects remove-iam-policy-binding ${PROJECT_ID} \
+       --member="serviceAccount:${FLEET_ENGINE_SA_EMAIL}" \
+       --role="roles/storage.objectAdmin"
    
    # Delete service account
    gcloud iam service-accounts delete ${FLEET_ENGINE_SA_EMAIL} \

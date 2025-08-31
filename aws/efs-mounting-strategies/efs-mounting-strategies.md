@@ -1,22 +1,21 @@
 ---
 title: EFS Mounting Strategies and Optimization
 id: 5b46906c
-category: compute
+category: storage
 difficulty: 300
 subject: aws
 services: efs, ec2, iam
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: efs, shared-storage, nfs, multi-az
 recipe-generator-version: 1.3
 ---
 
 # EFS Mounting Strategies and Optimization
-
 
 ## Problem
 
@@ -91,7 +90,8 @@ graph TB
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of NFS, file systems, and Linux mounting concepts
 4. Existing VPC with at least two subnets in different availability zones
-5. Estimated cost: $0.30/GB per month for standard storage + $0.10/GB per month for mount target usage
+5. SSH key pair for EC2 instance access
+6. Estimated cost: $0.30/GB per month for standard storage + $0.05/GB per month for provisioned throughput
 
 > **Note**: EFS charges are based on storage used and throughput consumed. This recipe creates resources that will incur costs if not cleaned up properly. For detailed pricing information, see the [EFS Pricing Guide](https://docs.aws.amazon.com/efs/latest/ug/how-it-works.html).
 
@@ -127,10 +127,11 @@ export SUBNET_A=$(echo $SUBNET_IDS | cut -d' ' -f1)
 export SUBNET_B=$(echo $SUBNET_IDS | cut -d' ' -f2)
 export SUBNET_C=$(echo $SUBNET_IDS | cut -d' ' -f3)
 
-# Get latest Amazon Linux 2 AMI ID
+# Get latest Amazon Linux 2023 AMI ID
 export AMI_ID=$(aws ec2 describe-images \
     --owners amazon \
-    --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" \
+    --filters "Name=name,Values=al2023-ami-*-x86_64" \
+              "Name=state,Values=available" \
     --query "Images | sort_by(@, &CreationDate) | [-1].ImageId" \
     --output text)
 
@@ -176,11 +177,12 @@ echo "Subnets: ${SUBNET_A}, ${SUBNET_B}, ${SUBNET_C}"
        --vpc-id ${VPC_ID} \
        --query "GroupId" --output text)
    
-   # Allow NFS traffic from VPC CIDR
+   # Get VPC CIDR block for security group rule
    VPC_CIDR=$(aws ec2 describe-vpcs \
        --vpc-ids ${VPC_ID} \
        --query "Vpcs[0].CidrBlock" --output text)
    
+   # Allow NFS traffic from VPC CIDR
    aws ec2 authorize-security-group-ingress \
        --group-id ${SG_ID} \
        --protocol tcp \
@@ -212,7 +214,7 @@ echo "Subnets: ${SUBNET_A}, ${SUBNET_B}, ${SUBNET_C}"
        --query "MountTargetId" --output text)
    
    # Create mount target in third AZ (if available)
-   if [ -n "${SUBNET_C}" ]; then
+   if [ -n "${SUBNET_C}" ] && [ "${SUBNET_C}" != "None" ]; then
        export MT_C=$(aws efs create-mount-target \
            --file-system-id ${EFS_ID} \
            --subnet-id ${SUBNET_C} \
@@ -321,16 +323,18 @@ echo "Subnets: ${SUBNET_A}, ${SUBNET_B}, ${SUBNET_C}"
    aws iam create-instance-profile \
        --instance-profile-name "EFS-EC2-Profile-${RANDOM_SUFFIX}"
    
+   # Add role to instance profile
    aws iam add-role-to-instance-profile \
        --instance-profile-name "EFS-EC2-Profile-${RANDOM_SUFFIX}" \
        --role-name "EFS-EC2-Role-${RANDOM_SUFFIX}"
+   
+   # Wait for instance profile propagation
+   sleep 10
    
    echo "✅ IAM role and instance profile created"
    ```
 
    The IAM infrastructure now enables secure, credential-free access to your EFS file system. EC2 instances using this role can mount, read, and write to EFS using automatically rotated temporary credentials, eliminating security risks associated with hardcoded access keys while maintaining full operational capabilities.
-
-> **Warning**: Ensure proper IAM permissions are configured before proceeding to avoid access denied errors when mounting EFS file systems.
 
 6. **Launch EC2 Instance with EFS Utils**:
 
@@ -341,7 +345,7 @@ echo "Subnets: ${SUBNET_A}, ${SUBNET_B}, ${SUBNET_C}"
    cat > /tmp/user-data.sh << 'EOF'
 #!/bin/bash
 yum update -y
-yum install -y amazon-efs-utils
+yum install -y amazon-efs-utils nfs-utils
 mkdir -p /mnt/efs
 mkdir -p /mnt/efs-app
 mkdir -p /mnt/efs-user
@@ -356,11 +360,15 @@ EOF
        --security-group-ids ${SG_ID} \
        --iam-instance-profile Name="EFS-EC2-Profile-${RANDOM_SUFFIX}" \
        --user-data file:///tmp/user-data.sh \
-       --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_NAME}}]" \
+       --tag-specifications \
+           "ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_NAME}}]" \
        --query "Instances[0].InstanceId" --output text)
    
    # Wait for instance to be running
    aws ec2 wait instance-running --instance-ids ${INSTANCE_ID}
+   
+   # Wait for status checks to pass
+   aws ec2 wait instance-status-ok --instance-ids ${INSTANCE_ID}
    
    echo "✅ EC2 instance launched: ${INSTANCE_ID}"
    ```
@@ -372,12 +380,6 @@ EOF
    Standard NFS mounting provides broad compatibility with existing applications and infrastructure while offering fine-grained control over performance parameters. The NFSv4.1 protocol delivers enhanced security features and improved performance compared to earlier versions. Optimized mount options like larger read/write buffer sizes (1MB) and appropriate timeout values ensure robust performance across varying network conditions while maintaining data consistency.
 
    ```bash
-   # Get instance public IP for SSH access
-   export INSTANCE_IP=$(aws ec2 describe-instances \
-       --instance-ids ${INSTANCE_ID} \
-       --query "Reservations[0].Instances[0].PublicIpAddress" \
-       --output text)
-   
    # Create mount commands script
    cat > /tmp/mount-commands.sh << EOF
 #!/bin/bash
@@ -391,7 +393,7 @@ echo "✅ Standard NFS mount completed"
 EOF
    
    chmod +x /tmp/mount-commands.sh
-   echo "✅ Standard mount script created"
+   echo "✅ Standard mount script created: /tmp/mount-commands.sh"
    ```
 
    The standard NFS mounting script implements production-ready parameters including hard mounts for data consistency, interrupt capability for responsive applications, and optimized buffer sizes for maximum throughput. This approach provides maximum compatibility with existing NFS-aware applications requiring minimal configuration changes.
@@ -407,10 +409,13 @@ EOF
 # Mount using EFS utils with TLS encryption
 sudo mount -t efs -o tls ${EFS_ID}:/ /mnt/efs
     
-# Mount using access points
-sudo mount -t efs -o tls,accesspoint=${AP_APP} ${EFS_ID}:/ /mnt/efs-app
-sudo mount -t efs -o tls,accesspoint=${AP_USER} ${EFS_ID}:/ /mnt/efs-user
-sudo mount -t efs -o tls,accesspoint=${AP_LOGS} ${EFS_ID}:/ /mnt/efs-logs
+# Mount using access points with TLS encryption
+sudo mount -t efs -o tls,accesspoint=${AP_APP} \
+    ${EFS_ID}:/ /mnt/efs-app
+sudo mount -t efs -o tls,accesspoint=${AP_USER} \
+    ${EFS_ID}:/ /mnt/efs-user
+sudo mount -t efs -o tls,accesspoint=${AP_LOGS} \
+    ${EFS_ID}:/ /mnt/efs-logs
     
 # Verify all mounts
 df -h | grep efs
@@ -418,7 +423,7 @@ echo "✅ EFS utils mounts completed"
 EOF
    
    chmod +x /tmp/efs-utils-mount.sh
-   echo "✅ EFS utils mount script created"
+   echo "✅ EFS utils mount script created: /tmp/efs-utils-mount.sh"
    ```
 
    The EFS Utils mounting strategy now provides encrypted data transmission and segregated access patterns through access points. Each mount point operates with its own security context and directory isolation, enabling secure multi-tenant architectures where different applications or user groups require isolated access to shared storage resources.
@@ -435,19 +440,23 @@ EOF
 sudo cp /etc/fstab /etc/fstab.backup
 
 # Add EFS entries to fstab for automatic mounting
-echo "${EFS_ID}.efs.${AWS_REGION}.amazonaws.com:/ /mnt/efs efs defaults,_netdev,tls" | sudo tee -a /etc/fstab
-echo "${EFS_ID}.efs.${AWS_REGION}.amazonaws.com:/ /mnt/efs-app efs defaults,_netdev,tls,accesspoint=${AP_APP}" | sudo tee -a /etc/fstab
-echo "${EFS_ID}.efs.${AWS_REGION}.amazonaws.com:/ /mnt/efs-user efs defaults,_netdev,tls,accesspoint=${AP_USER}" | sudo tee -a /etc/fstab
-echo "${EFS_ID}.efs.${AWS_REGION}.amazonaws.com:/ /mnt/efs-logs efs defaults,_netdev,tls,accesspoint=${AP_LOGS}" | sudo tee -a /etc/fstab
+echo "${EFS_ID}.efs.${AWS_REGION}.amazonaws.com:/ /mnt/efs efs defaults,_netdev,tls" | \
+    sudo tee -a /etc/fstab
+echo "${EFS_ID}.efs.${AWS_REGION}.amazonaws.com:/ /mnt/efs-app efs defaults,_netdev,tls,accesspoint=${AP_APP}" | \
+    sudo tee -a /etc/fstab
+echo "${EFS_ID}.efs.${AWS_REGION}.amazonaws.com:/ /mnt/efs-user efs defaults,_netdev,tls,accesspoint=${AP_USER}" | \
+    sudo tee -a /etc/fstab
+echo "${EFS_ID}.efs.${AWS_REGION}.amazonaws.com:/ /mnt/efs-logs efs defaults,_netdev,tls,accesspoint=${AP_LOGS}" | \
+    sudo tee -a /etc/fstab
 
-# Mount all entries
+# Test mount all entries
 sudo mount -a
 
 echo "✅ Automatic mounting configured"
 EOF
    
    chmod +x /tmp/fstab-config.sh
-   echo "✅ Fstab configuration script created"
+   echo "✅ Fstab configuration script created: /tmp/fstab-config.sh"
    ```
 
    Persistent mounting configuration is now established with encrypted connections and proper network dependency handling. This setup ensures reliable file system availability across instance lifecycles while maintaining security through TLS encryption and access point isolation for different application requirements.
@@ -476,8 +485,13 @@ time dd if=/mnt/efs/test-file of=/dev/null bs=1M
 
 # Show EFS statistics
 echo "EFS Mount Statistics:"
-sudo nfsstat -m | grep ${EFS_ID}
+sudo nfsstat -m | grep ${EFS_ID} || echo "Mount stats not available yet"
 
+# Show disk usage
+echo "EFS Disk Usage:"
+df -h /mnt/efs*
+
+# Cleanup test file
 rm -f /mnt/efs/test-file
 INNER_EOF
 
@@ -486,7 +500,7 @@ echo "✅ Performance monitoring setup completed"
 EOF
     
     chmod +x /tmp/efs-monitoring.sh
-    echo "✅ Monitoring script created"
+    echo "✅ Monitoring script created: /tmp/efs-monitoring.sh"
     ```
 
     Performance monitoring infrastructure is now configured to provide visibility into EFS operations through CloudWatch metrics and local performance testing capabilities. This monitoring foundation enables proactive optimization and troubleshooting, ensuring your shared storage infrastructure delivers consistent performance for distributed applications.
@@ -538,6 +552,22 @@ EOF
 
    Expected output: Instance in "running" state with security group allowing NFS traffic
 
+4. **Test mounting strategies (requires SSH access)**:
+
+   ```bash
+   # Get instance public IP for SSH access
+   export INSTANCE_IP=$(aws ec2 describe-instances \
+       --instance-ids ${INSTANCE_ID} \
+       --query "Reservations[0].Instances[0].PublicIpAddress" \
+       --output text)
+   
+   echo "Connect to instance to test mounting:"
+   echo "ssh -i your-key.pem ec2-user@${INSTANCE_IP}"
+   echo "Then run: sudo /tmp/efs-utils-mount.sh"
+   ```
+
+   Expected result: Successfully mounted EFS file systems with access point isolation
+
 ## Cleanup
 
 1. **Terminate EC2 instance**:
@@ -569,7 +599,7 @@ EOF
    # Delete mount targets
    aws efs delete-mount-target --mount-target-id ${MT_A}
    aws efs delete-mount-target --mount-target-id ${MT_B}
-   if [ -n "${MT_C}" ]; then
+   if [ -n "${MT_C}" ] && [ "${MT_C}" != "None" ]; then
        aws efs delete-mount-target --mount-target-id ${MT_C}
    fi
    
@@ -620,16 +650,18 @@ EOF
    echo "✅ Security group deleted"
    
    # Clean up temporary files
-   rm -f /tmp/user-data.sh /tmp/mount-commands.sh /tmp/efs-utils-mount.sh /tmp/fstab-config.sh /tmp/efs-monitoring.sh
+   rm -f /tmp/user-data.sh /tmp/mount-commands.sh \
+         /tmp/efs-utils-mount.sh /tmp/fstab-config.sh \
+         /tmp/efs-monitoring.sh
    
    echo "✅ Cleanup completed"
    ```
 
 ## Discussion
 
-Amazon EFS provides enterprise-grade shared file storage that automatically scales and delivers consistent performance across multiple compute instances. The mounting strategies implemented in this recipe address different use cases and performance requirements. The General Purpose performance mode offers the lowest latency for most workloads, while the provisioned throughput mode ensures consistent performance regardless of file system size.
+Amazon EFS provides enterprise-grade shared file storage that automatically scales and delivers consistent performance across multiple compute instances. The mounting strategies implemented in this recipe address different use cases and performance requirements. The General Purpose performance mode offers the lowest latency for most workloads, while the provisioned throughput mode ensures consistent performance regardless of file system size. This combination makes EFS ideal for content repositories, web serving, data analytics, and application development workflows.
 
-Access points provide a powerful mechanism for implementing fine-grained access control and directory-level permissions. Each access point can enforce specific POSIX user credentials and root directory paths, making it ideal for multi-tenant applications or scenarios where different applications need isolated access to specific portions of the file system. This approach eliminates the need for complex directory permission management while maintaining security boundaries.
+Access points provide a powerful mechanism for implementing fine-grained access control and directory-level permissions. Each access point can enforce specific POSIX user credentials and root directory paths, making it ideal for multi-tenant applications or scenarios where different applications need isolated access to specific portions of the file system. This approach eliminates the need for complex directory permission management while maintaining security boundaries essential for enterprise compliance requirements.
 
 The choice between standard NFS mounting and EFS utils mounting depends on security requirements and performance optimization needs. EFS utils provides enhanced features like TLS encryption in transit, IAM authentication, and automatic retries. For production environments, using EFS utils with TLS encryption is recommended to ensure data security and optimal performance. The automatic mounting configuration through fstab ensures that file systems are available after instance reboots, which is crucial for production workloads. For comprehensive mounting guidance, see the [EFS Mounting Documentation](https://docs.aws.amazon.com/efs/latest/ug/mounting-fs.html).
 

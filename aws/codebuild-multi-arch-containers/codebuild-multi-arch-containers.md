@@ -4,12 +4,12 @@ id: 0896bab5
 category: containers
 difficulty: 300
 subject: aws
-services: 'codebuild','ecr','iam'
+services: codebuild, ecr, iam, s3
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: 'containers','codebuild','multi-architecture','docker','ecr','arm','x86','buildx'
 recipe-generator-version: 1.3
@@ -222,7 +222,7 @@ echo "✅ Created ECR repository: ${ECR_REPO_URI}"
        "start": "node app.js"
      },
      "dependencies": {
-       "express": "^4.18.2"
+       "express": "^4.19.2"
      }
    }
    EOF
@@ -240,7 +240,7 @@ echo "✅ Created ECR repository: ${ECR_REPO_URI}"
    # Create Dockerfile optimized for multi-architecture builds
    cat > Dockerfile << 'EOF'
    # syntax=docker/dockerfile:1
-   FROM --platform=$BUILDPLATFORM node:18-alpine AS build
+   FROM --platform=$BUILDPLATFORM node:20-alpine AS build
    
    # Set working directory
    WORKDIR /app
@@ -252,7 +252,7 @@ echo "✅ Created ECR repository: ${ECR_REPO_URI}"
    RUN npm ci --only=production
    
    # Multi-stage build for final image
-   FROM node:18-alpine AS runtime
+   FROM node:20-alpine AS runtime
    
    # Install security updates
    RUN apk update && apk upgrade && apk add --no-cache dumb-init
@@ -368,7 +368,7 @@ echo "✅ Created ECR repository: ${ECR_REPO_URI}"
      },
      "environment": {
        "type": "LINUX_CONTAINER",
-       "image": "aws/codebuild/standard:7.0",
+       "image": "aws/codebuild/amazonlinux-x86_64-standard:5.0",
        "computeType": "BUILD_GENERAL1_MEDIUM",
        "privilegedMode": true,
        "environmentVariables": [
@@ -587,9 +587,9 @@ This solution addresses the growing need for multi-architecture container suppor
 
 The key architectural decision involves using Docker manifest lists, which act as a "pointer" to architecture-specific images. When a container runtime requests an image, Docker automatically selects the appropriate architecture variant, making the multi-architecture support transparent to deployment processes. This eliminates the need for architecture-specific deployment configurations and reduces the risk of deploying incompatible images.
 
-The solution leverages CodeBuild's privileged mode to enable Docker-in-Docker functionality required for Buildx operations. The build process utilizes layer caching to optimize build times, which is particularly important for multi-architecture builds that inherently require more compute resources. The buildspec configuration demonstrates best practices for cross-platform compilation, including proper handling of build arguments and platform-specific optimizations.
+The solution leverages CodeBuild's privileged mode to enable Docker-in-Docker functionality required for Buildx operations. The build process utilizes layer caching to optimize build times, which is particularly important for multi-architecture builds that inherently require more compute resources. The buildspec configuration demonstrates best practices for cross-platform compilation, including proper handling of build arguments and platform-specific optimizations. Following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html), this approach optimizes for both operational excellence and cost efficiency.
 
-From a cost perspective, multi-architecture builds consume additional compute time but provide significant operational benefits. ARM-based instances like those powered by AWS Graviton processors often provide better price-performance ratios for many workloads, making the initial investment in multi-architecture support worthwhile for long-term cost optimization.
+From a cost perspective, multi-architecture builds consume additional compute time but provide significant operational benefits. ARM-based instances like those powered by AWS Graviton processors often provide better price-performance ratios for many workloads, making the initial investment in multi-architecture support worthwhile for long-term cost optimization. The solution also incorporates security best practices by using least-privilege IAM permissions and encrypted container image storage.
 
 > **Tip**: Use build caching strategies and consider implementing conditional builds based on code changes to optimize build times and reduce costs for multi-architecture pipelines. See the [CodeBuild documentation](https://docs.aws.amazon.com/codebuild/latest/userguide/build-caching.html) for advanced caching strategies.
 

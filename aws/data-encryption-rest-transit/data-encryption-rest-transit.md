@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: kms,s3,rds,certificate-manager
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: security,encryption,compliance,kms,ssl-tls
 recipe-generator-version: 1.3
 ---
 
 # Data Encryption at Rest and in Transit
-
 
 ## Problem
 
@@ -201,10 +200,14 @@ echo "✅ Environment prepared with VPC: $VPC_ID"
 
    ```bash
    # Create S3 bucket with encryption enabled
-   aws s3api create-bucket \
-       --bucket $S3_BUCKET_NAME \
-       --region $AWS_REGION \
-       --create-bucket-configuration LocationConstraint=$AWS_REGION
+   if [ "$AWS_REGION" = "us-east-1" ]; then
+       aws s3api create-bucket --bucket $S3_BUCKET_NAME
+   else
+       aws s3api create-bucket \
+           --bucket $S3_BUCKET_NAME \
+           --region $AWS_REGION \
+           --create-bucket-configuration LocationConstraint=$AWS_REGION
+   fi
 
    # Enable default encryption with KMS
    aws s3api put-bucket-encryption \
@@ -456,10 +459,46 @@ echo "✅ Environment prepared with VPC: $VPC_ID"
    export CLOUDTRAIL_BUCKET="${S3_BUCKET_NAME}-cloudtrail"
    
    # Create separate bucket for CloudTrail logs
-   aws s3api create-bucket \
+   if [ "$AWS_REGION" = "us-east-1" ]; then
+       aws s3api create-bucket --bucket $CLOUDTRAIL_BUCKET
+   else
+       aws s3api create-bucket \
+           --bucket $CLOUDTRAIL_BUCKET \
+           --region $AWS_REGION \
+           --create-bucket-configuration LocationConstraint=$AWS_REGION
+   fi
+
+   # Set bucket policy for CloudTrail
+   aws s3api put-bucket-policy \
        --bucket $CLOUDTRAIL_BUCKET \
-       --region $AWS_REGION \
-       --create-bucket-configuration LocationConstraint=$AWS_REGION
+       --policy '{
+           "Version": "2012-10-17",
+           "Statement": [
+               {
+                   "Sid": "AWSCloudTrailAclCheck",
+                   "Effect": "Allow",
+                   "Principal": {
+                       "Service": "cloudtrail.amazonaws.com"
+                   },
+                   "Action": "s3:GetBucketAcl",
+                   "Resource": "arn:aws:s3:::'$CLOUDTRAIL_BUCKET'"
+               },
+               {
+                   "Sid": "AWSCloudTrailWrite",
+                   "Effect": "Allow",
+                   "Principal": {
+                       "Service": "cloudtrail.amazonaws.com"
+                   },
+                   "Action": "s3:PutObject",
+                   "Resource": "arn:aws:s3:::'$CLOUDTRAIL_BUCKET'/AWSLogs/'$AWS_ACCOUNT_ID'/*",
+                   "Condition": {
+                       "StringEquals": {
+                           "s3:x-amz-acl": "bucket-owner-full-control"
+                       }
+                   }
+               }
+           ]
+       }'
 
    # Enable CloudTrail
    aws cloudtrail create-trail \
@@ -733,15 +772,15 @@ echo "✅ Environment prepared with VPC: $VPC_ID"
 
 This comprehensive encryption implementation demonstrates AWS security best practices for protecting sensitive data both at rest and in transit. The solution leverages AWS KMS as the central key management service, providing a single point of control for encryption keys across multiple AWS services. By using customer-managed keys instead of AWS-managed keys, organizations maintain full control over key policies, rotation schedules, and access permissions.
 
-The encryption at rest implementation covers the most common data storage scenarios: S3 buckets with SSE-KMS encryption, RDS databases with transparent data encryption, and EC2 EBS volumes with block-level encryption. Each service integrates seamlessly with KMS, automatically handling encryption and decryption operations without impacting application performance. The use of S3 bucket keys reduces KMS API calls and associated costs while maintaining the same level of security.
+The encryption at rest implementation covers the most common data storage scenarios: S3 buckets with SSE-KMS encryption, RDS databases with transparent data encryption, and EC2 EBS volumes with block-level encryption. Each service integrates seamlessly with KMS, automatically handling encryption and decryption operations without impacting application performance. The use of S3 bucket keys reduces KMS API calls and associated costs while maintaining the same level of security, making it ideal for high-volume workloads.
 
 For data in transit protection, the solution demonstrates TLS/SSL certificate management through AWS Certificate Manager, which automates certificate provisioning, validation, and renewal. The integration with Application Load Balancers ensures encrypted communication between clients and applications. Additionally, the CloudTrail configuration provides comprehensive audit logging of all encryption-related activities, essential for compliance reporting and security monitoring.
 
 The implementation follows the principle of defense in depth, with multiple layers of encryption protection. Secrets Manager provides additional security for sensitive configuration data like database credentials, automatically rotating secrets and encrypting them with customer-managed KMS keys. This approach meets the requirements of various compliance frameworks including HIPAA, PCI DSS, and SOC 2 Type II.
 
-> **Tip**: Enable automatic key rotation for KMS keys to meet security best practices and compliance requirements. Keys can be rotated annually without requiring application changes.
+> **Tip**: Enable automatic key rotation for KMS keys to meet security best practices and compliance requirements. Keys can be rotated annually without requiring application changes. See the [AWS KMS key rotation documentation](https://docs.aws.amazon.com/kms/latest/developerguide/rotate-keys.html).
 
-> **Warning**: Ensure proper IAM permissions are configured before implementing encryption to avoid service disruptions. Test encryption configurations in development environments before deploying to production.
+> **Warning**: Ensure proper IAM permissions are configured before implementing encryption to avoid service disruptions. Test encryption configurations in development environments before deploying to production. Review the [AWS KMS best practices](https://docs.aws.amazon.com/kms/latest/developerguide/best-practices.html).
 
 > **Note**: RDS encryption cannot be disabled once enabled. To encrypt an existing unencrypted database, you must create an encrypted snapshot and restore it. Learn more about [RDS encryption](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Overview.Encryption.html).
 

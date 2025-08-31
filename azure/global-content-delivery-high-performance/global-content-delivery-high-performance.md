@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Front Door Premium, Azure NetApp Files, Azure Private Link, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: content-delivery, global-distribution, high-performance, private-link, monitoring
 recipe-generator-version: 1.3
@@ -275,7 +275,7 @@ echo "✅ Resource providers registered successfully"
        --volume-name ${VOLUME_NAME} \
        --service-level Premium \
        --usage-threshold 1000 \
-       --file-path "content-primary" \
+       --creation-token "content-primary" \
        --subnet ${SUBNET_ID_PRIMARY} \
        --protocol-types NFSv3
    
@@ -288,7 +288,7 @@ echo "✅ Resource providers registered successfully"
        --volume-name ${VOLUME_NAME} \
        --service-level Premium \
        --usage-threshold 1000 \
-       --file-path "content-secondary" \
+       --creation-token "content-secondary" \
        --subnet ${SUBNET_ID_SECONDARY} \
        --protocol-types NFSv3
    
@@ -436,6 +436,12 @@ echo "✅ Resource providers registered successfully"
        --link-to-default-domain Enabled \
        --https-redirect Enabled
    
+   # Create rule set for caching policies
+   az afd rule-set create \
+       --resource-group ${RESOURCE_GROUP} \
+       --profile-name ${FRONT_DOOR_NAME} \
+       --rule-set-name "caching-rules"
+   
    # Create caching rule for static content
    az afd rule create \
        --resource-group ${RESOURCE_GROUP} \
@@ -443,8 +449,13 @@ echo "✅ Resource providers registered successfully"
        --rule-set-name "caching-rules" \
        --rule-name "static-content" \
        --order 1 \
-       --conditions '[{"name":"UrlFileExtension","parameters":{"operator":"Equal","matchValues":["jpg","jpeg","png","gif","css","js","pdf","mp4","mp3"],"transforms":["Lowercase"]}}]' \
-       --actions '[{"name":"ModifyResponseHeader","parameters":{"headerAction":"Overwrite","headerName":"Cache-Control","value":"public, max-age=31536000"}}]'
+       --match-variable UrlFileExtension \
+       --operator Equal \
+       --match-values jpg jpeg png gif css js pdf mp4 mp3 \
+       --action-name ModifyResponseHeader \
+       --header-action Overwrite \
+       --header-name "Cache-Control" \
+       --header-value "public, max-age=31536000"
    
    echo "✅ Routes and caching rules configured"
    ```
@@ -459,34 +470,37 @@ echo "✅ Resource providers registered successfully"
    # Create WAF policy
    az network front-door waf-policy create \
        --resource-group ${RESOURCE_GROUP} \
-       --name "waf-content-${RANDOM_SUFFIX}" \
+       --name "wafcontentpolicy${RANDOM_SUFFIX}" \
        --mode Prevention \
        --enabled true \
        --sku Premium_AzureFrontDoor
    
-   # Create managed rule set
+   # Add managed rule set
    az network front-door waf-policy managed-rules add \
        --resource-group ${RESOURCE_GROUP} \
-       --policy-name "waf-content-${RANDOM_SUFFIX}" \
+       --policy-name "wafcontentpolicy${RANDOM_SUFFIX}" \
        --type Microsoft_DefaultRuleSet \
        --version 2.1 \
        --action Block
    
-   # Create rate limiting rule
-   az network front-door waf-policy rule create \
+   # Get WAF policy ID
+   WAF_POLICY_ID=$(az network front-door waf-policy show \
        --resource-group ${RESOURCE_GROUP} \
-       --policy-name "waf-content-${RANDOM_SUFFIX}" \
-       --name "RateLimitRule" \
-       --priority 100 \
-       --rule-type RateLimitRule \
-       --action Block \
-       --rate-limit-duration-in-minutes 1 \
-       --rate-limit-threshold 100
+       --name "wafcontentpolicy${RANDOM_SUFFIX}" \
+       --query id --output tsv)
    
-   echo "✅ WAF policy configured with managed rules"
+   # Create security policy to link WAF to Front Door
+   az afd security-policy create \
+       --resource-group ${RESOURCE_GROUP} \
+       --profile-name ${FRONT_DOOR_NAME} \
+       --security-policy-name "content-security-policy" \
+       --domains "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Cdn/profiles/${FRONT_DOOR_NAME}/endpoints/content-endpoint" \
+       --waf-policy ${WAF_POLICY_ID}
+   
+   echo "✅ WAF policy configured and linked to Front Door"
    ```
 
-   The WAF configuration provides comprehensive protection against web-based attacks while maintaining optimal performance for legitimate traffic. The managed rule sets automatically update to protect against emerging threats, while custom rate limiting prevents abuse and ensures service availability.
+   The WAF configuration provides comprehensive protection against web-based attacks while maintaining optimal performance for legitimate traffic. The managed rule sets automatically update to protect against emerging threats, while the security policy ensures all traffic through Front Door is protected.
 
 10. **Configure Azure Monitor and Diagnostics**:
 
@@ -506,23 +520,30 @@ echo "✅ Resource providers registered successfully"
         --workspace-name "law-content-${RANDOM_SUFFIX}" \
         --query id --output tsv)
     
+    # Get Front Door profile ID
+    FRONT_DOOR_ID=$(az afd profile show \
+        --resource-group ${RESOURCE_GROUP} \
+        --profile-name ${FRONT_DOOR_NAME} \
+        --query id --output tsv)
+    
     # Enable diagnostic settings for Front Door
     az monitor diagnostic-settings create \
         --resource-group ${RESOURCE_GROUP} \
         --name "fd-diagnostics" \
-        --resource ${FRONT_DOOR_NAME} \
-        --resource-type Microsoft.Cdn/profiles \
+        --resource ${FRONT_DOOR_ID} \
         --workspace ${WORKSPACE_ID} \
-        --logs '[{"category":"FrontDoorAccessLog","enabled":true}]' \
+        --logs '[{"category":"FrontDoorAccessLog","enabled":true},{"category":"FrontDoorHealthProbeLog","enabled":true}]' \
         --metrics '[{"category":"AllMetrics","enabled":true}]'
     
-    # Create alert rule for high latency
+    # Create alert rule for high request count
     az monitor metrics alert create \
         --resource-group ${RESOURCE_GROUP} \
-        --name "high-latency-alert" \
-        --scopes ${WORKSPACE_ID} \
-        --condition "avg requests > 1000" \
-        --description "Alert when request latency exceeds threshold"
+        --name "high-request-count-alert" \
+        --scopes ${FRONT_DOOR_ID} \
+        --condition "avg RequestCount > 1000" \
+        --description "Alert when request count exceeds threshold" \
+        --evaluation-frequency 5m \
+        --window-size 15m
     
     echo "✅ Monitoring and diagnostics configured"
     ```
@@ -568,7 +589,7 @@ echo "✅ Resource providers registered successfully"
    # Check WAF policy status
    az network front-door waf-policy show \
        --resource-group ${RESOURCE_GROUP} \
-       --name "waf-content-${RANDOM_SUFFIX}" \
+       --name "wafcontentpolicy${RANDOM_SUFFIX}" \
        --query "policySettings.enabledState" --output tsv
    ```
 
@@ -579,7 +600,7 @@ echo "✅ Resource providers registered successfully"
    ```bash
    # Query Front Door metrics
    az monitor metrics list \
-       --resource ${FRONT_DOOR_NAME} \
+       --resource ${FRONT_DOOR_ID} \
        --resource-type Microsoft.Cdn/profiles \
        --resource-group ${RESOURCE_GROUP} \
        --metric "RequestCount" \
@@ -607,7 +628,7 @@ echo "✅ Resource providers registered successfully"
    # Delete WAF policy
    az network front-door waf-policy delete \
        --resource-group ${RESOURCE_GROUP} \
-       --name "waf-content-${RANDOM_SUFFIX}" \
+       --name "wafcontentpolicy${RANDOM_SUFFIX}" \
        --yes
    
    echo "✅ WAF policy deleted"

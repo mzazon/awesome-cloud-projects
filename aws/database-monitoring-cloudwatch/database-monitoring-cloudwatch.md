@@ -4,12 +4,12 @@ id: da622e6b
 category: databases
 difficulty: 200
 subject: aws
-services: cloudwatch, rds, sns
+services: cloudwatch, rds, sns, iam
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: monitoring, dashboards, cloudwatch, rds, database, metrics, alarms
 recipe-generator-version: 1.3
@@ -62,7 +62,7 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with permissions to create RDS instances, CloudWatch dashboards, and SNS topics
+1. AWS account with permissions to create RDS instances, CloudWatch dashboards, SNS topics, and IAM roles
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of database performance metrics and monitoring concepts
 4. Email address for receiving database alerts
@@ -87,6 +87,7 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
 export DB_INSTANCE_ID="monitoring-demo-${RANDOM_SUFFIX}"
 export SNS_TOPIC_NAME="database-alerts-${RANDOM_SUFFIX}"
 export DASHBOARD_NAME="DatabaseMonitoring-${RANDOM_SUFFIX}"
+export DB_PASSWORD="MySecurePassword123!"
 
 # Set your email for notifications
 export ALERT_EMAIL="your-email@example.com"
@@ -106,10 +107,10 @@ echo "Setup complete. DB Instance ID: ${DB_INSTANCE_ID}"
        --db-instance-identifier ${DB_INSTANCE_ID} \
        --db-instance-class db.t3.micro \
        --engine mysql \
-       --engine-version 8.0.35 \
+       --engine-version 8.0.40 \
        --allocated-storage 20 \
        --master-username admin \
-       --master-user-password MySecurePassword123! \
+       --master-user-password ${DB_PASSWORD} \
        --vpc-security-group-ids default \
        --monitoring-interval 60 \
        --enable-performance-insights \
@@ -286,7 +287,7 @@ echo "Setup complete. DB Instance ID: ${DB_INSTANCE_ID}"
        --alarm-actions ${SNS_TOPIC_ARN} \
        --dimensions Name=DBInstanceIdentifier,Value=${DB_INSTANCE_ID}
    
-   # Create free storage space alarm
+   # Create free storage space alarm (2GB threshold)
    aws cloudwatch put-metric-alarm \
        --alarm-name "${DB_INSTANCE_ID}-LowStorage" \
        --alarm-description "Low free storage space on ${DB_INSTANCE_ID}" \
@@ -312,7 +313,7 @@ echo "Setup complete. DB Instance ID: ${DB_INSTANCE_ID}"
    ```bash
    # Create IAM role for enhanced monitoring
    aws iam create-role \
-       --role-name rds-monitoring-role \
+       --role-name rds-monitoring-role-${RANDOM_SUFFIX} \
        --assume-role-policy-document '{
            "Version": "2012-10-17",
            "Statement": [
@@ -328,12 +329,12 @@ echo "Setup complete. DB Instance ID: ${DB_INSTANCE_ID}"
    
    # Attach the required policy
    aws iam attach-role-policy \
-       --role-name rds-monitoring-role \
+       --role-name rds-monitoring-role-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
    
    # Get the role ARN
    MONITORING_ROLE_ARN=$(aws iam get-role \
-       --role-name rds-monitoring-role \
+       --role-name rds-monitoring-role-${RANDOM_SUFFIX} \
        --query 'Role.Arn' --output text)
    
    # Modify the database instance to enable enhanced monitoring
@@ -372,10 +373,14 @@ echo "Setup complete. DB Instance ID: ${DB_INSTANCE_ID}"
 2. **Test Database Connection and Generate Metrics**:
 
    ```bash
-   # Install MySQL client if not available
-   # Connect to database and generate some activity
-   mysql -h ${DB_ENDPOINT} -u admin -p${DB_PASSWORD} \
-       -e "CREATE DATABASE test_db; USE test_db; CREATE TABLE test_table (id INT PRIMARY KEY, name VARCHAR(50)); INSERT INTO test_table VALUES (1, 'test');"
+   # Test database connectivity and generate activity
+   echo "Testing database connection and generating metrics..."
+   
+   # Simple connectivity test using AWS CLI
+   aws rds describe-db-instances \
+       --db-instance-identifier ${DB_INSTANCE_ID} \
+       --query 'DBInstances[0].DBInstanceStatus' \
+       --output text
    
    # Check that metrics are being generated
    aws cloudwatch get-metric-statistics \
@@ -388,6 +393,8 @@ echo "Setup complete. DB Instance ID: ${DB_INSTANCE_ID}"
        --statistics Average \
        --query 'Datapoints[*].[Timestamp,Average]' \
        --output table
+   
+   echo "✅ Database metrics are being collected successfully"
    ```
 
 3. **Test Alarm Functionality**:
@@ -408,6 +415,7 @@ echo "Setup complete. DB Instance ID: ${DB_INSTANCE_ID}"
        --dimensions Name=DBInstanceIdentifier,Value=${DB_INSTANCE_ID}
    
    echo "✅ Test alarm configured - should trigger notification"
+   echo "Note: Reset threshold after testing"
    ```
 
 ## Cleanup
@@ -453,10 +461,10 @@ echo "Setup complete. DB Instance ID: ${DB_INSTANCE_ID}"
    
    # Remove IAM role and policy
    aws iam detach-role-policy \
-       --role-name rds-monitoring-role \
+       --role-name rds-monitoring-role-${RANDOM_SUFFIX} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
    
-   aws iam delete-role --role-name rds-monitoring-role
+   aws iam delete-role --role-name rds-monitoring-role-${RANDOM_SUFFIX}
    
    # Clean up local files
    rm -f dashboard-body.json

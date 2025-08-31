@@ -1,0 +1,548 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Community Knowledge Base with re:Post Private and SNS - Creates SNS topic for knowledge base notifications
+  with email subscriptions to support enterprise development team collaboration and knowledge sharing.
+  
+  This template deploys the notification infrastructure for AWS re:Post Private integration,
+  enabling teams to stay informed about new discussions, questions, and solutions in their
+  private knowledge base.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Knowledge Base Configuration"
+        Parameters:
+          - KnowledgeBaseTopicName
+          - DisplayName
+          - EnableDeliveryRetry
+      - Label:
+          default: "Team Email Subscriptions"
+        Parameters:
+          - TeamEmails
+          - IncludeTestSubscription
+      - Label:
+          default: "Access Control and Security"
+        Parameters:
+          - AllowedPublishers
+          - EnableDeliveryStatusLogging
+      - Label:
+          default: "Resource Tagging"
+        Parameters:
+          - Environment
+          - TeamName
+          - CostCenter
+    ParameterLabels:
+      KnowledgeBaseTopicName:
+        default: "Knowledge Base Topic Name"
+      DisplayName:
+        default: "SNS Topic Display Name"
+      TeamEmails:
+        default: "Team Email Addresses"
+      AllowedPublishers:
+        default: "Allowed Publisher ARNs"
+      Environment:
+        default: "Environment Tag"
+      TeamName:
+        default: "Team Name Tag"
+      CostCenter:
+        default: "Cost Center Tag"
+
+Parameters:
+  KnowledgeBaseTopicName:
+    Type: String
+    Default: "repost-knowledge-notifications"
+    Description: >
+      Name for the SNS topic that will receive re:Post Private notifications.
+      Must be between 1-256 characters and contain only alphanumeric characters,
+      hyphens (-), and underscores (_).
+    MinLength: 1
+    MaxLength: 256
+    AllowedPattern: "^[a-zA-Z0-9_-]+$"
+    ConstraintDescription: >
+      Topic name must contain only alphanumeric characters, hyphens, and underscores.
+
+  DisplayName:
+    Type: String
+    Default: "Knowledge Base Notifications"
+    Description: >
+      Human-readable name for the SNS topic that appears in email notifications.
+      This helps team members identify the source of knowledge base alerts.
+    MaxLength: 100
+
+  TeamEmails:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-separated list of email addresses for team members who should receive
+      knowledge base notifications. Each email will require confirmation before
+      notifications are delivered. Example: user1@company.com,user2@company.com
+    Default: ""
+
+  IncludeTestSubscription:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Whether to create a test email subscription for validation purposes.
+      Set to 'true' only for testing environments to avoid unnecessary subscriptions.
+
+  AllowedPublishers:
+    Type: CommaDelimitedList
+    Description: >
+      Optional: Comma-separated list of IAM ARNs (users, roles, or services)
+      allowed to publish messages to this topic. Leave empty to allow all
+      principals in the account to publish messages.
+    Default: ""
+
+  EnableDeliveryStatusLogging:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Enable delivery status logging to CloudWatch Logs for monitoring
+      notification delivery success and failures. Incurs additional logging costs.
+
+  EnableDeliveryRetry:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Enable automatic retry for failed email deliveries. Recommended for
+      enterprise environments to ensure reliable notification delivery.
+
+  Environment:
+    Type: String
+    Default: "production"
+    AllowedValues: ["development", "testing", "staging", "production"]
+    Description: >
+      Environment designation for resource tagging and identification.
+      Used for cost allocation and resource organization.
+
+  TeamName:
+    Type: String
+    Default: "DevOps"
+    Description: >
+      Name of the team or department using this knowledge base system.
+      Used for resource tagging and cost allocation.
+    MaxLength: 50
+
+  CostCenter:
+    Type: String
+    Default: ""
+    Description: >
+      Optional cost center code for billing and expense tracking.
+      Used in resource tags for financial reporting and chargeback.
+    MaxLength: 50
+
+Conditions:
+  # Condition to check if team emails are provided
+  HasTeamEmails: !Not [!Equals [!Join ["", !Ref TeamEmails], ""]]
+  
+  # Condition to create test subscription
+  CreateTestSubscription: !Equals [!Ref IncludeTestSubscription, "true"]
+  
+  # Condition to restrict publishers
+  RestrictPublishers: !Not [!Equals [!Join ["", !Ref AllowedPublishers], ""]]
+  
+  # Condition to enable delivery status logging
+  EnableLogging: !Equals [!Ref EnableDeliveryStatusLogging, "true"]
+  
+  # Condition to set cost center tag
+  HasCostCenter: !Not [!Equals [!Ref CostCenter, ""]]
+
+Resources:
+  # Main SNS Topic for Knowledge Base Notifications
+  KnowledgeBaseNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref KnowledgeBaseTopicName
+      DisplayName: !Ref DisplayName
+      FifoTopic: false
+      # Configure delivery policy for reliable message delivery
+      DeliveryPolicy: !Sub |
+        {
+          "http": {
+            "defaultHealthyRetryPolicy": {
+              "minDelayTarget": 20,
+              "maxDelayTarget": 20,
+              "numRetries": 3,
+              "numMaxDelayRetries": 0,
+              "numMinDelayRetries": 0,
+              "numNoDelayRetries": 0,
+              "backoffFunction": "linear"
+            },
+            "disableSubscriptionOverrides": false,
+            "defaultThrottlePolicy": {
+              "maxReceivesPerSecond": 1
+            }
+          }
+        }
+      # KMS encryption for message security
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub "${KnowledgeBaseTopicName}-topic"
+        - Key: Purpose
+          Value: "Knowledge Base Notifications"
+        - Key: Service
+          Value: "re:Post Private Integration"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref TeamName
+        - Key: ManagedBy
+          Value: "CloudFormation"
+        - Key: LastUpdated
+          Value: "2025-07-12"
+        - Key: CostCenter
+          Value: !If [HasCostCenter, !Ref CostCenter, !Ref "AWS::NoValue"]
+
+  # Topic Policy to control access if publishers are restricted
+  KnowledgeBaseTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: RestrictPublishers
+    Properties:
+      Topics:
+        - !Ref KnowledgeBaseNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: KnowledgeBaseTopicPolicy
+        Statement:
+          - Sid: AllowRestrictedPublishers
+            Effect: Allow
+            Principal:
+              AWS: !Ref AllowedPublishers
+            Action:
+              - SNS:Publish
+              - SNS:GetTopicAttributes
+            Resource: !Ref KnowledgeBaseNotificationTopic
+            Condition:
+              StringEquals:
+                "aws:PrincipalAccount": !Ref "AWS::AccountId"
+          - Sid: AllowAccountOwnerFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "SNS:*"
+            Resource: !Ref KnowledgeBaseNotificationTopic
+
+  # CloudWatch Log Group for delivery status logging
+  DeliveryStatusLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub "/aws/sns/${KnowledgeBaseTopicName}/delivery-status"
+      RetentionInDays: 14
+      Tags:
+        - Key: Name
+          Value: !Sub "${KnowledgeBaseTopicName}-delivery-logs"
+        - Key: Purpose
+          Value: "SNS Delivery Status Logging"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref TeamName
+
+  # IAM Role for SNS delivery status logging
+  SNSDeliveryStatusRole:
+    Type: AWS::IAM::Role
+    Condition: EnableLogging
+    Properties:
+      RoleName: !Sub "${KnowledgeBaseTopicName}-sns-logging-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsDeliveryRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:PutMetricFilter
+                  - logs:PutRetentionPolicy
+                Resource: !Sub "${DeliveryStatusLogGroup}:*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${KnowledgeBaseTopicName}-sns-logging-role"
+        - Key: Purpose
+          Value: "SNS Delivery Status Logging"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref TeamName
+
+# Custom Resource for Team Email Subscriptions
+# This creates email subscriptions for each provided team email address
+  TeamEmailSubscriptionsCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: HasTeamEmails
+    Properties:
+      ServiceToken: !GetAtt EmailSubscriptionFunction.Arn
+      TopicArn: !Ref KnowledgeBaseNotificationTopic
+      EmailList: !Ref TeamEmails
+      StackName: !Ref "AWS::StackName"
+
+  # Lambda function to handle email subscription creation
+  EmailSubscriptionFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasTeamEmails
+    Properties:
+      FunctionName: !Sub "${KnowledgeBaseTopicName}-email-subscriptions"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 60
+      Role: !GetAtt EmailSubscriptionFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  sns = boto3.client('sns')
+                  
+                  request_type = event['RequestType']
+                  topic_arn = event['ResourceProperties']['TopicArn']
+                  email_list = event['ResourceProperties']['EmailList']
+                  stack_name = event['ResourceProperties']['StackName']
+                  
+                  subscription_arns = []
+                  
+                  if request_type == 'Create' or request_type == 'Update':
+                      logger.info(f"Creating subscriptions for emails: {email_list}")
+                      
+                      for email in email_list:
+                          email = email.strip()
+                          if email:
+                              try:
+                                  response = sns.subscribe(
+                                      TopicArn=topic_arn,
+                                      Protocol='email',
+                                      Endpoint=email,
+                                      Attributes={
+                                          'FilterPolicy': json.dumps({
+                                              'source': ['knowledge-base']
+                                          })
+                                      }
+                                  )
+                                  subscription_arns.append(response['SubscriptionArn'])
+                                  logger.info(f"Created subscription for {email}: {response['SubscriptionArn']}")
+                              except Exception as e:
+                                  logger.error(f"Failed to create subscription for {email}: {str(e)}")
+                                  # Continue with other emails even if one fails
+                  
+                  elif request_type == 'Delete':
+                      # List all subscriptions for the topic and delete email ones created by this stack
+                      try:
+                          paginator = sns.get_paginator('list_subscriptions_by_topic')
+                          for page in paginator.paginate(TopicArn=topic_arn):
+                              for subscription in page['Subscriptions']:
+                                  if (subscription['Protocol'] == 'email' and 
+                                      subscription['SubscriptionArn'] != 'PendingConfirmation'):
+                                      try:
+                                          sns.unsubscribe(SubscriptionArn=subscription['SubscriptionArn'])
+                                          logger.info(f"Deleted subscription: {subscription['SubscriptionArn']}")
+                                      except Exception as e:
+                                          logger.error(f"Failed to delete subscription {subscription['SubscriptionArn']}: {str(e)}")
+                      except Exception as e:
+                          logger.error(f"Failed to list/delete subscriptions: {str(e)}")
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'SubscriptionArns': subscription_arns,
+                      'Message': f'Successfully processed {len(subscription_arns)} email subscriptions'
+                  })
+                  
+              except Exception as e:
+                  logger.error(f"Error in lambda_handler: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${KnowledgeBaseTopicName}-email-subscriptions"
+        - Key: Purpose
+          Value: "Email Subscription Management"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref TeamName
+
+  # IAM Role for the email subscription Lambda function
+  EmailSubscriptionFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: HasTeamEmails
+    Properties:
+      RoleName: !Sub "${KnowledgeBaseTopicName}-email-subscription-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSSubscriptionManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Subscribe
+                  - sns:Unsubscribe
+                  - sns:ListSubscriptionsByTopic
+                  - sns:GetSubscriptionAttributes
+                  - sns:SetSubscriptionAttributes
+                Resource: !Ref KnowledgeBaseNotificationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub "${KnowledgeBaseTopicName}-email-subscription-role"
+        - Key: Purpose
+          Value: "Email Subscription Management"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref TeamName
+
+  # Test email subscription (only created if enabled)
+  TestEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateTestSubscription
+    Properties:
+      TopicArn: !Ref KnowledgeBaseNotificationTopic
+      Protocol: email
+      Endpoint: !Sub "test-${KnowledgeBaseTopicName}@example.com"
+      FilterPolicy: |
+        {
+          "source": ["test"],
+          "environment": ["testing"]
+        }
+
+Outputs:
+  # Primary outputs for integration and verification
+  KnowledgeBaseTopicArn:
+    Description: >
+      ARN of the SNS topic for knowledge base notifications.
+      Use this ARN to publish messages from re:Post Private or other systems.
+    Value: !Ref KnowledgeBaseNotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-TopicArn"
+
+  KnowledgeBaseTopicName:
+    Description: >
+      Name of the SNS topic for knowledge base notifications.
+      Use this name for CLI commands and API calls.
+    Value: !GetAtt KnowledgeBaseNotificationTopic.TopicName
+    Export:
+      Name: !Sub "${AWS::StackName}-TopicName"
+
+  TopicDisplayName:
+    Description: >
+      Display name of the SNS topic as it appears in email notifications.
+      This helps team members identify the source of knowledge base alerts.
+    Value: !Ref DisplayName
+
+  # Subscription information
+  TeamEmailCount:
+    Condition: HasTeamEmails
+    Description: >
+      Number of team email addresses configured for notifications.
+      Each email requires manual confirmation before receiving messages.
+    Value: !GetAtt TeamEmailSubscriptionsCustomResource.Message
+
+  # Access and security information
+  RePostPrivateConsoleUrl:
+    Description: >
+      Direct URL to access AWS re:Post Private console for knowledge base management.
+      Requires Enterprise Support plan and appropriate IAM permissions.
+    Value: "https://console.aws.amazon.com/repost-private/"
+
+  # Configuration guidance
+  PublishingGuidance:
+    Description: >
+      Instructions for publishing messages to the knowledge base notification topic.
+      Use AWS CLI or SDK with the provided topic ARN.
+    Value: !Sub |
+      To send test notifications, use:
+      aws sns publish --topic-arn ${KnowledgeBaseNotificationTopic} --subject "Knowledge Base Alert" --message "Your message content"
+
+  # Cost and usage information
+  EstimatedMonthlyCost:
+    Description: >
+      Estimated monthly cost for SNS email notifications based on AWS free tier.
+      First 1,000 email notifications per month are free, then $0.75 per 1,000 emails.
+    Value: "$0.50-$2.00 depending on notification volume"
+
+  # Logging information
+  DeliveryStatusLogGroup:
+    Condition: EnableLogging
+    Description: >
+      CloudWatch Log Group for SNS delivery status logging.
+      Monitor this log group for notification delivery success and failures.
+    Value: !Ref DeliveryStatusLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroup"
+
+  # Integration endpoints
+  SubscriptionManagementEndpoint:
+    Description: >
+      Information about subscription management for the knowledge base topic.
+      Team members must confirm email subscriptions to receive notifications.
+    Value: !Sub |
+      Topic: ${KnowledgeBaseNotificationTopic}
+      Subscription confirmations will be sent to configured email addresses.
+      Check email inboxes and confirm subscriptions to begin receiving notifications.
+
+  # Support and troubleshooting
+  TroubleshootingGuide:
+    Description: >
+      Quick troubleshooting guide for common knowledge base notification issues.
+      Refer to AWS documentation for detailed support information.
+    Value: |
+      Common Issues:
+      1. Email not received: Check spam folder and confirm subscription
+      2. re:Post Private access denied: Verify Enterprise Support plan is active
+      3. Publishing failures: Check IAM permissions for SNS:Publish action
+      4. High costs: Monitor message volume and adjust notification frequency
+
+  # Stack metadata
+  StackVersion:
+    Description: >
+      Version information for this CloudFormation template.
+      Used for tracking deployments and updates.
+    Value: "1.0.0"
+
+  StackPurpose:
+    Description: >
+      Purpose and scope of this CloudFormation stack.
+      Part of the enterprise knowledge management solution.
+    Value: "Community Knowledge Base with re:Post Private and SNS Integration"
+
+  # Next steps guidance
+  NextSteps:
+    Description: >
+      Recommended next steps after deploying this infrastructure.
+      Follow the recipe documentation for complete setup.
+    Value: |
+      Next Steps:
+      1. Access re:Post Private console and complete initial configuration
+      2. Confirm email subscriptions for team members
+      3. Test notification system using the provided AWS CLI command
+      4. Create initial knowledge base content and discussions
+      5. Configure re:Post Private to integrate with SNS topic for automated notifications

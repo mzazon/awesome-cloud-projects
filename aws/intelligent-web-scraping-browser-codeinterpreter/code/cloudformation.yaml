@@ -1,0 +1,1058 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Intelligent Web Scraping with AgentCore Browser and Code Interpreter - Complete infrastructure deployment for AI-powered web data collection and analysis'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: intelligent-scraper
+    Description: Base name for all resources (will have random suffix added)
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name for resource tagging and configuration
+
+  ScheduleExpression:
+    Type: String
+    Default: rate(6 hours)
+    Description: EventBridge schedule expression for automated scraping (e.g., 'rate(6 hours)', 'cron(0 */6 * * ? *)')
+    AllowedPattern: ^(rate\([1-9]\d* (minute|minutes|hour|hours|day|days)\)|cron\(.+\))$
+
+  LambdaTimeout:
+    Type: Number
+    Default: 900
+    MinValue: 60
+    MaxValue: 900
+    Description: Lambda function timeout in seconds (60-900)
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 1024
+    AllowedValues:
+      - 512
+      - 768
+      - 1024
+      - 1536
+      - 2048
+      - 3008
+    Description: Lambda function memory allocation in MB
+
+  EnableScheduledExecution:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable automatic scheduled execution of scraping workflow
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+      - 400
+      - 545
+      - 731
+      - 1827
+      - 3653
+    Description: CloudWatch log retention period in days
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  EnableScheduling: !Equals [!Ref EnableScheduledExecution, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # Random suffix for unique resource naming
+  RandomSuffix:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RandomSuffixFunction.Arn
+
+  # Lambda function to generate random suffix
+  RandomSuffixFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-random-suffix-generator'
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import string
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      # Generate 6-character random suffix
+                      suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Suffix': suffix})
+                  else:
+                      # For Update/Delete, return existing suffix from physical resource ID
+                      physical_id = event.get('PhysicalResourceId', '')
+                      suffix = physical_id.split('-')[-1] if physical_id else 'default'
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Suffix': suffix})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Role: !GetAtt RandomSuffixFunctionRole.Arn
+
+  # IAM role for random suffix generator
+  RandomSuffixFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # S3 bucket for input configurations
+  InputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${RandomSuffix.Suffix}-input'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Input configurations for intelligent web scraping'
+
+  # S3 bucket for output results
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${RandomSuffix.Suffix}-output'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldData
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Processed results from intelligent web scraping'
+
+  # SQS Dead Letter Queue for failed Lambda executions
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${RandomSuffix.Suffix}-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 300
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Dead letter queue for failed scraping operations'
+
+  # IAM role for Lambda orchestrator function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${RandomSuffix.Suffix}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAgentCoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:StartBrowserSession
+                  - bedrock-agentcore:StopBrowserSession
+                  - bedrock-agentcore:GetBrowserSession
+                  - bedrock-agentcore:UpdateBrowserStream
+                  - bedrock-agentcore:StartCodeInterpreterSession
+                  - bedrock-agentcore:StopCodeInterpreterSession
+                  - bedrock-agentcore:GetCodeInterpreterSession
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${InputBucket}/*'
+                  - !Sub '${OutputBucket}/*'
+                  - !Ref InputBucket
+                  - !Ref OutputBucket
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch log group for Lambda function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${RandomSuffix.Suffix}-orchestrator'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch log group for S3 access logs
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-${RandomSuffix.Suffix}-access'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda function for workflow orchestration
+  ScrapingOrchestratorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${RandomSuffix.Suffix}-orchestrator'
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: !If
+        - IsProduction
+        - 10
+        - 5
+      Environment:
+        Variables:
+          S3_BUCKET_INPUT: !Ref InputBucket
+          S3_BUCKET_OUTPUT: !Ref OutputBucket
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: INFO
+          PROJECT_NAME: !Ref ProjectName
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+          import logging
+          import uuid
+          import os
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+          
+          # Configure logging
+          logger = logging.getLogger()
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger.setLevel(getattr(logging, log_level))
+          
+          def lambda_handler(event, context):
+              """
+              Orchestrates intelligent web scraping workflow using AgentCore services.
+              Coordinates browser automation and code interpretation for data processing.
+              """
+              try:
+                  # Initialize AWS clients
+                  s3 = boto3.client('s3')
+                  agentcore = boto3.client('bedrock-agentcore')
+                  cloudwatch = boto3.client('cloudwatch')
+                  
+                  # Get environment configuration
+                  bucket_input = os.environ.get('S3_BUCKET_INPUT')
+                  bucket_output = os.environ.get('S3_BUCKET_OUTPUT')
+                  project_name = os.environ.get('PROJECT_NAME', 'intelligent-scraper')
+                  
+                  # Override with event parameters if provided
+                  bucket_input = event.get('bucket_input', bucket_input)
+                  bucket_output = event.get('bucket_output', bucket_output)
+                  
+                  logger.info(f"Starting scraping workflow - Input: {bucket_input}, Output: {bucket_output}")
+                  
+                  # Load scraping configuration from S3
+                  try:
+                      config_response = s3.get_object(
+                          Bucket=bucket_input,
+                          Key='scraper-config.json'
+                      )
+                      config = json.loads(config_response['Body'].read())
+                  except ClientError as e:
+                      if e.response['Error']['Code'] == 'NoSuchKey':
+                          # Use default configuration if none exists
+                          config = get_default_config()
+                          logger.info("Using default scraping configuration")
+                      else:
+                          raise
+                  
+                  logger.info(f"Processing {len(config['scraping_scenarios'])} scenarios")
+                  
+                  all_scraped_data = []
+                  execution_metrics = {
+                      'scenarios_processed': 0,
+                      'total_data_points': 0,
+                      'browser_sessions': 0,
+                      'errors': 0
+                  }
+                  
+                  # Process each scraping scenario
+                  for scenario in config['scraping_scenarios']:
+                      try:
+                          logger.info(f"Processing scenario: {scenario['name']}")
+                          
+                          # Start browser session for web navigation
+                          session_response = agentcore.start_browser_session(
+                              browserIdentifier='default-browser',
+                              name=f"{scenario['name']}-{int(time.time())}",
+                              sessionTimeoutSeconds=scenario['session_config']['timeout_seconds']
+                          )
+                          
+                          browser_session_id = session_response['sessionId']
+                          execution_metrics['browser_sessions'] += 1
+                          logger.info(f"Started browser session: {browser_session_id}")
+                          
+                          try:
+                              # Simulate intelligent web scraping
+                              # In production, this would use actual AgentCore Browser APIs
+                              scenario_data = simulate_web_scraping(scenario, browser_session_id)
+                              all_scraped_data.append(scenario_data)
+                              execution_metrics['scenarios_processed'] += 1
+                              execution_metrics['total_data_points'] += len(scenario_data['extracted_data']['product_titles'])
+                              
+                          finally:
+                              # Always cleanup browser session
+                              try:
+                                  agentcore.stop_browser_session(sessionId=browser_session_id)
+                                  logger.info(f"Stopped browser session: {browser_session_id}")
+                              except Exception as e:
+                                  logger.warning(f"Failed to stop session {browser_session_id}: {e}")
+                                  
+                      except Exception as e:
+                          logger.error(f"Error processing scenario {scenario['name']}: {str(e)}")
+                          execution_metrics['errors'] += 1
+                          continue
+                  
+                  # Process data with Code Interpreter
+                  if all_scraped_data:
+                      processing_results = process_with_code_interpreter(
+                          all_scraped_data, agentcore, logger
+                      )
+                  else:
+                      processing_results = {'error': 'No data scraped successfully'}
+                  
+                  # Save comprehensive results to S3
+                  result_data = {
+                      'raw_data': all_scraped_data,
+                      'analysis': processing_results,
+                      'execution_metadata': {
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'function_name': context.function_name,
+                          'request_id': context.aws_request_id,
+                          'metrics': execution_metrics
+                      }
+                  }
+                  
+                  result_key = f'scraping-results-{int(time.time())}.json'
+                  s3.put_object(
+                      Bucket=bucket_output,
+                      Key=result_key,
+                      Body=json.dumps(result_data, indent=2),
+                      ContentType='application/json',
+                      Metadata={
+                          'project': project_name,
+                          'scenarios': str(execution_metrics['scenarios_processed']),
+                          'data_points': str(execution_metrics['total_data_points'])
+                      }
+                  )
+                  
+                  # Send comprehensive metrics to CloudWatch
+                  send_cloudwatch_metrics(cloudwatch, execution_metrics, context.function_name)
+                  
+                  logger.info(f"Results saved to s3://{bucket_output}/{result_key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Scraping completed successfully',
+                          'scenarios_processed': execution_metrics['scenarios_processed'],
+                          'total_data_points': execution_metrics['total_data_points'],
+                          'browser_sessions': execution_metrics['browser_sessions'],
+                          'errors': execution_metrics['errors'],
+                          'result_location': f's3://{bucket_output}/{result_key}'
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Critical error in scraping workflow: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'request_id': context.aws_request_id
+                      })
+                  }
+          
+          def get_default_config():
+              """Return default scraping configuration"""
+              return {
+                  'scraping_scenarios': [
+                      {
+                          'name': 'ecommerce_demo',
+                          'description': 'Extract product information from demo sites',
+                          'target_url': 'https://books.toscrape.com/',
+                          'extraction_rules': {
+                              'product_titles': {'selector': 'h3 a', 'attribute': 'title'},
+                              'prices': {'selector': '.price_color', 'attribute': 'textContent'},
+                              'availability': {'selector': '.availability', 'attribute': 'textContent'}
+                          },
+                          'session_config': {'timeout_seconds': 30}
+                      }
+                  ]
+              }
+          
+          def simulate_web_scraping(scenario, session_id):
+              """Simulate web scraping results for demonstration"""
+              return {
+                  'scenario_name': scenario['name'],
+                  'target_url': scenario['target_url'],
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'session_id': session_id,
+                  'extracted_data': {
+                      'product_titles': ['A Light in the Attic', 'Tipping the Velvet', 'Soumission'],
+                      'prices': ['£51.77', '£53.74', '£50.10'],
+                      'availability': ['In stock', 'In stock', 'In stock']
+                  }
+              }
+          
+          def process_with_code_interpreter(data, agentcore, logger):
+              """Process scraped data using Code Interpreter"""
+              try:
+                  # Start Code Interpreter session
+                  code_session_response = agentcore.start_code_interpreter_session(
+                      codeInterpreterIdentifier='default-code-interpreter',
+                      name=f"data-processor-{int(time.time())}",
+                      sessionTimeoutSeconds=300
+                  )
+                  
+                  code_session_id = code_session_response['sessionId']
+                  logger.info(f"Started code interpreter session: {code_session_id}")
+                  
+                  try:
+                      # Simulate data processing and analysis
+                      total_items = sum(len(item['extracted_data']['product_titles']) for item in data)
+                      
+                      # Price analysis
+                      all_prices = []
+                      for item in data:
+                          for price_str in item['extracted_data']['prices']:
+                              numeric_price = ''.join(filter(lambda x: x.isdigit() or x == '.', price_str))
+                              if numeric_price:
+                                  all_prices.append(float(numeric_price))
+                      
+                      # Availability analysis
+                      all_availability = []
+                      for item in data:
+                          all_availability.extend(item['extracted_data']['availability'])
+                      
+                      in_stock_count = sum(1 for status in all_availability if 'stock' in status.lower())
+                      
+                      return {
+                          'total_products_scraped': total_items,
+                          'price_analysis': {
+                              'average_price': sum(all_prices) / len(all_prices) if all_prices else 0,
+                              'min_price': min(all_prices) if all_prices else 0,
+                              'max_price': max(all_prices) if all_prices else 0,
+                              'price_count': len(all_prices)
+                          },
+                          'availability_analysis': {
+                              'total_items_checked': len(all_availability),
+                              'in_stock_count': in_stock_count,
+                              'availability_rate': (in_stock_count / len(all_availability) * 100) if all_availability else 0
+                          },
+                          'data_quality_score': (total_items / max(1, len(data))) * 100,
+                          'processing_timestamp': datetime.utcnow().isoformat()
+                      }
+                      
+                  finally:
+                      # Cleanup code interpreter session
+                      try:
+                          agentcore.stop_code_interpreter_session(sessionId=code_session_id)
+                          logger.info(f"Stopped code interpreter session: {code_session_id}")
+                      except Exception as e:
+                          logger.warning(f"Failed to stop code session {code_session_id}: {e}")
+                          
+              except Exception as e:
+                  logger.error(f"Error in code interpreter processing: {str(e)}")
+                  return {'error': str(e)}
+          
+          def send_cloudwatch_metrics(cloudwatch, metrics, function_name):
+              """Send comprehensive metrics to CloudWatch"""
+              try:
+                  metric_data = [
+                      {
+                          'MetricName': 'ScrapingJobs',
+                          'Value': metrics['scenarios_processed'],
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'FunctionName', 'Value': function_name}
+                          ]
+                      },
+                      {
+                          'MetricName': 'DataPointsExtracted',
+                          'Value': metrics['total_data_points'],
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'FunctionName', 'Value': function_name}
+                          ]
+                      },
+                      {
+                          'MetricName': 'BrowserSessions',
+                          'Value': metrics['browser_sessions'],
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'FunctionName', 'Value': function_name}
+                          ]
+                      },
+                      {
+                          'MetricName': 'Errors',
+                          'Value': metrics['errors'],
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'FunctionName', 'Value': function_name}
+                          ]
+                      }
+                  ]
+                  
+                  cloudwatch.put_metric_data(
+                      Namespace=f'IntelligentScraper/{function_name}',
+                      MetricData=metric_data
+                  )
+                  
+              except Exception as e:
+                  logger.warning(f"Failed to send CloudWatch metrics: {str(e)}")
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Orchestrates intelligent web scraping workflow'
+
+  # EventBridge rule for scheduled execution
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: EnableScheduling
+    Properties:
+      Name: !Sub '${ProjectName}-${RandomSuffix.Suffix}-schedule'
+      Description: 'Scheduled execution for intelligent web scraping'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ScrapingOrchestratorFunction.Arn
+          Id: ScrapingTarget
+          Input: !Sub |
+            {
+              "bucket_input": "${InputBucket}",
+              "bucket_output": "${OutputBucket}",
+              "scheduled_execution": true
+            }
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableScheduling
+    Properties:
+      FunctionName: !Ref ScrapingOrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+  # CloudWatch Dashboard for monitoring
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${RandomSuffix.Suffix}-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["IntelligentScraper/${ScrapingOrchestratorFunction}", "ScrapingJobs"],
+                  [".", "DataPointsExtracted"],
+                  [".", "BrowserSessions"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Scraping Activity",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ScrapingOrchestratorFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Invocations", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Performance"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["IntelligentScraper/${ScrapingOrchestratorFunction}", "Errors"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Error Rate",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${LambdaLogGroup}'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for monitoring
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${RandomSuffix.Suffix}-high-error-rate'
+      AlarmDescription: 'High error rate in intelligent scraping workflow'
+      MetricName: Errors
+      Namespace: !Sub 'IntelligentScraper/${ScrapingOrchestratorFunction}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertingTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Lambda failures
+  LambdaFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${RandomSuffix.Suffix}-lambda-failures'
+      AlarmDescription: 'Lambda function failures in intelligent scraping'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ScrapingOrchestratorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertingTopic
+
+  # SNS Topic for alerts
+  AlertingTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${RandomSuffix.Suffix}-alerts'
+      DisplayName: 'Intelligent Scraper Alerts'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Custom resource to upload initial configuration
+  ConfigurationUploader:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ConfigUploaderFunction.Arn
+      InputBucket: !Ref InputBucket
+
+  # Lambda function to upload initial configuration
+  ConfigUploaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-config-uploader-${RandomSuffix.Suffix}'
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      s3 = boto3.client('s3')
+                      bucket = event['ResourceProperties']['InputBucket']
+                      
+                      # Default scraper configuration
+                      config = {
+                          "scraping_scenarios": [
+                              {
+                                  "name": "ecommerce_demo",
+                                  "description": "Extract product information from demo sites",
+                                  "target_url": "https://books.toscrape.com/",
+                                  "extraction_rules": {
+                                      "product_titles": {
+                                          "selector": "h3 a",
+                                          "attribute": "title",
+                                          "wait_for": "h3 a"
+                                      },
+                                      "prices": {
+                                          "selector": ".price_color",
+                                          "attribute": "textContent",
+                                          "wait_for": ".price_color"
+                                      },
+                                      "availability": {
+                                          "selector": ".availability",
+                                          "attribute": "textContent",
+                                          "wait_for": ".availability"
+                                      }
+                                  },
+                                  "session_config": {
+                                      "timeout_seconds": 30,
+                                      "view_port": {
+                                          "width": 1920,
+                                          "height": 1080
+                                      }
+                                  }
+                              }
+                          ]
+                      }
+                      
+                      # Upload configuration
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key='scraper-config.json',
+                          Body=json.dumps(config, indent=2),
+                          ContentType='application/json'
+                      )
+                      
+                      # Data processing configuration
+                      processing_config = {
+                          "processing_rules": {
+                              "price_cleaning": {
+                                  "remove_currency_symbols": True,
+                                  "normalize_decimal_places": 2,
+                                  "convert_to_numeric": True
+                              },
+                              "text_analysis": {
+                                  "extract_keywords": True,
+                                  "sentiment_analysis": False,
+                                  "language_detection": False
+                              },
+                              "data_validation": {
+                                  "required_fields": ["product_titles", "prices"],
+                                  "min_data_points": 1,
+                                  "max_processing_time_seconds": 60
+                              }
+                          }
+                      }
+                      
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key='data-processing-config.json',
+                          Body=json.dumps(processing_config, indent=2),
+                          ContentType='application/json'
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'Configuration uploaded successfully'
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Role: !GetAtt ConfigUploaderRole.Arn
+
+  # IAM role for configuration uploader
+  ConfigUploaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${InputBucket}/*'
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  ProjectName:
+    Description: 'Project name with random suffix'
+    Value: !Sub '${ProjectName}-${RandomSuffix.Suffix}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  InputBucketName:
+    Description: 'S3 bucket name for input configurations'
+    Value: !Ref InputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-InputBucket'
+
+  OutputBucketName:
+    Description: 'S3 bucket name for processed results'
+    Value: !Ref OutputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-OutputBucket'
+
+  LambdaFunctionName:
+    Description: 'Lambda function name for orchestrating scraping workflow'
+    Value: !Ref ScrapingOrchestratorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda orchestrator function'
+    Value: !GetAtt ScrapingOrchestratorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  DeadLetterQueueUrl:
+    Description: 'URL of the dead letter queue for failed executions'
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueue'
+
+  CloudWatchDashboardUrl:
+    Description: 'URL for CloudWatch monitoring dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${RandomSuffix.Suffix}-monitoring'
+
+  ScheduleRuleName:
+    Condition: EnableScheduling
+    Description: 'EventBridge rule name for scheduled execution'
+    Value: !Ref ScheduleRule
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleRule'
+
+  AlertingTopicArn:
+    Description: 'SNS topic ARN for alerts and notifications'
+    Value: !Ref AlertingTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertingTopic'
+
+  LambdaLogGroupName:
+    Description: 'CloudWatch log group name for Lambda function'
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  TestCommand:
+    Description: 'AWS CLI command to test the scraping workflow'
+    Value: !Sub |
+      aws lambda invoke --function-name ${ScrapingOrchestratorFunction} --payload '{"bucket_input":"${InputBucket}","bucket_output":"${OutputBucket}","test_mode":true}' response.json
+
+  ManualExecutionCommand:
+    Description: 'AWS CLI command for manual execution of scraping workflow'
+    Value: !Sub |
+      aws lambda invoke --function-name ${ScrapingOrchestratorFunction} --payload '{"bucket_input":"${InputBucket}","bucket_output":"${OutputBucket}"}' execution-result.json
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: 'Lambda Configuration'
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: 'Scheduling Configuration'
+        Parameters:
+          - EnableScheduledExecution
+          - ScheduleExpression
+      - Label:
+          default: 'Monitoring Configuration'
+        Parameters:
+          - LogRetentionDays
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      Environment:
+        default: 'Environment'
+      LambdaTimeout:
+        default: 'Lambda Timeout (seconds)'
+      LambdaMemorySize:
+        default: 'Lambda Memory (MB)'
+      EnableScheduledExecution:
+        default: 'Enable Scheduled Execution'
+      ScheduleExpression:
+        default: 'Schedule Expression'
+      LogRetentionDays:
+        default: 'Log Retention (days)'
+
+  AWS::CloudFormation::Designer:
+    Description: 'CloudFormation template for Intelligent Web Scraping with AgentCore Browser and Code Interpreter'

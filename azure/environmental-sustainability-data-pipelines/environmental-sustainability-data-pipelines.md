@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Data Factory, Azure Sustainability Manager, Azure Monitor, Azure Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: environmental-data, sustainability-tracking, data-pipelines, carbon-monitoring, compliance-automation
 recipe-generator-version: 1.3
@@ -100,7 +100,7 @@ graph TB
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-env-data-pipeline"
+export RESOURCE_GROUP="rg-env-data-pipeline-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
@@ -129,6 +129,14 @@ az storage account create \
     --hierarchical-namespace true
 
 echo "✅ Storage account created with Data Lake Gen2 capabilities"
+
+# Create storage container for environmental data
+az storage container create \
+    --name environmental-data \
+    --account-name ${STORAGE_ACCOUNT_NAME} \
+    --auth-mode login
+
+echo "✅ Storage container created for environmental data"
 ```
 
 ## Steps
@@ -167,16 +175,11 @@ echo "✅ Storage account created with Data Lake Gen2 capabilities"
        --location ${LOCATION} \
        --sku pergb2018
    
-   # Get workspace ID and key for Data Factory integration
+   # Get workspace ID for Data Factory integration
    export WORKSPACE_ID=$(az monitor log-analytics workspace show \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${LOG_ANALYTICS_NAME} \
        --query customerId --output tsv)
-   
-   export WORKSPACE_KEY=$(az monitor log-analytics workspace get-shared-keys \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${LOG_ANALYTICS_NAME} \
-       --query primarySharedKey --output tsv)
    
    echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
    ```
@@ -198,13 +201,12 @@ echo "✅ Storage account created with Data Lake Gen2 capabilities"
        --storage-account ${STORAGE_ACCOUNT_NAME} \
        --os-type Linux
    
-   # Configure Function App with Log Analytics integration
+   # Configure Function App with monitoring integration
    az functionapp config appsettings set \
        --resource-group ${RESOURCE_GROUP} \
        --name ${FUNCTION_APP_NAME} \
-       --settings "APPINSIGHTS_INSTRUMENTATIONKEY=${WORKSPACE_ID}" \
-               "FUNCTIONS_WORKER_RUNTIME=python" \
-               "STORAGE_CONNECTION_STRING=$(az storage account show-connection-string \
+       --settings "FUNCTIONS_WORKER_RUNTIME=python" \
+               "AzureWebJobsStorage=$(az storage account show-connection-string \
                    --resource-group ${RESOURCE_GROUP} \
                    --name ${STORAGE_ACCOUNT_NAME} \
                    --query connectionString --output tsv)"
@@ -264,7 +266,30 @@ echo "✅ Storage account created with Data Lake Gen2 capabilities"
 
    The Data Factory now has configured data connections and dataset definitions for environmental data processing. This pipeline foundation enables automated data ingestion from multiple sources while maintaining data quality and lineage tracking essential for environmental reporting and compliance verification.
 
-5. **Create environmental data processing pipeline**:
+5. **Create Function linked service for pipeline integration**:
+
+   The Function linked service enables Data Factory pipelines to invoke Azure Functions for data transformation activities. This integration provides seamless connectivity between the orchestration layer and serverless compute resources while maintaining security and performance for environmental data processing workflows.
+
+   ```bash
+   # Create linked service for Azure Functions
+   az datafactory linked-service create \
+       --resource-group ${RESOURCE_GROUP} \
+       --factory-name ${DATA_FACTORY_NAME} \
+       --linked-service-name "FunctionLinkedService" \
+       --properties '{
+           "type": "AzureFunction",
+           "typeProperties": {
+               "functionAppUrl": "https://'${FUNCTION_APP_NAME}'.azurewebsites.net",
+               "authentication": "Anonymous"
+           }
+       }'
+   
+   echo "✅ Function linked service created for pipeline integration"
+   ```
+
+   The Function linked service now enables Data Factory pipelines to seamlessly invoke serverless functions for environmental data transformation. This integration provides the foundation for scalable, event-driven data processing while maintaining security and monitoring capabilities essential for environmental compliance workflows.
+
+6. **Create environmental data processing pipeline**:
 
    The pipeline orchestrates the complete data flow from ingestion through transformation to analytics, incorporating business logic for environmental metric calculations and compliance threshold monitoring. This automated workflow ensures consistent data processing while maintaining audit trails for regulatory compliance.
 
@@ -327,7 +352,7 @@ echo "✅ Storage account created with Data Lake Gen2 capabilities"
 
    The pipeline now orchestrates environmental data processing with built-in dependency management and error handling. This automated workflow ensures reliable data processing while maintaining comprehensive logging and monitoring capabilities essential for environmental compliance and sustainability reporting.
 
-6. **Configure pipeline triggers for automation**:
+7. **Configure pipeline triggers for automation**:
 
    Automated triggers ensure environmental data pipelines execute on schedule or in response to data availability, maintaining continuous monitoring capabilities essential for environmental compliance. These triggers support both time-based and event-driven execution patterns while maintaining reliability and monitoring.
 
@@ -368,7 +393,7 @@ echo "✅ Storage account created with Data Lake Gen2 capabilities"
 
    The automated trigger system now ensures continuous environmental data processing with reliable scheduling and monitoring capabilities. This foundation enables real-time sustainability tracking while maintaining the consistency and audit trails required for environmental compliance reporting.
 
-7. **Create Azure Monitor alerts for compliance thresholds**:
+8. **Create Azure Monitor alerts for compliance thresholds**:
 
    Azure Monitor provides intelligent alerting capabilities that automatically detect when environmental metrics exceed compliance thresholds, enabling proactive response to sustainability issues. This monitoring solution integrates with various notification channels while maintaining detailed audit logs for compliance reporting.
 
@@ -390,7 +415,7 @@ echo "✅ Storage account created with Data Lake Gen2 capabilities"
        --window-size 5m \
        --evaluation-frequency 1m \
        --severity 2 \
-       --action-groups "EnvironmentalAlerts"
+       --action EnvironmentalAlerts
    
    # Create alert for data processing delays
    az monitor metrics alert create \
@@ -402,14 +427,14 @@ echo "✅ Storage account created with Data Lake Gen2 capabilities"
        --window-size 15m \
        --evaluation-frequency 5m \
        --severity 3 \
-       --action-groups "EnvironmentalAlerts"
+       --action EnvironmentalAlerts
    
    echo "✅ Environmental monitoring alerts configured"
    ```
 
    The intelligent alerting system now provides proactive monitoring of environmental data pipelines with automatic notification of compliance threshold breaches and operational issues. This comprehensive monitoring solution ensures rapid response to environmental incidents while maintaining detailed audit trails for regulatory compliance.
 
-8. **Configure diagnostic settings for comprehensive monitoring**:
+9. **Configure diagnostic settings for comprehensive monitoring**:
 
    Diagnostic settings enable comprehensive logging and monitoring of environmental data pipelines, providing detailed insights into data processing activities and compliance metrics. This configuration ensures all pipeline activities are tracked and auditable for environmental reporting requirements.
 
@@ -470,7 +495,7 @@ echo "✅ Storage account created with Data Lake Gen2 capabilities"
    az datafactory show \
        --resource-group ${RESOURCE_GROUP} \
        --name ${DATA_FACTORY_NAME} \
-       --query "{name:name, state:state, location:location}" \
+       --query "{name:name, location:location}" \
        --output table
    
    # List all pipelines in the Data Factory
@@ -480,26 +505,30 @@ echo "✅ Storage account created with Data Lake Gen2 capabilities"
        --output table
    ```
 
-   Expected output: Data Factory should show as "Active" state with the environmental data pipeline listed.
+   Expected output: Data Factory should be listed with the environmental data pipeline showing as available.
 
 2. **Test pipeline execution manually**:
 
    ```bash
    # Manually trigger the pipeline for testing
-   az datafactory pipeline create-run \
+   PIPELINE_RUN_ID=$(az datafactory pipeline create-run \
        --resource-group ${RESOURCE_GROUP} \
        --factory-name ${DATA_FACTORY_NAME} \
-       --pipeline-name "EnvironmentalDataPipeline"
+       --pipeline-name "EnvironmentalDataPipeline" \
+       --query runId --output tsv)
+   
+   echo "Pipeline run initiated with ID: ${PIPELINE_RUN_ID}"
    
    # Check pipeline run status
-   az datafactory pipeline-run query-by-factory \
+   az datafactory pipeline-run show \
        --resource-group ${RESOURCE_GROUP} \
        --factory-name ${DATA_FACTORY_NAME} \
-       --filters operand=LastUpdatedAfter values="$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S.%3NZ)" \
+       --run-id ${PIPELINE_RUN_ID} \
+       --query "{status:status, runStart:runStart, runEnd:runEnd}" \
        --output table
    ```
 
-   Expected output: Pipeline run should show "Succeeded" status with execution details.
+   Expected output: Pipeline run should show successful execution status with start and end times.
 
 3. **Verify monitoring and alerting configuration**:
 
@@ -507,6 +536,7 @@ echo "✅ Storage account created with Data Lake Gen2 capabilities"
    # Check alert rules
    az monitor metrics alert list \
        --resource-group ${RESOURCE_GROUP} \
+       --query "[].{name:name, enabled:enabled, severity:severity}" \
        --output table
    
    # Verify Log Analytics workspace connection
@@ -591,29 +621,29 @@ echo "✅ Storage account created with Data Lake Gen2 capabilities"
 
 ## Discussion
 
-Azure Data Factory provides a comprehensive platform for orchestrating environmental data pipelines that seamlessly integrates with Azure's broader sustainability and monitoring ecosystem. The service's managed nature eliminates infrastructure management overhead while providing enterprise-grade reliability and security features essential for environmental compliance. For organizations implementing sustainability initiatives, the [Azure Data Factory documentation](https://docs.microsoft.com/en-us/azure/data-factory/) provides detailed guidance on advanced pipeline patterns and integration options.
+Azure Data Factory provides a comprehensive platform for orchestrating environmental data pipelines that seamlessly integrates with Azure's broader sustainability and monitoring ecosystem. The service's managed nature eliminates infrastructure management overhead while providing enterprise-grade reliability and security features essential for environmental compliance. For organizations implementing sustainability initiatives, the [Azure Data Factory documentation](https://docs.microsoft.com/en-us/azure/data-factory/) provides detailed guidance on advanced pipeline patterns and integration options that follow Azure Well-Architected Framework principles.
 
-The integration between Azure Data Factory and Azure Monitor creates a powerful foundation for proactive environmental monitoring and compliance management. Azure Monitor's intelligent alerting capabilities enable organizations to respond rapidly to environmental threshold breaches while maintaining comprehensive audit trails. The [Azure Monitor documentation](https://docs.microsoft.com/en-us/azure/azure-monitor/) offers extensive guidance on configuring advanced monitoring scenarios and integrating with external notification systems for comprehensive environmental incident response.
+The integration between Azure Data Factory and Azure Monitor creates a powerful foundation for proactive environmental monitoring and compliance management. Azure Monitor's intelligent alerting capabilities enable organizations to respond rapidly to environmental threshold breaches while maintaining comprehensive audit trails required for regulatory compliance. The [Azure Monitor documentation](https://docs.microsoft.com/en-us/azure/azure-monitor/) offers extensive guidance on configuring advanced monitoring scenarios and integrating with external notification systems for comprehensive environmental incident response workflows.
 
-Azure Functions serve as the transformation layer, providing serverless compute capabilities that automatically scale based on data volume while maintaining cost efficiency. This event-driven architecture pattern is particularly effective for environmental data processing because it handles variable workloads efficiently while maintaining low latency for real-time alerts. The [Azure Functions documentation](https://docs.microsoft.com/en-us/azure/azure-functions/) provides comprehensive guidance on implementing complex data transformation logic and integrating with external environmental monitoring systems.
+Azure Functions serve as the transformation layer, providing serverless compute capabilities that automatically scale based on data volume while maintaining cost efficiency through consumption-based pricing. This event-driven architecture pattern is particularly effective for environmental data processing because it handles variable workloads efficiently while maintaining low latency for real-time alerts and compliance monitoring. The [Azure Functions documentation](https://docs.microsoft.com/en-us/azure/azure-functions/) provides comprehensive guidance on implementing complex data transformation logic and integrating with external environmental monitoring systems.
 
-The combination of these services creates a robust foundation for environmental compliance that follows Azure Well-Architected Framework principles of reliability, security, and cost optimization. Organizations can leverage this architecture to build comprehensive sustainability reporting systems that meet regulatory requirements while providing actionable insights for environmental performance improvement. For detailed implementation guidance, refer to the [Azure Architecture Center](https://docs.microsoft.com/en-us/azure/architecture/) and the [Microsoft Cloud for Sustainability documentation](https://docs.microsoft.com/en-us/industry/sustainability/overview).
+The combination of these services creates a robust foundation for environmental compliance that follows Azure Well-Architected Framework principles of reliability, security, and cost optimization. Organizations can leverage this architecture to build comprehensive sustainability reporting systems that meet regulatory requirements while providing actionable insights for environmental performance improvement. For detailed implementation guidance, refer to the [Azure Architecture Center](https://docs.microsoft.com/en-us/azure/architecture/) and the [Microsoft Cloud for Sustainability documentation](https://docs.microsoft.com/en-us/industry/sustainability/overview) for industry-specific best practices.
 
-> **Tip**: Use Azure Policy to enforce consistent environmental data governance across your organization. The [Azure Policy documentation](https://docs.microsoft.com/en-us/azure/governance/policy/) provides guidance on implementing automated compliance checks and resource management policies that support environmental sustainability goals.
+> **Tip**: Use Azure Policy to enforce consistent environmental data governance across your organization. The [Azure Policy documentation](https://docs.microsoft.com/en-us/azure/governance/policy/) provides guidance on implementing automated compliance checks and resource management policies that support environmental sustainability goals while maintaining security and operational excellence.
 
 ## Challenge
 
 Extend this environmental data pipeline solution by implementing these enhancements:
 
-1. **Multi-source data integration**: Add connectors for additional environmental data sources such as weather APIs, energy management systems, and carbon footprint databases to create a comprehensive environmental data lake.
+1. **Multi-source data integration**: Add connectors for additional environmental data sources such as weather APIs, energy management systems, and carbon footprint databases to create a comprehensive environmental data lake with real-time streaming capabilities.
 
-2. **Advanced analytics with Azure Synapse**: Integrate Azure Synapse Analytics to perform complex environmental trend analysis, carbon footprint calculations, and sustainability forecasting using machine learning models.
+2. **Advanced analytics with Azure Synapse**: Integrate Azure Synapse Analytics to perform complex environmental trend analysis, carbon footprint calculations, and sustainability forecasting using machine learning models with predictive analytics capabilities.
 
-3. **Real-time dashboard creation**: Build Power BI dashboards that display real-time environmental metrics, compliance status, and sustainability KPIs with automatic refresh capabilities and mobile-friendly interfaces.
+3. **Real-time dashboard creation**: Build Power BI dashboards that display real-time environmental metrics, compliance status, and sustainability KPIs with automatic refresh capabilities, mobile-friendly interfaces, and interactive drill-down capabilities.
 
-4. **Automated compliance reporting**: Implement automated report generation that creates regulatory compliance documents, sustainability reports, and audit trails with configurable templates and scheduling.
+4. **Automated compliance reporting**: Implement automated report generation that creates regulatory compliance documents, sustainability reports, and audit trails with configurable templates, scheduling, and multi-format output capabilities.
 
-5. **Integration with Microsoft Sustainability Manager**: Connect the pipeline to Microsoft Sustainability Manager for advanced carbon accounting, emissions tracking, and sustainability reporting capabilities aligned with industry standards.
+5. **Integration with Microsoft Sustainability Manager**: Connect the pipeline to Microsoft Sustainability Manager for advanced carbon accounting, emissions tracking, and sustainability reporting capabilities aligned with industry standards like GRI and SASB frameworks.
 
 ## Infrastructure Code
 

@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: AWS Customer Carbon Footprint Tool, Amazon QuickSight, AWS Cost Explorer, AWS Lambda
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: sustainability, carbon-footprint, analytics, dashboard, cost-optimization
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Enterprise organizations struggle to correlate their cloud carbon footprint with
 
 ## Solution
 
-Create an automated sustainability intelligence platform using AWS Customer Carbon Footprint Tool for emissions tracking, Amazon QuickSight for advanced visualization, AWS Cost Explorer API for cost correlation, and AWS Lambda for automated data processing. This integrated approach enables real-time carbon footprint monitoring with intelligent cost optimization recommendations, providing actionable insights that drive both environmental responsibility and financial efficiency across cloud operations.
+Create an automated sustainability intelligence platform using AWS Customer Carbon Footprint Tool for emissions tracking, Amazon QuickSight for advanced visualization, AWS Cost Explorer API for cost correlation, and AWS Lambda for automated data processing. This integrated approach enables regular carbon footprint monitoring with intelligent cost optimization recommendations, providing actionable insights that drive both environmental responsibility and financial efficiency across cloud operations.
 
 ## Architecture Diagram
 
@@ -71,7 +71,7 @@ graph TB
 2. AWS CLI installed and configured (or AWS CloudShell)
 3. Basic understanding of AWS sustainability concepts and carbon footprint methodology
 4. Knowledge of data visualization principles and QuickSight dashboard creation
-5. Estimated cost: $50-100/month for QuickSight Standard edition, Lambda executions, and S3 storage
+5. Estimated cost: $25-50/month for QuickSight Standard edition ($9/user/month annual), Lambda executions, and S3 storage
 
 > **Note**: This recipe follows AWS Well-Architected Framework sustainability principles. Review the [AWS Well-Architected Framework Sustainability Pillar](https://docs.aws.amazon.com/wellarchitected/latest/sustainability-pillar/sustainability-pillar.html) for comprehensive guidance on building sustainable cloud solutions.
 
@@ -217,7 +217,6 @@ echo "✅ AWS environment configured with sustainability data lake"
    cat > sustainability_processor.py << 'EOF'
    import json
    import boto3
-   import pandas as pd
    from datetime import datetime, timedelta
    import logging
    import os
@@ -228,7 +227,7 @@ echo "✅ AWS environment configured with sustainability data lake"
    def lambda_handler(event, context):
        """
        Process sustainability and cost data to create integrated analytics.
-       AWS Customer Carbon Footprint Tool data is retrieved monthly with a 3-month delay.
+       AWS Customer Carbon Footprint Tool data is available with a 3-month delay.
        This function correlates cost data with carbon footprint insights.
        """
        
@@ -359,18 +358,17 @@ echo "✅ AWS environment configured with sustainability data lake"
            }
    EOF
    
-   # Package Lambda function with dependencies
-   pip install pandas -t . 2>/dev/null || echo "Note: Install pandas locally for full functionality"
+   # Package Lambda function
    zip -r function.zip sustainability_processor.py
    
    # Get role ARN
    ROLE_ARN=$(aws iam get-role --role-name ${ROLE_NAME} \
        --query Role.Arn --output text)
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    aws lambda create-function \
        --function-name ${FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler sustainability_processor.lambda_handler \
        --zip-file fileb://function.zip \
@@ -429,7 +427,7 @@ echo "✅ AWS environment configured with sustainability data lake"
    if [ "$QS_USER" = "not-found" ]; then
        echo "QuickSight account setup required. Please complete these steps:"
        echo "1. Navigate to QuickSight service in AWS Console"
-       echo "2. Sign up for QuickSight Standard edition (\$18/month per user)"
+       echo "2. Sign up for QuickSight Standard edition (\$9/month per user with annual commitment)"
        echo "3. Grant S3 access permissions during setup"
        echo "4. Enable access to Cost Explorer data"
        echo "5. Return here to continue with data source creation"
@@ -769,9 +767,9 @@ echo "✅ AWS environment configured with sustainability data lake"
 
 This solution demonstrates the power of integrated sustainability and cost analytics by combining AWS Customer Carbon Footprint Tool data with Cost Explorer insights through Amazon QuickSight's business intelligence capabilities. The [AWS Customer Carbon Footprint Tool](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/tracking-carbon-emissions.html) provides accurate Scope 2 emissions calculations using both market-based method (MBM) and location-based method (LBM) methodologies, following Greenhouse Gas Protocol standards with metric tons of carbon dioxide-equivalent (MTCO2e) measurements. By correlating this emissions data with detailed cost breakdowns from Cost Explorer, organizations gain unprecedented visibility into the relationship between cloud spending and environmental impact.
 
-The serverless architecture using AWS Lambda ensures cost-effective data processing that scales automatically with organizational needs while maintaining alignment with the AWS Well-Architected Framework's sustainability pillar. The EventBridge-triggered automation respects the Customer Carbon Footprint Tool's monthly data publication schedule (typically between the 15th-25th of each month with a three-month delay), ensuring timely insights without unnecessary processing overhead. This approach supports the sustainability principle of using only what you need when you need it, minimizing the environmental impact of the monitoring solution itself.
+The serverless architecture using AWS Lambda ensures cost-effective data processing that scales automatically with organizational needs while maintaining alignment with the AWS Well-Architected Framework's sustainability pillar. The EventBridge-triggered automation respects the Customer Carbon Footprint Tool's monthly data publication schedule (typically between the 15th-25th of each month with a three-month delay), ensuring timely insights without unnecessary processing overhead. This approach supports the sustainability principle of using only what you need when you need it, minimizing the environmental impact of the monitoring solution itself. For detailed information about the Cost Explorer API capabilities, see the [AWS Cost Explorer API documentation](https://docs.aws.amazon.com/cost-management/latest/userguide/ce-api.html).
 
-Amazon QuickSight's integration capabilities enable sophisticated analysis patterns including time-series carbon trend analysis, regional emissions comparisons, and service-specific sustainability optimization opportunities. The platform's machine learning insights can identify anomalies in carbon footprint patterns and suggest proactive optimization strategies. Organizations can leverage QuickSight's embedded analytics features to integrate sustainability metrics directly into existing business applications, democratizing access to environmental impact data across teams and stakeholders.
+Amazon QuickSight's integration capabilities enable sophisticated analysis patterns including time-series carbon trend analysis, regional emissions comparisons, and service-specific sustainability optimization opportunities. The platform's machine learning insights can identify anomalies in carbon footprint patterns and suggest proactive optimization strategies. Organizations can leverage QuickSight's embedded analytics features to integrate sustainability metrics directly into existing business applications, democratizing access to environmental impact data across teams and stakeholders. The [QuickSight S3 data source creation process](https://docs.aws.amazon.com/quicksight/latest/user/create-a-data-set-s3-procedure.html) provides flexible data ingestion capabilities that support evolving sustainability data schemas.
 
 The solution's design emphasizes actionable intelligence by connecting carbon footprint trends to specific optimization recommendations. For example, identifying regions with higher carbon intensity can inform workload placement decisions, while correlating service usage patterns with emissions data can guide architectural choices toward more sustainable alternatives. This data-driven approach transforms sustainability from a compliance requirement into a strategic business advantage that simultaneously reduces costs and environmental impact. For comprehensive sustainability guidance, refer to the [AWS Well-Architected Sustainability Pillar](https://docs.aws.amazon.com/wellarchitected/latest/sustainability-pillar/) documentation.
 

@@ -1,0 +1,613 @@
+# Infrastructure Manager Configuration for Digital Twin Manufacturing Resilience
+# This configuration deploys a comprehensive digital twin system for manufacturing
+# resilience testing using IoT sensors, Vertex AI, and stream processing
+
+# Blueprint metadata
+blueprint:
+  name: digital-twin-manufacturing-resilience
+  version: 1.0
+  description: "Digital twin system for manufacturing equipment resilience testing"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+  
+  region:
+    type: string
+    description: "Google Cloud region for resources"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Google Cloud zone for compute resources"
+    default: "us-central1-a"
+    
+  dataset_name:
+    type: string
+    description: "BigQuery dataset name for manufacturing data"
+    default: "manufacturing_data"
+    
+  random_suffix:
+    type: string
+    description: "Random suffix for resource names to ensure uniqueness"
+    default: "001"
+
+# Main infrastructure resources
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable_apis
+    type: google-cloud-foundation/modules/project-services
+    properties:
+      project_id: ${var.project_id}
+      services:
+        - pubsub.googleapis.com
+        - dataflow.googleapis.com
+        - bigquery.googleapis.com
+        - aiplatform.googleapis.com
+        - cloudfunctions.googleapis.com
+        - storage.googleapis.com
+        - monitoring.googleapis.com
+        - logging.googleapis.com
+        - cloudresourcemanager.googleapis.com
+
+  # Cloud Storage bucket for model artifacts and data pipeline
+  - name: manufacturing_storage_bucket
+    type: google-cloud-storage/bucket
+    properties:
+      name: manufacturing-twin-storage-${var.random_suffix}
+      location: ${var.region}
+      storage_class: STANDARD
+      # Enable versioning for model artifact management
+      versioning:
+        enabled: true
+      # Lifecycle management for cost optimization
+      lifecycle_rule:
+        - action:
+            type: SetStorageClass
+            storage_class: NEARLINE
+          condition:
+            age: 30
+        - action:
+            type: SetStorageClass
+            storage_class: COLDLINE
+          condition:
+            age: 90
+      # Uniform bucket-level access for simplified IAM
+      uniform_bucket_level_access:
+        enabled: true
+    depends_on:
+      - enable_apis
+
+  # Pub/Sub topics for IoT data ingestion and event processing
+  - name: sensor_data_topic
+    type: google-cloud-pubsub/topic
+    properties:
+      name: manufacturing-sensor-data
+      project: ${var.project_id}
+      # Message retention for data durability
+      message_retention_duration: "604800s"  # 7 days
+      # Schema validation for data quality
+      schema_settings:
+        encoding: JSON
+    depends_on:
+      - enable_apis
+
+  - name: failure_simulation_topic
+    type: google-cloud-pubsub/topic
+    properties:
+      name: failure-simulation-events
+      project: ${var.project_id}
+      message_retention_duration: "259200s"  # 3 days
+    depends_on:
+      - enable_apis
+
+  - name: recovery_commands_topic
+    type: google-cloud-pubsub/topic
+    properties:
+      name: recovery-commands
+      project: ${var.project_id}
+      message_retention_duration: "86400s"  # 1 day
+    depends_on:
+      - enable_apis
+
+  # Pub/Sub subscriptions for data processing
+  - name: sensor_data_subscription
+    type: google-cloud-pubsub/subscription
+    properties:
+      name: sensor-data-processing
+      project: ${var.project_id}
+      topic: ${manufacturing_sensor_data_topic.name}
+      # Dead letter queue configuration for reliability
+      dead_letter_policy:
+        dead_letter_topic: projects/${var.project_id}/topics/sensor-data-dlq
+        max_delivery_attempts: 5
+      # Acknowledgment deadline for processing time
+      ack_deadline_seconds: 300
+      # Retry policy for failed messages
+      retry_policy:
+        minimum_backoff: "10s"
+        maximum_backoff: "600s"
+    depends_on:
+      - sensor_data_topic
+
+  - name: simulation_processing_subscription
+    type: google-cloud-pubsub/subscription
+    properties:
+      name: simulation-processing
+      project: ${var.project_id}
+      topic: ${failure_simulation_events_topic.name}
+      ack_deadline_seconds: 600
+      retry_policy:
+        minimum_backoff: "10s"
+        maximum_backoff: "300s"
+    depends_on:
+      - failure_simulation_topic
+
+  # Dead letter queue topic for failed message handling
+  - name: sensor_data_dlq_topic
+    type: google-cloud-pubsub/topic
+    properties:
+      name: sensor-data-dlq
+      project: ${var.project_id}
+      message_retention_duration: "1209600s"  # 14 days
+    depends_on:
+      - enable_apis
+
+  # BigQuery dataset for data warehousing
+  - name: manufacturing_dataset
+    type: google-cloud-bigquery/dataset
+    properties:
+      dataset_id: ${var.dataset_name}
+      project: ${var.project_id}
+      location: ${var.region}
+      description: "Manufacturing sensor data and simulation results"
+      # Access control configuration
+      access:
+        - role: OWNER
+          user_by_email: "admin@example.com"
+        - role: READER
+          special_group: "projectReaders"
+      # Default table expiration for cost management
+      default_table_expiration_ms: 7776000000  # 90 days
+    depends_on:
+      - enable_apis
+
+  # BigQuery tables for structured data storage
+  - name: sensor_data_table
+    type: google-cloud-bigquery/table
+    properties:
+      table_id: sensor_data
+      project: ${var.project_id}
+      dataset_id: ${manufacturing_dataset.dataset_id}
+      description: "Real-time sensor data from manufacturing equipment"
+      # Time partitioning for performance and cost optimization
+      time_partitioning:
+        type: DAY
+        field: timestamp
+        expiration_ms: 7776000000  # 90 days
+      # Clustering for query optimization
+      clustering:
+        - equipment_id
+        - sensor_type
+      # Schema definition
+      schema: |
+        [
+          {
+            "name": "timestamp",
+            "type": "TIMESTAMP",
+            "mode": "REQUIRED",
+            "description": "Sensor reading timestamp"
+          },
+          {
+            "name": "equipment_id",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Unique equipment identifier"
+          },
+          {
+            "name": "sensor_type",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Type of sensor (temperature, vibration, pressure)"
+          },
+          {
+            "name": "value",
+            "type": "FLOAT",
+            "mode": "REQUIRED",
+            "description": "Sensor reading value"
+          },
+          {
+            "name": "unit",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Unit of measurement"
+          },
+          {
+            "name": "location",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Physical location of equipment"
+          },
+          {
+            "name": "processing_timestamp",
+            "type": "TIMESTAMP",
+            "mode": "NULLABLE",
+            "description": "Data processing timestamp"
+          }
+        ]
+    depends_on:
+      - manufacturing_dataset
+
+  - name: simulation_results_table
+    type: google-cloud-bigquery/table
+    properties:
+      table_id: simulation_results
+      project: ${var.project_id}
+      dataset_id: ${manufacturing_dataset.dataset_id}
+      description: "Digital twin simulation results and failure scenarios"
+      time_partitioning:
+        type: DAY
+        field: timestamp
+        expiration_ms: 15552000000  # 180 days
+      clustering:
+        - simulation_id
+        - equipment_id
+      schema: |
+        [
+          {
+            "name": "simulation_id",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Unique simulation identifier"
+          },
+          {
+            "name": "timestamp",
+            "type": "TIMESTAMP",
+            "mode": "REQUIRED",
+            "description": "Simulation execution timestamp"
+          },
+          {
+            "name": "scenario",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Failure scenario type"
+          },
+          {
+            "name": "equipment_id",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Equipment being simulated"
+          },
+          {
+            "name": "predicted_outcome",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Predicted failure outcome"
+          },
+          {
+            "name": "confidence",
+            "type": "FLOAT",
+            "mode": "NULLABLE",
+            "description": "Prediction confidence score"
+          },
+          {
+            "name": "recovery_time",
+            "type": "INTEGER",
+            "mode": "NULLABLE",
+            "description": "Estimated recovery time in minutes"
+          },
+          {
+            "name": "business_impact",
+            "type": "JSON",
+            "mode": "NULLABLE",
+            "description": "Business impact analysis"
+          }
+        ]
+    depends_on:
+      - manufacturing_dataset
+
+  - name: equipment_metadata_table
+    type: google-cloud-bigquery/table
+    properties:
+      table_id: equipment_metadata
+      project: ${var.project_id}
+      dataset_id: ${manufacturing_dataset.dataset_id}
+      description: "Manufacturing equipment metadata and specifications"
+      schema: |
+        [
+          {
+            "name": "equipment_id",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Unique equipment identifier"
+          },
+          {
+            "name": "equipment_type",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Type of equipment (pump, compressor, etc.)"
+          },
+          {
+            "name": "manufacturer",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Equipment manufacturer"
+          },
+          {
+            "name": "model",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Equipment model"
+          },
+          {
+            "name": "installation_date",
+            "type": "DATE",
+            "mode": "NULLABLE",
+            "description": "Equipment installation date"
+          },
+          {
+            "name": "criticality_level",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Business criticality level"
+          },
+          {
+            "name": "location",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Physical location"
+          }
+        ]
+    depends_on:
+      - manufacturing_dataset
+
+  # Service account for Cloud Functions
+  - name: cloud_function_service_account
+    type: google-cloud-iam/service-account
+    properties:
+      account_id: digital-twin-function-sa
+      project: ${var.project_id}
+      display_name: "Digital Twin Simulation Function Service Account"
+      description: "Service account for digital twin simulation Cloud Function"
+    depends_on:
+      - enable_apis
+
+  # IAM roles for Cloud Function service account
+  - name: function_pubsub_publisher_binding
+    type: google-cloud-iam/project-iam-member
+    properties:
+      project: ${var.project_id}
+      role: roles/pubsub.publisher
+      member: serviceAccount:${cloud_function_service_account.email}
+    depends_on:
+      - cloud_function_service_account
+
+  - name: function_bigquery_user_binding
+    type: google-cloud-iam/project-iam-member
+    properties:
+      project: ${var.project_id}
+      role: roles/bigquery.user
+      member: serviceAccount:${cloud_function_service_account.email}
+    depends_on:
+      - cloud_function_service_account
+
+  - name: function_storage_object_viewer_binding
+    type: google-cloud-iam/project-iam-member
+    properties:
+      project: ${var.project_id}
+      role: roles/storage.objectViewer
+      member: serviceAccount:${cloud_function_service_account.email}
+    depends_on:
+      - cloud_function_service_account
+
+  # Cloud Function for digital twin simulation engine
+  - name: digital_twin_simulation_function
+    type: google-cloud-functions/function
+    properties:
+      name: digital-twin-simulator
+      project: ${var.project_id}
+      region: ${var.region}
+      description: "Digital twin simulation engine for failure scenario testing"
+      # Runtime configuration
+      runtime: python311
+      entry_point: simulate_failure_scenario
+      # Resource allocation
+      available_memory_mb: 256
+      timeout: "60s"
+      max_instances: 100
+      # Environment variables
+      environment_variables:
+        PROJECT_ID: ${var.project_id}
+        DATASET_NAME: ${var.dataset_name}
+        BUCKET_NAME: ${manufacturing_storage_bucket.name}
+      # Service account
+      service_account_email: ${cloud_function_service_account.email}
+      # HTTP trigger configuration
+      https_trigger:
+        security_level: SECURE_ALWAYS
+      # Source code configuration (inline for simplicity)
+      source_archive_url: gs://${manufacturing_storage_bucket.name}/function-source.zip
+    depends_on:
+      - manufacturing_storage_bucket
+      - cloud_function_service_account
+      - function_pubsub_publisher_binding
+
+  # Vertex AI dataset for machine learning
+  - name: manufacturing_ai_dataset
+    type: google-cloud-aiplatform/dataset
+    properties:
+      display_name: manufacturing-failure-prediction
+      project: ${var.project_id}
+      region: ${var.region}
+      metadata_schema_uri: "gs://google-cloud-aiplatform/schema/dataset/metadata/tabular_1.0.0.yaml"
+      metadata:
+        description: "Manufacturing equipment failure prediction dataset"
+        input_config:
+          gcs_source:
+            uri: gs://${manufacturing_storage_bucket.name}/training-data/*
+    depends_on:
+      - manufacturing_storage_bucket
+      - enable_apis
+
+  # Cloud Monitoring dashboard for digital twin operations
+  - name: manufacturing_dashboard
+    type: google-cloud-monitoring/dashboard
+    properties:
+      project: ${var.project_id}
+      display_name: "Manufacturing Digital Twin Dashboard"
+      # Dashboard configuration with tiles for key metrics
+      mosaic_layout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "Sensor Data Ingestion Rate"
+              xy_chart:
+                data_sets:
+                  - time_series_query:
+                      unit_override: "1/s"
+                      time_series_filter:
+                        filter: 'resource.type="pubsub_topic" AND resource.labels.topic_id="manufacturing-sensor-data"'
+                        aggregation:
+                          alignment_period: "60s"
+                          per_series_aligner: "ALIGN_RATE"
+                          cross_series_reducer: "REDUCE_SUM"
+          - width: 6
+            height: 4
+            widget:
+              title: "Simulation Function Execution Count"
+              xy_chart:
+                data_sets:
+                  - time_series_query:
+                      time_series_filter:
+                        filter: 'resource.type="cloud_function" AND resource.labels.function_name="digital-twin-simulator"'
+                        aggregation:
+                          alignment_period: "300s"
+                          per_series_aligner: "ALIGN_RATE"
+                          cross_series_reducer: "REDUCE_SUM"
+          - width: 12
+            height: 4
+            widget:
+              title: "BigQuery Data Processing Volume"
+              xy_chart:
+                data_sets:
+                  - time_series_query:
+                      time_series_filter:
+                        filter: 'resource.type="bigquery_dataset" AND resource.labels.dataset_id="${var.dataset_name}"'
+                        aggregation:
+                          alignment_period: "300s"
+                          per_series_aligner: "ALIGN_MEAN"
+    depends_on:
+      - enable_apis
+      - manufacturing_dataset
+      - digital_twin_simulation_function
+
+  # Log sink for structured logging
+  - name: manufacturing_log_sink
+    type: google-cloud-logging/project-sink
+    properties:
+      name: manufacturing-digital-twin-logs
+      project: ${var.project_id}
+      destination: bigquery.googleapis.com/projects/${var.project_id}/datasets/${var.dataset_name}
+      description: "Log sink for digital twin operations"
+      # Filter for relevant log entries
+      filter: |
+        resource.type="cloud_function" AND 
+        resource.labels.function_name="digital-twin-simulator" OR
+        resource.type="pubsub_topic" AND 
+        (resource.labels.topic_id="manufacturing-sensor-data" OR 
+         resource.labels.topic_id="failure-simulation-events")
+      # Unique writer identity for BigQuery access
+      unique_writer_identity: true
+    depends_on:
+      - manufacturing_dataset
+      - digital_twin_simulation_function
+
+  # IAM binding for log sink to write to BigQuery
+  - name: log_sink_bigquery_binding
+    type: google-cloud-iam/project-iam-member
+    properties:
+      project: ${var.project_id}
+      role: roles/bigquery.dataEditor
+      member: ${manufacturing_log_sink.writer_identity}
+    depends_on:
+      - manufacturing_log_sink
+
+  # Alerting policy for simulation failures
+  - name: simulation_failure_alert
+    type: google-cloud-monitoring/alert-policy
+    properties:
+      project: ${var.project_id}
+      display_name: "Digital Twin Simulation Failures"
+      documentation:
+        content: "Alert triggered when digital twin simulation function encounters errors"
+        mime_type: "text/markdown"
+      # Condition for function errors
+      conditions:
+        - display_name: "Function Error Rate"
+          condition_threshold:
+            filter: 'resource.type="cloud_function" AND resource.labels.function_name="digital-twin-simulator"'
+            comparison: COMPARISON_GREATER_THAN
+            threshold_value: 5
+            duration: "300s"
+            aggregations:
+              - alignment_period: "60s"
+                per_series_aligner: "ALIGN_RATE"
+                cross_series_reducer: "REDUCE_SUM"
+      # Notification channels (requires manual configuration)
+      enabled: true
+      combiner: OR
+    depends_on:
+      - enable_apis
+      - digital_twin_simulation_function
+
+# Output values for verification and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+    
+  region:
+    description: "Deployment region"
+    value: ${var.region}
+    
+  storage_bucket_name:
+    description: "Cloud Storage bucket for model artifacts"
+    value: ${manufacturing_storage_bucket.name}
+    
+  dataset_name:
+    description: "BigQuery dataset name"
+    value: ${manufacturing_dataset.dataset_id}
+    
+  sensor_data_topic:
+    description: "Pub/Sub topic for sensor data"
+    value: ${sensor_data_topic.name}
+    
+  simulation_topic:
+    description: "Pub/Sub topic for simulation events"
+    value: ${failure_simulation_topic.name}
+    
+  function_url:
+    description: "Digital twin simulation function URL"
+    value: ${digital_twin_simulation_function.https_trigger.url}
+    
+  ai_dataset_id:
+    description: "Vertex AI dataset ID"
+    value: ${manufacturing_ai_dataset.name}
+    
+  dashboard_url:
+    description: "Cloud Monitoring dashboard URL"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/${manufacturing_dashboard.id}?project=${var.project_id}"
+
+# Metadata for deployment tracking
+metadata:
+  version: "1.0"
+  description: "Complete infrastructure for digital twin manufacturing resilience system"
+  author: "Google Cloud Infrastructure Manager"
+  created_date: "2025-07-23"
+  recipe_source: "digital-twin-manufacturing-resilience-iot-vertex"
+  estimated_cost: "$50-100 per day for testing workloads"
+  deployment_time: "10-15 minutes"

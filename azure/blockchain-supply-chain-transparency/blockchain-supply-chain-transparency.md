@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure Confidential Ledger, Azure Cosmos DB, Azure Logic Apps, Azure Event Grid
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: blockchain, supply-chain, immutability, distributed-ledger, global-distribution
 recipe-generator-version: 1.3
@@ -153,9 +153,8 @@ echo "✅ Azure AD application created for ledger access"
        --location ${LOCATION} \
        --ledger-type Public \
        --aad-based-security-principals \
-           objectId=${SP_ID} \
-           tenantId=$(az account show --query tenantId -o tsv) \
-           ledgerRoleName=Administrator
+           ledger-role-name=Administrator \
+           principal-id=${SP_ID}
    
    # Wait for ledger creation
    echo "⏳ Waiting for ledger creation (this may take 5-10 minutes)..."
@@ -340,102 +339,70 @@ echo "✅ Azure AD application created for ledger access"
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --mi-user-assigned ${LOGIC_APP_IDENTITY}
-   
-   # Create workflow definition for supply chain recording
-   cat > workflow-definition.json << EOF
-   {
-     "definition": {
-       "\$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-       "contentVersion": "1.0.0.0",
-       "triggers": {
-         "When_a_HTTP_request_is_received": {
-           "type": "Request",
-           "kind": "Http",
-           "inputs": {
-             "method": "POST",
-             "schema": {
-               "type": "object",
-               "properties": {
-                 "transactionId": { "type": "string" },
-                 "productId": { "type": "string" },
-                 "action": { "type": "string" },
-                 "timestamp": { "type": "string" },
-                 "location": { "type": "string" },
-                 "participant": { "type": "string" },
-                 "metadata": { "type": "object" }
+       --definition '{
+         "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+         "contentVersion": "1.0.0.0",
+         "triggers": {
+           "When_a_HTTP_request_is_received": {
+             "type": "Request",
+             "kind": "Http",
+             "inputs": {
+               "method": "POST",
+               "schema": {
+                 "type": "object",
+                 "properties": {
+                   "transactionId": { "type": "string" },
+                   "productId": { "type": "string" },
+                   "action": { "type": "string" },
+                   "timestamp": { "type": "string" },
+                   "location": { "type": "string" },
+                   "participant": { "type": "string" },
+                   "metadata": { "type": "object" }
+                 }
                }
              }
            }
-         }
-       },
-       "actions": {
-         "Record_to_Confidential_Ledger": {
-           "type": "Http",
-           "inputs": {
-             "method": "POST",
-             "uri": "@{parameters('ledgerEndpoint')}/app/transactions",
-             "headers": {
-               "Content-Type": "application/json"
+         },
+         "actions": {
+           "Record_to_Confidential_Ledger": {
+             "type": "Http",
+             "inputs": {
+               "method": "POST",
+               "uri": "@parameters(\"ledgerEndpoint\")/app/transactions",
+               "headers": {
+                 "Content-Type": "application/json"
+               },
+               "body": "@triggerBody()"
+             }
+           },
+           "Publish_Event": {
+             "type": "Http",
+             "inputs": {
+               "method": "POST",
+               "uri": "@parameters(\"eventGridEndpoint\")",
+               "headers": {
+                 "aeg-sas-key": "@parameters(\"eventGridKey\")",
+                 "Content-Type": "application/json"
+               },
+               "body": [{
+                 "id": "@guid()",
+                 "eventType": "@triggerBody()[\"action\"]",
+                 "subject": "supplychain/products/@{triggerBody()[\"productId\"]}",
+                 "eventTime": "@utcNow()",
+                 "data": "@triggerBody()"
+               }]
              },
-             "body": "@triggerBody()",
-             "authentication": {
-               "type": "ManagedServiceIdentity"
+             "runAfter": {
+               "Record_to_Confidential_Ledger": ["Succeeded"]
              }
            }
-         },
-         "Store_in_Cosmos_DB": {
-           "type": "ApiConnection",
-           "inputs": {
-             "host": {
-               "connection": {
-                 "name": "@parameters('\$connections')['cosmosdb']['connectionId']"
-               }
-             },
-             "method": "post",
-             "body": "@triggerBody()",
-             "path": "/dbs/SupplyChainDB/colls/Transactions/docs"
-           },
-           "runAfter": {
-             "Record_to_Confidential_Ledger": ["Succeeded"]
-           }
-         },
-         "Publish_Event": {
-           "type": "Http",
-           "inputs": {
-             "method": "POST",
-             "uri": "@{parameters('eventGridEndpoint')}",
-             "headers": {
-               "aeg-sas-key": "@{parameters('eventGridKey')}",
-               "Content-Type": "application/json"
-             },
-             "body": [{
-               "id": "@{guid()}",
-               "eventType": "@{triggerBody()['action']}",
-               "subject": "supplychain/products/@{triggerBody()['productId']}",
-               "eventTime": "@{utcNow()}",
-               "data": "@triggerBody()"
-             }]
-           },
-           "runAfter": {
-             "Store_in_Cosmos_DB": ["Succeeded"]
-           }
          }
-       }
-     }
-   }
-   EOF
-   
-   # Update Logic App with workflow
-   az logic workflow update \
-       --name ${LOGIC_APP_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --definition workflow-definition.json
+       }'
    
    echo "✅ Logic Apps workflow created for blockchain orchestration"
    ```
 
-   The Logic App now orchestrates the complete transaction flow: receiving supply chain events, recording immutable entries to the Confidential Ledger, storing queryable data in Cosmos DB, and publishing notifications through Event Grid for downstream systems.
+   The Logic App now orchestrates the complete transaction flow: receiving supply chain events, recording immutable entries to the Confidential Ledger, and publishing notifications through Event Grid for downstream systems.
 
 6. **Deploy API Management for Partner Integration**:
 
@@ -471,24 +438,6 @@ echo "✅ Azure AD application created for ledger access"
        --display-name "Submit Transaction" \
        --method POST \
        --url-template "/transactions"
-   
-   # Configure rate limiting policy
-   cat > api-policy.xml << EOF
-   <policies>
-     <inbound>
-       <rate-limit-by-key calls="100" renewal-period="60" 
-           counter-key="@(context.Subscription?.Key ?? \"anonymous\")" />
-       <validate-jwt header-name="Authorization" 
-           failed-validation-httpcode="401" 
-           failed-validation-error-message="Unauthorized">
-         <openid-config url="https://login.microsoftonline.com/\${TENANT_ID}/v2.0/.well-known/openid-configuration" />
-         <audiences>
-           <audience>api://supply-chain-api</audience>
-         </audiences>
-       </validate-jwt>
-     </inbound>
-   </policies>
-   EOF
    
    echo "✅ API Management configured for secure partner access"
    ```

@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: Network Connectivity Center, Parallelstore, Cloud Workflows, Cloud Monitoring
 estimated-time: 150 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: 2025-07-17
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: disaster-recovery, cloud-wan, parallelstore, automation, orchestration
 recipe-generator-version: 1.3
@@ -189,8 +189,7 @@ echo "✅ Secondary region: ${SECONDARY_REGION}"
    ```bash
    # Create Network Connectivity Center hub
    gcloud network-connectivity hubs create ${DR_PREFIX}-wan-hub \
-       --description="Global WAN hub for HPC disaster recovery" \
-       --project=${PROJECT_ID}
+       --description="Global WAN hub for HPC disaster recovery"
    
    # Create primary region spoke
    gcloud network-connectivity spokes create ${DR_PREFIX}-primary-spoke \
@@ -217,28 +216,32 @@ echo "✅ Secondary region: ${SECONDARY_REGION}"
 
    ```bash
    # Create primary Parallelstore instance
-   gcloud parallelstore instances create ${DR_PREFIX}-primary-pfs \
+   gcloud beta parallelstore instances create ${DR_PREFIX}-primary-pfs \
        --location=${PRIMARY_ZONE} \
-       --capacity=100 \
+       --capacity-gib=102400 \
        --network=projects/${PROJECT_ID}/global/networks/${DR_PREFIX}-primary-vpc \
-       --description="Primary Parallelstore for HPC workloads"
+       --description="Primary Parallelstore for HPC workloads" \
+       --file-stripe-level=file-stripe-level-balanced \
+       --directory-stripe-level=directory-stripe-level-balanced
    
    # Create secondary Parallelstore instance
-   gcloud parallelstore instances create ${DR_PREFIX}-secondary-pfs \
+   gcloud beta parallelstore instances create ${DR_PREFIX}-secondary-pfs \
        --location=${SECONDARY_ZONE} \
-       --capacity=100 \
+       --capacity-gib=102400 \
        --network=projects/${PROJECT_ID}/global/networks/${DR_PREFIX}-secondary-vpc \
-       --description="Secondary Parallelstore for DR replication"
+       --description="Secondary Parallelstore for DR replication" \
+       --file-stripe-level=file-stripe-level-balanced \
+       --directory-stripe-level=directory-stripe-level-balanced
    
    # Wait for instances to be ready
    echo "Waiting for Parallelstore instances to become ready..."
-   while [[ $(gcloud parallelstore instances describe ${DR_PREFIX}-primary-pfs \
+   while [[ $(gcloud beta parallelstore instances describe ${DR_PREFIX}-primary-pfs \
        --location=${PRIMARY_ZONE} --format="value(state)") != "READY" ]]; do
        echo "Primary Parallelstore instance not ready yet..."
        sleep 30
    done
    
-   while [[ $(gcloud parallelstore instances describe ${DR_PREFIX}-secondary-pfs \
+   while [[ $(gcloud beta parallelstore instances describe ${DR_PREFIX}-secondary-pfs \
        --location=${SECONDARY_ZONE} --format="value(state)") != "READY" ]]; do
        echo "Secondary Parallelstore instance not ready yet..."
        sleep 30
@@ -304,27 +307,21 @@ echo "✅ Secondary region: ${SECONDARY_REGION}"
 
    ```bash
    # Create Pub/Sub topics for DR orchestration
-   gcloud pubsub topics create ${DR_PREFIX}-health-alerts \
-       --project=${PROJECT_ID}
+   gcloud pubsub topics create ${DR_PREFIX}-health-alerts
    
-   gcloud pubsub topics create ${DR_PREFIX}-failover-commands \
-       --project=${PROJECT_ID}
+   gcloud pubsub topics create ${DR_PREFIX}-failover-commands
    
-   gcloud pubsub topics create ${DR_PREFIX}-replication-status \
-       --project=${PROJECT_ID}
+   gcloud pubsub topics create ${DR_PREFIX}-replication-status
    
    # Create subscriptions for workflow processing
    gcloud pubsub subscriptions create ${DR_PREFIX}-health-subscription \
-       --topic=${DR_PREFIX}-health-alerts \
-       --project=${PROJECT_ID}
+       --topic=${DR_PREFIX}-health-alerts
    
    gcloud pubsub subscriptions create ${DR_PREFIX}-failover-subscription \
-       --topic=${DR_PREFIX}-failover-commands \
-       --project=${PROJECT_ID}
+       --topic=${DR_PREFIX}-failover-commands
    
    gcloud pubsub subscriptions create ${DR_PREFIX}-replication-subscription \
-       --topic=${DR_PREFIX}-replication-status \
-       --project=${PROJECT_ID}
+       --topic=${DR_PREFIX}-replication-status
    
    echo "✅ Pub/Sub messaging infrastructure configured"
    ```
@@ -428,6 +425,7 @@ EOF
     
     # Deploy the health monitoring function
     gcloud functions deploy ${DR_PREFIX}-health-monitor \
+        --gen2 \
         --runtime=python312 \
         --trigger=http \
         --entry-point=monitor_hpc_health \
@@ -636,7 +634,6 @@ EOF
     # Create the notification channel
     CHANNEL_ID=$(gcloud alpha monitoring channels create \
         --channel-content-from-file=/tmp/${DR_PREFIX}-notification-channel.json \
-        --project=${PROJECT_ID} \
         --format="value(name)")
     
     # Update alerting policy with notification channel
@@ -677,8 +674,7 @@ EOF
     
     # Create the alerting policy
     gcloud alpha monitoring policies create \
-        --policy-from-file=/tmp/${DR_PREFIX}-alerting-policy-updated.json \
-        --project=${PROJECT_ID}
+        --policy-from-file=/tmp/${DR_PREFIX}-alerting-policy-updated.json
     
     echo "✅ Cloud Monitoring alerting policies configured"
     ```
@@ -751,6 +747,7 @@ EOF
     
     # Deploy replication function
     gcloud functions deploy ${DR_PREFIX}-replication-scheduler \
+        --gen2 \
         --runtime=python312 \
         --trigger=topic=${DR_PREFIX}-replication-status \
         --entry-point=replicate_hpc_data \
@@ -779,24 +776,24 @@ EOF
 
    ```bash
    # Check primary Parallelstore instance status
-   gcloud parallelstore instances describe ${DR_PREFIX}-primary-pfs \
+   gcloud beta parallelstore instances describe ${DR_PREFIX}-primary-pfs \
        --location=${PRIMARY_ZONE} \
-       --format="table(name,state,capacityGib,dasdVolumeConfigs)"
+       --format="table(name,state,capacityGib)"
    
    # Check secondary Parallelstore instance status
-   gcloud parallelstore instances describe ${DR_PREFIX}-secondary-pfs \
+   gcloud beta parallelstore instances describe ${DR_PREFIX}-secondary-pfs \
        --location=${SECONDARY_ZONE} \
-       --format="table(name,state,capacityGib,dasdVolumeConfigs)"
+       --format="table(name,state,capacityGib)"
    ```
 
-   Expected output: Both instances should show `state: READY` with 100 TiB capacity.
+   Expected output: Both instances should show `state: READY` with 102400 GiB capacity.
 
 2. Test Cloud WAN connectivity between regions:
 
    ```bash
    # Verify Network Connectivity Center hub status
    gcloud network-connectivity hubs describe ${DR_PREFIX}-wan-hub \
-       --format="table(name,state,routingVpcs)"
+       --format="table(name,state)"
    
    # Check spoke connectivity
    gcloud network-connectivity spokes list \
@@ -834,7 +831,7 @@ EOF
    # Get health monitoring function URL
    HEALTH_FUNCTION_URL=$(gcloud functions describe ${DR_PREFIX}-health-monitor \
        --region=${PRIMARY_REGION} \
-       --format="value(httpsTrigger.url)")
+       --format="value(serviceConfig.uri)")
    
    # Trigger health monitoring function
    curl -X GET "${HEALTH_FUNCTION_URL}" \
@@ -896,12 +893,12 @@ EOF
 
    ```bash
    # Delete primary Parallelstore instance
-   gcloud parallelstore instances delete ${DR_PREFIX}-primary-pfs \
+   gcloud beta parallelstore instances delete ${DR_PREFIX}-primary-pfs \
        --location=${PRIMARY_ZONE} \
        --quiet
    
    # Delete secondary Parallelstore instance
-   gcloud parallelstore instances delete ${DR_PREFIX}-secondary-pfs \
+   gcloud beta parallelstore instances delete ${DR_PREFIX}-secondary-pfs \
        --location=${SECONDARY_ZONE} \
        --quiet
    

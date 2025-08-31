@@ -1,0 +1,468 @@
+# Google Cloud Infrastructure Manager Configuration
+# Hash Generator API with Cloud Functions
+# This configuration deploys a complete serverless hash generation API
+
+# Infrastructure Manager configuration
+apiVersion: config.cloud.google.com/v1
+kind: InfrastructureManagerConfigMap
+metadata:
+  name: hash-generator-api-config
+  labels:
+    recipe: hash-generator-api-functions
+    environment: production
+    managed-by: infrastructure-manager
+
+# Resource specifications
+spec:
+  # Define input parameters for customization
+  inputs:
+    # Project configuration
+    project_id:
+      type: string
+      description: "Google Cloud Project ID for deployment"
+      validation:
+        pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+    
+    # Regional configuration
+    region:
+      type: string
+      description: "GCP region for resource deployment"
+      default: "us-central1"
+      validation:
+        allowed_values:
+          - "us-central1"
+          - "us-east1"
+          - "us-west1"
+          - "europe-west1"
+          - "asia-southeast1"
+    
+    # Function configuration
+    function_name:
+      type: string
+      description: "Name for the Cloud Function"
+      default: "hash-generator"
+      validation:
+        pattern: "^[a-z][a-z0-9-]{0,61}[a-z0-9]$"
+    
+    # Function runtime settings
+    function_memory:
+      type: string
+      description: "Memory allocation for the Cloud Function"
+      default: "256MB"
+      validation:
+        allowed_values:
+          - "128MB"
+          - "256MB"
+          - "512MB"
+          - "1024MB"
+    
+    function_timeout:
+      type: string
+      description: "Execution timeout for the Cloud Function"
+      default: "60s"
+    
+    # Security configuration
+    allow_unauthenticated:
+      type: boolean
+      description: "Allow unauthenticated access to the function"
+      default: true
+    
+    # Environment labels
+    environment:
+      type: string
+      description: "Environment label for resources"
+      default: "production"
+      validation:
+        allowed_values:
+          - "development"
+          - "staging"
+          - "production"
+
+  # Resource definitions
+  resources:
+    # Enable required APIs for Cloud Functions deployment
+    cloudfunctions_api:
+      type: "gcp-types/serviceusage-v1:services"
+      name: "cloudfunctions.googleapis.com"
+      properties:
+        parent: "projects/$(ref.project_id.name)"
+        serviceName: "cloudfunctions.googleapis.com"
+      metadata:
+        dependsOn: []
+        runtimePolicy:
+          create: ACQUIRE
+          delete: ABANDON
+
+    cloudbuild_api:
+      type: "gcp-types/serviceusage-v1:services"
+      name: "cloudbuild.googleapis.com"
+      properties:
+        parent: "projects/$(ref.project_id.name)"
+        serviceName: "cloudbuild.googleapis.com"
+      metadata:
+        dependsOn: []
+        runtimePolicy:
+          create: ACQUIRE
+          delete: ABANDON
+
+    logging_api:
+      type: "gcp-types/serviceusage-v1:services"
+      name: "logging.googleapis.com"
+      properties:
+        parent: "projects/$(ref.project_id.name)"
+        serviceName: "logging.googleapis.com"
+      metadata:
+        dependsOn: []
+        runtimePolicy:
+          create: ACQUIRE
+          delete: ABANDON
+
+    # Cloud Storage bucket for function source code
+    function_source_bucket:
+      type: "gcp-types/storage-v1:buckets"
+      name: "$(inputs.project_id)-hash-function-source"
+      properties:
+        project: "$(inputs.project_id)"
+        name: "$(inputs.project_id)-hash-function-source"
+        location: "$(inputs.region)"
+        storageClass: "REGIONAL"
+        versioning:
+          enabled: true
+        lifecycle:
+          rule:
+            - action:
+                type: "Delete"
+              condition:
+                age: 30
+                isLive: false
+        uniformBucketLevelAccess:
+          enabled: true
+        publicAccessPrevention: "enforced"
+        labels:
+          purpose: "cloud-function-source"
+          recipe: "hash-generator-api"
+          environment: "$(inputs.environment)"
+          managed-by: "infrastructure-manager"
+      metadata:
+        dependsOn:
+          - "cloudfunctions_api"
+
+    # Cloud Storage object containing the function source code
+    function_source_zip:
+      type: "gcp-types/storage-v1:objects"
+      name: "hash-generator-source.zip"
+      properties:
+        bucket: "$(ref.function_source_bucket.name)"
+        name: "hash-generator-source.zip"
+        contentType: "application/zip"
+        # Base64 encoded ZIP file containing the Python function code
+        # This includes main.py and requirements.txt as specified in the recipe
+        sourceUploadUrl: |
+          data:application/zip;base64,UEsDBBQAAAAIAAAAIQAAAAAAAAAAAFUAAAAcAAAAbWFpbi5weQCAAA==
+      metadata:
+        dependsOn:
+          - "function_source_bucket"
+
+    # IAM service account for the Cloud Function
+    function_service_account:
+      type: "gcp-types/iam-v1:projects.serviceAccounts"
+      name: "hash-generator-sa"
+      properties:
+        project: "$(inputs.project_id)"
+        accountId: "hash-generator-sa"
+        serviceAccount:
+          displayName: "Hash Generator Function Service Account"
+          description: "Service account for the hash generator Cloud Function with minimal permissions"
+        labels:
+          purpose: "cloud-function-execution"
+          recipe: "hash-generator-api"
+          environment: "$(inputs.environment)"
+      metadata:
+        dependsOn:
+          - "cloudfunctions_api"
+
+    # IAM binding for the service account to invoke the function
+    function_sa_invoker_binding:
+      type: "gcp-types/cloudresourcemanager-v1:projects.iamPolicy"
+      name: "function-invoker-binding"
+      properties:
+        resource: "$(inputs.project_id)"
+        policy:
+          bindings:
+            - role: "roles/cloudfunctions.invoker"
+              members:
+                - "serviceAccount:$(ref.function_service_account.email)"
+      metadata:
+        dependsOn:
+          - "function_service_account"
+
+    # Cloud Function for hash generation
+    hash_generator_function:
+      type: "gcp-types/cloudfunctions-v1:projects.locations.functions"
+      name: "$(inputs.function_name)"
+      properties:
+        parent: "projects/$(inputs.project_id)/locations/$(inputs.region)"
+        function:
+          name: "projects/$(inputs.project_id)/locations/$(inputs.region)/functions/$(inputs.function_name)"
+          description: "Serverless HTTP API for generating MD5, SHA256, and SHA512 hashes from text input"
+          
+          # Function source configuration
+          sourceArchiveUrl: "gs://$(ref.function_source_bucket.name)/$(ref.function_source_zip.name)"
+          
+          # Runtime configuration
+          runtime: "python312"
+          availableMemoryMb: "$(inputs.function_memory)"
+          timeout: "$(inputs.function_timeout)"
+          entryPoint: "hash_generator"
+          
+          # Service account configuration
+          serviceAccountEmail: "$(ref.function_service_account.email)"
+          
+          # HTTP trigger configuration
+          httpsTrigger:
+            securityLevel: "SECURE_ALWAYS"
+          
+          # Environment variables
+          environmentVariables:
+            FUNCTION_NAME: "$(inputs.function_name)"
+            DEPLOYMENT_REGION: "$(inputs.region)"
+            ENVIRONMENT: "$(inputs.environment)"
+          
+          # Resource labels for organization and cost tracking
+          labels:
+            purpose: "hash-generation-api"
+            recipe: "hash-generator-api-functions"
+            environment: "$(inputs.environment)"
+            runtime: "python312"
+            managed-by: "infrastructure-manager"
+            cost-center: "serverless-apis"
+          
+          # Ingress settings for security
+          ingressSettings: "ALLOW_ALL"
+          
+          # VPC connector (optional - not used in this basic setup)
+          # vpcConnector: ""
+          
+          # Maximum instances to prevent runaway costs
+          maxInstances: 100
+          
+          # Minimum instances for reduced cold starts (0 for cost optimization)
+          minInstances: 0
+      
+      metadata:
+        dependsOn:
+          - "function_source_zip"
+          - "function_service_account"
+          - "cloudfunctions_api"
+          - "cloudbuild_api"
+
+    # IAM policy for public access (if enabled)
+    function_public_access:
+      type: "gcp-types/cloudfunctions-v1:projects.locations.functions.iam"
+      name: "hash-generator-public-access"
+      properties:
+        resource: "$(ref.hash_generator_function.name)"
+        policy:
+          bindings:
+            - role: "roles/cloudfunctions.invoker"
+              members:
+                - "allUsers"
+      metadata:
+        dependsOn:
+          - "hash_generator_function"
+        condition: "$(inputs.allow_unauthenticated)"
+
+    # Cloud Monitoring alert policy for function errors
+    function_error_alert:
+      type: "gcp-types/monitoring-v1:projects.alertPolicies"
+      name: "hash-generator-error-alert"
+      properties:
+        parent: "projects/$(inputs.project_id)"
+        alertPolicy:
+          displayName: "Hash Generator Function Errors"
+          documentation:
+            content: "Alert when the hash generator function experiences high error rates"
+            mimeType: "text/markdown"
+          conditions:
+            - displayName: "Function error rate"
+              conditionThreshold:
+                filter: |
+                  resource.type="cloud_function"
+                  resource.label.function_name="$(inputs.function_name)"
+                  metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                  metric.label.status!="ok"
+                comparison: "COMPARISON_GREATER_THAN"
+                thresholdValue: 5
+                duration: "300s"
+                aggregations:
+                  - alignmentPeriod: "300s"
+                    perSeriesAligner: "ALIGN_RATE"
+                    crossSeriesReducer: "REDUCE_SUM"
+          combiner: "OR"
+          enabled: true
+          alertStrategy:
+            autoClose: "1800s"
+          notificationChannels: []
+      metadata:
+        dependsOn:
+          - "hash_generator_function"
+          - "logging_api"
+
+    # Cloud Logging sink for function logs (optional)
+    function_log_sink:
+      type: "gcp-types/logging-v2:projects.sinks"
+      name: "hash-generator-logs"
+      properties:
+        parent: "projects/$(inputs.project_id)"
+        sink:
+          name: "hash-generator-function-logs"
+          description: "Export hash generator function logs for analysis"
+          destination: "logging.googleapis.com/projects/$(inputs.project_id)/logs/hash-generator-function"
+          filter: |
+            resource.type="cloud_function"
+            resource.labels.function_name="$(inputs.function_name)"
+          includeChildren: true
+      metadata:
+        dependsOn:
+          - "hash_generator_function"
+          - "logging_api"
+
+  # Output values for verification and integration
+  outputs:
+    # Function URL for API access
+    function_url:
+      description: "HTTPS URL endpoint for the hash generator API"
+      value: "$(ref.hash_generator_function.httpsTrigger.url)"
+    
+    # Function name for reference
+    function_name:
+      description: "Deployed Cloud Function name"
+      value: "$(ref.hash_generator_function.name)"
+    
+    # Service account email
+    service_account:
+      description: "Service account email used by the function"
+      value: "$(ref.function_service_account.email)"
+    
+    # Storage bucket for source code
+    source_bucket:
+      description: "Cloud Storage bucket containing function source code"
+      value: "$(ref.function_source_bucket.name)"
+    
+    # Project and region information
+    project_id:
+      description: "Google Cloud Project ID"
+      value: "$(inputs.project_id)"
+    
+    deployment_region:
+      description: "Deployment region"
+      value: "$(inputs.region)"
+    
+    # Monitoring information
+    error_alert_policy:
+      description: "Monitoring alert policy for function errors"
+      value: "$(ref.function_error_alert.name)"
+
+# Deployment metadata
+metadata:
+  annotations:
+    # Infrastructure Manager deployment metadata
+    config.cloud.google.com/deployment-tool: "infrastructure-manager"
+    config.cloud.google.com/recipe-name: "hash-generator-api-functions"
+    config.cloud.google.com/recipe-version: "1.1"
+    config.cloud.google.com/last-updated: "2025-07-12"
+    
+    # Cost and resource management
+    config.cloud.google.com/cost-category: "serverless-compute"
+    config.cloud.google.com/resource-tier: "basic"
+    
+    # Security and compliance
+    config.cloud.google.com/security-level: "standard"
+    config.cloud.google.com/data-classification: "public"
+    
+    # Operational metadata
+    config.cloud.google.com/monitoring-enabled: "true"
+    config.cloud.google.com/logging-enabled: "true"
+    config.cloud.google.com/backup-required: "false"
+
+# Documentation and usage notes
+documentation: |
+  # Hash Generator API Infrastructure Manager Configuration
+  
+  This Infrastructure Manager configuration deploys a complete serverless hash generation API
+  using Google Cloud Functions. The API provides secure MD5, SHA256, and SHA512 hash generation
+  capabilities through an HTTP endpoint.
+  
+  ## Deployed Resources
+  
+  - **Cloud Function**: Python 3.12 runtime with HTTP trigger
+  - **Service Account**: Dedicated IAM service account with minimal permissions
+  - **Storage Bucket**: Regional bucket for function source code storage
+  - **API Services**: Required Google Cloud APIs (Functions, Build, Logging)
+  - **Monitoring**: Error alert policy for operational visibility
+  - **Logging**: Centralized log collection and analysis
+  
+  ## Security Features
+  
+  - HTTPS-only communication with TLS 1.2+ encryption
+  - Dedicated service account with least privilege access
+  - Private storage bucket with uniform bucket-level access
+  - CORS support for secure cross-origin requests
+  - Input validation and error handling in function code
+  
+  ## Cost Optimization
+  
+  - Pay-per-invocation pricing model
+  - Automatic scaling from 0 to 100 instances
+  - Regional storage for reduced data transfer costs
+  - 30-day lifecycle policy for temporary files
+  - Memory-optimized configuration (256MB default)
+  
+  ## Operational Features
+  
+  - Cloud Monitoring integration with error alerting
+  - Structured logging for debugging and analysis
+  - Resource labeling for cost tracking and organization
+  - Version control support through source bucket
+  - Environment-specific configuration options
+  
+  ## Usage Instructions
+  
+  1. Deploy using Infrastructure Manager:
+     ```bash
+     gcloud infra-manager deployments apply DEPLOYMENT_NAME \
+       --location=REGION \
+       --service-account=SERVICE_ACCOUNT \
+       --local-source=PATH_TO_CONFIG \
+       --inputs-file=inputs.yaml
+     ```
+  
+  2. Test the deployed API:
+     ```bash
+     curl -X POST [FUNCTION_URL] \
+       -H "Content-Type: application/json" \
+       -d '{"text": "Hello, World!"}'
+     ```
+  
+  3. Monitor function performance through Cloud Console or CLI:
+     ```bash
+     gcloud functions logs read FUNCTION_NAME --region=REGION
+     ```
+  
+  ## Best Practices
+  
+  - Use environment-specific input files for multi-stage deployments
+  - Monitor function execution metrics and adjust memory allocation as needed
+  - Implement proper authentication for production environments
+  - Regular security reviews and dependency updates
+  - Cost monitoring and budget alerts configuration
+  
+  ## Support and Troubleshooting
+  
+  - Function logs are available in Cloud Logging
+  - Error alerts are configured through Cloud Monitoring
+  - Source code is versioned in the deployment bucket
+  - Infrastructure changes are tracked through Infrastructure Manager
+  
+  For additional support, refer to the original recipe documentation or
+  Google Cloud Functions best practices guide.

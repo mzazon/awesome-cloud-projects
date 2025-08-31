@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Workload Identity, Azure Container Storage, Azure Key Vault, Azure Kubernetes Service
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: workload-identity, container-storage, security, kubernetes, federated-credentials, ephemeral-storage
 recipe-generator-version: 1.3
@@ -75,25 +75,23 @@ graph TB
 1. Azure subscription with appropriate permissions for AKS, storage, and identity management
 2. Azure CLI v2.47.0 or later installed and configured
 3. kubectl command-line tool installed
-4. Helm v3.0+ installed for package management
-5. Basic understanding of Kubernetes concepts and Azure identity management
-6. Estimated cost: $30-50 for testing resources (delete after completion to avoid ongoing charges)
+4. Basic understanding of Kubernetes concepts and Azure identity management
+5. Estimated cost: $30-50 for testing resources (delete after completion to avoid ongoing charges)
 
 > **Note**: This recipe requires AKS version 1.22 or higher for Workload Identity support. Ensure your cluster meets this requirement before proceeding.
 
 ## Preparation
 
 ```bash
+# Generate unique suffix for resource names
+RANDOM_SUFFIX=$(openssl rand -hex 3)
+
 # Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-workload-identity-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 export AKS_CLUSTER_NAME="aks-workload-identity-${RANDOM_SUFFIX}"
 export KEY_VAULT_NAME="kv-workload-${RANDOM_SUFFIX}"
-export STORAGE_ACCOUNT_NAME="stworkload${RANDOM_SUFFIX}"
-
-# Generate unique suffix for resource names
-RANDOM_SUFFIX=$(openssl rand -hex 3)
 
 # Create resource group
 az group create \
@@ -108,9 +106,8 @@ az provider register --namespace Microsoft.ContainerService
 az provider register --namespace Microsoft.Storage
 az provider register --namespace Microsoft.KeyVault
 
-# Install required Azure CLI extensions
-az extension add --name aks-preview
-az extension add --name k8s-extension
+# Install/upgrade required Azure CLI extensions
+az extension add --upgrade --name k8s-extension
 
 echo "✅ Azure providers registered and extensions installed"
 ```
@@ -165,21 +162,35 @@ echo "✅ Azure providers registered and extensions installed"
        --cluster-type managedClusters \
        --extension-type microsoft.azurecontainerstorage \
        --name azure-container-storage \
+       --scope cluster \
+       --release-train stable \
        --release-namespace acstor \
-       --auto-upgrade false
+       --auto-upgrade-minor-version false
    
    # Wait for extension installation to complete
-   az k8s-extension wait \
-       --cluster-name ${AKS_CLUSTER_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --cluster-type managedClusters \
-       --name azure-container-storage \
-       --created
+   echo "⏳ Waiting for Azure Container Storage extension to install..."
+   while true; do
+       STATUS=$(az k8s-extension show \
+           --cluster-name ${AKS_CLUSTER_NAME} \
+           --resource-group ${RESOURCE_GROUP} \
+           --cluster-type managedClusters \
+           --name azure-container-storage \
+           --query "installState" \
+           --output tsv)
+       
+       if [ "$STATUS" = "Installed" ]; then
+           echo "✅ Azure Container Storage extension installed successfully"
+           break
+       elif [ "$STATUS" = "Failed" ]; then
+           echo "❌ Extension installation failed"
+           exit 1
+       else
+           sleep 30
+       fi
+   done
    
    # Verify extension installation
    kubectl get pods -n acstor
-   
-   echo "✅ Azure Container Storage extension installed successfully"
    ```
 
    The Container Storage extension is now running in your cluster, providing the necessary components for ephemeral storage provisioning. This includes CSI drivers, storage operators, and monitoring components that enable secure, high-performance temporary storage access.
@@ -197,6 +208,18 @@ echo "✅ Azure providers registered and extensions installed"
        --enable-rbac-authorization \
        --sku standard \
        --tags purpose=workload-identity-demo
+   
+   # Get current user object ID for secret creation permission
+   CURRENT_USER_ID=$(az ad signed-in-user show --query id --output tsv)
+   
+   # Grant Key Vault Secrets Officer role to current user for secret creation
+   az role assignment create \
+       --role "Key Vault Secrets Officer" \
+       --assignee ${CURRENT_USER_ID} \
+       --scope $(az keyvault show --name ${KEY_VAULT_NAME} --query id --output tsv)
+   
+   # Wait for role assignment to propagate
+   sleep 30
    
    # Create a sample secret for testing
    az keyvault secret set \
@@ -268,7 +291,8 @@ echo "✅ Azure providers registered and extensions installed"
    EOF
    
    # Wait for storage pool to be ready
-   kubectl wait --for=condition=Ready storagepool/ephemeral-pool -n acstor --timeout=300s
+   kubectl wait --for=condition=Ready storagepool/ephemeral-pool \
+       -n acstor --timeout=300s
    
    # Create storage class for ephemeral workloads
    kubectl apply -f - <<EOF

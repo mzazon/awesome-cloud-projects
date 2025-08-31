@@ -4,12 +4,12 @@ id: b4e7c2d8
 category: containers
 difficulty: 200
 subject: gcp
-services: Cloud Run, Cloud SQL, Secret Manager
+services: Cloud Run, Cloud SQL, Secret Manager, Artifact Registry
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: containers, multi-container, cloud-run, sidecar, docker-compose, microservices
 recipe-generator-version: 1.3
@@ -38,6 +38,7 @@ graph TB
         FRONTEND[Frontend Container<br/>React/Vue App]
         BACKEND[Backend API Container<br/>Node.js/Python]
         PROXY[Nginx Proxy<br/>Sidecar Container]
+        SQLPROXY[Cloud SQL Proxy<br/>Database Connector]
     end
     
     subgraph "Google Cloud Services"
@@ -50,12 +51,14 @@ graph TB
     WEB --> PROXY
     PROXY --> FRONTEND
     PROXY --> BACKEND
+    BACKEND --> SQLPROXY
+    SQLPROXY --> SQL
     BACKEND --> SECRETS
-    BACKEND --> SQL
     
     style FRONTEND fill:#4285f4
     style BACKEND fill:#34a853
     style PROXY fill:#fbbc04
+    style SQLPROXY fill:#9aa0a6
     style SQL fill:#ea4335
     style SECRETS fill:#9aa0a6
 ```
@@ -140,8 +143,7 @@ The environment setup enables all necessary Google Cloud services and establishe
        --region=${REGION} \
        --storage-type=SSD \
        --storage-size=10GB \
-       --backup \
-       --enable-bin-log
+       --backup
    
    # Create application database
    gcloud sql databases create appdb \
@@ -563,7 +565,7 @@ The environment setup enables all necessary Google Cloud services and establishe
            run.googleapis.com/cpu-throttling: "false"
            run.googleapis.com/execution-environment: gen2
        spec:
-         serviceAccountName: ${PROJECT_ID}@appspot.gserviceaccount.com
+         serviceAccountName: ${PROJECT_ID}-compute@developer.gserviceaccount.com
          containers:
          - name: proxy
            image: ${BASE_URL}/proxy:latest

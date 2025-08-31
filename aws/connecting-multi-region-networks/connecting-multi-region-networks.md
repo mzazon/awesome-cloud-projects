@@ -4,12 +4,12 @@ id: e99b0a1f
 category: networking
 difficulty: 300
 subject: aws
-services: transit-gateway, vpc, cloudwatch, route53
+services: transit-gateway, vpc, cloudwatch, ec2
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: transit-gateway, networking, multi-region, vpc, connectivity, peering, routing, security
 recipe-generator-version: 1.3
@@ -84,7 +84,7 @@ graph TB
 4. Familiarity with multi-region AWS architectures and cross-region data transfer costs
 5. Estimated cost: $150-200/month for Transit Gateway attachments, data processing, and cross-region data transfer
 
-> **Note**: Cross-region Transit Gateway peering incurs data transfer charges. Review AWS pricing for Transit Gateway and data transfer costs before implementation.
+> **Note**: Cross-region Transit Gateway peering incurs data transfer charges. Review [AWS Transit Gateway pricing](https://aws.amazon.com/transit-gateway/pricing/) for Transit Gateway and data transfer costs before implementation.
 
 ## Preparation
 
@@ -122,21 +122,23 @@ echo "Project Name: ${PROJECT_NAME}"
 
 1. **Create VPCs in Primary Region**:
 
-   Amazon VPC (Virtual Private Cloud) provides isolated network environments within AWS, serving as the foundation for all our network resources. Creating multiple VPCs in the primary region simulates a common enterprise scenario where different applications or business units require network isolation. Each VPC operates as a separate network segment with its own IP address range, routing tables, and security settings, ensuring logical separation while enabling centralized connectivity through Transit Gateway.
+   Amazon VPC (Virtual Private Cloud) provides isolated network environments within AWS, serving as the foundation for all our network resources. Creating multiple VPCs in the primary region simulates a common enterprise scenario where different applications or business units require network isolation. Each VPC operates as a separate network segment with its own IP address range, routing tables, and security settings, ensuring logical separation while enabling centralized connectivity through Transit Galaxy.
 
    ```bash
    # Create VPC A in primary region
    PRIMARY_VPC_A_ID=$(aws ec2 create-vpc \
        --cidr-block ${PRIMARY_VPC_A_CIDR} \
        --region ${PRIMARY_REGION} \
-       --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${PROJECT_NAME}-primary-vpc-a}]" \
+       --tag-specifications \
+           "ResourceType=vpc,Tags=[{Key=Name,Value=${PROJECT_NAME}-primary-vpc-a}]" \
        --query 'Vpc.VpcId' --output text)
    
    # Create VPC B in primary region
    PRIMARY_VPC_B_ID=$(aws ec2 create-vpc \
        --cidr-block ${PRIMARY_VPC_B_CIDR} \
        --region ${PRIMARY_REGION} \
-       --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${PROJECT_NAME}-primary-vpc-b}]" \
+       --tag-specifications \
+           "ResourceType=vpc,Tags=[{Key=Name,Value=${PROJECT_NAME}-primary-vpc-b}]" \
        --query 'Vpc.VpcId' --output text)
    
    # Wait for VPCs to be available
@@ -163,7 +165,8 @@ echo "Project Name: ${PROJECT_NAME}"
        --cidr-block 10.1.1.0/24 \
        --availability-zone ${PRIMARY_REGION}a \
        --region ${PRIMARY_REGION} \
-       --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${PROJECT_NAME}-primary-subnet-a}]" \
+       --tag-specifications \
+           "ResourceType=subnet,Tags=[{Key=Name,Value=${PROJECT_NAME}-primary-subnet-a}]" \
        --query 'Subnet.SubnetId' --output text)
    
    # Create subnet in VPC B
@@ -172,7 +175,8 @@ echo "Project Name: ${PROJECT_NAME}"
        --cidr-block 10.2.1.0/24 \
        --availability-zone ${PRIMARY_REGION}a \
        --region ${PRIMARY_REGION} \
-       --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${PROJECT_NAME}-primary-subnet-b}]" \
+       --tag-specifications \
+           "ResourceType=subnet,Tags=[{Key=Name,Value=${PROJECT_NAME}-primary-subnet-b}]" \
        --query 'Subnet.SubnetId' --output text)
    
    echo "✅ Created subnets in primary region:"
@@ -191,14 +195,16 @@ echo "Project Name: ${PROJECT_NAME}"
    SECONDARY_VPC_A_ID=$(aws ec2 create-vpc \
        --cidr-block ${SECONDARY_VPC_A_CIDR} \
        --region ${SECONDARY_REGION} \
-       --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${PROJECT_NAME}-secondary-vpc-a}]" \
+       --tag-specifications \
+           "ResourceType=vpc,Tags=[{Key=Name,Value=${PROJECT_NAME}-secondary-vpc-a}]" \
        --query 'Vpc.VpcId' --output text)
    
    # Create VPC B in secondary region
    SECONDARY_VPC_B_ID=$(aws ec2 create-vpc \
        --cidr-block ${SECONDARY_VPC_B_CIDR} \
        --region ${SECONDARY_REGION} \
-       --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${PROJECT_NAME}-secondary-vpc-b}]" \
+       --tag-specifications \
+           "ResourceType=vpc,Tags=[{Key=Name,Value=${PROJECT_NAME}-secondary-vpc-b}]" \
        --query 'Vpc.VpcId' --output text)
    
    # Wait for VPCs to be available
@@ -213,7 +219,8 @@ echo "Project Name: ${PROJECT_NAME}"
        --cidr-block 10.3.1.0/24 \
        --availability-zone ${SECONDARY_REGION}a \
        --region ${SECONDARY_REGION} \
-       --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${PROJECT_NAME}-secondary-subnet-a}]" \
+       --tag-specifications \
+           "ResourceType=subnet,Tags=[{Key=Name,Value=${PROJECT_NAME}-secondary-subnet-a}]" \
        --query 'Subnet.SubnetId' --output text)
    
    SECONDARY_SUBNET_B_ID=$(aws ec2 create-subnet \
@@ -221,7 +228,8 @@ echo "Project Name: ${PROJECT_NAME}"
        --cidr-block 10.4.1.0/24 \
        --availability-zone ${SECONDARY_REGION}a \
        --region ${SECONDARY_REGION} \
-       --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${PROJECT_NAME}-secondary-subnet-b}]" \
+       --tag-specifications \
+           "ResourceType=subnet,Tags=[{Key=Name,Value=${PROJECT_NAME}-secondary-subnet-b}]" \
        --query 'Subnet.SubnetId' --output text)
    
    echo "✅ Created VPCs and subnets in secondary region:"
@@ -239,8 +247,10 @@ echo "Project Name: ${PROJECT_NAME}"
    # Create Transit Gateway in primary region
    PRIMARY_TGW_ID=$(aws ec2 create-transit-gateway \
        --description "Primary region Transit Gateway for ${PROJECT_NAME}" \
-       --options DefaultRouteTableAssociation=enable,DefaultRouteTablePropagation=enable,AmazonSideAsn=64512 \
-       --tag-specifications "ResourceType=transit-gateway,Tags=[{Key=Name,Value=${PRIMARY_TGW_NAME}}]" \
+       --options \
+           DefaultRouteTableAssociation=enable,DefaultRouteTablePropagation=enable,AmazonSideAsn=64512 \
+       --tag-specifications \
+           "ResourceType=transit-gateway,Tags=[{Key=Name,Value=${PRIMARY_TGW_NAME}}]" \
        --region ${PRIMARY_REGION} \
        --query 'TransitGateway.TransitGatewayId' --output text)
    
@@ -262,8 +272,10 @@ echo "Project Name: ${PROJECT_NAME}"
    # Create Transit Gateway in secondary region
    SECONDARY_TGW_ID=$(aws ec2 create-transit-gateway \
        --description "Secondary region Transit Gateway for ${PROJECT_NAME}" \
-       --options DefaultRouteTableAssociation=enable,DefaultRouteTablePropagation=enable,AmazonSideAsn=64513 \
-       --tag-specifications "ResourceType=transit-gateway,Tags=[{Key=Name,Value=${SECONDARY_TGW_NAME}}]" \
+       --options \
+           DefaultRouteTableAssociation=enable,DefaultRouteTablePropagation=enable,AmazonSideAsn=64513 \
+       --tag-specifications \
+           "ResourceType=transit-gateway,Tags=[{Key=Name,Value=${SECONDARY_TGW_NAME}}]" \
        --region ${SECONDARY_REGION} \
        --query 'TransitGateway.TransitGatewayId' --output text)
    
@@ -288,14 +300,16 @@ echo "Project Name: ${PROJECT_NAME}"
        --vpc-id ${PRIMARY_VPC_A_ID} \
        --subnet-ids ${PRIMARY_SUBNET_A_ID} \
        --region ${PRIMARY_REGION} \
-       --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' --output text)
+       --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' \
+       --output text)
    
    PRIMARY_ATTACHMENT_B_ID=$(aws ec2 create-transit-gateway-vpc-attachment \
        --transit-gateway-id ${PRIMARY_TGW_ID} \
        --vpc-id ${PRIMARY_VPC_B_ID} \
        --subnet-ids ${PRIMARY_SUBNET_B_ID} \
        --region ${PRIMARY_REGION} \
-       --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' --output text)
+       --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' \
+       --output text)
    
    # Attach secondary VPCs to secondary Transit Gateway
    SECONDARY_ATTACHMENT_A_ID=$(aws ec2 create-transit-gateway-vpc-attachment \
@@ -303,14 +317,16 @@ echo "Project Name: ${PROJECT_NAME}"
        --vpc-id ${SECONDARY_VPC_A_ID} \
        --subnet-ids ${SECONDARY_SUBNET_A_ID} \
        --region ${SECONDARY_REGION} \
-       --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' --output text)
+       --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' \
+       --output text)
    
    SECONDARY_ATTACHMENT_B_ID=$(aws ec2 create-transit-gateway-vpc-attachment \
        --transit-gateway-id ${SECONDARY_TGW_ID} \
        --vpc-id ${SECONDARY_VPC_B_ID} \
        --subnet-ids ${SECONDARY_SUBNET_B_ID} \
        --region ${SECONDARY_REGION} \
-       --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' --output text)
+       --query 'TransitGatewayVpcAttachment.TransitGatewayAttachmentId' \
+       --output text)
    
    echo "✅ Created VPC attachments to Transit Gateways"
    ```
@@ -331,7 +347,8 @@ echo "Project Name: ${PROJECT_NAME}"
        --peer-account-id ${AWS_ACCOUNT_ID} \
        --peer-region ${SECONDARY_REGION} \
        --region ${PRIMARY_REGION} \
-       --query 'TransitGatewayPeeringAttachment.TransitGatewayAttachmentId' --output text)
+       --query 'TransitGatewayPeeringAttachment.TransitGatewayAttachmentId' \
+       --output text)
    
    # Wait for peering attachment to be in pending state
    sleep 30
@@ -354,16 +371,20 @@ echo "Project Name: ${PROJECT_NAME}"
    # Create custom route table for primary region
    PRIMARY_ROUTE_TABLE_ID=$(aws ec2 create-transit-gateway-route-table \
        --transit-gateway-id ${PRIMARY_TGW_ID} \
-       --tag-specifications "ResourceType=transit-gateway-route-table,Tags=[{Key=Name,Value=${PROJECT_NAME}-primary-rt}]" \
+       --tag-specifications \
+           "ResourceType=transit-gateway-route-table,Tags=[{Key=Name,Value=${PROJECT_NAME}-primary-rt}]" \
        --region ${PRIMARY_REGION} \
-       --query 'TransitGatewayRouteTable.TransitGatewayRouteTableId' --output text)
+       --query 'TransitGatewayRouteTable.TransitGatewayRouteTableId' \
+       --output text)
    
    # Create custom route table for secondary region
    SECONDARY_ROUTE_TABLE_ID=$(aws ec2 create-transit-gateway-route-table \
        --transit-gateway-id ${SECONDARY_TGW_ID} \
-       --tag-specifications "ResourceType=transit-gateway-route-table,Tags=[{Key=Name,Value=${PROJECT_NAME}-secondary-rt}]" \
+       --tag-specifications \
+           "ResourceType=transit-gateway-route-table,Tags=[{Key=Name,Value=${PROJECT_NAME}-secondary-rt}]" \
        --region ${SECONDARY_REGION} \
-       --query 'TransitGatewayRouteTable.TransitGatewayRouteTableId' --output text)
+       --query 'TransitGatewayRouteTable.TransitGatewayRouteTableId' \
+       --output text)
    
    echo "✅ Created custom route tables:"
    echo "Primary Route Table: ${PRIMARY_ROUTE_TABLE_ID}"
@@ -497,7 +518,7 @@ echo "Project Name: ${PROJECT_NAME}"
 
     CloudWatch monitoring provides essential visibility into Transit Gateway performance, helping identify potential issues, track usage patterns, and optimize network performance. The dashboard displays key metrics including data transfer volumes, packet drop counts, and attachment status across both regions. This monitoring capability enables proactive network management, cost optimization, and troubleshooting, ensuring that the multi-region network infrastructure operates efficiently and meets business requirements.
 
-> **Tip**: Enable Transit Gateway Flow Logs for detailed network traffic analysis. This feature provides comprehensive visibility into traffic patterns, security analysis capabilities, and detailed troubleshooting information for complex network scenarios.
+> **Tip**: Enable Transit Gateway Flow Logs for detailed network traffic analysis. This feature provides comprehensive visibility into traffic patterns, security analysis capabilities, and detailed troubleshooting information for complex network scenarios. For more information, see [AWS Transit Gateway Flow Logs documentation](https://docs.aws.amazon.com/vpc/latest/tgw/tgw-flow-logs.html).
 
     ```bash
     # Create CloudWatch dashboard for Transit Gateway monitoring
@@ -803,13 +824,15 @@ echo "Project Name: ${PROJECT_NAME}"
 
 ## Discussion
 
-This multi-region Transit Gateway architecture provides a robust foundation for enterprise-scale networking across AWS regions. The hub-and-spoke model significantly reduces the complexity compared to traditional VPC peering mesh architectures, where the number of peering connections grows exponentially with each additional VPC. Transit Gateway centralizes routing decisions and provides a single point of control for network policies, making it easier to manage security rules and traffic flow patterns.
+This multi-region Transit Gateway architecture provides a robust foundation for enterprise-scale networking across AWS regions. The hub-and-spoke model significantly reduces the complexity compared to traditional VPC peering mesh architectures, where the number of peering connections grows exponentially with each additional VPC. Transit Gateway centralizes routing decisions and provides a single point of control for network policies, making it easier to manage security rules and traffic flow patterns. The architecture follows AWS Well-Architected Framework principles for operational excellence and performance efficiency.
 
-The cross-region peering capability is particularly valuable for organizations with disaster recovery requirements or global applications that need low-latency access to resources in multiple regions. The encrypted connections between regions ensure that data in transit is protected, while the ability to create custom route tables allows for sophisticated traffic engineering and segmentation strategies. Organizations can implement different routing policies for different types of traffic, such as separating production and development workloads or implementing specific compliance requirements.
+The cross-region peering capability is particularly valuable for organizations with disaster recovery requirements or global applications that need low-latency access to resources in multiple regions. The encrypted connections between regions ensure that data in transit is protected using AES-256 encryption, while the ability to create custom route tables allows for sophisticated traffic engineering and segmentation strategies. Organizations can implement different routing policies for different types of traffic, such as separating production and development workloads or implementing specific compliance requirements.
 
-From a cost perspective, Transit Gateway operates on a pay-per-use model with charges for attachments, data processing, and cross-region data transfer. While this can be more expensive than VPC peering for simple scenarios, the operational benefits and reduced management overhead often justify the additional cost for complex multi-region architectures. The centralized monitoring capabilities through CloudWatch provide visibility into network performance and help identify potential issues before they impact applications.
+From a cost perspective, Transit Gateway operates on a pay-per-use model with charges for attachments, data processing, and cross-region data transfer. While this can be more expensive than VPC peering for simple scenarios, the operational benefits and reduced management overhead often justify the additional cost for complex multi-region architectures. The centralized monitoring capabilities through CloudWatch provide visibility into network performance and help identify potential issues before they impact applications. For detailed pricing information, see the [AWS Transit Gateway pricing page](https://aws.amazon.com/transit-gateway/pricing/).
 
-For implementation best practices, consider using unique ASN (Autonomous System Number) values for each Transit Gateway to enable future BGP-based routing enhancements. The architecture also supports advanced features like multicast domains for specialized applications and Connect attachments for integration with third-party network appliances. Regular monitoring of route table propagation and attachment states helps ensure optimal performance and quick identification of connectivity issues.
+For implementation best practices, consider using unique ASN (Autonomous System Number) values for each Transit Gateway to enable future BGP-based routing enhancements. The architecture also supports advanced features like multicast domains for specialized applications and Connect attachments for integration with third-party network appliances. Regular monitoring of route table propagation and attachment states helps ensure optimal performance and quick identification of connectivity issues. For comprehensive guidance, refer to the [AWS Transit Gateway design best practices documentation](https://docs.aws.amazon.com/vpc/latest/tgw/tgw-best-design-practices.html).
+
+> **Note**: This configuration follows AWS Well-Architected Framework principles for networking and connectivity. See the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/) for additional guidance on designing robust, secure, and efficient cloud architectures.
 
 ## Challenge
 

@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Cloud Healthcare API, Cloud Natural Language, Cloud Functions, BigQuery
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: healthcare, sentiment-analysis, fhir, natural-language, machine-learning, patient-insights
 recipe-generator-version: 1.3
@@ -66,7 +66,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with billing enabled and Healthcare API access
-2. Google Cloud CLI v2 installed and configured (or Cloud Shell)
+2. Google Cloud CLI v455+ installed and configured (or Cloud Shell)
 3. Basic understanding of FHIR healthcare data standards and JSON
 4. Familiarity with Cloud Functions and BigQuery fundamentals
 5. Estimated cost: $15-25 for running this recipe (includes FHIR store, Natural Language API calls, and BigQuery storage)
@@ -80,7 +80,6 @@ graph TB
 export PROJECT_ID="healthcare-sentiment-$(date +%s)"
 export REGION="us-central1"
 export ZONE="us-central1-a"
-export DATASET_ID="healthcare_analytics"
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
@@ -311,12 +310,12 @@ def store_sentiment_results(fhir_resource, text_content, sentiment_result):
         logging.info("Sentiment results stored in BigQuery")
 EOF
    
-   # Create requirements.txt
+   # Create requirements.txt with latest library versions
    cat > requirements.txt << 'EOF'
-google-cloud-language==2.13.4
-google-cloud-bigquery==3.25.0
+google-cloud-language==2.16.0
+google-cloud-bigquery==3.26.0
 google-cloud-healthcare==1.12.0
-functions-framework==3.5.0
+functions-framework==3.8.3
 EOF
    
    echo "✅ Cloud Function code created"
@@ -329,9 +328,9 @@ EOF
    Deploying the function requires specific IAM permissions for Healthcare API access, Natural Language processing, and BigQuery operations. These permissions follow the principle of least privilege while enabling the function to process sensitive healthcare data securely and compliantly.
 
    ```bash
-   # Deploy Cloud Function
+   # Deploy Cloud Function with Python 3.11 runtime
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime=python39 \
+       --runtime=python311 \
        --trigger-topic=${PUBSUB_TOPIC} \
        --entry-point=process_fhir_sentiment \
        --memory=512MB \
@@ -363,7 +362,7 @@ EOF
    echo "✅ Cloud Function deployed with healthcare permissions"
    ```
 
-   The sentiment analysis function is now deployed and configured with appropriate security permissions, ready to process FHIR events and generate patient sentiment insights while maintaining healthcare data compliance and security standards.
+   The sentiment analysis function is now deployed with Python 3.11 runtime and configured with appropriate security permissions, ready to process FHIR events and generate patient sentiment insights while maintaining healthcare data compliance and security standards.
 
 6. **Create Sample FHIR Patient and Observation Records**:
 
@@ -433,11 +432,6 @@ EOF
 EOF
    
    # Upload patient record
-   gcloud healthcare fhir-stores import gcs ${FHIR_STORE} \
-       --dataset=${HEALTHCARE_DATASET} \
-       --location=${REGION} \
-       --gcs-uri=gs://temp-bucket/patient.json \
-       --content-structure=RESOURCE || \
    curl -X POST \
        -H "Authorization: Bearer $(gcloud auth print-access-token)" \
        -H "Content-Type: application/fhir+json" \
@@ -672,6 +666,7 @@ EOF
    gcloud projects delete ${PROJECT_ID} --quiet
    
    echo "✅ Project and local files cleaned up"
+   echo "Note: Project deletion may take several minutes to complete"
    ```
 
 ## Discussion
@@ -682,7 +677,7 @@ The event-driven architecture using [Pub/Sub](https://cloud.google.com/pubsub) e
 
 The integration with [BigQuery](https://cloud.google.com/bigquery) creates a comprehensive analytics platform that supports both real-time dashboards and longitudinal patient sentiment analysis. Healthcare organizations can identify patterns in patient satisfaction, correlate sentiment with clinical outcomes, and implement data-driven improvements to care delivery processes.
 
-The serverless architecture using [Cloud Functions](https://cloud.google.com/functions) provides cost-effective processing that scales from small clinics to large hospital systems, while maintaining the security and compliance requirements essential for healthcare applications.
+The serverless architecture using [Cloud Functions](https://cloud.google.com/functions) provides cost-effective processing that scales from small clinics to large hospital systems, while maintaining the security and compliance requirements essential for healthcare applications. The Python 3.11 runtime ensures optimal performance and access to the latest language features for healthcare data processing.
 
 > **Warning**: This implementation processes healthcare data and must comply with HIPAA, GDPR, and other applicable healthcare privacy regulations. Ensure proper security controls, access logging, and data encryption are implemented before processing real patient information.
 
@@ -690,15 +685,15 @@ The serverless architecture using [Cloud Functions](https://cloud.google.com/fun
 
 Extend this intelligent patient sentiment analysis solution by implementing these enhancements:
 
-1. **Real-time Alerting System**: Integrate Cloud Monitoring to create alerts when negative sentiment scores exceed threshold values, automatically notifying healthcare staff of patient concerns requiring immediate attention.
+1. **Real-time Alerting System**: Integrate Cloud Monitoring to create alerts when negative sentiment scores exceed threshold values, automatically notifying healthcare staff of patient concerns requiring immediate attention using Cloud Functions and Cloud Monitoring APIs.
 
-2. **Multi-language Support**: Enhance the Natural Language processing to support multiple languages using Cloud Translation API, enabling sentiment analysis for diverse patient populations and international healthcare facilities.
+2. **Multi-language Support**: Enhance the Natural Language processing to support multiple languages using Cloud Translation API, enabling sentiment analysis for diverse patient populations and international healthcare facilities with automatic language detection.
 
-3. **Longitudinal Patient Journey Analysis**: Implement BigQuery ML models to analyze sentiment trends over time for individual patients, identifying early warning signs of deteriorating patient satisfaction or treatment adherence issues.
+3. **Longitudinal Patient Journey Analysis**: Implement BigQuery ML models to analyze sentiment trends over time for individual patients, identifying early warning signs of deteriorating patient satisfaction or treatment adherence issues using time-series forecasting.
 
-4. **Integration with Clinical Decision Support**: Connect sentiment insights with electronic health record systems to provide clinicians with patient mood and satisfaction context during care planning and treatment decision-making processes.
+4. **Integration with Clinical Decision Support**: Connect sentiment insights with electronic health record systems to provide clinicians with patient mood and satisfaction context during care planning and treatment decision-making processes through FHIR API integration.
 
-5. **Advanced Analytics Dashboard**: Build comprehensive Looker Studio dashboards with predictive analytics capabilities, enabling healthcare administrators to forecast patient satisfaction trends and optimize resource allocation for improved care delivery.
+5. **Advanced Analytics Dashboard**: Build comprehensive Looker Studio dashboards with predictive analytics capabilities, enabling healthcare administrators to forecast patient satisfaction trends and optimize resource allocation for improved care delivery using BigQuery data visualization.
 
 ## Infrastructure Code
 

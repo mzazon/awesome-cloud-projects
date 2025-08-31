@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: AppFabric, EventBridge, Lambda, SNS
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: security, monitoring, saas, event-driven, alerting
 recipe-generator-version: 1.3
@@ -230,6 +230,7 @@ echo "✅ AWS environment configured with secure S3 bucket"
    logger.setLevel(logging.INFO)
    
    sns = boto3.client('sns')
+   s3 = boto3.client('s3')
    
    def lambda_handler(event, context):
        """Process security events from AppFabric and generate alerts"""
@@ -241,8 +242,8 @@ echo "✅ AWS environment configured with secure S3 bucket"
                    process_s3_security_log(record)
            
            # Process direct EventBridge events
-           if 'source' in event:
-               process_eventbridge_event(event)
+           if 'source' in event and event['source'] == 'aws.s3':
+               process_eventbridge_s3_event(event)
                
            return {
                'statusCode': 200,
@@ -261,56 +262,121 @@ echo "✅ AWS environment configured with secure S3 bucket"
        
        logger.info(f"Processing security log: s3://{bucket}/{key}")
        
-       # Extract application name from S3 key path
-       app_name = extract_app_name(key)
-       
-       # Generate alert for new security log
-       alert_message = {
-           'alert_type': 'NEW_SECURITY_LOG',
-           'application': app_name,
-           'timestamp': datetime.utcnow().isoformat(),
-           's3_location': f"s3://{bucket}/{key}",
-           'severity': 'INFO'
-       }
-       
-       send_security_alert(alert_message)
+       try:
+           # Read and analyze the security log content
+           response = s3.get_object(Bucket=bucket, Key=key)
+           log_content = response['Body'].read().decode('utf-8')
+           
+           # Parse OCSF security events
+           security_events = parse_ocsf_logs(log_content)
+           
+           for event in security_events:
+               analyze_security_event(event, key)
+               
+       except Exception as e:
+           logger.error(f"Error processing S3 log {key}: {str(e)}")
    
-   def process_eventbridge_event(event):
-       """Process custom security events from EventBridge"""
+   def process_eventbridge_s3_event(event):
+       """Process S3 events from EventBridge"""
        
-       event_type = event.get('detail-type', 'Unknown')
-       source = event.get('source', 'Unknown')
+       detail = event.get('detail', {})
+       bucket = detail.get('bucket', {}).get('name')
+       key = detail.get('object', {}).get('key')
        
-       logger.info(f"Processing EventBridge event: {event_type} from {source}")
-       
-       # Apply threat detection logic based on event patterns
-       if is_suspicious_activity(event):
+       if bucket and key:
+           logger.info(f"Processing EventBridge S3 event: s3://{bucket}/{key}")
+           
+           # Extract application name from S3 key path
+           app_name = extract_app_name(key)
+           
+           # Generate alert for new security log
            alert_message = {
-               'alert_type': 'SUSPICIOUS_ACTIVITY',
-               'event_type': event_type,
-               'source': source,
+               'alert_type': 'NEW_SECURITY_LOG',
+               'application': app_name,
                'timestamp': datetime.utcnow().isoformat(),
-               'severity': 'HIGH',
-               'details': event.get('detail', {})
+               's3_location': f"s3://{bucket}/{key}",
+               'severity': 'INFO'
            }
            
            send_security_alert(alert_message)
    
-   def is_suspicious_activity(event):
-       """Apply threat detection logic to identify suspicious activities"""
+   def parse_ocsf_logs(log_content):
+       """Parse OCSF-formatted security logs"""
        
-       detail = event.get('detail', {})
+       events = []
+       try:
+           # Handle both single events and newline-delimited JSON
+           for line in log_content.strip().split('\n'):
+               if line.strip():
+                   events.append(json.loads(line))
+       except json.JSONDecodeError:
+           logger.warning("Failed to parse OCSF log content as JSON")
+           
+       return events
+   
+   def analyze_security_event(event, s3_key):
+       """Analyze OCSF security event for threats"""
        
-       # Example threat detection rules
+       # Apply threat detection logic based on OCSF event patterns
+       if is_suspicious_ocsf_activity(event):
+           app_name = extract_app_name(s3_key)
+           
+           alert_message = {
+               'alert_type': 'SUSPICIOUS_ACTIVITY',
+               'application': app_name,
+               'event_type': event.get('type_name', 'Unknown'),
+               'user': event.get('actor', {}).get('user', {}).get('name', 'Unknown'),
+               'timestamp': event.get('time', datetime.utcnow().isoformat()),
+               'severity': determine_severity(event),
+               'details': event
+           }
+           
+           send_security_alert(alert_message)
+   
+   def is_suspicious_ocsf_activity(event):
+       """Apply threat detection logic to OCSF events"""
+       
+       # Check for authentication failures
+       if event.get('class_uid') == 3002:  # Authentication class
+           if event.get('activity_id') == 2:  # Failed logon
+               return True
+       
+       # Check for privilege escalation
+       if event.get('class_uid') == 3005:  # Account Change class
+           if 'privilege' in str(event.get('activity_name', '')).lower():
+               return True
+       
+       # Check for unusual access patterns
+       severity_id = event.get('severity_id', 0)
+       if severity_id >= 4:  # Medium to Critical severity
+           return True
+       
+       # Check for specific threat indicators in event text
+       event_text = json.dumps(event).lower()
        suspicious_indicators = [
-           'failed_login_attempt',
+           'failed_login',
+           'brute_force',
            'privilege_escalation',
-           'unusual_access_pattern',
-           'data_exfiltration'
+           'data_exfiltration',
+           'malware',
+           'unauthorized_access'
        ]
        
-       event_text = json.dumps(detail).lower()
        return any(indicator in event_text for indicator in suspicious_indicators)
+   
+   def determine_severity(event):
+       """Determine alert severity based on OCSF event"""
+       
+       severity_id = event.get('severity_id', 1)
+       severity_map = {
+           1: 'INFO',
+           2: 'LOW',
+           3: 'MEDIUM',
+           4: 'HIGH',
+           5: 'CRITICAL'
+       }
+       
+       return severity_map.get(severity_id, 'MEDIUM')
    
    def extract_app_name(s3_key):
        """Extract application name from S3 key path"""
@@ -348,18 +414,20 @@ echo "✅ AWS environment configured with secure S3 bucket"
    Severity: {alert['severity']}
    Timestamp: {alert['timestamp']}
    Application: {alert.get('application', 'N/A')}
-   Source: {alert.get('source', 'N/A')}
+   User: {alert.get('user', 'N/A')}
+   Event Type: {alert.get('event_type', 'N/A')}
    
    Details:
    {json.dumps(alert.get('details', {}), indent=2)}
    
    This is an automated security alert from your SaaS monitoring system.
+   Review the security event details and take appropriate action if required.
    """
    
    def format_sms_alert(alert):
        """Format security alert for SMS delivery"""
        
-       return f"SECURITY ALERT: {alert['alert_type']} - {alert['severity']} severity detected at {alert['timestamp']}"
+       return f"SECURITY ALERT: {alert['alert_type']} - {alert['severity']} severity detected in {alert.get('application', 'Unknown')} at {alert['timestamp']}"
    EOF
    
    # Create deployment package
@@ -396,10 +464,10 @@ echo "✅ AWS environment configured with secure S3 bucket"
        --role-name LambdaSecurityProcessorRole-${RANDOM_SUFFIX} \
        --query 'Role.Arn' --output text)
    
-   echo "✅ Lambda function code prepared with security processing logic"
+   echo "✅ Lambda function code prepared with OCSF security processing logic"
    ```
 
-   The Lambda function is now configured with comprehensive security event processing capabilities, including threat detection logic and multi-format alert generation for different communication channels.
+   The Lambda function is now configured with comprehensive OCSF security event processing capabilities, including threat detection logic based on Open Cybersecurity Schema Framework standards and multi-format alert generation for different communication channels.
 
 4. **Create SNS Topic for Security Alerts**:
 
@@ -413,7 +481,7 @@ echo "✅ AWS environment configured with secure S3 bucket"
        --topic-arn arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC} \
        --query 'Attributes.TopicArn' --output text)
    
-   # Add Lambda permissions to publish to SNS
+   # Add Lambda permissions to publish to SNS and read from S3
    cat > lambda-sns-policy.json << EOF
    {
      "Version": "2012-10-17",
@@ -463,10 +531,10 @@ echo "✅ AWS environment configured with secure S3 bucket"
    # Wait for IAM role propagation
    sleep 10
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler index.lambda_handler \
        --zip-file fileb://security-processor.zip \
@@ -482,7 +550,7 @@ echo "✅ AWS environment configured with secure S3 bucket"
    echo "✅ Lambda function deployed with SNS integration"
    ```
 
-   The Lambda function is now operational with proper IAM permissions and environment configuration, ready to process security events and generate intelligent alerts.
+   The Lambda function is now operational with proper IAM permissions and environment configuration, ready to process security events and generate intelligent alerts using the latest Python 3.12 runtime.
 
 6. **Configure EventBridge Rules for Security Event Processing**:
 
@@ -534,19 +602,25 @@ echo "✅ AWS environment configured with secure S3 bucket"
    ```bash
    # Create AppFabric app bundle
    aws appfabric create-app-bundle \
-       --tags Purpose=SecurityMonitoring,Environment=Production \
-       --customer-managed-key-identifier alias/aws/s3
+       --tags key=Purpose,value=SecurityMonitoring \
+              key=Environment,value=Production
    
    export APP_BUNDLE_ARN=$(aws appfabric list-app-bundles \
        --query 'appBundles[0].arn' --output text)
    
-   # Note: Creating ingestions requires manual SaaS app authorization
-   # This is a placeholder for the ingestion setup
+   # Wait for app bundle to be active
+   sleep 5
+   
    echo "App Bundle ARN: ${APP_BUNDLE_ARN}"
-   echo "To complete setup, use AWS Console to:"
-   echo "1. Create ingestions for your SaaS applications"
-   echo "2. Authorize AppFabric to access SaaS APIs"
-   echo "3. Configure S3 destination: s3://${S3_BUCKET}/security-logs/"
+   echo ""
+   echo "To complete AppFabric setup, use the AWS Console to:"
+   echo "1. Navigate to AWS AppFabric console"
+   echo "2. Select your app bundle: ${APP_BUNDLE_ARN}"
+   echo "3. Create ingestions for your SaaS applications"
+   echo "4. Authorize AppFabric to access SaaS APIs"
+   echo "5. Configure S3 destination: s3://${S3_BUCKET}/security-logs/"
+   echo "6. Set destination role: ${APPFABRIC_ROLE_ARN}"
+   echo ""
    
    echo "✅ AppFabric app bundle created (manual SaaS authorization required)"
    ```
@@ -558,7 +632,7 @@ echo "✅ AWS environment configured with secure S3 bucket"
    Testing validates the complete security monitoring pipeline by simulating security events and verifying end-to-end processing, alerting, and notification delivery. This verification ensures all components work together correctly and that security teams will receive timely alerts for real security incidents.
 
    ```bash
-   # Create test security log file
+   # Create test OCSF security event file
    cat > test-security-event.json << EOF
    {
      "metadata": {
@@ -571,17 +645,20 @@ echo "✅ AWS environment configured with secure S3 bucket"
      "time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
      "class_uid": 3002,
      "category_uid": 3,
-     "severity_id": 2,
-     "activity_id": 1,
-     "type_name": "Authentication: Logon",
-     "user": {
-       "name": "test.user@example.com",
-       "type": "User"
+     "severity_id": 4,
+     "activity_id": 2,
+     "type_name": "Authentication: Failed Logon",
+     "actor": {
+       "user": {
+         "name": "test.user@example.com",
+         "type": "User"
+       }
      },
      "src_endpoint": {
        "ip": "192.168.1.100"
      },
-     "status": "Success"
+     "status": "Failure",
+     "status_id": 2
    }
    EOF
    
@@ -594,16 +671,20 @@ echo "✅ AWS environment configured with secure S3 bucket"
    sleep 30
    
    # Check Lambda function logs
-   LOG_GROUP_NAME=$(aws logs describe-log-groups \
-       --log-group-name-prefix /aws/lambda/${LAMBDA_FUNCTION} \
-       --query 'logGroups[0].logGroupName' --output text)
+   LOG_GROUP_NAME="/aws/lambda/${LAMBDA_FUNCTION}"
    
-   echo "✅ Test security event uploaded and processed"
+   echo "✅ Test OCSF security event uploaded and processed"
    echo "Check your email for security alert notification"
    echo "Review CloudWatch logs: ${LOG_GROUP_NAME}"
+   
+   # Display recent log events
+   aws logs filter-log-events \
+       --log-group-name ${LOG_GROUP_NAME} \
+       --start-time $(date -d '5 minutes ago' +%s)000 \
+       --query 'events[].message' --output text
    ```
 
-   The security monitoring pipeline is now validated and operational, with test events confirming proper processing, analysis, and alert delivery through the complete system.
+   The security monitoring pipeline is now validated and operational, with test OCSF events confirming proper processing, analysis, and alert delivery through the complete system.
 
 ## Validation & Testing
 
@@ -638,10 +719,11 @@ echo "✅ AWS environment configured with secure S3 bucket"
    aws lambda get-function \
        --function-name ${LAMBDA_FUNCTION}
    
-   # Review function logs
+   # Review function logs for security event processing
    aws logs filter-log-events \
        --log-group-name /aws/lambda/${LAMBDA_FUNCTION} \
-       --start-time $(date -d '1 hour ago' +%s)000
+       --start-time $(date -d '1 hour ago' +%s)000 \
+       --filter-pattern "Processing security log"
    ```
 
 4. **Test SNS Alert Delivery**:
@@ -745,29 +827,29 @@ echo "✅ AWS environment configured with secure S3 bucket"
 
 ## Discussion
 
-AWS AppFabric represents a significant advancement in SaaS security monitoring by providing standardized connectivity to popular applications through the Open Cybersecurity Schema Framework (OCSF). This standardization eliminates the complexity of managing multiple API connections and data formats, enabling organizations to build unified security monitoring capabilities across their entire SaaS ecosystem. The service automatically handles authentication, data collection, and normalization, significantly reducing the operational overhead typically associated with multi-vendor security monitoring solutions. According to the [AWS AppFabric documentation](https://docs.aws.amazon.com/appfabric/latest/adminguide/what-is-appfabric.html), this approach provides consistent security visibility across over 250 supported SaaS applications.
+AWS AppFabric represents a significant advancement in SaaS security monitoring by providing standardized connectivity to popular applications through the Open Cybersecurity Schema Framework (OCSF). This standardization eliminates the complexity of managing multiple API connections and data formats, enabling organizations to build unified security monitoring capabilities across their entire SaaS ecosystem. The service automatically handles authentication, data collection, and normalization, significantly reducing the operational overhead typically associated with multi-vendor security monitoring solutions. According to the [AWS AppFabric documentation](https://docs.aws.amazon.com/appfabric/latest/adminguide/what-is-appfabric.html), this approach provides consistent security visibility across over 250 supported SaaS applications while maintaining data sovereignty and compliance requirements.
 
-EventBridge serves as the central nervous system for this security monitoring architecture, providing reliable event routing and filtering capabilities that scale automatically with your organization's needs. By implementing custom event buses for security events, we create logical separation that improves security posture while enabling fine-grained access control and monitoring. The integration between S3 event notifications and EventBridge creates a real-time processing pipeline that responds immediately to new security logs, ensuring minimal detection latency for potential threats. This follows the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principle of operational excellence through automated monitoring and response.
+EventBridge serves as the central nervous system for this security monitoring architecture, providing reliable event routing and filtering capabilities that scale automatically with your organization's needs. By implementing custom event buses for security events, we create logical separation that improves security posture while enabling fine-grained access control and monitoring. The integration between S3 event notifications and EventBridge creates a real-time processing pipeline that responds immediately to new security logs, ensuring minimal detection latency for potential threats. This follows the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principle of operational excellence through automated monitoring and response, while the custom bus architecture supports the security pillar through defense-in-depth strategies.
 
-The serverless Lambda function provides intelligent security event processing with built-in threat detection logic that can be customized based on your organization's specific security requirements. Lambda's automatic scaling ensures consistent performance regardless of event volume, while the pay-per-invocation model optimizes costs for variable workloads. The function's ability to analyze OCSF-formatted events enables consistent threat detection across different SaaS applications, providing a unified security perspective that would be difficult to achieve with application-specific monitoring approaches. This architecture implements the security pillar of the Well-Architected Framework through defense-in-depth strategies and automated threat detection.
+The serverless Lambda function provides intelligent security event processing with built-in threat detection logic that leverages the standardized OCSF format for consistent analysis across different SaaS applications. Lambda's automatic scaling ensures consistent performance regardless of event volume, while the pay-per-invocation model optimizes costs for variable workloads. The function's ability to parse and analyze OCSF-formatted events enables sophisticated threat detection patterns including authentication failures, privilege escalation attempts, and data exfiltration indicators. This architecture implements multiple Well-Architected Framework pillars: security through automated threat detection, reliability through fault-tolerant serverless design, and cost optimization through event-driven scaling.
 
-This solution provides a foundation for advanced security capabilities including machine learning-based anomaly detection, automated incident response, and integration with existing security orchestration platforms. The combination of standardized data ingestion, event-driven processing, and multi-channel alerting creates a comprehensive security monitoring platform that scales with organizational growth while maintaining cost efficiency through serverless technologies.
+This solution provides a foundation for advanced security capabilities including machine learning-based anomaly detection, automated incident response, and integration with existing SIEM platforms. The combination of standardized data ingestion, intelligent event processing, and multi-channel alerting creates a comprehensive security monitoring platform that scales with organizational growth while maintaining cost efficiency through serverless technologies and AWS managed services.
 
-> **Tip**: Consider implementing [Amazon GuardDuty](https://docs.aws.amazon.com/guardduty/latest/ug/what-is-guardduty.html) integration for enhanced threat detection capabilities that complement your SaaS monitoring pipeline. GuardDuty's machine learning algorithms can identify sophisticated threats that rule-based detection might miss.
+> **Tip**: Consider implementing [Amazon GuardDuty](https://docs.aws.amazon.com/guardduty/latest/ug/what-is-guardduty.html) integration for enhanced threat detection capabilities that complement your SaaS monitoring pipeline. GuardDuty's machine learning algorithms can identify sophisticated threats that rule-based detection might miss, while [AWS Security Hub](https://docs.aws.amazon.com/securityhub/latest/userguide/what-is-securityhub.html) can centralize findings from both AppFabric and GuardDuty for unified security visibility.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Machine Learning Threat Detection**: Integrate Amazon SageMaker to build custom threat detection models that learn from your organization's normal SaaS usage patterns and identify anomalous behavior with higher accuracy than rule-based systems.
+1. **Machine Learning Threat Detection**: Integrate Amazon SageMaker to build custom threat detection models that learn from your organization's normal SaaS usage patterns and identify anomalous behavior with higher accuracy than rule-based systems. Use historical OCSF data to train models for user behavior analytics and anomaly detection.
 
-2. **Automated Incident Response**: Implement AWS Step Functions to orchestrate automated response workflows that can temporarily disable user accounts, revoke API tokens, or trigger additional security investigations based on alert severity and type.
+2. **Automated Incident Response**: Implement AWS Step Functions to orchestrate automated response workflows that can temporarily disable user accounts, revoke API tokens, or trigger additional security investigations based on alert severity and type. Include integration with AWS Systems Manager for automated remediation actions.
 
-3. **Cross-Platform User Behavior Analytics**: Enhance the Lambda function to correlate user activities across multiple SaaS applications, building comprehensive user behavior profiles that can detect sophisticated attack patterns like account takeover or insider threats.
+3. **Cross-Platform User Behavior Analytics**: Enhance the Lambda function to correlate user activities across multiple SaaS applications using Amazon DynamoDB to maintain user behavior profiles, enabling detection of sophisticated attack patterns like account takeover or insider threats across your entire SaaS ecosystem.
 
-4. **Advanced Compliance Reporting**: Create automated compliance reports using Amazon QuickSight that aggregate security events across all connected SaaS applications, providing executive dashboards and regulatory compliance evidence with customizable time ranges and filters.
+4. **Advanced Compliance Reporting**: Create automated compliance reports using Amazon QuickSight that aggregate security events across all connected SaaS applications, providing executive dashboards and regulatory compliance evidence with customizable time ranges and filters for frameworks like SOC 2, PCI DSS, and GDPR.
 
-5. **Real-time Security Dashboard**: Build a real-time security operations center dashboard using Amazon Managed Grafana that visualizes security events, threat trends, and system health metrics, enabling security teams to monitor the entire SaaS ecosystem from a single interface.
+5. **Real-time Security Dashboard**: Build a real-time security operations center dashboard using Amazon Managed Grafana that visualizes security events, threat trends, and system health metrics, enabling security teams to monitor the entire SaaS ecosystem from a single interface with customizable alerts and automated response capabilities.
 
 ## Infrastructure Code
 

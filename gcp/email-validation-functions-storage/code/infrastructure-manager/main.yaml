@@ -1,0 +1,332 @@
+# Email Validation with Cloud Functions - Infrastructure Manager Configuration
+# This configuration deploys a complete serverless email validation solution
+# with Cloud Functions for processing and Cloud Storage for logging
+
+metadata:
+  name: email-validation-infrastructure
+  description: "Infrastructure for serverless email validation with Cloud Functions and Storage"
+  labels:
+    environment: "production"
+    application: "email-validation"
+    component: "serverless-api"
+
+# Project and deployment configuration
+project_id: ${project_id}
+region: ${region}
+deployment_name: email-validation-${random_suffix}
+
+# Input variables with default values and validation
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for deployment"
+    validation:
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+  
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    validation:
+      allowed_values: ["us-central1", "us-east1", "us-west1", "europe-west1", "asia-northeast1"]
+  
+  random_suffix:
+    type: string
+    description: "Random suffix for unique resource naming"
+    validation:
+      pattern: "^[a-z0-9]{6}$"
+  
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Function"
+    default: "256MiB"
+    validation:
+      allowed_values: ["128MiB", "256MiB", "512MiB", "1GiB"]
+  
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Function execution"
+    default: "60s"
+  
+  storage_class:
+    type: string
+    description: "Cloud Storage class for log bucket"
+    default: "STANDARD"
+    validation:
+      allowed_values: ["STANDARD", "NEARLINE", "COLDLINE", "ARCHIVE"]
+
+# Resource definitions following Google Cloud best practices
+resources:
+  # Cloud Storage bucket for validation logs with lifecycle management
+  - name: email-validation-logs-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      # Unique bucket name with project and suffix to ensure global uniqueness
+      name: "email-validation-logs-${project_id}-${random_suffix}"
+      location: ${region}
+      storageClass: ${storage_class}
+      
+      # Enable versioning for data protection and recovery
+      versioning:
+        enabled: true
+      
+      # Configure lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          # Transition to Nearline after 30 days for cost savings
+          - action:
+              type: "SetStorageClass"
+              storageClass: "NEARLINE"
+            condition:
+              age: 30
+          # Delete objects after 365 days for compliance
+          - action:
+              type: "Delete"
+            condition:
+              age: 365
+      
+      # Enable uniform bucket-level access for simplified IAM
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      
+      # Enable public access prevention for security
+      publicAccessPrevention: "enforced"
+      
+      # Add labels for resource management and billing
+      labels:
+        environment: "production"
+        application: "email-validation"
+        component: "storage"
+        managed-by: "infrastructure-manager"
+
+  # Service account for Cloud Function with minimal required permissions
+  - name: email-validator-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: "email-validator-${random_suffix}"
+      displayName: "Email Validator Function Service Account"
+      description: "Service account for email validation Cloud Function"
+      # Use project ID from variable
+      project: ${project_id}
+
+  # IAM binding for service account to write to Cloud Storage bucket
+  - name: storage-object-creator-binding
+    type: gcp-types/storage-v1:buckets.setIamPolicy
+    properties:
+      bucket: $(ref.email-validation-logs-bucket.name)
+      policy:
+        bindings:
+          # Grant minimum required permission for object creation
+          - role: "roles/storage.objectCreator"
+            members:
+              - "serviceAccount:$(ref.email-validator-service-account.email)"
+          # Allow function to read bucket metadata
+          - role: "roles/storage.legacyBucketReader"
+            members:
+              - "serviceAccount:$(ref.email-validator-service-account.email)"
+    # Ensure service account is created before IAM binding
+    metadata:
+      dependsOn:
+        - email-validator-service-account
+        - email-validation-logs-bucket
+
+  # Cloud Function for email validation with comprehensive configuration
+  - name: email-validator-function
+    type: gcp-types/cloudfunctions-v2beta:projects.locations.functions
+    properties:
+      # Function resource name following GCP naming conventions
+      name: "projects/${project_id}/locations/${region}/functions/email-validator-${random_suffix}"
+      
+      # Build configuration for function deployment
+      buildConfig:
+        # Use Python 3.11 runtime for latest security and performance
+        runtime: "python311"
+        # Entry point matches the function name in main.py
+        entryPoint: "validate_email"
+        # Source code configuration - in production, use Cloud Source Repositories
+        source:
+          # For Infrastructure Manager, source code should be uploaded separately
+          # This configuration assumes code is available in the deployment package
+          storageSource:
+            bucket: "cloudfunctions-source-${project_id}-${random_suffix}"
+            object: "email-validator-source.zip"
+        
+        # Environment variables for build process
+        environmentVariables:
+          BUCKET_NAME: $(ref.email-validation-logs-bucket.name)
+
+      # Service configuration for runtime behavior
+      serviceConfig:
+        # Memory and CPU allocation
+        availableMemory: ${function_memory}
+        # Timeout configuration
+        timeoutSeconds: "60"
+        # Maximum number of concurrent instances
+        maxInstanceCount: 100
+        # Minimum instances (0 for cost optimization)
+        minInstanceCount: 0
+        # Service account for function execution
+        serviceAccountEmail: $(ref.email-validator-service-account.email)
+        
+        # Environment variables for function runtime
+        environmentVariables:
+          BUCKET_NAME: $(ref.email-validation-logs-bucket.name)
+          PYTHON_VERSION: "3.11"
+        
+        # Ingress settings - allow all traffic for public API
+        ingressSettings: "ALLOW_ALL"
+        
+        # VPC connector configuration (optional, for private resources)
+        # vpcConnector: "projects/${project_id}/locations/${region}/connectors/default"
+        
+        # Security settings
+        allTrafficOnLatestRevision: true
+
+      # Event trigger configuration for HTTP requests
+      eventTrigger:
+        # HTTP trigger for REST API functionality
+        trigger: "httpsTrigger"
+        # Allow unauthenticated access for public API
+        # In production, consider using Cloud Endpoints or API Gateway for authentication
+        httpsTrigger:
+          securityLevel: "SECURE_ALWAYS"
+    
+    # Ensure dependencies are created first
+    metadata:
+      dependsOn:
+        - email-validator-service-account
+        - email-validation-logs-bucket
+        - storage-object-creator-binding
+
+  # IAM policy to allow public access to the function (for testing)
+  # In production, implement proper authentication and authorization
+  - name: function-invoker-binding
+    type: gcp-types/cloudfunctions-v2beta:projects.locations.functions.setIamPolicy
+    properties:
+      resource: $(ref.email-validator-function.name)
+      policy:
+        bindings:
+          # Allow public access for testing purposes
+          # In production, replace with specific service accounts or user groups
+          - role: "roles/cloudfunctions.invoker"
+            members:
+              - "allUsers"
+    metadata:
+      dependsOn:
+        - email-validator-function
+
+  # Cloud Storage bucket for function source code (if needed)
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: "cloudfunctions-source-${project_id}-${random_suffix}"
+      location: ${region}
+      storageClass: "STANDARD"
+      
+      # Lifecycle rule to clean up old source artifacts
+      lifecycle:
+        rule:
+          - action:
+              type: "Delete"
+            condition:
+              age: 30
+      
+      # Labels for resource management
+      labels:
+        environment: "production"
+        application: "email-validation"
+        component: "source-storage"
+        managed-by: "infrastructure-manager"
+
+  # Cloud Monitoring alert policy for function errors
+  - name: function-error-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "Email Validator Function Errors"
+      documentation:
+        content: "Alert when email validation function has high error rate"
+        mimeType: "text/markdown"
+      
+      # Alert conditions based on function error rate
+      conditions:
+        - displayName: "Function error rate too high"
+          conditionThreshold:
+            filter: 'resource.type="cloud_function" AND resource.labels.function_name="email-validator-${random_suffix}"'
+            comparison: "COMPARISON_GREATER_THAN"
+            thresholdValue: 0.1  # 10% error rate
+            duration: "300s"     # 5 minutes
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: "ALIGN_RATE"
+                crossSeriesReducer: "REDUCE_MEAN"
+                groupByFields:
+                  - "resource.labels.function_name"
+      
+      # Alert notification configuration
+      combiner: "OR"
+      enabled: true
+      
+      # Notification channels would be configured separately
+      # notificationChannels: []
+    
+    metadata:
+      dependsOn:
+        - email-validator-function
+
+# Output values for reference and integration with other systems
+outputs:
+  # Function trigger URL for API access
+  function_url:
+    description: "HTTPS URL for the email validation function"
+    value: $(ref.email-validator-function.serviceConfig.uri)
+  
+  # Storage bucket name for log access
+  logs_bucket_name:
+    description: "Name of the Cloud Storage bucket containing validation logs"
+    value: $(ref.email-validation-logs-bucket.name)
+  
+  # Service account email for additional IAM configuration
+  service_account_email:
+    description: "Email of the service account used by the function"
+    value: $(ref.email-validator-service-account.email)
+  
+  # Function name for monitoring and management
+  function_name:
+    description: "Fully qualified name of the deployed function"
+    value: $(ref.email-validator-function.name)
+  
+  # Project information
+  project_id:
+    description: "Google Cloud Project ID where resources are deployed"
+    value: ${project_id}
+  
+  # Region information
+  deployment_region:
+    description: "Google Cloud region where resources are deployed"
+    value: ${region}
+
+# Deployment configuration and settings
+deployment:
+  # Preview mode for testing (set to false for actual deployment)
+  preview: false
+  
+  # Import existing resources if needed (for migration scenarios)
+  # imports: []
+  
+  # Automatic rollback on failure
+  rollbackEnabled: true
+  
+  # Deployment timeout
+  timeout: "1200s"  # 20 minutes
+
+# Schema validation ensures configuration correctness
+schema_version: "1.0"
+api_version: "v1"
+
+# Additional metadata for deployment tracking and management
+annotations:
+  deployment_timestamp: "{{ .Values.timestamp }}"
+  deployed_by: "infrastructure-manager"
+  recipe_version: "1.1"
+  infrastructure_version: "1.0"

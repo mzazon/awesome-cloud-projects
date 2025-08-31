@@ -1,0 +1,822 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simple Daily Quote Generator - Serverless API with Lambda and S3'
+
+# ==============================================================================
+# METADATA
+# ==============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaMemory
+          - LambdaTimeout
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - EnableS3Versioning
+          - S3StorageClass
+      - Label:
+          default: "Advanced Configuration"
+        Parameters:
+          - EnableXRayTracing
+          - EnableDetailedCloudWatchMetrics
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      LambdaRuntime:
+        default: "Lambda Runtime"
+      LambdaMemory:
+        default: "Lambda Memory (MB)"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      EnableS3Versioning:
+        default: "Enable S3 Versioning"
+      S3StorageClass:
+        default: "S3 Storage Class"
+      EnableXRayTracing:
+        default: "Enable X-Ray Tracing"
+      EnableDetailedCloudWatchMetrics:
+        default: "Enable Detailed CloudWatch Metrics"
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'daily-quote-generator'
+    Description: 'Name of the project used for resource naming'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+    MinLength: 3
+    MaxLength: 50
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name (dev, staging, prod)'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: 'Must be one of: dev, staging, prod'
+
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.12'
+    Description: 'Python runtime for Lambda function'
+    AllowedValues:
+      - python3.12
+      - python3.11
+      - python3.10
+    ConstraintDescription: 'Must be a supported Python runtime'
+
+  LambdaMemory:
+    Type: Number
+    Default: 128
+    Description: 'Memory allocation for Lambda function in MB'
+    MinValue: 128
+    MaxValue: 10240
+    ConstraintDescription: 'Must be between 128 and 10240 MB'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: 'Timeout for Lambda function in seconds'
+    MinValue: 3
+    MaxValue: 900
+    ConstraintDescription: 'Must be between 3 and 900 seconds'
+
+  EnableS3Versioning:
+    Type: String
+    Default: 'false'
+    Description: 'Enable versioning for S3 bucket'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  S3StorageClass:
+    Type: String
+    Default: 'STANDARD'
+    Description: 'Storage class for S3 objects'
+    AllowedValues:
+      - STANDARD
+      - STANDARD_IA
+      - REDUCED_REDUNDANCY
+    ConstraintDescription: 'Must be a valid S3 storage class'
+
+  EnableXRayTracing:
+    Type: String
+    Default: 'false'
+    Description: 'Enable AWS X-Ray tracing for Lambda function'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableDetailedCloudWatchMetrics:
+    Type: String
+    Default: 'false'
+    Description: 'Enable detailed CloudWatch metrics for Lambda function'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  # Environment conditions
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  IsDevelopment: !Equals [!Ref Environment, 'dev']
+  
+  # Feature conditions
+  EnableVersioning: !Equals [!Ref EnableS3Versioning, 'true']
+  EnableXRay: !Equals [!Ref EnableXRayTracing, 'true']
+  EnableDetailedMetrics: !Equals [!Ref EnableDetailedCloudWatchMetrics, 'true']
+  
+  # Storage conditions
+  UseStandardStorage: !Equals [!Ref S3StorageClass, 'STANDARD']
+  UseStandardIAStorage: !Equals [!Ref S3StorageClass, 'STANDARD_IA']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ------------------------------------------------------------------------------
+  # S3 BUCKET - Quote Data Storage
+  # ------------------------------------------------------------------------------
+  QuotesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-quotes-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, 'Enabled', 'Suspended']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: OptimizeStorage
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref QuotesLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-quotes-bucket-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'Storage'
+
+  # ------------------------------------------------------------------------------
+  # S3 BUCKET POLICY - Secure access
+  # ------------------------------------------------------------------------------
+  QuotesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref QuotesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${QuotesBucket}/*'
+              - !Sub '${QuotesBucket}'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+            Resource: !Sub '${QuotesBucket}/*'
+
+  # ------------------------------------------------------------------------------
+  # IAM ROLE - Lambda Execution Role
+  # ------------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If 
+          - EnableXRay
+          - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+          - !Ref 'AWS::NoValue'
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                Resource: !Sub '${QuotesBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource: !Ref QuotesBucket
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'Security'
+
+  # ------------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUP - Lambda Logs
+  # ------------------------------------------------------------------------------
+  QuotesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-quote-api-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'Monitoring'
+
+  # ------------------------------------------------------------------------------
+  # LAMBDA FUNCTION - Quote API
+  # ------------------------------------------------------------------------------
+  QuoteLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: QuotesLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-quote-api-${Environment}'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref QuotesBucket
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [IsDevelopment, 'DEBUG', 'INFO']
+      TracingConfig:
+        Mode: !If [EnableXRay, 'Active', 'PassThrough']
+      DeadLetterQueue:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import random
+          import os
+          import logging
+          from botocore.exceptions import ClientError
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+          
+          # Initialize S3 client outside handler for connection reuse
+          s3_client = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              """
+              Lambda function to serve random inspirational quotes from S3.
+              
+              Args:
+                  event: Lambda event object
+                  context: Lambda context object
+                  
+              Returns:
+                  dict: HTTP response with quote data or error message
+              """
+              
+              # Get environment variables
+              bucket_name = os.environ.get('BUCKET_NAME')
+              environment = os.environ.get('ENVIRONMENT', 'dev')
+              
+              # Log request details (excluding sensitive data)
+              logger.info(f"Processing request in {environment} environment")
+              logger.debug(f"Event: {json.dumps(event, default=str)}")
+              
+              # CORS headers for all responses
+              cors_headers = {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Cache-Control': 'no-cache'
+              }
+              
+              try:
+                  # Handle preflight OPTIONS request
+                  if event.get('httpMethod') == 'OPTIONS':
+                      return {
+                          'statusCode': 200,
+                          'headers': cors_headers,
+                          'body': json.dumps({'message': 'CORS preflight successful'})
+                      }
+                  
+                  # Validate bucket name
+                  if not bucket_name:
+                      raise ValueError("BUCKET_NAME environment variable not set")
+                  
+                  logger.info(f"Fetching quotes from bucket: {bucket_name}")
+                  
+                  # Get quotes from S3 with retry logic
+                  try:
+                      response = s3_client.get_object(
+                          Bucket=bucket_name, 
+                          Key='quotes.json'
+                      )
+                      quotes_content = response['Body'].read().decode('utf-8')
+                      logger.debug(f"Retrieved {len(quotes_content)} bytes from S3")
+                      
+                  except ClientError as e:
+                      error_code = e.response['Error']['Code']
+                      if error_code == 'NoSuchKey':
+                          logger.error("quotes.json file not found in S3 bucket")
+                          return {
+                              'statusCode': 404,
+                              'headers': cors_headers,
+                              'body': json.dumps({
+                                  'error': 'Quote data not found',
+                                  'message': 'Please ensure quotes.json is uploaded to the S3 bucket'
+                              })
+                          }
+                      elif error_code == 'NoSuchBucket':
+                          logger.error(f"S3 bucket {bucket_name} does not exist")
+                          return {
+                              'statusCode': 500,
+                              'headers': cors_headers,
+                              'body': json.dumps({
+                                  'error': 'Configuration error',
+                                  'message': 'Storage bucket not found'
+                              })
+                          }
+                      else:
+                          logger.error(f"S3 error: {error_code} - {e}")
+                          raise
+                  
+                  # Parse JSON data
+                  try:
+                      quotes_data = json.loads(quotes_content)
+                      quotes_list = quotes_data.get('quotes', [])
+                      
+                      if not quotes_list:
+                          logger.warning("No quotes found in the data file")
+                          return {
+                              'statusCode': 404,
+                              'headers': cors_headers,
+                              'body': json.dumps({
+                                  'error': 'No quotes available',
+                                  'message': 'Quote data file is empty or malformed'
+                              })
+                          }
+                          
+                  except json.JSONDecodeError as e:
+                      logger.error(f"Invalid JSON in quotes file: {e}")
+                      return {
+                          'statusCode': 500,
+                          'headers': cors_headers,
+                          'body': json.dumps({
+                              'error': 'Data format error',
+                              'message': 'Quote data file contains invalid JSON'
+                          })
+                      }
+                  
+                  # Select random quote
+                  random_quote = random.choice(quotes_list)
+                  logger.info(f"Selected quote by {random_quote.get('author', 'Unknown')}")
+                  
+                  # Validate quote structure
+                  required_fields = ['text', 'author']
+                  missing_fields = [field for field in required_fields if field not in random_quote]
+                  
+                  if missing_fields:
+                      logger.error(f"Quote missing required fields: {missing_fields}")
+                      return {
+                          'statusCode': 500,
+                          'headers': cors_headers,
+                          'body': json.dumps({
+                              'error': 'Data integrity error',
+                              'message': f'Quote data missing required fields: {", ".join(missing_fields)}'
+                          })
+                      }
+                  
+                  # Prepare response
+                  response_body = {
+                      'quote': random_quote['text'],
+                      'author': random_quote['author'],
+                      'timestamp': context.aws_request_id,
+                      'environment': environment,
+                      'total_quotes': len(quotes_list)
+                  }
+                  
+                  logger.info("Successfully processed quote request")
+                  return {
+                      'statusCode': 200,
+                      'headers': cors_headers,
+                      'body': json.dumps(response_body, ensure_ascii=False)
+                  }
+                  
+              except ValueError as e:
+                  logger.error(f"Configuration error: {e}")
+                  return {
+                      'statusCode': 500,
+                      'headers': cors_headers,
+                      'body': json.dumps({
+                          'error': 'Configuration error',
+                          'message': str(e)
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Unexpected error: {type(e).__name__}: {e}")
+                  return {
+                      'statusCode': 500,
+                      'headers': cors_headers,
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'message': 'An unexpected error occurred while processing your request'
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-quote-api-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'Compute'
+
+  # ------------------------------------------------------------------------------
+  # SQS DEAD LETTER QUEUE - Error handling
+  # ------------------------------------------------------------------------------
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dlq-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'Messaging'
+
+  # ------------------------------------------------------------------------------
+  # LAMBDA FUNCTION URL - Direct HTTPS access
+  # ------------------------------------------------------------------------------
+  QuoteFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt QuoteLambdaFunction.Arn
+      AuthType: NONE
+      Cors:
+        AllowCredentials: false
+        AllowHeaders:
+          - '*'
+        AllowMethods:
+          - GET
+          - OPTIONS
+        AllowOrigins:
+          - '*'
+        MaxAge: 86400
+      Qualifier: $LATEST
+
+  # ------------------------------------------------------------------------------
+  # LAMBDA PERMISSION - Function URL access
+  # ------------------------------------------------------------------------------
+  QuoteFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QuoteLambdaFunction
+      Principal: '*'
+      Action: lambda:InvokeFunctionUrl
+      FunctionUrlAuthType: NONE
+
+  # ------------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS - Monitoring and alerting
+  # ------------------------------------------------------------------------------
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: 'Lambda function error rate is too high'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref QuoteLambdaFunction
+      TreatMissingData: notBreaching
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: 'Lambda function duration is too high'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10000  # 10 seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref QuoteLambdaFunction
+      TreatMissingData: notBreaching
+
+  # ------------------------------------------------------------------------------
+  # CUSTOM RESOURCE - Initial quote data upload
+  # ------------------------------------------------------------------------------
+  QuoteDataUploader:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt QuoteDataUploaderFunction.Arn
+      BucketName: !Ref QuotesBucket
+      QuoteData: |
+        {
+          "quotes": [
+            {
+              "text": "The only way to do great work is to love what you do.",
+              "author": "Steve Jobs"
+            },
+            {
+              "text": "Innovation distinguishes between a leader and a follower.",
+              "author": "Steve Jobs"
+            },
+            {
+              "text": "Life is what happens to you while you're busy making other plans.",
+              "author": "John Lennon"
+            },
+            {
+              "text": "The future belongs to those who believe in the beauty of their dreams.",
+              "author": "Eleanor Roosevelt"
+            },
+            {
+              "text": "It is during our darkest moments that we must focus to see the light.",
+              "author": "Aristotle"
+            },
+            {
+              "text": "Success is not final, failure is not fatal: it is the courage to continue that counts.",
+              "author": "Winston Churchill"
+            },
+            {
+              "text": "The way to get started is to quit talking and begin doing.",
+              "author": "Walt Disney"
+            },
+            {
+              "text": "Don't let yesterday take up too much of today.",
+              "author": "Will Rogers"
+            },
+            {
+              "text": "You learn more from failure than from success. Don't let it stop you. Failure builds character.",
+              "author": "Unknown"
+            },
+            {
+              "text": "If you are working on something that you really care about, you don't have to be pushed. The vision pulls you.",
+              "author": "Steve Jobs"
+            }
+          ]
+        }
+
+  # ------------------------------------------------------------------------------
+  # LAMBDA FUNCTION - Quote data uploader (Custom Resource)
+  # ------------------------------------------------------------------------------
+  QuoteDataUploaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-data-uploader-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt UploaderLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          s3_client = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              """
+              Custom resource handler to upload initial quote data to S3.
+              """
+              try:
+                  logger.info(f"Request Type: {event['RequestType']}")
+                  
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      quote_data = event['ResourceProperties']['QuoteData']
+                      
+                      # Upload quotes.json to S3
+                      s3_client.put_object(
+                          Bucket=bucket_name,
+                          Key='quotes.json',
+                          Body=quote_data.encode('utf-8'),
+                          ContentType='application/json',
+                          ServerSideEncryption='AES256'
+                      )
+                      
+                      logger.info(f"Successfully uploaded quotes.json to {bucket_name}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Quote data uploaded successfully'})
+                      
+                  elif event['RequestType'] == 'Delete':
+                      # Optionally delete the object on stack deletion
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      try:
+                          s3_client.delete_object(Bucket=bucket_name, Key='quotes.json')
+                          logger.info(f"Deleted quotes.json from {bucket_name}")
+                      except Exception as e:
+                          logger.warning(f"Could not delete quotes.json: {e}")
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Quote data cleanup completed'})
+                      
+              except Exception as e:
+                  logger.error(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Message': str(e)})
+
+  # ------------------------------------------------------------------------------
+  # IAM ROLE - Uploader Lambda Role
+  # ------------------------------------------------------------------------------
+  UploaderLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3WriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource: !Sub '${QuotesBucket}/*'
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  # Function Information
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function'
+    Value: !Ref QuoteLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt QuoteLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  # API Access
+  FunctionUrl:
+    Description: 'HTTPS URL for the Lambda function'
+    Value: !GetAtt QuoteFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionUrl'
+
+  # Storage Information
+  S3BucketName:
+    Description: 'Name of the S3 bucket storing quotes'
+    Value: !Ref QuotesBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  S3BucketArn:
+    Description: 'ARN of the S3 bucket storing quotes'
+    Value: !GetAtt QuotesBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'
+
+  # Security Information
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # Monitoring Information
+  CloudWatchLogGroup:
+    Description: 'CloudWatch Log Group for Lambda function'
+    Value: !Ref QuotesLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchLogGroup'
+
+  DeadLetterQueueUrl:
+    Description: 'URL of the Dead Letter Queue'
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueUrl'
+
+  # Testing Information
+  TestCommand:
+    Description: 'cURL command to test the API'
+    Value: !Sub 'curl -s "${QuoteFunctionUrl.FunctionUrl}" | jq .'
+
+  # Cost Information
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost (USD) for typical usage'
+    Value: '$0.01 - $0.05 (Free Tier eligible)'
+
+  # Regional Information
+  DeploymentRegion:
+    Description: 'AWS region where resources are deployed'
+    Value: !Ref 'AWS::Region'
+
+  # Stack Information
+  StackId:
+    Description: 'CloudFormation Stack ID'
+    Value: !Ref 'AWS::StackId'
+    Export:
+      Name: !Sub '${AWS::StackName}-StackId'

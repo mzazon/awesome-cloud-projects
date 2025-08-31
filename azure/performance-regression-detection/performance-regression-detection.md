@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Load Testing, Azure Monitor Workbooks, Azure DevOps, Azure Container Apps
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: performance-testing, ci-cd, monitoring, devops, automation
 recipe-generator-version: 1.3
@@ -345,6 +345,9 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    Azure Monitor Workbooks provide interactive, customizable dashboards for visualizing performance trends and anomalies. This workbook configuration creates a comprehensive performance monitoring solution that correlates load test results with application metrics. The visualization enables quick identification of performance regressions and their root causes.
 
    ```bash
+   # Generate UUID for workbook name
+   WORKBOOK_UUID=$(uuidgen)
+
    # Create workbook template
    cat > performance-workbook.json << 'EOF'
    {
@@ -390,8 +393,8 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
    # Create the workbook
    az monitor app-insights workbook create \
+       --name ${WORKBOOK_UUID} \
        --resource-group ${RESOURCE_GROUP} \
-       --name "Performance Regression Dashboard" \
        --location ${LOCATION} \
        --display-name "Performance Regression Detection" \
        --category "performance" \
@@ -404,29 +407,31 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
 8. **Set Up Automated Regression Detection**:
 
-   Automated regression detection uses Azure Monitor alerts to identify performance degradations compared to established baselines. This configuration creates intelligent alerting that considers historical performance patterns and statistical variations, reducing false positives while ensuring genuine regressions are promptly identified. The integration with Azure DevOps enables automatic rollback capabilities.
+   Automated regression detection uses Azure Monitor scheduled query alerts to identify performance degradations compared to established baselines. This configuration creates intelligent alerting that considers historical performance patterns and statistical variations, reducing false positives while ensuring genuine regressions are promptly identified. The integration with Azure DevOps enables automatic rollback capabilities.
 
    ```bash
-   # Create alert rule for response time regression
-   az monitor metrics alert create \
+   # Create alert rule for response time regression using scheduled query
+   az monitor scheduled-query create \
        --name "ResponseTimeRegression" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes ${WORKSPACE_ID} \
        --description "Alert when response time exceeds baseline by 20%" \
-       --condition "avg Perf | where ObjectName == 'Container App' | where CounterName == 'Response Time' > 600" \
+       --condition "avg(avgResponseTime) > 600" \
+       --condition-query "ContainerAppConsoleLogs_CL | where TimeGenerated > ago(5m) | summarize avgResponseTime=avg(todouble(Properties_s.duration))" \
+       --evaluation-frequency 5m \
        --window-size 5m \
-       --evaluation-frequency 1m \
        --severity 2
 
-   # Create alert rule for error rate regression  
-   az monitor metrics alert create \
+   # Create alert rule for error rate regression using scheduled query
+   az monitor scheduled-query create \
        --name "ErrorRateRegression" \
        --resource-group ${RESOURCE_GROUP} \
        --scopes ${WORKSPACE_ID} \
        --description "Alert when error rate exceeds 5%" \
-       --condition "avg Perf | where ObjectName == 'Container App' | where CounterName == 'Error Rate' > 5" \
+       --condition "avg(errorRate) > 5" \
+       --condition-query "ContainerAppConsoleLogs_CL | where TimeGenerated > ago(5m) | summarize errorRate=countif(Properties_s.status >= 400) * 100.0 / count()" \
+       --evaluation-frequency 5m \
        --window-size 5m \
-       --evaluation-frequency 1m \
        --severity 2
 
    echo "✅ Regression detection alerts configured"
@@ -466,7 +471,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --output table
    ```
 
-   Expected output: Should display "Performance Regression Dashboard" in the list
+   Expected output: Should display "Performance Regression Detection" in the list
 
 4. Validate pipeline configuration:
 
@@ -517,6 +522,8 @@ Azure Load Testing combined with Azure Monitor Workbooks creates a powerful auto
 The integration between Azure Load Testing and Container Apps provides realistic performance testing scenarios that accurately reflect production behavior. Azure Load Testing's managed infrastructure eliminates the operational overhead of maintaining test environments while providing enterprise-scale capabilities. For detailed implementation guidance, refer to the [Azure Load Testing documentation](https://docs.microsoft.com/en-us/azure/load-testing/) and [performance testing best practices](https://docs.microsoft.com/en-us/azure/load-testing/best-practices-performance-testing).
 
 From a cost optimization perspective, the serverless nature of both Azure Container Apps and Load Testing ensures you only pay for actual usage during test execution. The consumption-based pricing model makes this solution accessible for teams of all sizes while maintaining the ability to scale for enterprise workloads. Azure Monitor Workbooks provide rich visualization capabilities without additional licensing costs, as documented in the [Azure Monitor pricing guide](https://docs.microsoft.com/en-us/azure/azure-monitor/costs).
+
+The automated alerting system uses Azure Monitor's scheduled query alerts to provide more flexible and powerful regression detection capabilities compared to traditional metric-based alerts. This approach allows for complex KQL queries that can analyze trends, patterns, and statistical variations in performance data, reducing false positives while maintaining sensitivity to genuine performance degradations.
 
 > **Tip**: Use Azure Load Testing's comparison feature to automatically detect performance regressions by comparing test runs against established baselines. Configure percentage-based thresholds to account for normal variations while catching meaningful degradations. See the [regression detection guide](https://docs.microsoft.com/en-us/azure/load-testing/how-to-compare-test-results) for implementation details.
 

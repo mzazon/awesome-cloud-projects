@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Media CDN, Vertex AI, Cloud Functions, Cloud Storage
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: video analytics, edge computing, ai, content delivery, object detection, media streaming, automation
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Media companies and content creators face the challenge of efficiently processin
 
 ## Solution
 
-This solution leverages Google Cloud's Media CDN for global edge distribution combined with Vertex AI's powerful video analytics capabilities to create an intelligent, automated video processing pipeline. The architecture uses Cloud Storage as the central repository, Cloud Functions for event-driven processing triggers, and Vertex AI for sophisticated object detection and content classification. This integrated approach enables real-time video analysis at scale while ensuring optimal content delivery performance through Google's global edge network infrastructure.
+This solution leverages Google Cloud's Media CDN for global edge distribution combined with Vertex AI's powerful video analytics capabilities to create an intelligent, automated video processing pipeline. The architecture uses Cloud Storage as the central repository, Cloud Functions for event-driven processing triggers, and Vertex AI Video Intelligence API for sophisticated object detection and content classification. This integrated approach enables real-time video analysis at scale while ensuring optimal content delivery performance through Google's global edge network infrastructure.
 
 ## Architecture Diagram
 
@@ -46,7 +46,7 @@ graph TB
     end
     
     subgraph "AI Analytics"
-        VERTEX[Vertex AI<br/>Video Analytics]
+        VERTEX[Vertex AI<br/>Video Intelligence API]
         DETECT[Object Detection]
         CLASSIFY[Content Classification]
     end
@@ -82,7 +82,7 @@ graph TB
 
 ## Prerequisites
 
-1. Google Cloud Project with billing enabled and appropriate IAM permissions
+1. Google Cloud Project with billing enabled and appropriate IAM permissions for Media CDN, Vertex AI, Cloud Functions, and Cloud Storage
 2. Google Cloud CLI (gcloud) installed and configured or Cloud Shell access
 3. Basic knowledge of video processing concepts and AI/ML workflows
 4. Understanding of serverless functions and event-driven architectures
@@ -110,7 +110,9 @@ gcloud config set compute/zone ${ZONE}
 gcloud services enable storage.googleapis.com
 gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable aiplatform.googleapis.com
-gcloud services enable networkconnectivity.googleapis.com
+gcloud services enable videointelligence.googleapis.com
+gcloud services enable networkservices.googleapis.com
+gcloud services enable certificatemanager.googleapis.com
 gcloud services enable eventarc.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
@@ -154,29 +156,9 @@ echo "✅ Resource names generated with suffix: ${RANDOM_SUFFIX}"
 
    The storage buckets now provide scalable, durable storage with automatic encryption and versioning enabled. This foundation supports both the real-time streaming requirements of Media CDN and the batch processing needs of Vertex AI analytics workflows.
 
-2. **Configure Media CDN Edge Cache Service for Global Distribution**:
+2. **Deploy Cloud Function for Automated Video Processing Triggers**:
 
-   Media CDN leverages Google's global edge network with over 100Tbps of capacity to deliver video content with minimal latency. The EdgeCacheService configuration defines how content is cached, routed, and delivered from edge locations worldwide. This setup enables cache hit ratios of 98.5-99% for video-on-demand content while providing origin protection and advanced routing capabilities.
-
-   ```bash
-   # Create EdgeCacheOrigin for Cloud Storage
-   gcloud compute network-edge-security-services create ${CDN_SERVICE_NAME}-origin \
-       --description="Origin for video content storage" \
-       --region=${REGION}
-   
-   # Note: Full Media CDN configuration requires additional
-   # setup through Google Cloud Console or REST API
-   # as it involves advanced routing and caching policies
-   
-   echo "✅ Media CDN origin configuration initiated"
-   echo "Complete setup in Cloud Console for full Media CDN configuration"
-   ```
-
-   The Media CDN configuration establishes the foundation for global content delivery with intelligent caching and routing. This infrastructure reduces origin load while ensuring optimal performance for users accessing video content from any geographic location.
-
-3. **Deploy Cloud Function for Automated Video Processing Triggers**:
-
-   Cloud Functions provides event-driven processing that automatically responds to new video uploads in Cloud Storage. The function serves as the orchestration layer, triggering Vertex AI analytics workflows whenever new content is available. This serverless approach ensures scalable, cost-effective processing that only consumes resources when videos require analysis.
+   Cloud Functions provides event-driven processing that automatically responds to new video uploads in Cloud Storage. The function serves as the orchestration layer, triggering Vertex AI Video Intelligence API workflows whenever new content is available. This serverless approach ensures scalable, cost-effective processing that only consumes resources when videos require analysis.
 
    ```bash
    # Create function source directory
@@ -187,10 +169,9 @@ echo "✅ Resource names generated with suffix: ${RANDOM_SUFFIX}"
    cat > main.py << 'EOF'
 import os
 import json
-from google.cloud import aiplatform
+from google.cloud import videointelligence
 from google.cloud import storage
-from google.cloud import functions_v1
-import base64
+import logging
 
 def process_video(cloud_event):
     """Triggered by Cloud Storage object upload."""
@@ -200,145 +181,16 @@ def process_video(cloud_event):
     bucket_name = cloud_event.data["bucket"]
     
     # Skip if not a video file
-    if not file_name.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+    video_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.webm')
+    if not file_name.lower().endswith(video_extensions):
         print(f"Skipping non-video file: {file_name}")
-        return
+        return {"status": "skipped", "reason": "not a video file"}
     
     print(f"Processing video: {file_name} from bucket: {bucket_name}")
     
-    # Initialize Vertex AI client
-    project_id = os.environ.get('PROJECT_ID')
-    region = os.environ.get('REGION', 'us-central1')
-    
-    aiplatform.init(project=project_id, location=region)
-    
-    # Trigger video analysis workflow
-    video_uri = f"gs://{bucket_name}/{file_name}"
-    
-    # Create analytics job metadata
-    analytics_metadata = {
-        "video_uri": video_uri,
-        "file_name": file_name,
-        "bucket_name": bucket_name,
-        "processing_status": "initiated",
-        "timestamp": cloud_event.time
-    }
-    
-    # Store metadata in results bucket
-    results_bucket = os.environ.get('RESULTS_BUCKET')
-    storage_client = storage.Client()
-    results_bucket_obj = storage_client.bucket(results_bucket)
-    
-    metadata_blob = results_bucket_obj.blob(f"metadata/{file_name}.json")
-    metadata_blob.upload_from_string(json.dumps(analytics_metadata))
-    
-    print(f"✅ Video processing initiated for: {file_name}")
-    
-    return {"status": "success", "video_uri": video_uri}
-EOF
-   
-   # Create requirements.txt
-   cat > requirements.txt << 'EOF'
-google-cloud-aiplatform==1.38.0
-google-cloud-storage==2.10.0
-google-cloud-functions==1.8.3
-EOF
-   
-   # Deploy the Cloud Function
-   gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python39 \
-       --trigger-bucket ${BUCKET_NAME} \
-       --entry-point process_video \
-       --memory 512MB \
-       --timeout 540s \
-       --set-env-vars PROJECT_ID=${PROJECT_ID},REGION=${REGION},RESULTS_BUCKET=${RESULTS_BUCKET}
-   
-   cd ..
-   
-   echo "✅ Cloud Function deployed with Cloud Storage trigger"
-   echo "Function Name: ${FUNCTION_NAME}"
-   ```
-
-   The Cloud Function now automatically processes new video uploads with built-in error handling and metadata tracking. This serverless architecture provides reliable, scalable event processing while maintaining cost efficiency through pay-per-invocation pricing.
-
-4. **Configure Vertex AI Video Analytics Models for Object Detection**:
-
-   Vertex AI provides pre-trained video analytics models optimized for object detection and content classification. These models leverage Google's advanced machine learning infrastructure to analyze video content at scale, identifying objects, activities, and content themes with high accuracy. The configuration enables automated analysis workflows that extract valuable insights from video content.
-
-   ```bash
-   # Create Vertex AI dataset for video analytics
-   gcloud ai datasets create \
-       --display-name="video-analytics-dataset-${RANDOM_SUFFIX}" \
-       --metadata-schema-uri="gs://google-cloud-aiplatform/schema/dataset/metadata/video_1.0.0.yaml" \
-       --region=${REGION}
-   
-   # Store dataset ID for future reference
-   DATASET_ID=$(gcloud ai datasets list \
-       --region=${REGION} \
-       --filter="displayName:video-analytics-dataset-${RANDOM_SUFFIX}" \
-       --format="value(name)" | cut -d'/' -f6)
-   
-   echo "Dataset ID: ${DATASET_ID}"
-   
-   # Create video analysis pipeline configuration
-   cat > video-analysis-config.json << EOF
-{
-  "displayName": "video-analytics-pipeline-${RANDOM_SUFFIX}",
-  "description": "Automated video analytics for object detection and classification",
-  "inputDataConfig": {
-    "gcsSource": {
-      "uris": ["gs://${BUCKET_NAME}/*"]
-    }
-  },
-  "outputDataConfig": {
-    "gcsDestination": {
-      "outputUriPrefix": "gs://${RESULTS_BUCKET}/analysis-results/"
-    }
-  }
-}
-EOF
-   
-   echo "✅ Vertex AI analytics configuration created"
-   echo "Dataset ID: ${DATASET_ID}"
-   ```
-
-   The Vertex AI configuration establishes automated video analysis capabilities with pre-trained models for object detection and content classification. This setup enables sophisticated AI-powered insights while maintaining integration with the broader analytics pipeline.
-
-5. **Create Advanced Video Processing Function for Vertex AI Integration**:
-
-   This enhanced function leverages Vertex AI's Video Intelligence API to perform detailed video analysis including object detection, activity recognition, and content classification. The function processes videos asynchronously and stores detailed analytics results in Cloud Storage, creating a comprehensive video intelligence pipeline.
-
-   ```bash
-   # Create advanced video analytics function
-   mkdir -p advanced-video-analytics
-   cd advanced-video-analytics
-   
-   # Create enhanced processing function
-   cat > main.py << 'EOF'
-import os
-import json
-import asyncio
-from google.cloud import videointelligence
-from google.cloud import storage
-from google.cloud import aiplatform
-import logging
-
-def analyze_video_content(cloud_event):
-    """Advanced video analysis using Vertex AI Video Intelligence."""
-    
-    file_name = cloud_event.data["name"]
-    bucket_name = cloud_event.data["bucket"]
-    
-    # Skip non-video files
-    video_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.webm')
-    if not file_name.lower().endswith(video_extensions):
-        return {"status": "skipped", "reason": "not a video file"}
-    
-    video_uri = f"gs://{bucket_name}/{file_name}"
-    logging.info(f"Starting analysis for: {video_uri}")
-    
     # Initialize Video Intelligence client
     video_client = videointelligence.VideoIntelligenceServiceClient()
+    video_uri = f"gs://{bucket_name}/{file_name}"
     
     # Configure analysis features
     features = [
@@ -369,9 +221,6 @@ def analyze_video_content(cloud_event):
         }
     )
     
-    # Process results asynchronously
-    print(f"Analysis started for {file_name}. Operation: {operation.operation.name}")
-    
     # Store analysis metadata
     storage_client = storage.Client()
     results_bucket = storage_client.bucket(os.environ.get('RESULTS_BUCKET'))
@@ -388,6 +237,8 @@ def analyze_video_content(cloud_event):
     metadata_blob = results_bucket.blob(f"operations/{file_name}_metadata.json")
     metadata_blob.upload_from_string(json.dumps(analysis_metadata, indent=2))
     
+    print(f"✅ Video processing initiated for: {file_name}")
+    
     return {
         "status": "analysis_started",
         "operation_name": operation.operation.name,
@@ -395,72 +246,66 @@ def analyze_video_content(cloud_event):
     }
 EOF
    
-   # Create requirements for advanced function
+   # Create requirements.txt with updated versions
    cat > requirements.txt << 'EOF'
-google-cloud-videointelligence==2.11.3
-google-cloud-storage==2.10.0
-google-cloud-aiplatform==1.38.0
-asyncio
+google-cloud-videointelligence==2.13.5
+google-cloud-storage==2.17.0
+functions-framework==3.8.1
 EOF
    
-   # Deploy advanced analytics function
-   gcloud functions deploy advanced-video-analytics-${RANDOM_SUFFIX} \
-       --runtime python39 \
+   # Deploy the Cloud Function with Gen 2
+   gcloud functions deploy ${FUNCTION_NAME} \
+       --gen2 \
+       --runtime python311 \
        --trigger-bucket ${BUCKET_NAME} \
-       --entry-point analyze_video_content \
+       --entry-point process_video \
        --memory 1024MB \
        --timeout 540s \
+       --region ${REGION} \
        --set-env-vars PROJECT_ID=${PROJECT_ID},REGION=${REGION},RESULTS_BUCKET=${RESULTS_BUCKET}
    
    cd ..
    
-   echo "✅ Advanced video analytics function deployed"
+   echo "✅ Cloud Function deployed with Cloud Storage trigger"
+   echo "Function Name: ${FUNCTION_NAME}"
    ```
 
-   The advanced video analytics function now provides comprehensive video analysis capabilities including object tracking, label detection, shot change detection, and text recognition. This creates a powerful AI-driven video intelligence pipeline that automatically processes content and generates detailed insights.
+   The Cloud Function now automatically processes new video uploads with built-in error handling and metadata tracking. This serverless architecture provides reliable, scalable event processing while maintaining cost efficiency through pay-per-invocation pricing.
 
-6. **Set Up Media CDN Cache Policies and Edge Optimization**:
+3. **Create EdgeCacheOrigin for Media CDN Configuration**:
 
-   Media CDN's advanced caching policies optimize content delivery based on video characteristics, user location, and access patterns. Configuring appropriate cache headers, TTL values, and edge behaviors ensures optimal performance while minimizing origin load. This setup leverages Google's global edge network to deliver video content with minimal latency worldwide.
+   Media CDN leverages Google's global edge network with over 100Tbps of capacity to deliver video content with minimal latency. The EdgeCacheOrigin configuration defines how content is cached, routed, and delivered from edge locations worldwide. This setup enables cache hit ratios of 98.5-99% for video-on-demand content while providing origin protection and advanced routing capabilities.
 
    ```bash
-   # Create cache policy configuration
-   cat > media-cdn-config.yaml << EOF
-# Media CDN Configuration for Video Streaming
-name: ${CDN_SERVICE_NAME}
-description: "Intelligent edge caching for video analytics pipeline"
-cache_policies:
-  - name: "video-content-policy"
-    default_ttl: "86400s"  # 24 hours
-    max_ttl: "604800s"     # 7 days
-    cache_key_policy:
-      include_query_string: true
-      query_string_blacklist: ["utm_source", "utm_medium"]
-  - name: "analytics-results-policy"
-    default_ttl: "3600s"   # 1 hour
-    max_ttl: "86400s"      # 24 hours
-origin_config:
-  origin_uri: "gs://${BUCKET_NAME}"
-  protocol: "HTTPS"
-EOF
+   # Create EdgeCacheOrigin for Cloud Storage
+   gcloud network-services edge-cache-origins create ${CDN_SERVICE_NAME}-origin \
+       --origin-address="storage.googleapis.com" \
+       --description="Origin for video content storage bucket" \
+       --region=${REGION}
    
-   # Configure origin for Media CDN (requires Cloud Console completion)
-   echo "📋 Media CDN Configuration Summary:"
-   echo "   Service Name: ${CDN_SERVICE_NAME}"
-   echo "   Origin Bucket: gs://${BUCKET_NAME}"
-   echo "   Cache Policy: Optimized for video streaming"
+   # Create EdgeCacheService
+   gcloud network-services edge-cache-services create ${CDN_SERVICE_NAME} \
+       --description="Edge cache service for video analytics pipeline" \
+       --region=${REGION}
+   
+   echo "✅ Media CDN EdgeCacheOrigin created"
+   echo "Origin: ${CDN_SERVICE_NAME}-origin"
+   echo "Service: ${CDN_SERVICE_NAME}"
+   
+   # Note: Complete Media CDN configuration requires additional
+   # setup through Google Cloud Console or REST API
+   # for advanced routing and caching policies
    echo ""
    echo "⚠️  Complete Media CDN setup in Google Cloud Console:"
    echo "   1. Navigate to Network Services > Media CDN"
-   echo "   2. Create EdgeCacheService with the configuration above"
-   echo "   3. Configure custom domain and SSL certificates"
-   
-   echo "✅ Media CDN configuration prepared"
+   echo "   2. Configure EdgeCacheService with routing rules"
+   echo "   3. Set up custom domain and SSL certificates"
+   echo "   4. Configure cache policies for optimal performance"
    ```
 
-   The Media CDN cache policies are optimized for video content delivery with intelligent caching strategies that balance performance and freshness. This configuration ensures optimal content delivery while supporting the analytics pipeline's requirements for both streaming and processed results.
+   The Media CDN configuration establishes the foundation for global content delivery with intelligent caching and routing. This infrastructure reduces origin load while ensuring optimal performance for users accessing video content from any geographic location.
 
-7. **Configure Automated Analytics Results Processing**:
+4. **Configure Automated Analytics Results Processing**:
 
    This step creates a comprehensive results processing pipeline that monitors Vertex AI analysis operations and processes completed analytics results. The system automatically organizes insights, generates summaries, and creates searchable metadata for video content analytics.
 
@@ -473,7 +318,6 @@ EOF
 import json
 import os
 from google.cloud import storage
-from google.cloud import videointelligence
 import logging
 
 def process_analytics_results(cloud_event):
@@ -558,17 +402,19 @@ def process_analytics_results(cloud_event):
 EOF
    
    cat > requirements.txt << 'EOF'
-google-cloud-storage==2.10.0
-google-cloud-videointelligence==2.11.3
+google-cloud-storage==2.17.0
+functions-framework==3.8.1
 EOF
    
    # Deploy results processing function
    gcloud functions deploy results-processor-${RANDOM_SUFFIX} \
-       --runtime python39 \
+       --gen2 \
+       --runtime python311 \
        --trigger-bucket ${RESULTS_BUCKET} \
        --entry-point process_analytics_results \
        --memory 512MB \
        --timeout 300s \
+       --region ${REGION} \
        --set-env-vars PROJECT_ID=${PROJECT_ID},REGION=${REGION}
    
    cd ..
@@ -583,13 +429,15 @@ EOF
 1. **Upload a test video and verify end-to-end processing**:
 
    ```bash
-   # Create a test video file (or use an existing one)
+   # Create a small test video file or download a sample
    echo "Uploading test video to trigger the analytics pipeline..."
    
    # Upload test video (replace with actual video file)
-   gsutil cp sample-video.mp4 gs://${BUCKET_NAME}/test-videos/
+   # Note: Use a real video file for actual testing
+   echo "Please upload a video file to test the pipeline:"
+   echo "gsutil cp your-test-video.mp4 gs://${BUCKET_NAME}/test-videos/"
    
-   echo "✅ Test video uploaded to: gs://${BUCKET_NAME}/test-videos/"
+   echo "✅ Upload command provided for test video"
    ```
 
    Expected output: Video upload triggers Cloud Function processing and initiates Vertex AI analysis.
@@ -599,13 +447,17 @@ EOF
    ```bash
    # Check Cloud Function logs
    gcloud functions logs read ${FUNCTION_NAME} \
+       --gen2 \
+       --region ${REGION} \
        --limit 50 \
-       --format="table(timestamp,level,message)"
+       --format="table(timestamp,severity,textPayload)"
    
-   # Check advanced analytics function logs
-   gcloud functions logs read advanced-video-analytics-${RANDOM_SUFFIX} \
+   # Check results processing function logs
+   gcloud functions logs read results-processor-${RANDOM_SUFFIX} \
+       --gen2 \
+       --region ${REGION} \
        --limit 50 \
-       --format="table(timestamp,level,message)"
+       --format="table(timestamp,severity,textPayload)"
    ```
 
    Expected output: Function execution logs showing successful video processing initiation.
@@ -618,24 +470,30 @@ EOF
    gsutil ls gs://${RESULTS_BUCKET}/insights/
    gsutil ls gs://${RESULTS_BUCKET}/summaries/
    
-   # View sample insights
-   gsutil cat gs://${RESULTS_BUCKET}/insights/*_insights.json | head -20
+   # View sample insights (if available)
+   echo "Sample insights files:"
+   gsutil ls gs://${RESULTS_BUCKET}/insights/*.json | head -1 | \
+       xargs gsutil cat 2>/dev/null || echo "No insights files found yet"
    ```
 
    Expected output: JSON files containing video analytics results, insights, and summaries.
 
-4. **Test Media CDN content delivery performance**:
+4. **Test Media CDN configuration status**:
 
    ```bash
-   # Check CDN configuration status
-   gcloud compute network-edge-security-services list
+   # Check EdgeCacheOrigin and EdgeCacheService status
+   gcloud network-services edge-cache-origins list \
+       --region=${REGION}
+   
+   gcloud network-services edge-cache-services list \
+       --region=${REGION}
    
    # Test video accessibility through storage
-   gsutil ls -l gs://${BUCKET_NAME}/test-videos/
+   gsutil ls -l gs://${BUCKET_NAME}/
    
    echo "📊 Media CDN Performance Test:"
-   echo "Access your video content through the configured CDN endpoint"
-   echo "Monitor cache hit ratios in Cloud Console > Media CDN"
+   echo "Configure routing rules in Cloud Console to complete CDN setup"
+   echo "Monitor cache hit ratios in Cloud Console > Network Services > Media CDN"
    ```
 
 ## Cleanup
@@ -644,24 +502,32 @@ EOF
 
    ```bash
    # Delete all created Cloud Functions
-   gcloud functions delete ${FUNCTION_NAME} --quiet
-   gcloud functions delete advanced-video-analytics-${RANDOM_SUFFIX} --quiet
-   gcloud functions delete results-processor-${RANDOM_SUFFIX} --quiet
+   gcloud functions delete ${FUNCTION_NAME} \
+       --gen2 \
+       --region ${REGION} \
+       --quiet
+   
+   gcloud functions delete results-processor-${RANDOM_SUFFIX} \
+       --gen2 \
+       --region ${REGION} \
+       --quiet
    
    echo "✅ Cloud Functions deleted"
    ```
 
-2. **Remove Vertex AI resources and datasets**:
+2. **Remove Media CDN configuration**:
 
    ```bash
-   # Delete Vertex AI dataset
-   if [ ! -z "${DATASET_ID}" ]; then
-       gcloud ai datasets delete ${DATASET_ID} \
-           --region=${REGION} \
-           --quiet
-   fi
+   # Remove Media CDN edge cache service and origin
+   gcloud network-services edge-cache-services delete ${CDN_SERVICE_NAME} \
+       --region=${REGION} \
+       --quiet
    
-   echo "✅ Vertex AI resources cleaned up"
+   gcloud network-services edge-cache-origins delete ${CDN_SERVICE_NAME}-origin \
+       --region=${REGION} \
+       --quiet
+   
+   echo "✅ Media CDN resources cleaned up"
    ```
 
 3. **Remove Cloud Storage buckets and all content**:
@@ -674,27 +540,25 @@ EOF
    echo "✅ Storage buckets and content deleted"
    ```
 
-4. **Clean up Media CDN configuration**:
+4. **Clean up environment variables**:
 
    ```bash
-   # Remove Media CDN edge security services
-   gcloud compute network-edge-security-services delete ${CDN_SERVICE_NAME}-origin \
-       --region=${REGION} \
-       --quiet
+   # Unset environment variables
+   unset PROJECT_ID REGION ZONE RANDOM_SUFFIX
+   unset BUCKET_NAME RESULTS_BUCKET FUNCTION_NAME CDN_SERVICE_NAME
    
-   echo "✅ Media CDN resources cleaned up"
-   echo "Note: Complete Media CDN cleanup may require manual steps in Cloud Console"
+   echo "✅ Environment variables cleaned up"
    ```
 
 ## Discussion
 
-This recipe demonstrates how to orchestrate an intelligent edge-to-cloud video analytics pipeline that combines Google Cloud's Media CDN global distribution capabilities with Vertex AI's advanced video analysis features. The architecture leverages Cloud Storage as the central data repository, Cloud Functions for event-driven automation, and Vertex AI for sophisticated content analysis including object detection and content classification.
+This recipe demonstrates how to orchestrate an intelligent edge-to-cloud video analytics pipeline that combines Google Cloud's Media CDN global distribution capabilities with Vertex AI's Video Intelligence API for advanced video analysis. The architecture leverages Cloud Storage as the central data repository, Cloud Functions for event-driven automation, and the Video Intelligence API for sophisticated content analysis including object detection, label detection, and content classification.
 
-The solution addresses the growing need for automated video content analysis at scale while maintaining optimal delivery performance for global audiences. Media CDN's edge caching capabilities, with over 100Tbps of global capacity and cache hit ratios averaging 98.5-99% for video-on-demand content, ensure that video content is delivered with minimal latency worldwide. Meanwhile, Vertex AI's pre-trained video intelligence models provide accurate object detection, activity recognition, and content classification without requiring custom model development.
+The solution addresses the growing need for automated video content analysis at scale while maintaining optimal delivery performance for global audiences. Media CDN's edge caching capabilities, with over 100Tbps of global capacity and cache hit ratios averaging 98.5-99% for video-on-demand content, ensure that video content is delivered with minimal latency worldwide. Meanwhile, Vertex AI's Video Intelligence API provides accurate object detection, activity recognition, and content classification without requiring custom model development.
 
-The event-driven architecture using Cloud Functions creates a seamless automation pipeline that processes videos as soon as they're uploaded to Cloud Storage. This serverless approach ensures cost-effective scaling, as resources are only consumed during actual processing operations. The integration with Vertex AI Video Intelligence API enables sophisticated analysis capabilities including object tracking, label detection, shot change detection, and text recognition, providing comprehensive insights into video content.
+The event-driven architecture using Cloud Functions creates a seamless automation pipeline that processes videos as soon as they're uploaded to Cloud Storage. This serverless approach ensures cost-effective scaling, as resources are only consumed during actual processing operations. The integration with Video Intelligence API enables sophisticated analysis capabilities including object tracking, label detection, shot change detection, and text recognition, providing comprehensive insights into video content.
 
-One of the key architectural decisions involves separating content storage from analytics results storage, which enables different access patterns and security policies for each data type. The pipeline also implements comprehensive metadata tracking and results processing, creating searchable insights and summary reports that make analytics results immediately actionable for content creators and media organizations.
+One of the key architectural decisions involves separating content storage from analytics results storage, which enables different access patterns and security policies for each data type. The pipeline also implements comprehensive metadata tracking and results processing, creating searchable insights and summary reports that make analytics results immediately actionable for content creators and media organizations. The use of Cloud Functions Gen 2 provides improved performance, better scaling characteristics, and enhanced event handling for the video processing workflow.
 
 > **Note**: This architecture follows Google Cloud's Well-Architected Framework principles, emphasizing operational excellence, security, reliability, and cost optimization. For production deployments, consider implementing additional monitoring, alerting, and security controls. See the [Google Cloud Architecture Center](https://cloud.google.com/architecture) for advanced patterns and best practices.
 

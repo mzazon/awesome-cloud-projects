@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Scheduler, Cloud Filestore, Cloud Functions, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: multi-tenant, resource-scheduling, automation, devops, cloud-orchestration
 recipe-generator-version: 1.3
@@ -298,16 +298,16 @@ def send_allocation_metrics(tenant_id, capacity, status):
         logging.error(f"Failed to send metrics: {str(e)}")
 EOF
    
-   # Create requirements file
+   # Create requirements file with updated versions
    cat > requirements.txt << 'EOF'
-google-cloud-monitoring==2.16.0
-google-cloud-logging==3.8.0
-functions-framework==3.4.0
+google-cloud-monitoring==2.27.2
+google-cloud-logging==3.11.2
+functions-framework==3.8.1
 EOF
    
    # Deploy the Cloud Function
    gcloud functions deploy resource-scheduler-${RESOURCE_SUFFIX} \
-       --runtime=python311 \
+       --runtime=python312 \
        --trigger=http \
        --entry-point=schedule_tenant_resources \
        --memory=512MB \
@@ -450,7 +450,8 @@ EOF
        --region=${REGION} \
        --format="value(httpsTrigger.url)")
    
-   # Test tenant A resource request
+   # Test tenant A resource request (should succeed)
+   echo "Testing successful tenant A resource request..."
    curl -X POST ${FUNCTION_URL} \
        -H "Content-Type: application/json" \
        -d '{
@@ -460,7 +461,8 @@ EOF
            "duration": 4
        }' | jq '.'
    
-   # Test tenant B resource request
+   # Test tenant B resource request (should succeed)
+   echo "Testing successful tenant B resource request..."
    curl -X POST ${FUNCTION_URL} \
        -H "Content-Type: application/json" \
        -d '{
@@ -470,7 +472,8 @@ EOF
            "duration": 2
        }' | jq '.'
    
-   # Test quota violation scenario
+   # Test quota violation scenario (should be denied)
+   echo "Testing quota violation scenario..."
    curl -X POST ${FUNCTION_URL} \
        -H "Content-Type: application/json" \
        -d '{
@@ -586,6 +589,7 @@ EOF
    
    # Note: Alert policies and dashboards can be deleted via Cloud Console
    echo "✅ Cleaned up local files and resources"
+   echo "Note: Alert policies and dashboards may need manual deletion via Cloud Console"
    ```
 
 ## Discussion

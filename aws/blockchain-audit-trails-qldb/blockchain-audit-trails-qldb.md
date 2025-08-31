@@ -4,19 +4,18 @@ id: d34ab64a
 category: blockchain
 difficulty: 400
 subject: aws
-services: QLDB, CloudTrail, IAM, KMS
+services: QLDB, CloudTrail, IAM, EventBridge
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: blockchain, compliance, audit, immutable-ledger
 recipe-generator-version: 1.3
 ---
 
-# Blockchain Audit Trails for Compliance
-
+# Blockchain Audit Trails for Compliance with QLDB
 
 ## Problem
 
@@ -224,6 +223,9 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
        --policy-name ${LAMBDA_FUNCTION_NAME}-policy \
        --policy-document file:///tmp/lambda-custom-policy.json
    
+   # Wait for role propagation
+   sleep 10
+   
    # Get role ARN
    LAMBDA_ROLE_ARN=$(aws iam get-role \
        --role-name ${LAMBDA_FUNCTION_NAME}-role \
@@ -245,6 +247,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    import boto3
    import hashlib
    import datetime
+   import os
    from botocore.exceptions import ClientError
    
    qldb_client = boto3.client('qldb')
@@ -260,7 +263,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
            ledger_name = os.environ['LEDGER_NAME']
            store_audit_record(ledger_name, audit_record)
            
-           # Generate compliance report
+           # Generate compliance metrics
            generate_compliance_metrics(audit_record)
            
            return {
@@ -329,10 +332,10 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    cd /tmp
    zip audit_processor.zip audit_processor.py
    
-   # Create Lambda function
+   # Create Lambda function with current Python runtime
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler audit_processor.lambda_handler \
        --zip-file fileb://audit_processor.zip \
@@ -380,7 +383,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    echo "✅ CloudTrail ARN: ${CLOUDTRAIL_ARN}"
    ```
 
-   CloudTrail is now actively logging all API activities across your AWS environment with log file validation enabled for cryptographic integrity verification. This establishes the comprehensive audit trail foundation required for compliance frameworks, capturing the detailed activity logs that will be processed into immutable records. Learn more about [CloudTrail compliance capabilities](https://docs.aws.amazon.com/awscloudtrail/latest/userguide/CloudTrail-compliance.html).
+   CloudTrail is now actively logging all API activities across your AWS environment with log file validation enabled for cryptographic integrity verification. This establishes the comprehensive audit trail foundation required for compliance frameworks, capturing the detailed activity logs that will be processed into immutable records. Learn more about [CloudTrail compliance capabilities](https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-compliance.html).
 
 5. **Create EventBridge Rule for Real-time Processing**:
 
@@ -549,6 +552,9 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
        --policy-name compliance-firehose-policy \
        --policy-document file:///tmp/firehose-policy.json
    
+   # Wait for role propagation
+   sleep 10
+   
    # Get Firehose role ARN
    FIREHOSE_ROLE_ARN=$(aws iam get-role \
        --role-name compliance-firehose-role \
@@ -714,8 +720,8 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
     if __name__ == "__main__":
         import sys
         ledger_name = sys.argv[1] if len(sys.argv) > 1 else "test-ledger"
-        start_date = "2024-01-01"
-        end_date = "2024-12-31"
+        start_date = "2025-01-01"
+        end_date = "2025-12-31"
         
         report = generate_compliance_report(ledger_name, start_date, end_date)
         if report:
@@ -756,11 +762,11 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    # Test CloudTrail logging
    aws cloudtrail get-trail-status --name ${CLOUDTRAIL_NAME}
    
-   # Check if events are being logged
+   # Check if events are being logged (adjust dates as needed)
    aws cloudtrail lookup-events \
        --lookup-attributes AttributeKey=EventName,AttributeValue=CreateRole \
-       --start-time 2024-01-01T00:00:00Z \
-       --end-time 2024-12-31T23:59:59Z
+       --start-time 2025-01-01T00:00:00Z \
+       --end-time 2025-12-31T23:59:59Z
    ```
 
 3. **Verify Lambda Function Processing**:
@@ -901,9 +907,11 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
 
 This solution creates a comprehensive blockchain-based audit trail system that addresses critical compliance requirements across multiple regulatory frameworks. Amazon QLDB provides cryptographically verifiable immutable records, ensuring that audit data cannot be tampered with retroactively—a key requirement for SOX compliance and financial auditing standards. The integration with CloudTrail captures all API activities, while EventBridge enables real-time processing and alerting for compliance violations.
 
-The architecture demonstrates several key compliance advantages: immutable audit trails with cryptographic verification, real-time monitoring and alerting, automated compliance reporting, and tamper-evident data storage. The QLDB digest feature provides cryptographic proof of data integrity, allowing auditors to verify that records have not been altered since creation. This is particularly valuable for PCI-DSS compliance, where payment card data access must be logged and verified.
+The architecture demonstrates several key compliance advantages: immutable audit trails with cryptographic verification, real-time monitoring and alerting, automated compliance reporting, and tamper-evident data storage. The QLDB digest feature provides cryptographic proof of data integrity, allowing auditors to verify that records have not been altered since creation. This is particularly valuable for PCI-DSS compliance, where payment card data access must be logged and verified. Learn more about the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles applied in this solution.
 
-The solution also addresses the challenge of audit data retention and analysis. By streaming audit records to S3 via Kinesis Data Firehose and enabling analysis through Athena, organizations can perform complex compliance queries across large datasets while maintaining cost-effectiveness. The integration with CloudWatch provides operational visibility and ensures that audit processing failures are immediately detected and addressed.
+The solution also addresses the challenge of audit data retention and analysis. By streaming audit records to S3 via Kinesis Data Firehose and enabling analysis through Athena, organizations can perform complex compliance queries across large datasets while maintaining cost-effectiveness. The integration with CloudWatch provides operational visibility and ensures that audit processing failures are immediately detected and addressed, following [AWS security best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html).
+
+> **Note**: Given QLDB's deprecation, organizations should plan migration to [Amazon Aurora PostgreSQL with audit capabilities](https://aws.amazon.com/blogs/database/migrate-an-amazon-qldb-ledger-to-amazon-aurora-postgresql/) before the July 31, 2025 end-of-support date. This solution provides a blueprint for implementing similar audit trails using Aurora's native audit features and immutable storage capabilities.
 
 ## Challenge
 

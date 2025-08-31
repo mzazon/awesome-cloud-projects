@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Container Apps, Azure Key Vault, Azure Container Registry, Azure Monitor
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: containers, security, microservices, serverless, devops
 recipe-generator-version: 1.3
@@ -81,12 +81,13 @@ graph TB
 
 ```bash
 # Set environment variables for consistent resource naming
-export RESOURCE_GROUP="rg-secure-containers-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for globally unique resource names
-RANDOM_SUFFIX=$(openssl rand -hex 3)
+export RANDOM_SUFFIX=$(openssl rand -hex 3)
+
+export RESOURCE_GROUP="rg-secure-containers-${RANDOM_SUFFIX}"
 
 # Set specific resource names
 export ACR_NAME="acrsecure${RANDOM_SUFFIX}"
@@ -332,15 +333,15 @@ echo "✅ Log Analytics workspace created for monitoring"
        --name ${APP_NAME_1} \
        --resource-group ${RESOURCE_GROUP} \
        --secrets "db-connection=keyvaultref:${KEY_VAULT_ID}/secrets/DatabaseConnectionString,identityref:system" \
-       "api-key=keyvaultref:${KEY_VAULT_ID}/secrets/ApiKey,identityref:system"
+                 "api-key=keyvaultref:${KEY_VAULT_ID}/secrets/ApiKey,identityref:system"
 
    # Add environment variables that reference the secrets
    az containerapp update \
        --name ${APP_NAME_1} \
        --resource-group ${RESOURCE_GROUP} \
        --set-env-vars "DATABASE_CONNECTION=secretref:db-connection" \
-       "API_KEY=secretref:api-key" \
-       "ENVIRONMENT=Production"
+                      "API_KEY=secretref:api-key" \
+                      "ENVIRONMENT=Production"
 
    echo "✅ Key Vault secrets integrated with Container App"
    ```
@@ -367,11 +368,15 @@ echo "✅ Log Analytics workspace created for monitoring"
        --set-env-vars "APPLICATIONINSIGHTS_CONNECTION_STRING=InstrumentationKey=${APP_INSIGHTS_KEY}"
 
    # Create metric alert for high CPU usage
+   CONTAINER_APP_ID=$(az containerapp show \
+       --name ${APP_NAME_1} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query id --output tsv)
+   
    az monitor metrics alert create \
        --name "high-cpu-alert" \
        --resource-group ${RESOURCE_GROUP} \
-       --scopes $(az containerapp show --name ${APP_NAME_1} \
-           --resource-group ${RESOURCE_GROUP} --query id --output tsv) \
+       --scopes ${CONTAINER_APP_ID} \
        --condition "avg CPU > 80" \
        --window-size 5m \
        --evaluation-frequency 1m \
@@ -436,9 +441,13 @@ echo "✅ Log Analytics workspace created for monitoring"
        --time-span PT1H
    
    # Check metrics availability
+   CONTAINER_APP_ID=$(az containerapp show \
+       --name ${APP_NAME_1} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query id --output tsv)
+   
    az monitor metrics list-definitions \
-       --resource $(az containerapp show --name ${APP_NAME_1} \
-           --resource-group ${RESOURCE_GROUP} --query id --output tsv)
+       --resource ${CONTAINER_APP_ID}
    ```
 
    Expected output: Recent log entries and available metrics like CPU, memory, and request count.
@@ -468,6 +477,8 @@ echo "✅ Log Analytics workspace created for monitoring"
    unset RESOURCE_GROUP LOCATION SUBSCRIPTION_ID RANDOM_SUFFIX
    unset ACR_NAME KEY_VAULT_NAME ENVIRONMENT_NAME LOG_ANALYTICS_NAME
    unset APP_NAME_1 APP_NAME_2 API_IDENTITY WORKER_IDENTITY
+   unset LOG_ANALYTICS_ID LOG_ANALYTICS_KEY KEY_VAULT_ID
+   unset APP_INSIGHTS_KEY CONTAINER_APP_ID
    
    echo "✅ Local environment cleaned up"
    ```

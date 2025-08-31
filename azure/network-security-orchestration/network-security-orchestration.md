@@ -4,12 +4,12 @@ id: b4a7c3e9
 category: security
 difficulty: 200
 subject: azure
-services: Azure Logic Apps, Azure Network Security Groups, Azure Monitor, Azure Key Vault
+services: Logic Apps, Network Security Groups, Monitor, Key Vault
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: security orchestration, network security, automation, threat response, compliance
 recipe-generator-version: 1.3
@@ -82,7 +82,7 @@ graph TB
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-security-orchestration"
+export RESOURCE_GROUP="rg-security-orchestration-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
@@ -226,51 +226,56 @@ echo "✅ Log Analytics workspace created for security monitoring"
    Azure Logic Apps provides a powerful low-code platform for creating sophisticated security orchestration workflows that can integrate with multiple data sources, threat intelligence feeds, and Azure services. This workflow engine enables automated decision-making and response actions based on predefined security policies and real-time threat intelligence.
 
    ```bash
-   # Create Logic Apps resource
+   # Create workflow definition file
+   cat > workflow-definition.json << EOF
+   {
+     "\$schema": "https://schema.management.azure.com/schemas/2016-06-01/Microsoft.Logic.json",
+     "contentVersion": "1.0.0.0",
+     "parameters": {},
+     "triggers": {
+       "manual": {
+         "type": "Request",
+         "kind": "Http",
+         "inputs": {
+           "schema": {
+             "properties": {
+               "threatType": {"type": "string"},
+               "sourceIP": {"type": "string"},
+               "severity": {"type": "string"},
+               "action": {"type": "string"}
+             },
+             "type": "object"
+           }
+         }
+       }
+     },
+     "actions": {
+       "Parse_Security_Event": {
+         "type": "ParseJson",
+         "inputs": {
+           "content": "@triggerBody()",
+           "schema": {
+             "properties": {
+               "threatType": {"type": "string"},
+               "sourceIP": {"type": "string"},
+               "severity": {"type": "string"},
+               "action": {"type": "string"}
+             },
+             "type": "object"
+           }
+         }
+       }
+     },
+     "outputs": {}
+   }
+   EOF
+   
+   # Create Logic Apps resource with definition file
    az logic workflow create \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --definition '{
-         "$schema": "https://schema.management.azure.com/schemas/2016-06-01/Microsoft.Logic.json",
-         "contentVersion": "1.0.0.0",
-         "parameters": {},
-         "triggers": {
-           "manual": {
-             "type": "Request",
-             "kind": "Http",
-             "inputs": {
-               "schema": {
-                 "properties": {
-                   "threatType": {"type": "string"},
-                   "sourceIP": {"type": "string"},
-                   "severity": {"type": "string"},
-                   "action": {"type": "string"}
-                 },
-                 "type": "object"
-               }
-             }
-           }
-         },
-         "actions": {
-           "Parse_Security_Event": {
-             "type": "ParseJson",
-             "inputs": {
-               "content": "@triggerBody()",
-               "schema": {
-                 "properties": {
-                   "threatType": {"type": "string"},
-                   "sourceIP": {"type": "string"},
-                   "severity": {"type": "string"},
-                   "action": {"type": "string"}
-                 },
-                 "type": "object"
-               }
-             }
-           }
-         },
-         "outputs": {}
-       }'
+       --definition @workflow-definition.json
    
    echo "✅ Logic Apps workflow created for security orchestration"
    ```
@@ -282,14 +287,18 @@ echo "✅ Log Analytics workspace created for security monitoring"
    Azure Monitor provides comprehensive monitoring and alerting capabilities that enable real-time detection of security events and anomalies across Azure resources. Integrating Monitor with the Logic Apps workflow creates an automated pipeline that can respond to security incidents within seconds of detection.
 
    ```bash
+   # Get Logic Apps callback URL first
+   CALLBACK_URL=$(az logic workflow show \
+       --name ${LOGIC_APP_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query "accessEndpoint" --output tsv)
+   
    # Create action group for Logic Apps integration
    az monitor action-group create \
        --name "SecurityOrchestrationActions" \
        --resource-group ${RESOURCE_GROUP} \
        --short-name "SecOrch" \
-       --action webhook \
-       --webhook-receiver-name "LogicAppsTrigger" \
-       --webhook-service-uri "https://logic-apps-trigger-url"
+       --action webhook LogicAppsTrigger "${CALLBACK_URL}"
    
    # Create alert rule for suspicious network activity
    az monitor metrics alert create \
@@ -312,63 +321,67 @@ echo "✅ Log Analytics workspace created for security monitoring"
    This step creates the core automation logic that dynamically updates Network Security Group rules based on threat intelligence and security events. The Logic Apps workflow uses Azure REST APIs to programmatically modify network security rules, enabling rapid response to emerging threats while maintaining comprehensive audit trails.
 
    ```bash
-   # Get Logic Apps callback URL for webhook integration
-   CALLBACK_URL=$(az logic workflow show \
-       --name ${LOGIC_APP_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --query "accessEndpoint" --output tsv)
-   
-   # Update Logic Apps definition with NSG automation actions
-   az logic workflow update \
-       --name ${LOGIC_APP_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --definition '{
-         "$schema": "https://schema.management.azure.com/schemas/2016-06-01/Microsoft.Logic.json",
-         "contentVersion": "1.0.0.0",
-         "parameters": {},
-         "triggers": {
-           "manual": {
-             "type": "Request",
-             "kind": "Http"
+   # Create advanced workflow definition with NSG automation
+   cat > advanced-workflow-definition.json << EOF
+   {
+     "\$schema": "https://schema.management.azure.com/schemas/2016-06-01/Microsoft.Logic.json",
+     "contentVersion": "1.0.0.0",
+     "parameters": {},
+     "triggers": {
+       "manual": {
+         "type": "Request",
+         "kind": "Http"
+       }
+     },
+     "actions": {
+       "Parse_Security_Event": {
+         "type": "ParseJson",
+         "inputs": {
+           "content": "@triggerBody()",
+           "schema": {
+             "properties": {
+               "threatType": {"type": "string"},
+               "sourceIP": {"type": "string"},
+               "severity": {"type": "string"},
+               "action": {"type": "string"}
+             },
+             "type": "object"
            }
-         },
-         "actions": {
-           "Get_Key_Vault_Secret": {
-             "type": "ApiConnection",
-             "inputs": {
-               "host": {
-                 "connection": {
-                   "name": "@parameters('\''$connections'\'')[\''keyvault'\''][\''connectionId'\'']"
-                 }
-               },
-               "method": "get",
-               "path": "/secrets/@{encodeURIComponent('\''ThreatIntelApiKey'\'')}/value"
-             }
+         }
+       },
+       "Block_Malicious_IP": {
+         "type": "Http",
+         "inputs": {
+           "method": "PUT",
+           "uri": "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/networkSecurityGroups/${NSG_NAME}/securityRules/BlockMaliciousIP-@{rand(1000,9999)}?api-version=2023-09-01",
+           "headers": {
+             "Authorization": "Bearer @{listKeys(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities/', '${LOGIC_APP_NAME}'), '2023-01-31').principalId}",
+             "Content-Type": "application/json"
            },
-           "Block_Malicious_IP": {
-             "type": "Http",
-             "inputs": {
-               "method": "PUT",
-               "uri": "https://management.azure.com/subscriptions/'${SUBSCRIPTION_ID}'/resourceGroups/'${RESOURCE_GROUP}'/providers/Microsoft.Network/networkSecurityGroups/'${NSG_NAME}'/securityRules/BlockMaliciousIP",
-               "headers": {
-                 "Authorization": "Bearer @{body('\''Get_Access_Token'\'')['\''access_token'\'']}"
-               },
-               "body": {
-                 "properties": {
-                   "priority": 100,
-                   "direction": "Inbound",
-                   "access": "Deny",
-                   "protocol": "*",
-                   "sourceAddressPrefix": "@{triggerBody()['\''sourceIP'\'']}",
-                   "destinationAddressPrefix": "*",
-                   "sourcePortRange": "*",
-                   "destinationPortRange": "*"
-                 }
-               }
+           "body": {
+             "properties": {
+               "priority": 100,
+               "direction": "Inbound",
+               "access": "Deny",
+               "protocol": "*",
+               "sourceAddressPrefix": "@{body('Parse_Security_Event')['sourceIP']}",
+               "destinationAddressPrefix": "*",
+               "sourcePortRange": "*",
+               "destinationPortRange": "*"
              }
            }
          }
-       }'
+       }
+     }
+   }
+   EOF
+   
+   # Update Logic Apps definition with NSG automation actions
+   az logic workflow create \
+       --name ${LOGIC_APP_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
+       --definition @advanced-workflow-definition.json
    
    echo "✅ NSG automation logic configured in Logic Apps"
    ```
@@ -406,23 +419,8 @@ echo "✅ Log Analytics workspace created for security monitoring"
    az monitor log-analytics workspace table create \
        --workspace-name ${LOG_ANALYTICS_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --name "SecurityOrchestrationEvents" \
-       --columns '[{
-         "name": "TimeGenerated",
-         "type": "datetime"
-       }, {
-         "name": "ThreatType",
-         "type": "string"
-       }, {
-         "name": "SourceIP",
-         "type": "string"
-       }, {
-         "name": "Action",
-         "type": "string"
-       }, {
-         "name": "Severity",
-         "type": "string"
-       }]'
+       --name "SecurityOrchestrationEvents_CL" \
+       --columns TimeGenerated=datetime ThreatType=string SourceIP=string Action=string Severity=string
    
    echo "✅ Compliance monitoring and reporting configured"
    ```
@@ -454,6 +452,12 @@ echo "✅ Log Analytics workspace created for security monitoring"
 2. **Test Network Security Group Rule Creation**:
 
    ```bash
+   # Get Logic Apps callback URL for testing
+   CALLBACK_URL=$(az logic workflow show \
+       --name ${LOGIC_APP_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query "accessEndpoint" --output tsv)
+   
    # Trigger Logic Apps workflow with test security event
    curl -X POST \
        "${CALLBACK_URL}" \
@@ -465,11 +469,13 @@ echo "✅ Log Analytics workspace created for security monitoring"
          "action": "block"
        }'
    
-   # Verify NSG rule was created
-   az network nsg rule show \
+   # Wait for processing
+   sleep 30
+   
+   # List NSG rules to verify creation
+   az network nsg rule list \
        --nsg-name ${NSG_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --name "BlockMaliciousIP" \
        --output table
    ```
 
@@ -481,7 +487,7 @@ echo "✅ Log Analytics workspace created for security monitoring"
    # Check Log Analytics workspace logs
    az monitor log-analytics query \
        --workspace "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${LOG_ANALYTICS_NAME}" \
-       --analytics-query "SecurityOrchestrationEvents | take 10" \
+       --analytics-query "SecurityOrchestrationEvents_CL | take 10" \
        --output table
    
    # Verify diagnostic settings are active
@@ -550,6 +556,9 @@ echo "✅ Log Analytics workspace created for security monitoring"
    
    echo "✅ Resource group deletion initiated: ${RESOURCE_GROUP}"
    echo "Note: Deletion may take several minutes to complete"
+   
+   # Clean up local files
+   rm -f workflow-definition.json advanced-workflow-definition.json
    ```
 
 ## Discussion

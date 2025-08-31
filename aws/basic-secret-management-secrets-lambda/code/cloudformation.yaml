@@ -1,0 +1,560 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template for Basic Secret Management with AWS Secrets Manager and Lambda.
+  This template creates a Lambda function that securely retrieves secrets using the 
+  AWS Parameters and Secrets Lambda Extension with proper IAM permissions and encryption.
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Secret Configuration"
+        Parameters:
+          - SecretDescription
+          - DatabaseHost
+          - DatabasePort
+          - DatabaseName
+          - DatabaseUsername
+          - DatabasePassword
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaTimeout
+          - LambdaMemorySize
+          - ExtensionCacheEnabled
+          - ExtensionCacheTTL
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      SecretDescription:
+        default: "Secret Description"
+      DatabaseHost:
+        default: "Database Host"
+      DatabasePort:
+        default: "Database Port"
+      DatabaseName:
+        default: "Database Name"
+      DatabaseUsername:
+        default: "Database Username"
+      DatabasePassword:
+        default: "Database Password"
+      LambdaRuntime:
+        default: "Lambda Runtime"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      ExtensionCacheEnabled:
+        default: "Enable Extension Caching"
+      ExtensionCacheTTL:
+        default: "Extension Cache TTL (seconds)"
+
+# Template Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Default: secret-demo
+    Description: Name prefix for all resources
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name (dev, test, prod)
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: Must be one of dev, test, staging, or prod
+
+  SecretDescription:
+    Type: String
+    Default: Sample application secrets for Lambda demo
+    Description: Description for the secret stored in Secrets Manager
+    MaxLength: 255
+
+  DatabaseHost:
+    Type: String
+    Default: mydb.cluster-xyz.us-east-1.rds.amazonaws.com
+    Description: Database hostname or endpoint
+    MinLength: 1
+    MaxLength: 255
+
+  DatabasePort:
+    Type: Number
+    Default: 5432
+    Description: Database port number
+    MinValue: 1
+    MaxValue: 65535
+
+  DatabaseName:
+    Type: String
+    Default: production
+    Description: Database name
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9_]*$
+    ConstraintDescription: Must start with a letter and contain only letters, numbers, and underscores
+
+  DatabaseUsername:
+    Type: String
+    Default: appuser
+    Description: Database username
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9_]*$
+    ConstraintDescription: Must start with a letter and contain only letters, numbers, and underscores
+
+  DatabasePassword:
+    Type: String
+    Default: secure-random-password-123
+    Description: Database password (will be stored encrypted in Secrets Manager)
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+    ConstraintDescription: Must be between 8 and 128 characters
+
+  LambdaRuntime:
+    Type: String
+    Default: python3.11
+    Description: Lambda function runtime version
+    AllowedValues:
+      - python3.9
+      - python3.10
+      - python3.11
+      - python3.12
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: Lambda function timeout in seconds
+    MinValue: 3
+    MaxValue: 900
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: Lambda function memory size in MB
+    AllowedValues: [128, 256, 512, 1024, 1536, 2048, 3008]
+
+  ExtensionCacheEnabled:
+    Type: String
+    Default: true
+    Description: Enable caching in the AWS Parameters and Secrets Lambda Extension
+    AllowedValues: [true, false]
+
+  ExtensionCacheTTL:
+    Type: Number
+    Default: 300
+    Description: Cache TTL in seconds for the extension (5 minutes default)
+    MinValue: 60
+    MaxValue: 3600
+
+# Template Conditions
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  EnableExtensionCache: !Equals [!Ref ExtensionCacheEnabled, true]
+
+# Template Resources
+Resources:
+  # KMS Key for additional encryption (optional enhancement)
+  SecretsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for ${ProjectName} secrets encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Secrets Manager access
+            Effect: Allow
+            Principal:
+              Service: secretsmanager.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:ReEncrypt*
+            Resource: '*'
+          - Sid: Allow Lambda access
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-secrets-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # KMS Key Alias for easier reference
+  SecretsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}-secrets'
+      TargetKeyId: !Ref SecretsKMSKey
+
+  # Secrets Manager Secret
+  ApplicationSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-app-secrets'
+      Description: !Ref SecretDescription
+      KmsKeyId: !Ref SecretsKMSKey
+      SecretString: !Sub |
+        {
+          "database_host": "${DatabaseHost}",
+          "database_port": "${DatabasePort}",
+          "database_name": "${DatabaseName}",
+          "username": "${DatabaseUsername}",
+          "password": "${DatabasePassword}"
+        }
+      ReplicaRegions:
+        - Region: !If 
+            - IsProduction
+            - us-west-2
+            - !Ref AWS::NoValue
+          KmsKeyId: !If
+            - IsProduction
+            - alias/aws/secretsmanager
+            - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-secrets'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for Lambda Execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-secrets-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Secrets Manager permissions
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref ApplicationSecret
+              # KMS permissions for secret decryption
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt SecretsKMSKey.Arn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for Lambda
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-secret-demo'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Function
+  SecretDemoFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-secret-demo'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: !If [IsProduction, 10, 5]
+      Environment:
+        Variables:
+          SECRET_NAME: !Ref ApplicationSecret
+          PARAMETERS_SECRETS_EXTENSION_CACHE_ENABLED: !Ref ExtensionCacheEnabled
+          PARAMETERS_SECRETS_EXTENSION_CACHE_SIZE: '1000'
+          PARAMETERS_SECRETS_EXTENSION_MAX_CONNECTIONS: '3'
+          PARAMETERS_SECRETS_EXTENSION_HTTP_PORT: '2773'
+          PARAMETERS_SECRETS_EXTENSION_CACHE_TTL: !Ref ExtensionCacheTTL
+      Layers:
+        # AWS Parameters and Secrets Lambda Extension Layer
+        # Version 18 as of 2024 - this should be updated as new versions are released
+        - !Sub 'arn:aws:lambda:${AWS::Region}:177933569100:layer:AWS-Parameters-and-Secrets-Lambda-Extension:18'
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import urllib.error
+          import os
+          
+          # AWS Parameters and Secrets Lambda Extension HTTP endpoint
+          SECRETS_EXTENSION_HTTP_PORT = "2773"
+          SECRETS_EXTENSION_SERVER_PORT = os.environ.get(
+              'PARAMETERS_SECRETS_EXTENSION_HTTP_PORT', 
+              SECRETS_EXTENSION_HTTP_PORT
+          )
+          
+          def get_secret(secret_name):
+              """Retrieve secret using AWS Parameters and Secrets Lambda Extension"""
+              secrets_extension_endpoint = (
+                  f"http://localhost:{SECRETS_EXTENSION_SERVER_PORT}"
+                  f"/secretsmanager/get?secretId={secret_name}"
+              )
+              
+              # Add authentication header for the extension
+              headers = {
+                  'X-Aws-Parameters-Secrets-Token': os.environ.get('AWS_SESSION_TOKEN', '')
+              }
+              
+              try:
+                  req = urllib.request.Request(
+                      secrets_extension_endpoint, 
+                      headers=headers
+                  )
+                  with urllib.request.urlopen(req, timeout=10) as response:
+                      secret_data = response.read().decode('utf-8')
+                      return json.loads(secret_data)
+              except urllib.error.URLError as e:
+                  print(f"Error retrieving secret from extension: {e}")
+                  raise
+              except json.JSONDecodeError as e:
+                  print(f"Error parsing secret JSON: {e}")
+                  raise
+              except Exception as e:
+                  print(f"Unexpected error in get_secret: {e}")
+                  raise
+          
+          def lambda_handler(event, context):
+              """Main Lambda function handler"""
+              secret_name = os.environ.get('SECRET_NAME')
+              
+              if not secret_name:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({
+                          'error': 'SECRET_NAME environment variable not set'
+                      })
+                  }
+              
+              try:
+                  # Retrieve secret using the extension
+                  print(f"Attempting to retrieve secret: {secret_name}")
+                  secret_response = get_secret(secret_name)
+                  secret_value = json.loads(secret_response['SecretString'])
+                  
+                  # Use secret values (example: database connection info)
+                  db_host = secret_value.get('database_host', 'Not found')
+                  db_name = secret_value.get('database_name', 'Not found')
+                  username = secret_value.get('username', 'Not found')
+                  
+                  print(f"Successfully retrieved secret for database: {db_name}")
+                  
+                  # In a real application, you would use these values to connect
+                  # to your database or external service
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Secret retrieved successfully',
+                          'database_host': db_host,
+                          'database_name': db_name,
+                          'username': username,
+                          'extension_cache': f"Enabled with {os.environ.get('PARAMETERS_SECRETS_EXTENSION_CACHE_TTL', '300')}s TTL" if os.environ.get('PARAMETERS_SECRETS_EXTENSION_CACHE_ENABLED') == 'true' else 'Disabled',
+                          'note': 'Password retrieved but not displayed for security'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in lambda_handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'details': str(e)
+                      })
+                  }
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Dead Letter Queue for Lambda error handling
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-lambda-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-dlq'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM permissions for Lambda to access Dead Letter Queue
+  LambdaDLQPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: DeadLetterQueueAccess
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt DeadLetterQueue.Arn
+      Roles:
+        - !Ref LambdaExecutionRole
+
+  # CloudWatch Alarms for monitoring
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-lambda-errors'
+      AlarmDescription: 'Lambda function error rate alarm'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SecretDemoFunction
+      TreatMissingData: notBreaching
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-lambda-duration'
+      AlarmDescription: 'Lambda function duration alarm'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 25000  # 25 seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SecretDemoFunction
+      TreatMissingData: notBreaching
+
+# Template Outputs
+Outputs:
+  SecretArn:
+    Description: ARN of the created secret in Secrets Manager
+    Value: !Ref ApplicationSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-SecretArn'
+
+  SecretName:
+    Description: Name of the created secret in Secrets Manager
+    Value: !Ref ApplicationSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-SecretName'
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt SecretDemoFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaArn'
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref SecretDemoFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaName'
+
+  IAMRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  KMSKeyId:
+    Description: ID of the KMS key used for secret encryption
+    Value: !Ref SecretsKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyId'
+
+  KMSKeyAlias:
+    Description: Alias of the KMS key used for secret encryption
+    Value: !Ref SecretsKMSKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyAlias'
+
+  LogGroupName:
+    Description: CloudWatch Log Group name for the Lambda function
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  TestCommand:
+    Description: AWS CLI command to test the Lambda function
+    Value: !Sub |
+      aws lambda invoke --function-name ${SecretDemoFunction} --payload '{}' response.json && cat response.json
+
+  CleanupInstructions:
+    Description: Instructions for cleaning up the stack
+    Value: !Sub |
+      To delete this stack: aws cloudformation delete-stack --stack-name ${AWS::StackName}

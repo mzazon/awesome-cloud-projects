@@ -4,12 +4,12 @@ id: f7a3b2c9
 category: iot
 difficulty: 200
 subject: azure
-services: Azure IoT Edge, Azure Machine Learning, Azure IoT Hub, Azure Stream Analytics
+services: IoT Edge, Machine Learning, IoT Hub, Stream Analytics
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: iot, machine-learning, edge-computing, anomaly-detection, manufacturing
 recipe-generator-version: 1.3
@@ -62,22 +62,22 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with contributor access to create resources
-2. Azure CLI v2.50+ installed and configured (or use Azure Cloud Shell)
+2. Azure CLI v2.70+ installed and configured (or use Azure Cloud Shell)
 3. Basic understanding of IoT concepts and machine learning
 4. Ubuntu 20.04+ VM or physical device for IoT Edge (minimum 2 vCPU, 4GB RAM)
 5. Estimated cost: ~$50-100/month for development environment
 
-> **Note**: This recipe uses Azure IoT Edge 1.5 LTS which is the currently supported version. Ensure your edge device meets the [system requirements](https://docs.microsoft.com/en-us/azure/iot-edge/support).
+> **Note**: This recipe uses Azure IoT Edge 1.5 LTS which is the currently supported version. Ensure your edge device meets the [system requirements](https://learn.microsoft.com/en-us/azure/iot-edge/support).
 
 ## Preparation
 
 ```bash
-# Set environment variables
+# Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-anomaly-detection-$(openssl rand -hex 3)"
 export LOCATION="eastus"
 export IOT_HUB_NAME="iot-hub-anomaly-$(openssl rand -hex 3)"
 export STORAGE_ACCOUNT="stanomalydata$(openssl rand -hex 3)"
-export ML_WORKSPACE="ml-anomaly-detection"
+export ML_WORKSPACE="ml-anomaly-detection-$(openssl rand -hex 3)"
 export EDGE_DEVICE_ID="factory-edge-device-01"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
@@ -107,20 +107,28 @@ echo "✅ IoT Hub created: ${IOT_HUB_NAME}"
    Azure Machine Learning provides a comprehensive platform for training, deploying, and managing ML models at scale. Creating a workspace establishes the foundation for developing anomaly detection models that can identify equipment failures before they occur. This workspace will store your trained models, compute resources, and deployment configurations.
 
    ```bash
-   # Create ML workspace with associated storage and insights
+   # Create storage account first
+   az storage account create \
+       --name ${STORAGE_ACCOUNT} \
+       --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
+       --sku Standard_LRS \
+       --kind StorageV2
+   
+   # Create ML workspace
    az ml workspace create \
        --name ${ML_WORKSPACE} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --storage-account ${STORAGE_ACCOUNT}
    
-   # Create compute instance for model training
+   # Create compute cluster for model training
    az ml compute create \
        --name cpu-cluster \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${ML_WORKSPACE} \
-       --type amlcompute \
        --size Standard_DS3_v2 \
+       --type amlcompute \
        --min-instances 0 \
        --max-instances 4
    
@@ -134,6 +142,9 @@ echo "✅ IoT Hub created: ${IOT_HUB_NAME}"
    Azure IoT Edge extends cloud intelligence to edge devices, enabling local data processing and decision-making. Registering an edge device creates a secure identity in IoT Hub, establishing the trust relationship needed for bi-directional communication between your factory equipment and the cloud.
 
    ```bash
+   # Install IoT extension for Azure CLI if not already installed
+   az extension add --name azure-iot
+   
    # Register IoT Edge device
    az iot hub device-identity create \
        --device-id ${EDGE_DEVICE_ID} \
@@ -151,41 +162,90 @@ echo "✅ IoT Hub created: ${IOT_HUB_NAME}"
    echo "📋 Save this connection string for device setup: ${CONNECTION_STRING}"
    ```
 
-3. **Deploy Stream Analytics Module for Edge Processing**:
+3. **Create Stream Analytics Edge Job for Processing**:
 
    Azure Stream Analytics on IoT Edge brings real-time data processing capabilities directly to your devices. This module filters and aggregates sensor data locally, reducing bandwidth usage by up to 95% and enabling sub-millisecond response times for critical anomalies.
 
    ```bash
    # Create Stream Analytics job for edge
    az stream-analytics job create \
-       --name "asa-edge-anomaly-job" \
-       --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --compatibility-level "1.2" \
-       --sku "Edge"
-   
-   # Define input from IoT Edge Hub
-   az stream-analytics input create \
        --resource-group ${RESOURCE_GROUP} \
        --job-name "asa-edge-anomaly-job" \
-       --name "sensorInput" \
-       --type "Stream" \
-       --datasource @- << EOF
-   {
-     "type": "Microsoft.Devices/IotHubs",
-     "properties": {
-       "iotHubNamespace": "${IOT_HUB_NAME}",
-       "sharedAccessPolicyName": "service",
-       "endpoint": "messages/events",
-       "consumerGroupName": "\$Default"
-     }
-   }
-   EOF
+       --location ${LOCATION} \
+       --sku "Standard" \
+       --type "Edge" \
+       --no-wait
+   
+   # Wait for job creation to complete
+   sleep 30
    
    echo "✅ Stream Analytics edge job configured"
    ```
 
-4. **Create Anomaly Detection Query**:
+4. **Configure Input and Output for Stream Analytics**:
+
+   Stream Analytics requires input and output configurations to process data flows. Edge Hub inputs receive sensor data from IoT Edge modules, while outputs send processed results to cloud services or other edge modules.
+
+   ```bash
+   # Create input for sensor data from Edge Hub
+   cat > input-config.json << EOF
+   {
+     "name": "sensorInput",
+     "properties": {
+       "type": "Stream",
+       "datasource": {
+         "type": "GatewayMessageBus",
+         "properties": {
+           "topic": "temperature"
+         }
+       },
+       "serialization": {
+         "type": "Json",
+         "properties": {
+           "encoding": "UTF8"
+         }
+       }
+     }
+   }
+   EOF
+   
+   # Create output for sending alerts to Edge Hub
+   cat > output-config.json << EOF
+   {
+     "name": "alertOutput",
+     "properties": {
+       "datasource": {
+         "type": "GatewayMessageBus",
+         "properties": {
+           "topic": "alerts"
+         }
+       },
+       "serialization": {
+         "type": "Json",
+         "properties": {
+           "encoding": "UTF8"
+         }
+       }
+     }
+   }
+   EOF
+   
+   # Add input to Stream Analytics job
+   az stream-analytics input create \
+       --resource-group ${RESOURCE_GROUP} \
+       --job-name "asa-edge-anomaly-job" \
+       --input "@input-config.json"
+   
+   # Add output to Stream Analytics job
+   az stream-analytics output create \
+       --resource-group ${RESOURCE_GROUP} \
+       --job-name "asa-edge-anomaly-job" \
+       --output "@output-config.json"
+   
+   echo "✅ Stream Analytics input and output configured"
+   ```
+
+5. **Create Anomaly Detection Query**:
 
    The Stream Analytics query implements sliding window analysis to detect anomalies in real-time sensor data. This query uses built-in ML functions to identify spikes, dips, and change points that indicate potential equipment failures, enabling predictive maintenance strategies.
 
@@ -211,7 +271,7 @@ echo "✅ IoT Hub created: ${IOT_HUB_NAME}"
        temp_scores,
        pressure_scores,
        eventTime
-   INTO output
+   INTO alertOutput
    FROM AnomalyDetectionStep
    WHERE
        CAST(GetRecordPropertyValue(temp_scores, "BiLevelChangeScore") AS FLOAT) > 3.5
@@ -221,26 +281,23 @@ echo "✅ IoT Hub created: ${IOT_HUB_NAME}"
    az stream-analytics transformation create \
        --resource-group ${RESOURCE_GROUP} \
        --job-name "asa-edge-anomaly-job" \
-       --name "anomalyQuery" \
+       --transformation-name "anomalyQuery" \
        --streaming-units 1 \
        --query "${QUERY}"
    
    echo "✅ Anomaly detection query deployed"
    ```
 
-5. **Configure Storage for Model and Data Persistence**:
+6. **Configure Storage for Model and Data Persistence**:
 
    Azure Storage provides durable, scalable storage for ML models and anomaly detection results. The hierarchical namespace enables efficient data organization for time-series sensor data, while lifecycle policies automatically optimize costs by moving older data to cooler storage tiers.
 
    ```bash
-   # Create storage account with Data Lake capabilities
-   az storage account create \
+   # Enable hierarchical namespace for Data Lake capabilities
+   az storage account update \
        --name ${STORAGE_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --sku Standard_LRS \
-       --kind StorageV2 \
-       --hierarchical-namespace true
+       --enable-hierarchical-namespace true
    
    # Create containers for models and data
    az storage container create \
@@ -256,7 +313,23 @@ echo "✅ IoT Hub created: ${IOT_HUB_NAME}"
    echo "✅ Storage account configured with containers"
    ```
 
-6. **Deploy ML Model to IoT Edge**:
+7. **Publish Stream Analytics Job for Edge Deployment**:
+
+   Publishing the Stream Analytics job creates an edge-deployable package that can be deployed as an IoT Edge module. This process optimizes the query for edge execution and creates the necessary deployment artifacts.
+
+   ```bash
+   # Publish the Stream Analytics job for edge deployment
+   az stream-analytics job publish-edge-package \
+       --resource-group ${RESOURCE_GROUP} \
+       --job-name "asa-edge-anomaly-job"
+   
+   # Wait for publishing to complete
+   sleep 60
+   
+   echo "✅ Stream Analytics job published for edge deployment"
+   ```
+
+8. **Create IoT Edge Deployment Manifest**:
 
    Deploying ML models to edge devices enables real-time inference without cloud dependency. This deployment manifest configures the edge runtime with necessary modules, security settings, and resource constraints optimized for industrial environments.
 
@@ -267,7 +340,7 @@ echo "✅ IoT Hub created: ${IOT_HUB_NAME}"
      "modulesContent": {
        "\$edgeAgent": {
          "properties.desired": {
-           "schemaVersion": "1.0",
+           "schemaVersion": "1.1",
            "runtime": {
              "type": "docker",
              "settings": {
@@ -292,7 +365,8 @@ echo "✅ IoT Hub created: ${IOT_HUB_NAME}"
                    "HostConfig": {
                      "PortBindings": {
                        "5671/tcp": [{"HostPort": "5671"}],
-                       "8883/tcp": [{"HostPort": "8883"}]
+                       "8883/tcp": [{"HostPort": "8883"}],
+                       "443/tcp": [{"HostPort": "443"}]
                      }
                    }
                  }
@@ -318,7 +392,29 @@ echo "✅ IoT Hub created: ${IOT_HUB_NAME}"
                    }
                  }
                }
+             },
+             "SimulatedTemperatureSensor": {
+               "version": "1.0",
+               "type": "docker",
+               "status": "running",
+               "restartPolicy": "always",
+               "settings": {
+                 "image": "mcr.microsoft.com/azureiotedge-simulated-temperature-sensor:1.5",
+                 "createOptions": {}
+               }
              }
+           }
+         }
+       },
+       "\$edgeHub": {
+         "properties.desired": {
+           "schemaVersion": "1.1",
+           "routes": {
+             "sensorToAnalytics": "FROM /messages/modules/SimulatedTemperatureSensor/* INTO BrokeredEndpoint(\"/modules/asa-edge-anomaly-job/inputs/temperature\")",
+             "analyticsToIoTHub": "FROM /messages/modules/asa-edge-anomaly-job/* INTO \$upstream"
+           },
+           "storeAndForwardConfiguration": {
+             "timeToLiveSecs": 7200
            }
          }
        }
@@ -337,7 +433,7 @@ echo "✅ IoT Hub created: ${IOT_HUB_NAME}"
    echo "✅ ML model deployment initiated to edge device"
    ```
 
-7. **Configure Monitoring and Alerts**:
+9. **Configure Monitoring and Alerts**:
 
    Azure Monitor provides comprehensive observability for your edge deployment, tracking model performance, device health, and anomaly detection rates. Custom alerts ensure immediate notification when critical anomalies are detected or when edge devices experience issues.
 
@@ -396,7 +492,7 @@ echo "✅ IoT Hub created: ${IOT_HUB_NAME}"
        --output tsv
    ```
 
-3. Validate ML model deployment:
+3. Validate IoT Edge deployment:
 
    ```bash
    # Check deployment status
@@ -432,32 +528,33 @@ echo "✅ IoT Hub created: ${IOT_HUB_NAME}"
 3. Clean up local files:
 
    ```bash
-   # Remove deployment manifest
-   rm -f deployment.json
+   # Remove deployment files
+   rm -f deployment.json input-config.json output-config.json
    
    echo "✅ Local files cleaned up"
    ```
 
 ## Discussion
 
-Azure IoT Edge transforms traditional reactive maintenance into predictive maintenance by bringing machine learning capabilities directly to the factory floor. This edge computing approach addresses the fundamental challenge of cloud-based solutions: network latency. According to the [Azure IoT Edge documentation](https://docs.microsoft.com/en-us/azure/iot-edge/about-iot-edge), edge processing can reduce response times from seconds to milliseconds, enabling real-time intervention before equipment failures occur.
+Azure IoT Edge transforms traditional reactive maintenance into predictive maintenance by bringing machine learning capabilities directly to the factory floor. This edge computing approach addresses the fundamental challenge of cloud-based solutions: network latency. According to the [Azure IoT Edge documentation](https://learn.microsoft.com/en-us/azure/iot-edge/about-iot-edge), edge processing can reduce response times from seconds to milliseconds, enabling real-time intervention before equipment failures occur.
 
-The combination of Azure Stream Analytics and Machine Learning at the edge creates a powerful anomaly detection system that operates autonomously. Stream Analytics provides [built-in ML functions](https://docs.microsoft.com/en-us/azure/stream-analytics/stream-analytics-machine-learning-anomaly-detection) for spike and dip detection, while custom ML models can identify complex patterns specific to your equipment. This dual approach ensures both immediate response to obvious anomalies and sophisticated pattern recognition for subtle degradation indicators.
+Stream Analytics on IoT Edge provides [built-in ML functions](https://learn.microsoft.com/en-us/azure/stream-analytics/stream-analytics-machine-learning-anomaly-detection) for anomaly detection including spike detection, trend changes, and bi-level change detection. These functions use advanced statistical algorithms to identify patterns that deviate from normal behavior, making them ideal for industrial IoT scenarios where equipment degradation often follows predictable patterns before catastrophic failure.
 
-From a architectural perspective, this solution follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles by ensuring reliability through local processing, security through Azure AD integration, and cost optimization through intelligent data filtering. The edge-first approach reduces bandwidth costs by up to 95% while maintaining cloud connectivity for model updates and aggregated analytics.
+From an architectural perspective, this solution follows the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) principles by ensuring reliability through local processing, security through Azure AD integration and device attestation, and cost optimization through intelligent data filtering. The edge-first approach reduces bandwidth costs by processing data locally and only sending relevant insights to the cloud.
 
-Security considerations are paramount in industrial IoT deployments. Azure IoT Edge implements [hardware-based security](https://docs.microsoft.com/en-us/azure/iot-edge/security) with secure boot and runtime attestation, ensuring device integrity even in physically accessible locations. Combined with Azure Key Vault for credential management and Azure Monitor for continuous security monitoring, this creates a defense-in-depth strategy suitable for critical infrastructure.
+Security considerations are paramount in industrial IoT deployments. Azure IoT Edge implements [hardware-based security](https://learn.microsoft.com/en-us/azure/iot-edge/security) with secure boot and runtime attestation, ensuring device integrity even in physically accessible locations. Combined with Azure Monitor for continuous security monitoring and automatic certificate rotation, this creates a defense-in-depth strategy suitable for critical infrastructure.
 
-> **Tip**: Start with pre-built anomaly detection models from the Azure Marketplace, then gradually customize them based on your specific equipment patterns. The [Azure AI Anomaly Detector](https://azure.microsoft.com/en-us/products/ai-services/ai-anomaly-detector) service provides excellent baseline models that can be fine-tuned for industrial applications.
+> **Tip**: Start with pre-built anomaly detection models from Azure Cognitive Services, then gradually customize them based on your specific equipment patterns. The [Azure AI Anomaly Detector](https://azure.microsoft.com/en-us/products/ai-services/ai-anomaly-detector) service provides excellent baseline models that can be fine-tuned for industrial applications.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. Add multi-variate anomaly detection to identify correlations between temperature, pressure, and vibration patterns
-2. Implement automated model retraining pipelines that learn from confirmed anomalies to improve accuracy
+1. Add multi-variate anomaly detection to identify correlations between temperature, pressure, and vibration patterns using Azure ML AutoML
+2. Implement automated model retraining pipelines using Azure ML pipelines that learn from confirmed anomalies to improve accuracy
 3. Create a digital twin visualization using Azure Digital Twins to provide real-time 3D representation of equipment status
 4. Build a predictive maintenance scheduler that integrates with enterprise resource planning (ERP) systems based on anomaly predictions
+5. Deploy a custom vision model for visual anomaly detection using Azure Custom Vision on IoT Edge
 
 ## Infrastructure Code
 

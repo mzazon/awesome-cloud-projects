@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure AI Speech, Power Platform, Azure Logic Apps
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: voice automation, speech recognition, business process automation, power platform, azure ai, serverless, workflow automation
 recipe-generator-version: 1.3
@@ -78,7 +78,7 @@ graph TB
 
 1. Azure subscription with permissions to create Cognitive Services and Logic Apps
 2. Power Platform environment with Power Automate premium license
-3. Azure CLI v2 installed and configured (or Azure CloudShell)
+3. Azure CLI v2.0 or later installed and configured (or Azure Cloud Shell)
 4. Power Platform CLI installed locally or accessible through browser
 5. Basic understanding of REST APIs and webhook configuration
 6. Estimated cost: $20-50/month for development and testing (varies by usage)
@@ -109,7 +109,7 @@ az group create \
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
-# Create storage account for Logic Apps
+# Create storage account for Logic Apps (only needed for Standard tier)
 az storage account create \
     --name ${STORAGE_ACCOUNT_NAME} \
     --resource-group ${RESOURCE_GROUP} \
@@ -127,7 +127,7 @@ echo "✅ Storage account created for Logic Apps"
    Azure AI Speech Service provides real-time speech recognition and text-to-speech capabilities with support for multiple languages and custom models. This managed service eliminates the complexity of building speech recognition infrastructure while providing enterprise-grade security and compliance features. The service supports both batch and real-time processing, making it ideal for interactive business applications.
 
    ```bash
-   # Create Azure AI Speech Service
+   # Create Azure AI Speech Service (now part of AI Foundry resource)
    az cognitiveservices account create \
        --name ${SPEECH_SERVICE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
@@ -157,14 +157,13 @@ echo "✅ Storage account created for Logic Apps"
    Azure Logic Apps provides serverless workflow orchestration that connects cloud services, on-premises systems, and APIs without managing infrastructure. This integration platform enables sophisticated business process automation with built-in error handling, retry mechanisms, and monitoring capabilities. Logic Apps serve as the perfect bridge between Azure AI services and Power Platform components.
 
    ```bash
-   # Create Logic App
+   # Create Logic App (Consumption tier - no storage account needed)
    az logic workflow create \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --storage-account ${STORAGE_ACCOUNT_NAME}
+       --location ${LOCATION}
    
-   # Get Logic App callback URL (will be configured in next step)
+   # Get Logic App resource ID for later configuration
    LOGIC_APP_ID=$(az logic workflow show \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
@@ -605,16 +604,15 @@ echo "✅ Storage account created for Logic Apps"
    az cognitiveservices account show \
        --name ${SPEECH_SERVICE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query '{name:name,state:properties.provisioningState,endpoint:properties.endpoint}'
+       --query '{name:name,state:properties.provisioningState,endpoint:properties.endpoint}' \
+       --output table
    
-   # Test Speech Service connectivity
-   curl -X POST "${SPEECH_ENDPOINT}/speech/recognition/conversation/cognitiveservices/v1?language=en-US" \
-       -H "Ocp-Apim-Subscription-Key: ${SPEECH_KEY}" \
-       -H "Content-Type: audio/wav" \
-       --data-binary "@sample-audio.wav"
+   # Test Speech Service connectivity (requires audio file)
+   echo "To test speech recognition, use the Speech CLI:"
+   echo "spx recognize --microphone --source en-US"
    ```
 
-   Expected output: Speech Service should return recognized text with confidence scores.
+   Expected output: Speech Service should show as "Succeeded" in provisioning state.
 
 2. **Test Logic App Workflow Execution**:
 
@@ -623,7 +621,8 @@ echo "✅ Storage account created for Logic Apps"
    az logic workflow run list \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query '[0].{status:status,startTime:startTime,endTime:endTime}'
+       --query '[0].{status:status,startTime:startTime,endTime:endTime}' \
+       --output table
    
    # Test webhook endpoint
    curl -X POST "${LOGIC_APP_TRIGGER_URL}" \
@@ -637,10 +636,9 @@ echo "✅ Storage account created for Logic Apps"
 
    ```bash
    # Query Dataverse records through Power Platform CLI
-   pac data list-records \
-       --environment-url "https://your-environment.crm.dynamics.com" \
-       --table-name "voice_automation_approvals" \
-       --columns "request_id,status,approved_by"
+   # (Requires authentication to Power Platform environment)
+   echo "Use Power Platform CLI to verify data:"
+   echo "pac data list-records --table-name voice_automation_approvals"
    ```
 
    Expected output: Records should show processed voice commands with proper status updates.

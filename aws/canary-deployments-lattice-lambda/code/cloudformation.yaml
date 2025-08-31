@@ -1,0 +1,619 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Canary Deployments with VPC Lattice and Lambda - Progressive deployment infrastructure with weighted routing and automated monitoring'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'canary-demo'
+    Description: 'Base name for all resources created in this stack'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  CanaryTrafficPercentage:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 100
+    Description: 'Initial percentage of traffic to route to canary version (0-100)'
+
+  ProductionTrafficPercentage:
+    Type: Number
+    Default: 90
+    MinValue: 0
+    MaxValue: 100
+    Description: 'Initial percentage of traffic to route to production version (0-100)'
+
+  ErrorThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Number of errors that trigger automatic rollback alarm'
+
+  DurationThreshold:
+    Type: Number
+    Default: 5000
+    MinValue: 1000
+    MaxValue: 30000
+    Description: 'Lambda duration in milliseconds that triggers performance alarm'
+
+  EnableAutomaticRollback:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable automatic rollback on alarm triggers'
+
+Conditions:
+  CreateRollbackFunction: !Equals [!Ref EnableAutomaticRollback, 'true']
+
+Resources:
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/VPCLatticeServiceAccess'
+      Policies:
+        - PolicyName: CanaryDeploymentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'vpc-lattice:UpdateListener'
+                  - 'vpc-lattice:GetListener'
+                  - 'vpc-lattice:GetService'
+                  - 'cloudwatch:PutMetricData'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Canary Deployment Lambda Execution'
+
+  # Lambda Function for Application Logic
+  CanaryDemoFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-function'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Description: 'Demo function for canary deployment testing'
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import os
+
+          def lambda_handler(event, context):
+              version = os.environ.get('FUNCTION_VERSION', 'v1.0.0')
+              environment = os.environ.get('ENVIRONMENT', 'production')
+              
+              response_data = {
+                  'version': version,
+                  'message': f'Hello from {environment} version',
+                  'timestamp': int(time.time()),
+                  'environment': environment,
+                  'request_id': context.aws_request_id
+              }
+              
+              # Add version-specific features
+              if version.startswith('v2'):
+                  response_data['features'] = ['feature-a', 'feature-b', 'enhanced-logging']
+                  response_data['response_time'] = 150
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'X-Version': version
+                  },
+                  'body': json.dumps(response_data)
+              }
+      Environment:
+        Variables:
+          FUNCTION_VERSION: 'v1.0.0'
+          ENVIRONMENT: 'production'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Canary Deployment Demo'
+
+  # Production Version (v1)
+  ProductionVersion:
+    Type: 'AWS::Lambda::Version'
+    Properties:
+      FunctionName: !Ref CanaryDemoFunction
+      Description: 'Production version 1.0.0'
+
+  # Canary Version (v2) - Updated function code
+  CanaryFunctionCode:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-function-canary'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Description: 'Canary version for deployment testing'
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import random
+          import os
+
+          def lambda_handler(event, context):
+              version = os.environ.get('FUNCTION_VERSION', 'v2.0.0')
+              environment = os.environ.get('ENVIRONMENT', 'canary')
+              
+              # Simulate enhanced features in canary version
+              features = ['feature-a', 'feature-b', 'enhanced-logging']
+              
+              response_data = {
+                  'version': version,
+                  'message': f'Hello from {environment} version',
+                  'timestamp': int(time.time()),
+                  'environment': environment,
+                  'features': features,
+                  'response_time': random.randint(50, 200),
+                  'request_id': context.aws_request_id
+              }
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'X-Version': version
+                  },
+                  'body': json.dumps(response_data)
+              }
+      Environment:
+        Variables:
+          FUNCTION_VERSION: 'v2.0.0'
+          ENVIRONMENT: 'canary'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Canary Deployment Demo'
+
+  # Canary Version
+  CanaryVersion:
+    Type: 'AWS::Lambda::Version'
+    Properties:
+      FunctionName: !Ref CanaryFunctionCode
+      Description: 'Canary version 2.0.0 with enhanced features'
+
+  # VPC Lattice Service Network
+  ServiceNetwork:
+    Type: 'AWS::VpcLattice::ServiceNetwork'
+    Properties:
+      Name: !Sub '${ProjectName}-service-network'
+      AuthType: NONE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Canary Deployment Service Network'
+
+  # Target Group for Production Version
+  ProductionTargetGroup:
+    Type: 'AWS::VpcLattice::TargetGroup'
+    Properties:
+      Name: !Sub '${ProjectName}-prod-targets'
+      Type: LAMBDA
+      Targets:
+        - Id: !Sub '${CanaryDemoFunction}:${ProductionVersion}'
+      HealthCheck:
+        Enabled: true
+        HealthCheckIntervalSeconds: 30
+        HealthCheckTimeoutSeconds: 5
+        HealthyThresholdCount: 2
+        UnhealthyThresholdCount: 2
+        Matcher:
+          HttpCode: '200'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Production Target Group'
+
+  # Target Group for Canary Version
+  CanaryTargetGroup:
+    Type: 'AWS::VpcLattice::TargetGroup'
+    Properties:
+      Name: !Sub '${ProjectName}-canary-targets'
+      Type: LAMBDA
+      Targets:
+        - Id: !Sub '${CanaryFunctionCode}:${CanaryVersion}'
+      HealthCheck:
+        Enabled: true
+        HealthCheckIntervalSeconds: 30
+        HealthCheckTimeoutSeconds: 5
+        HealthyThresholdCount: 2
+        UnhealthyThresholdCount: 2
+        Matcher:
+          HttpCode: '200'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Canary Target Group'
+
+  # VPC Lattice Service
+  LatticeService:
+    Type: 'AWS::VpcLattice::Service'
+    Properties:
+      Name: !Sub '${ProjectName}-service'
+      AuthType: NONE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Canary Deployment Service'
+
+  # HTTP Listener with Weighted Routing
+  ServiceListener:
+    Type: 'AWS::VpcLattice::Listener'
+    Properties:
+      ServiceIdentifier: !Ref LatticeService
+      Name: canary-listener
+      Protocol: HTTP
+      Port: 80
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref ProductionTargetGroup
+              Weight: !Ref ProductionTrafficPercentage
+            - TargetGroupIdentifier: !Ref CanaryTargetGroup
+              Weight: !Ref CanaryTrafficPercentage
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Weighted Traffic Distribution'
+
+  # Service Network Association
+  ServiceNetworkServiceAssociation:
+    Type: 'AWS::VpcLattice::ServiceNetworkServiceAssociation'
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      ServiceIdentifier: !Ref LatticeService
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Service Association'
+
+  # Lambda Permissions for VPC Lattice
+  ProductionLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Sub '${CanaryDemoFunction}:${ProductionVersion}'
+      Action: lambda:InvokeFunction
+      Principal: vpc-lattice.amazonaws.com
+      SourceArn: !Sub 'arn:aws:vpc-lattice:${AWS::Region}:${AWS::AccountId}:targetgroup/${ProductionTargetGroup}'
+
+  CanaryLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Sub '${CanaryFunctionCode}:${CanaryVersion}'
+      Action: lambda:InvokeFunction
+      Principal: vpc-lattice.amazonaws.com
+      SourceArn: !Sub 'arn:aws:vpc-lattice:${AWS::Region}:${AWS::AccountId}:targetgroup/${CanaryTargetGroup}'
+
+  # SNS Topic for Rollback Notifications
+  RollbackTopic:
+    Type: 'AWS::SNS::Topic'
+    Condition: CreateRollbackFunction
+    Properties:
+      TopicName: !Sub '${ProjectName}-rollback-notifications'
+      DisplayName: 'Canary Deployment Rollback Notifications'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Rollback Notifications'
+
+  # Automatic Rollback Lambda Function
+  RollbackFunction:
+    Type: 'AWS::Lambda::Function'
+    Condition: CreateRollbackFunction
+    Properties:
+      FunctionName: !Sub '${ProjectName}-rollback-function'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Description: 'Automatic rollback function for canary deployments'
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import os
+
+          def lambda_handler(event, context):
+              lattice = boto3.client('vpc-lattice')
+              
+              try:
+                  # Parse CloudWatch alarm message
+                  if 'Records' in event and event['Records']:
+                      message = json.loads(event['Records'][0]['Sns']['Message'])
+                      alarm_name = message['AlarmName']
+                      
+                      if 'canary' in alarm_name and message['NewStateValue'] == 'ALARM':
+                          print(f"Alarm triggered: {alarm_name}")
+                          
+                          # Rollback to 100% production traffic
+                          response = lattice.update_listener(
+                              serviceIdentifier='${LatticeService}',
+                              listenerIdentifier='${ServiceListener}',
+                              defaultAction={
+                                  'forward': {
+                                      'targetGroups': [
+                                          {
+                                              'targetGroupIdentifier': '${ProductionTargetGroup}',
+                                              'weight': 100
+                                          }
+                                      ]
+                                  }
+                              }
+                          )
+                          
+                          print(f"Automatic rollback completed. Response: {response}")
+                          return {
+                              'statusCode': 200,
+                              'body': f'Rollback successful for alarm: {alarm_name}'
+                          }
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': 'No action required'
+                  }
+                  
+              except Exception as e:
+                  print(f"Rollback failed: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': f'Rollback failed: {str(e)}'
+                  }
+      Environment:
+        Variables:
+          SERVICE_ID: !Ref LatticeService
+          LISTENER_ID: !Ref ServiceListener
+          PROD_TARGET_GROUP_ID: !Ref ProductionTargetGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Automatic Rollback'
+
+  # SNS Subscription for Rollback Function
+  RollbackSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Condition: CreateRollbackFunction
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref RollbackTopic
+      Endpoint: !GetAtt RollbackFunction.Arn
+
+  # Lambda Permission for SNS
+  RollbackLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Condition: CreateRollbackFunction
+    Properties:
+      FunctionName: !Ref RollbackFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref RollbackTopic
+
+  # CloudWatch Alarms for Monitoring
+  CanaryErrorAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-canary-errors'
+      AlarmDescription: 'Monitor errors in canary Lambda version'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CanaryFunctionCode
+        - Name: Resource
+          Value: !Sub '${CanaryFunctionCode}:${CanaryVersion}'
+      AlarmActions: !If
+        - CreateRollbackFunction
+        - [!Ref RollbackTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Canary Error Monitoring'
+
+  CanaryDurationAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-canary-duration'
+      AlarmDescription: 'Monitor duration in canary Lambda version'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref DurationThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CanaryFunctionCode
+        - Name: Resource
+          Value: !Sub '${CanaryFunctionCode}:${CanaryVersion}'
+      AlarmActions: !If
+        - CreateRollbackFunction
+        - [!Ref RollbackTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Canary Performance Monitoring'
+
+  # CloudWatch Dashboard for Canary Monitoring
+  CanaryDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: !Sub '${ProjectName}-canary-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${CanaryDemoFunction}", "Resource", "${CanaryDemoFunction}:${ProductionVersion}" ],
+                  [ "...", "${CanaryFunctionCode}", "Resource", "${CanaryFunctionCode}:${CanaryVersion}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Invocations - Production vs Canary",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${CanaryDemoFunction}", "Resource", "${CanaryDemoFunction}:${ProductionVersion}" ],
+                  [ "...", "${CanaryFunctionCode}", "Resource", "${CanaryFunctionCode}:${CanaryVersion}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Errors - Production vs Canary",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${CanaryDemoFunction}", "Resource", "${CanaryDemoFunction}:${ProductionVersion}" ],
+                  [ "...", "${CanaryFunctionCode}", "Resource", "${CanaryFunctionCode}:${CanaryVersion}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Duration - Production vs Canary",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ServiceDomainName:
+    Description: 'VPC Lattice service domain name for testing'
+    Value: !GetAtt LatticeService.DnsEntry.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceDomain'
+
+  ServiceId:
+    Description: 'VPC Lattice service ID'
+    Value: !Ref LatticeService
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceId'
+
+  ServiceNetworkId:
+    Description: 'VPC Lattice service network ID'
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetworkId'
+
+  ProductionFunctionArn:
+    Description: 'Production Lambda function ARN'
+    Value: !Sub '${CanaryDemoFunction}:${ProductionVersion}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductionFunctionArn'
+
+  CanaryFunctionArn:
+    Description: 'Canary Lambda function ARN'
+    Value: !Sub '${CanaryFunctionCode}:${CanaryVersion}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CanaryFunctionArn'
+
+  ProductionTargetGroupId:
+    Description: 'Production target group ID'
+    Value: !Ref ProductionTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductionTargetGroupId'
+
+  CanaryTargetGroupId:
+    Description: 'Canary target group ID'
+    Value: !Ref CanaryTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CanaryTargetGroupId'
+
+  ListenerId:
+    Description: 'VPC Lattice listener ID for traffic management'
+    Value: !Ref ServiceListener
+    Export:
+      Name: !Sub '${AWS::StackName}-ListenerId'
+
+  DashboardURL:
+    Description: 'CloudWatch dashboard URL for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-canary-dashboard'
+
+  TestCommand:
+    Description: 'Command to test the canary deployment'
+    Value: !Sub 'curl -s "https://${LatticeService.DnsEntry.DomainName}" | jq'
+
+  RollbackTopicArn:
+    Condition: CreateRollbackFunction
+    Description: 'SNS topic ARN for rollback notifications'
+    Value: !Ref RollbackTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-RollbackTopicArn'
+
+  CurrentTrafficSplit:
+    Description: 'Current traffic split configuration'
+    Value: !Sub 'Production: ${ProductionTrafficPercentage}%, Canary: ${CanaryTrafficPercentage}%'

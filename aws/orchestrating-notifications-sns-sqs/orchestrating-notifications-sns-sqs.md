@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: sns, sqs, lambda
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: sns, sqs, lambda, serverless
 recipe-generator-version: 1.3
 ---
 
 # Building Serverless Notification Systems with SNS, SQS, and Lambda
-
 
 ## Problem
 
@@ -97,7 +96,7 @@ graph TB
 1. AWS account with permissions to create SNS topics, SQS queues, and Lambda functions
 2. AWS CLI v2 installed and configured with appropriate credentials
 3. Basic understanding of serverless architectures and message queuing concepts
-4. Python 3.9+ for Lambda function development (or preferred language)
+4. Python 3.12+ for Lambda function development (or preferred language)
 5. Email address for testing notifications
 6. Estimated cost: SNS (~$0.50/million requests), SQS (~$0.40/million requests), Lambda (~$0.20/million requests)
 
@@ -184,7 +183,7 @@ echo "✅ Environment variables configured"
        --attribute-names QueueArn \
        --query 'Attributes.QueueArn' --output text)
    
-   # Create email processing queue
+   # Create email processing queue with DLQ configuration
    EMAIL_QUEUE_URL=$(aws sqs create-queue \
        --queue-name ${EMAIL_QUEUE_NAME} \
        --attributes '{
@@ -194,7 +193,7 @@ echo "✅ Environment variables configured"
        }' \
        --query 'QueueUrl' --output text)
    
-   # Create SMS processing queue
+   # Create SMS processing queue with DLQ configuration
    SMS_QUEUE_URL=$(aws sqs create-queue \
        --queue-name ${SMS_QUEUE_NAME} \
        --attributes '{
@@ -204,7 +203,7 @@ echo "✅ Environment variables configured"
        }' \
        --query 'QueueUrl' --output text)
    
-   # Create webhook processing queue
+   # Create webhook processing queue with DLQ configuration
    WEBHOOK_QUEUE_URL=$(aws sqs create-queue \
        --queue-name ${WEBHOOK_QUEUE_NAME} \
        --attributes '{
@@ -219,12 +218,12 @@ echo "✅ Environment variables configured"
 
    The queues are configured with 5-minute visibility timeouts to handle Lambda processing time, 14-day message retention for reliability, and dead letter queue redrive after 3 failed attempts. This configuration provides robust message handling while preventing message loss and enabling error investigation.
 
-3. **Subscribe SQS queues to SNS topic with message filtering**:
+3. **Configure SQS queue permissions for SNS access**:
 
-   SNS message filtering enables intelligent routing by evaluating message attributes before delivery, reducing unnecessary processing and costs. Each queue subscription includes filter policies that determine which messages are delivered based on the notification_type attribute. This approach creates efficient, targeted message distribution while supporting both specific channel routing and broadcast capabilities.
+   Before subscribing SQS queues to SNS topics, we must configure queue policies to allow SNS to send messages to each queue. This step ensures secure message delivery by explicitly granting the SNS service permission to perform the sqs:SendMessage action on our queues. Without these permissions, SNS subscription attempts would fail with access denied errors.
 
    ```bash
-   # Get queue ARNs
+   # Get queue ARNs for policy configuration
    EMAIL_QUEUE_ARN=$(aws sqs get-queue-attributes \
        --queue-url ${EMAIL_QUEUE_URL} \
        --attribute-names QueueArn \
@@ -240,7 +239,38 @@ echo "✅ Environment variables configured"
        --attribute-names QueueArn \
        --query 'Attributes.QueueArn' --output text)
    
-   # Subscribe email queue with filter
+   # Set queue policy for email queue
+   aws sqs set-queue-attributes \
+       --queue-url ${EMAIL_QUEUE_URL} \
+       --attributes '{
+         "Policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"sns.amazonaws.com\"},\"Action\":\"sqs:SendMessage\",\"Resource\":\"'${EMAIL_QUEUE_ARN}'\",\"Condition\":{\"ArnEquals\":{\"aws:SourceArn\":\"'${SNS_TOPIC_ARN}'\"}}}]}"
+       }'
+   
+   # Set queue policy for SMS queue
+   aws sqs set-queue-attributes \
+       --queue-url ${SMS_QUEUE_URL} \
+       --attributes '{
+         "Policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"sns.amazonaws.com\"},\"Action\":\"sqs:SendMessage\",\"Resource\":\"'${SMS_QUEUE_ARN}'\",\"Condition\":{\"ArnEquals\":{\"aws:SourceArn\":\"'${SNS_TOPIC_ARN}'\"}}}]}"
+       }'
+   
+   # Set queue policy for webhook queue
+   aws sqs set-queue-attributes \
+       --queue-url ${WEBHOOK_QUEUE_URL} \
+       --attributes '{
+         "Policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"sns.amazonaws.com\"},\"Action\":\"sqs:SendMessage\",\"Resource\":\"'${WEBHOOK_QUEUE_ARN}'\",\"Condition\":{\"ArnEquals\":{\"aws:SourceArn\":\"'${SNS_TOPIC_ARN}'\"}}}]}"
+       }'
+   
+   echo "✅ Configured SQS queue permissions for SNS access"
+   ```
+
+   These policies follow the principle of least privilege by restricting SNS access to only the specific topic ARN we created. The condition ensures that only our designated SNS topic can send messages to these queues, preventing unauthorized access from other SNS topics.
+
+4. **Subscribe SQS queues to SNS topic with message filtering**:
+
+   SNS message filtering enables intelligent routing by evaluating message attributes before delivery, reducing unnecessary processing and costs. Each queue subscription includes filter policies that determine which messages are delivered based on the notification_type attribute. This approach creates efficient, targeted message distribution while supporting both specific channel routing and broadcast capabilities.
+
+   ```bash
+   # Subscribe email queue with filter policy
    aws sns subscribe \
        --topic-arn ${SNS_TOPIC_ARN} \
        --protocol sqs \
@@ -250,7 +280,7 @@ echo "✅ Environment variables configured"
          "RawMessageDelivery": "true"
        }'
    
-   # Subscribe SMS queue with filter
+   # Subscribe SMS queue with filter policy
    aws sns subscribe \
        --topic-arn ${SNS_TOPIC_ARN} \
        --protocol sqs \
@@ -260,7 +290,7 @@ echo "✅ Environment variables configured"
          "RawMessageDelivery": "true"
        }'
    
-   # Subscribe webhook queue with filter
+   # Subscribe webhook queue with filter policy
    aws sns subscribe \
        --topic-arn ${SNS_TOPIC_ARN} \
        --protocol sqs \
@@ -275,7 +305,7 @@ echo "✅ Environment variables configured"
 
    Raw message delivery is enabled to receive the original message content without SNS metadata wrapping. The filter policies ensure email notifications route only to email queues, SMS to SMS queues, and webhook to webhook queues, while "all" type messages reach every channel for broadcast scenarios.
 
-4. **Create IAM role for Lambda functions**:
+5. **Create IAM role for Lambda functions**:
 
    IAM roles provide secure, temporary credential access for Lambda functions without embedding long-term credentials in code. This follows the principle of least privilege, granting only the minimum permissions required for SQS message processing and CloudWatch logging. The role enables Lambda functions to securely interact with SQS queues while maintaining audit trails through CloudWatch Logs.
 
@@ -346,6 +376,9 @@ echo "✅ Environment variables configured"
        --policy-name SQSAccessPolicy \
        --policy-document file://sqs-access-policy.json
    
+   # Wait for role propagation
+   sleep 10
+   
    # Get role ARN
    LAMBDA_ROLE_ARN=$(aws iam get-role \
        --role-name NotificationLambdaRole \
@@ -356,7 +389,7 @@ echo "✅ Environment variables configured"
 
    The IAM role now provides Lambda functions with secure access to receive, process, and delete messages from SQS queues. CloudWatch logging permissions enable comprehensive monitoring and debugging capabilities, while the limited scope ensures security best practices are maintained throughout the notification system.
 
-5. **Create Lambda function for email processing**:
+6. **Create Lambda function for email processing**:
 
    AWS Lambda provides serverless compute for processing email notifications with automatic scaling and pay-per-request billing. This function demonstrates the integration pattern for connecting SQS message processing with external email services. Lambda's event-driven execution model ensures efficient resource utilization while the batch processing capability handles multiple messages simultaneously for improved throughput.
 
@@ -392,7 +425,7 @@ echo "✅ Environment variables configured"
                logger.info(f"Priority: {priority}")
                
                # Here you would integrate with SES, SendGrid, or other email service
-               # For demo purposes, we'll just log the email details
+               # Example: ses.send_email(recipient, subject, message)
                
                processed_messages.append({
                    'messageId': record['messageId'],
@@ -418,10 +451,10 @@ echo "✅ Environment variables configured"
    # Create deployment package
    zip email_handler.zip email_handler.py
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    EMAIL_LAMBDA_ARN=$(aws lambda create-function \
        --function-name EmailNotificationHandler \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler email_handler.lambda_handler \
        --zip-file fileb://email_handler.zip \
@@ -433,7 +466,9 @@ echo "✅ Environment variables configured"
 
    The Lambda function is configured with a 5-minute timeout to handle email service latency and batch processing. In production, you would replace the logging statements with actual email service integration using Amazon SES, SendGrid, or similar providers to deliver notifications to recipients.
 
-6. **Create Lambda function for webhook processing**:
+7. **Create Lambda function for webhook processing**:
+
+   The webhook processing function demonstrates HTTP integration patterns for delivering notifications to external APIs. This function includes retry logic, timeout handling, and error management to ensure reliable webhook delivery. The HTTP connection pooling using urllib3 optimizes performance for multiple webhook calls within a single invocation.
 
    ```bash
    # Create webhook handler function
@@ -441,7 +476,6 @@ echo "✅ Environment variables configured"
    import json
    import logging
    import urllib3
-   import time
    
    logger = logging.getLogger()
    logger.setLevel(logging.INFO)
@@ -468,7 +502,7 @@ echo "✅ Environment variables configured"
                    logger.error("No webhook URL provided")
                    continue
                
-               # Send webhook request
+               # Send webhook request with timeout
                logger.info(f"Sending webhook to {webhook_url}")
                
                try:
@@ -516,10 +550,10 @@ echo "✅ Environment variables configured"
    # Create deployment package
    zip webhook_handler.zip webhook_handler.py
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    WEBHOOK_LAMBDA_ARN=$(aws lambda create-function \
        --function-name WebhookNotificationHandler \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler webhook_handler.lambda_handler \
        --zip-file fileb://webhook_handler.zip \
@@ -529,7 +563,9 @@ echo "✅ Environment variables configured"
    echo "✅ Created webhook processing Lambda function"
    ```
 
-7. **Create event source mappings for Lambda functions**:
+   The webhook function includes robust error handling and retry logic that integrates with SQS's built-in retry mechanism. Failed webhooks are automatically retried up to 3 times before being sent to the dead letter queue for investigation.
+
+8. **Create event source mappings for Lambda functions**:
 
    Event source mappings create the crucial link between SQS queues and Lambda functions, enabling automatic message processing without polling overhead. The batch configuration optimizes throughput by processing up to 10 messages per invocation while the batching window ensures low-latency processing even with light message volumes. This configuration balances cost efficiency with responsiveness for real-time notification delivery.
 
@@ -553,7 +589,9 @@ echo "✅ Environment variables configured"
 
    The event source mappings are now active, enabling automatic message processing as soon as messages arrive in the queues. Lambda will scale concurrency automatically based on queue depth, ensuring high throughput during peak notification periods while maintaining cost efficiency during quiet periods.
 
-8. **Create test notification publisher**:
+9. **Create test notification publisher**:
+
+   This Python script demonstrates how to publish messages to our SNS topic with proper message attributes for filtering. The script includes examples of targeted notifications (email-only, webhook-only) and broadcast notifications that reach all channels. Message attributes enable SNS filtering while the message body contains the actual notification data.
 
    ```bash
    # Create notification publisher script
@@ -621,7 +659,7 @@ echo "✅ Environment variables configured"
            },
            {
                'type': 'webhook',
-               'subject': 'Test Webhook Notification',
+               'subject': 'Test Webhook Notification', 
                'message': 'This is a test webhook notification.',
                'webhook_url': 'https://httpbin.org/post',
                'payload': {
@@ -660,6 +698,8 @@ echo "✅ Environment variables configured"
    echo "✅ Created notification publisher script"
    ```
 
+   The publisher script demonstrates the complete message flow from source to destination, showing how message attributes control routing while the message body contains the actual notification payload for processing by Lambda functions.
+
 ## Validation & Testing
 
 1. **Test the notification system**:
@@ -671,10 +711,12 @@ echo "✅ Environment variables configured"
    echo "✅ Published test notifications"
    ```
 
+   Expected output: Three notifications published with different message IDs for email, webhook, and broadcast types.
+
 2. **Monitor Lambda function execution**:
 
    ```bash
-   # Check Lambda function logs
+   # Check email handler logs
    echo "Checking email handler logs..."
    aws logs describe-log-groups \
        --log-group-name-prefix "/aws/lambda/EmailNotificationHandler" \
@@ -704,10 +746,12 @@ echo "✅ Environment variables configured"
        --query 'events[].message' --output text
    ```
 
+   Expected output: Log entries showing successful processing of email and webhook notifications with message details.
+
 3. **Check queue metrics**:
 
    ```bash
-   # Check queue depths
+   # Check queue depths and verify message processing
    echo "Queue message counts:"
    
    for queue_url in "${EMAIL_QUEUE_URL}" "${SMS_QUEUE_URL}" "${WEBHOOK_QUEUE_URL}" "${DLQ_URL}"; do
@@ -719,6 +763,8 @@ echo "✅ Environment variables configured"
        echo "  ${queue_name}: ${message_count} messages"
    done
    ```
+
+   Expected output: All queues should show 0 messages, indicating successful processing. If messages remain, check Lambda function logs for errors.
 
 ## Cleanup
 
@@ -799,9 +845,9 @@ This serverless notification system demonstrates the power of combining SNS, SQS
 
 The architecture supports multiple notification channels simultaneously, allowing you to send the same message to email, SMS, webhooks, and custom processors. Message filtering ensures that each queue only receives relevant messages, reducing processing overhead and costs. The dead letter queue pattern provides visibility into failed messages and enables manual intervention when needed.
 
-For production deployments, consider implementing additional features such as message encryption using AWS KMS, enhanced monitoring with CloudWatch alarms, integration with AWS X-Ray for distributed tracing, and implementing circuit breaker patterns to handle downstream service failures gracefully. The system can easily be extended to support additional notification channels like Slack, Microsoft Teams, or mobile push notifications.
+For production deployments, consider implementing additional features such as message encryption using AWS KMS, enhanced monitoring with CloudWatch alarms, integration with AWS X-Ray for distributed tracing, and implementing circuit breaker patterns to handle downstream service failures gracefully. The system can easily be extended to support additional notification channels like Slack, Microsoft Teams, or mobile push notifications. Refer to the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) for additional architectural guidance on building resilient, secure, and cost-optimized systems.
 
-> **Tip**: Use SNS message attributes for filtering rather than parsing message bodies, as this is more efficient and allows SNS to filter messages before they reach SQS queues.
+> **Tip**: Use SNS message attributes for filtering rather than parsing message bodies, as this is more efficient and allows SNS to filter messages before they reach SQS queues. Learn more about [SNS message filtering](https://docs.aws.amazon.com/sns/latest/dg/sns-subscription-filter-policies.html) in the AWS documentation.
 
 ## Challenge
 

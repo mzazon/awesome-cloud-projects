@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Storage, Agent Development Kit, Vertex AI, Cloud Workflows
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: content-syndication, hierarchical-namespace, agent-development-kit, ai-agents, content-routing
 recipe-generator-version: 1.3
@@ -85,7 +85,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with billing enabled and Vertex AI API access
-2. Google Cloud CLI (gcloud) installed and configured
+2. Google Cloud CLI (gcloud) installed and configured (version 400.0.0+)
 3. Python 3.10+ environment with pip for Agent Development Kit
 4. Basic understanding of AI/ML workflows and content management systems
 5. Estimated cost: $50-100 for development and testing (varies by usage)
@@ -149,7 +149,7 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
 
 2. **Set Up Agent Development Kit Environment**:
 
-   The Agent Development Kit provides a Python framework for building multi-agent AI systems that can process content intelligently. Setting up the development environment enables local testing and development of content analysis agents before deployment to Vertex AI.
+   The Agent Development Kit (ADK) is Google's open-source framework for building multi-agent AI systems. ADK version 1.5.0 provides production-ready capabilities for developing, testing, and deploying intelligent agents that can process content autonomously.
 
    ```bash
    # Create virtual environment for Agent Development Kit
@@ -157,7 +157,7 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
    source adk-env/bin/activate
    
    # Install Agent Development Kit and dependencies
-   pip install google-adk-agents
+   pip install google-adk==1.5.0
    pip install google-cloud-storage
    pip install google-cloud-aiplatform
    pip install google-cloud-workflows
@@ -169,7 +169,8 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
    # Initialize agent configuration
    cat > .env << EOF
 GOOGLE_CLOUD_PROJECT=${PROJECT_ID}
-GOOGLE_CLOUD_REGION=${REGION}
+GOOGLE_CLOUD_LOCATION=${REGION}
+GOOGLE_GENAI_USE_VERTEXAI=True
 STORAGE_BUCKET=${BUCKET_NAME}
 EOF
    
@@ -180,10 +181,14 @@ EOF
 
 3. **Create Content Analyzer Agent**:
 
-   The Content Analyzer Agent uses Vertex AI's multimodal capabilities to analyze uploaded content, extract metadata, and determine content type and characteristics. This agent serves as the first stage in the intelligent content processing pipeline.
+   The Content Analyzer Agent uses Google Cloud's AI capabilities to analyze uploaded content, extract metadata, and determine content type and characteristics. This agent serves as the first stage in the intelligent content processing pipeline, utilizing Vertex AI for enhanced content understanding.
 
    ```bash
    # Create content analyzer agent
+   cat > analyzers/__init__.py << 'EOF'
+from . import content_analyzer
+EOF
+
    cat > analyzers/content_analyzer.py << 'EOF'
 from google.adk.agents import Agent
 from google.cloud import storage
@@ -191,14 +196,13 @@ from google.cloud import aiplatform
 import json
 import os
 
-class ContentAnalyzer:
-    def __init__(self):
-        self.storage_client = storage.Client()
-        self.bucket_name = os.getenv('STORAGE_BUCKET')
-    
-    def analyze_content(self, file_path: str) -> dict:
-        """Analyze content and extract metadata"""
-        bucket = self.storage_client.bucket(self.bucket_name)
+def analyze_content(file_path: str) -> str:
+    """Analyze content and extract metadata"""
+    try:
+        storage_client = storage.Client()
+        bucket_name = os.getenv('STORAGE_BUCKET')
+        
+        bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(file_path)
         
         # Get file metadata
@@ -206,42 +210,45 @@ class ContentAnalyzer:
         file_info = {
             'name': blob.name,
             'size': blob.size,
-            'content_type': blob.content_type,
-            'created': blob.time_created.isoformat(),
+            'content_type': blob.content_type or 'application/octet-stream',
+            'created': blob.time_created.isoformat() if blob.time_created else None,
         }
         
-        # Determine content category
-        if blob.content_type.startswith('video/'):
+        # Determine content category based on MIME type
+        content_type = file_info['content_type'].lower()
+        if content_type.startswith('video/'):
             category = 'video'
-        elif blob.content_type.startswith('image/'):
+        elif content_type.startswith('image/'):
             category = 'image'
-        elif blob.content_type.startswith('audio/'):
+        elif content_type.startswith('audio/'):
             category = 'audio'
         else:
             category = 'document'
         
         file_info['category'] = category
-        return file_info
+        return json.dumps(file_info, indent=2)
+        
+    except Exception as e:
+        error_result = {
+            'error': f'Failed to analyze content: {str(e)}',
+            'file_path': file_path
+        }
+        return json.dumps(error_result, indent=2)
 
 # Create agent instance
 content_analyzer_agent = Agent(
     name="content_analyzer",
+    model="gemini-2.0-flash",
     description="Agent to analyze uploaded content and extract metadata",
-    instructions="""
+    instruction="""
     You are a content analyzer agent responsible for:
     1. Analyzing uploaded content files
     2. Extracting relevant metadata
     3. Determining content category and type
     4. Preparing content for routing decisions
-    """
+    """,
+    tools=[analyze_content]
 )
-
-@content_analyzer_agent.tool
-def analyze_file(file_path: str) -> str:
-    """Analyze a content file and return metadata"""
-    analyzer = ContentAnalyzer()
-    result = analyzer.analyze_content(file_path)
-    return json.dumps(result, indent=2)
 EOF
    
    echo "✅ Content Analyzer Agent created"
@@ -251,69 +258,73 @@ EOF
 
 4. **Create Content Router Agent**:
 
-   The Content Router Agent makes intelligent decisions about content distribution based on analysis results, audience targeting rules, and platform-specific requirements. This agent coordinates the content syndication workflow across multiple channels.
+   The Content Router Agent makes intelligent decisions about content distribution based on analysis results, audience targeting rules, and platform-specific requirements. This agent coordinates the content syndication workflow across multiple channels using configurable routing rules.
 
    ```bash
    # Create content router agent
+   cat > routers/__init__.py << 'EOF'
+from . import content_router
+EOF
+
    cat > routers/content_router.py << 'EOF'
 from google.adk.agents import Agent
-from google.cloud import storage
 import json
 import os
 
-class ContentRouter:
-    def __init__(self):
-        self.storage_client = storage.Client()
-        self.bucket_name = os.getenv('STORAGE_BUCKET')
-        self.routing_rules = {
+def route_content(metadata_json: str) -> str:
+    """Route content based on analysis results"""
+    try:
+        metadata = json.loads(metadata_json)
+        category = metadata.get('category', 'document')
+        file_size = metadata.get('size', 0)
+        
+        # Define routing rules for different content types
+        routing_rules = {
             'video': ['youtube', 'tiktok', 'instagram'],
             'image': ['instagram', 'pinterest', 'twitter'],
             'audio': ['spotify', 'apple_music', 'podcast'],
             'document': ['medium', 'linkedin', 'blog']
         }
-    
-    def route_content(self, metadata: dict) -> dict:
-        """Route content based on analysis results"""
-        category = metadata.get('category', 'document')
-        file_size = metadata.get('size', 0)
         
         # Determine target platforms
-        platforms = self.routing_rules.get(category, ['blog'])
+        platforms = routing_rules.get(category, ['blog'])
         
-        # Filter based on size constraints
-        if file_size > 100 * 1024 * 1024:  # 100MB
-            platforms = [p for p in platforms if p not in ['twitter', 'instagram']]
+        # Filter based on file size constraints
+        if file_size > 100 * 1024 * 1024:  # 100MB limit
+            platforms = [p for p in platforms 
+                        if p not in ['twitter', 'instagram']]
         
         routing_decision = {
-            'source_file': metadata['name'],
+            'source_file': metadata.get('name', 'unknown'),
             'category': category,
             'target_platforms': platforms,
             'priority': 'high' if file_size < 10 * 1024 * 1024 else 'normal',
             'processing_required': category in ['video', 'image']
         }
         
-        return routing_decision
+        return json.dumps(routing_decision, indent=2)
+        
+    except Exception as e:
+        error_result = {
+            'error': f'Failed to route content: {str(e)}',
+            'metadata': metadata_json
+        }
+        return json.dumps(error_result, indent=2)
 
 # Create router agent
 content_router_agent = Agent(
     name="content_router",
+    model="gemini-2.0-flash",
     description="Agent to route content to appropriate distribution channels",
-    instructions="""
+    instruction="""
     You are a content router agent responsible for:
     1. Analyzing content metadata and characteristics
     2. Determining optimal distribution channels
     3. Setting processing priorities
     4. Coordinating multi-platform syndication
-    """
+    """,
+    tools=[route_content]
 )
-
-@content_router_agent.tool
-def route_content_file(metadata_json: str) -> str:
-    """Route content based on analysis metadata"""
-    router = ContentRouter()
-    metadata = json.loads(metadata_json)
-    result = router.route_content(metadata)
-    return json.dumps(result, indent=2)
 EOF
    
    echo "✅ Content Router Agent created"
@@ -323,32 +334,37 @@ EOF
 
 5. **Create Quality Assessment Agent**:
 
-   The Quality Assessment Agent evaluates content quality metrics and determines whether content meets distribution standards. This agent ensures only high-quality content proceeds through the syndication pipeline.
+   The Quality Assessment Agent evaluates content quality metrics and determines whether content meets distribution standards. This agent ensures only high-quality content proceeds through the syndication pipeline, using configurable quality thresholds and assessment criteria.
 
    ```bash
    # Create quality assessment agent
+   cat > quality/__init__.py << 'EOF'
+from . import quality_assessor
+EOF
+
    cat > quality/quality_assessor.py << 'EOF'
 from google.adk.agents import Agent
-from google.cloud import aiplatform
 import json
 import random
 
-class QualityAssessor:
-    def __init__(self):
-        self.quality_thresholds = {
+def assess_content_quality(metadata_json: str, routing_json: str) -> str:
+    """Assess content quality and provide distribution approval"""
+    try:
+        metadata = json.loads(metadata_json)
+        routing_info = json.loads(routing_json)
+        
+        category = metadata.get('category', 'document')
+        file_size = metadata.get('size', 0)
+        
+        # Define quality thresholds by content type
+        quality_thresholds = {
             'video': {'min_resolution': 720, 'min_bitrate': 1000},
             'image': {'min_resolution': 1024, 'min_quality': 0.8},
             'audio': {'min_bitrate': 128, 'min_duration': 30},
             'document': {'min_word_count': 100, 'readability_score': 0.7}
         }
-    
-    def assess_quality(self, metadata: dict, routing_info: dict) -> dict:
-        """Assess content quality for distribution"""
-        category = metadata.get('category', 'document')
-        file_size = metadata.get('size', 0)
         
-        # Simulate quality assessment (in real implementation, 
-        # would use actual AI models for quality analysis)
+        # Simulate quality assessment (production would use AI models)
         quality_score = random.uniform(0.6, 1.0)
         
         # Determine if content passes quality checks
@@ -357,10 +373,14 @@ class QualityAssessor:
         # Generate recommendations
         recommendations = []
         if not passes_quality:
-            recommendations.append("Consider improving content quality before distribution")
+            recommendations.append(
+                "Consider improving content quality before distribution"
+            )
         
         if file_size > 50 * 1024 * 1024:
-            recommendations.append("Consider compressing file for better performance")
+            recommendations.append(
+                "Consider compressing file for better performance"
+            )
         
         assessment = {
             'quality_score': round(quality_score, 2),
@@ -371,29 +391,30 @@ class QualityAssessor:
             'target_platforms': routing_info.get('target_platforms', [])
         }
         
-        return assessment
+        return json.dumps(assessment, indent=2)
+        
+    except Exception as e:
+        error_result = {
+            'error': f'Failed to assess quality: {str(e)}',
+            'metadata': metadata_json,
+            'routing': routing_json
+        }
+        return json.dumps(error_result, indent=2)
 
 # Create quality assessment agent
 quality_agent = Agent(
     name="quality_assessor",
+    model="gemini-2.0-flash",
     description="Agent to assess content quality and approve for distribution",
-    instructions="""
+    instruction="""
     You are a quality assessment agent responsible for:
     1. Evaluating content quality metrics
     2. Determining distribution readiness
     3. Providing quality improvement recommendations
     4. Ensuring content meets platform standards
-    """
+    """,
+    tools=[assess_content_quality]
 )
-
-@quality_agent.tool
-def assess_content_quality(metadata_json: str, routing_json: str) -> str:
-    """Assess content quality and provide distribution approval"""
-    assessor = QualityAssessor()
-    metadata = json.loads(metadata_json)
-    routing_info = json.loads(routing_json)
-    result = assessor.assess_quality(metadata, routing_info)
-    return json.dumps(result, indent=2)
 EOF
    
    echo "✅ Quality Assessment Agent created"
@@ -403,12 +424,12 @@ EOF
 
 6. **Create Multi-Agent Orchestration System**:
 
-   The orchestration system coordinates all three agents to process content through the complete syndication pipeline. This system manages agent interactions and maintains workflow state throughout the content processing lifecycle.
+   The orchestration system coordinates all three agents to process content through the complete syndication pipeline. This system uses ADK's agent composition capabilities to manage agent interactions and maintain workflow state throughout the content processing lifecycle.
 
    ```bash
    # Create main orchestration system
    cat > content_syndication_system.py << 'EOF'
-from google.adk.agents import Agent, AdkApp
+from google.adk.agents import Agent
 from analyzers.content_analyzer import content_analyzer_agent
 from routers.content_router import content_router_agent
 from quality.quality_assessor import quality_agent
@@ -416,96 +437,92 @@ from google.cloud import storage
 import json
 import os
 
-class ContentSyndicationSystem:
-    def __init__(self):
-        self.storage_client = storage.Client()
-        self.bucket_name = os.getenv('STORAGE_BUCKET')
-    
-    def move_content(self, source_path: str, target_folder: str) -> str:
-        """Move content between folders in hierarchical storage"""
-        bucket = self.storage_client.bucket(self.bucket_name)
-        source_blob = bucket.blob(source_path)
+def process_content_pipeline(file_path: str) -> str:
+    """Process content through the complete syndication pipeline"""
+    try:
+        storage_client = storage.Client()
+        bucket_name = os.getenv('STORAGE_BUCKET')
         
-        # Extract filename from source path
-        filename = source_path.split('/')[-1]
-        target_path = f"{target_folder}/{filename}"
+        # Step 1: Analyze content
+        analysis_result = content_analyzer_agent.run(
+            f"Please analyze the file at path: {file_path}"
+        )
         
-        # Copy to new location
-        bucket.copy_blob(source_blob, bucket, target_path)
-        source_blob.delete()
+        # Step 2: Route content
+        routing_result = content_router_agent.run(
+            f"Please route this content based on analysis: {analysis_result}"
+        )
         
-        return target_path
+        # Step 3: Assess quality
+        quality_result = quality_agent.run(
+            f"Please assess quality for metadata: {analysis_result} "
+            f"and routing: {routing_result}"
+        )
+        
+        # Step 4: Move content based on results
+        try:
+            quality_data = json.loads(quality_result)
+            bucket = storage_client.bucket(bucket_name)
+            source_blob = bucket.blob(file_path)
+            
+            if quality_data.get('approved_for_distribution', False):
+                category = quality_data.get('category', 'document')
+                filename = file_path.split('/')[-1]
+                target_path = f"categorized/{category}/{filename}"
+                
+                # Copy to new location
+                bucket.copy_blob(source_blob, bucket, target_path)
+                source_blob.delete()
+                
+                new_path = target_path
+                result_status = "approved_and_categorized"
+            else:
+                filename = file_path.split('/')[-1]
+                target_path = f"processing/{filename}"
+                
+                # Copy to processing folder
+                bucket.copy_blob(source_blob, bucket, target_path)
+                source_blob.delete()
+                
+                new_path = target_path
+                result_status = "requires_improvement"
+                
+        except Exception as move_error:
+            new_path = file_path
+            result_status = f"move_error: {str(move_error)}"
+        
+        pipeline_result = {
+            'original_path': file_path,
+            'new_path': new_path,
+            'status': result_status,
+            'analysis': analysis_result,
+            'routing': routing_result,
+            'quality': quality_result
+        }
+        
+        return json.dumps(pipeline_result, indent=2)
+        
+    except Exception as e:
+        error_result = {
+            'error': f'Pipeline processing failed: {str(e)}',
+            'file_path': file_path
+        }
+        return json.dumps(error_result, indent=2)
 
 # Create orchestrator agent
 orchestrator_agent = Agent(
     name="content_orchestrator",
+    model="gemini-2.0-flash",
     description="Master agent that coordinates content syndication workflow",
-    instructions="""
+    instruction="""
     You are the content syndication orchestrator responsible for:
     1. Coordinating the complete content processing pipeline
     2. Managing interactions between analyzer, router, and quality agents
     3. Moving content through hierarchical storage folders
     4. Ensuring successful content syndication
-    """
+    """,
+    tools=[process_content_pipeline]
 )
-
-@orchestrator_agent.tool
-def process_content_pipeline(file_path: str) -> str:
-    """Process content through the complete syndication pipeline"""
-    system = ContentSyndicationSystem()
-    
-    # Step 1: Analyze content
-    analysis_result = content_analyzer_agent.query(
-        f"Please analyze the file at path: {file_path}"
-    )
-    
-    # Step 2: Route content
-    routing_result = content_router_agent.query(
-        f"Please route this content based on analysis: {analysis_result}"
-    )
-    
-    # Step 3: Assess quality
-    quality_result = quality_agent.query(
-        f"Please assess quality for metadata: {analysis_result} and routing: {routing_result}"
-    )
-    
-    # Step 4: Move content based on results
-    try:
-        quality_data = json.loads(quality_result)
-        if quality_data.get('approved_for_distribution', False):
-            category = quality_data.get('category', 'document')
-            new_path = system.move_content(file_path, f"categorized/{category}")
-            result_status = "approved_and_categorized"
-        else:
-            new_path = system.move_content(file_path, "processing")
-            result_status = "requires_improvement"
-    except Exception as e:
-        new_path = file_path
-        result_status = f"error: {str(e)}"
-    
-    pipeline_result = {
-        'original_path': file_path,
-        'new_path': new_path,
-        'status': result_status,
-        'analysis': analysis_result,
-        'routing': routing_result,
-        'quality': quality_result
-    }
-    
-    return json.dumps(pipeline_result, indent=2)
-
-# Create ADK application
-app = AdkApp(
-    agents=[
-        content_analyzer_agent,
-        content_router_agent,
-        quality_agent,
-        orchestrator_agent
-    ]
-)
-
-if __name__ == "__main__":
-    app.run()
 EOF
    
    echo "✅ Multi-agent orchestration system created"
@@ -519,41 +536,41 @@ EOF
 
    ```bash
    # Create workflow definition
-   cat > content-syndication-workflow.yaml << EOF
+   cat > content-syndication-workflow.yaml << 'EOF'
 main:
   params: [event]
   steps:
     - init:
         assign:
-          - bucket: \${event.bucket}
-          - object: \${event.name}
-          - project_id: \${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - bucket: ${event.bucket}
+          - object: ${event.name}
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
     
     - check_incoming_folder:
         switch:
-          - condition: \${text.match_regex(object, "^incoming/")}
+          - condition: ${text.match_regex(object, "^incoming/")}
             next: process_content
         next: end
     
     - process_content:
         call: http.post
         args:
-          url: \${"https://\${project_id}.cloudfunctions.net/process-content"}
+          url: ${"https://" + project_id + ".cloudfunctions.net/process-content"}
           headers:
             Content-Type: "application/json"
           body:
-            bucket: \${bucket}
-            object: \${object}
+            bucket: ${bucket}
+            object: ${object}
         result: processing_result
     
     - log_result:
         call: sys.log
         args:
-          text: \${"Content processing completed for " + object}
+          text: ${"Content processing completed for " + object}
           severity: "INFO"
     
     - end:
-        return: \${processing_result}
+        return: ${processing_result}
 EOF
    
    # Deploy workflow
@@ -575,10 +592,9 @@ EOF
    mkdir cloud-function
    cd cloud-function
    
-   cat > main.py << EOF
+   cat > main.py << 'EOF'
 import functions_framework
 import json
-import subprocess
 import os
 from google.cloud import storage
 
@@ -599,9 +615,11 @@ def process_content(request):
     try:
         # Set environment variables for the agent system
         os.environ['STORAGE_BUCKET'] = bucket_name
-        os.environ['GOOGLE_CLOUD_PROJECT'] = os.getenv('GOOGLE_CLOUD_PROJECT')
+        os.environ['GOOGLE_CLOUD_PROJECT'] = \
+            os.getenv('GOOGLE_CLOUD_PROJECT')
         
-        # Simulate agent processing (in production, would integrate with ADK)
+        # In production, integrate with actual ADK orchestrator
+        # For this demo, simulate processing
         result = {
             'status': 'processed',
             'bucket': bucket_name,
@@ -609,13 +627,13 @@ def process_content(request):
             'message': 'Content successfully processed through agent pipeline'
         }
         
-        return result
+        return result, 200
     
     except Exception as e:
         return {'error': f'Processing failed: {str(e)}'}, 500
 EOF
    
-   cat > requirements.txt << EOF
+   cat > requirements.txt << 'EOF'
 functions-framework==3.*
 google-cloud-storage==2.*
 google-cloud-aiplatform==1.*
@@ -623,13 +641,14 @@ EOF
    
    # Deploy Cloud Function
    gcloud functions deploy process-content \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-http \
        --allow-unauthenticated \
        --source . \
        --entry-point process_content \
        --memory 512MB \
-       --timeout 300s
+       --timeout 300s \
+       --region ${REGION}
    
    cd ..
    echo "✅ Content processing Cloud Function deployed"
@@ -662,12 +681,9 @@ EOF
    cd content-agents
    source adk-env/bin/activate
    
-   # Test content analysis
-   python -c "
-   from content_syndication_system import orchestrator_agent
-   result = orchestrator_agent.query('Process content pipeline for incoming/test-video.mp4')
-   print(result)
-   "
+   # Test the orchestrator agent using ADK CLI
+   adk run content_syndication_system \
+       --input "Process content pipeline for incoming/test-video.mp4"
    ```
 
    Expected output: JSON response showing analysis, routing, and quality assessment results.
@@ -694,7 +710,9 @@ EOF
 
    ```bash
    # Delete Cloud Function
-   gcloud functions delete process-content --quiet
+   gcloud functions delete process-content \
+       --region=${REGION} \
+       --quiet
    
    # Delete Cloud Workflow
    gcloud workflows delete ${WORKFLOW_NAME} \
@@ -709,9 +727,6 @@ EOF
    ```bash
    # Remove all content from hierarchical bucket
    gcloud storage rm -r gs://${BUCKET_NAME}
-   
-   # Delete the hierarchical namespace bucket
-   gcloud storage buckets delete gs://${BUCKET_NAME}
    
    echo "✅ Storage resources cleaned up"
    ```
@@ -733,13 +748,13 @@ EOF
 
 This content syndication platform demonstrates the power of combining Google Cloud's Hierarchical Namespace Storage with the Agent Development Kit to create intelligent, automated content processing workflows. The hierarchical storage provides up to 8x higher initial QPS limits and atomic folder operations, essential for high-throughput content management scenarios. The folder-based organization enables efficient content categorization and status tracking throughout the syndication pipeline.
 
-The Agent Development Kit enables sophisticated multi-agent AI systems that can analyze content characteristics, make intelligent routing decisions, and assess quality metrics autonomously. This approach scales beyond simple rule-based systems to provide adaptive content processing that improves over time through machine learning integration. The agent-based architecture also provides modularity, allowing individual agents to be updated or replaced without affecting the entire system.
+The Agent Development Kit (ADK) enables sophisticated multi-agent AI systems that can analyze content characteristics, make intelligent routing decisions, and assess quality metrics autonomously. ADK version 1.5.0 provides production-ready capabilities with built-in deployment options, evaluation frameworks, and integration with Google Cloud services. This approach scales beyond simple rule-based systems to provide adaptive content processing that improves over time through machine learning integration.
 
 The integration with Cloud Workflows provides event-driven automation that scales automatically based on content volume, while Cloud Functions provide the serverless glue between storage events and agent processing. This serverless architecture minimizes operational overhead while providing reliable content processing at scale. The system can handle diverse content types including video, audio, images, and documents, making it suitable for modern media companies and content creators.
 
-> **Tip**: Monitor agent performance and quality assessment accuracy over time to continuously improve the syndication decisions and content routing effectiveness.
+> **Tip**: Monitor agent performance and quality assessment accuracy over time to continuously improve the syndication decisions and content routing effectiveness using ADK's built-in evaluation capabilities.
 
-For additional guidance on building AI-driven content systems, refer to the [Google Cloud AI/ML Best Practices](https://cloud.google.com/architecture/ai-ml), [Hierarchical Namespace Storage Documentation](https://cloud.google.com/storage/docs/hns-overview), [Agent Development Kit Guide](https://cloud.google.com/vertex-ai/generative-ai/docs/agent-development-kit/quickstart), [Cloud Workflows Patterns](https://cloud.google.com/workflows/docs/patterns), and [Content Management Architecture Patterns](https://cloud.google.com/architecture/content-management).
+For additional guidance on building AI-driven content systems, refer to the [Google Cloud AI/ML Best Practices](https://cloud.google.com/architecture/ai-ml), [Hierarchical Namespace Storage Documentation](https://cloud.google.com/storage/docs/hns-overview), [Agent Development Kit Guide](https://google.github.io/adk-docs/get-started/quickstart/), [Cloud Workflows Patterns](https://cloud.google.com/workflows/docs/patterns), and [Content Management Architecture Patterns](https://cloud.google.com/architecture/content-management).
 
 ## Challenge
 

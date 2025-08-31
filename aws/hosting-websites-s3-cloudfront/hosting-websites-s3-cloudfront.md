@@ -1,22 +1,21 @@
 ---
 title: Hosting Websites with S3 CloudFront and Route 53
 id: db114261
-category: compute
+category: networking
 difficulty: 200
 subject: aws
-services: s3,cloudfront,route53
+services: s3, cloudfront, route53, acm
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: s3,cloudfront,route53
+tags: s3, cloudfront, route53, acm, static-website, cdn
 recipe-generator-version: 1.3
 ---
 
 # Building Static Website Hosting with S3, CloudFront, and Route 53
-
 
 ## Problem
 
@@ -45,17 +44,20 @@ graph TB
     
     subgraph "Origin Storage"
         S3[S3 Bucket<br/>Static Website Hosting]
+        S3R[S3 Redirect Bucket<br/>Root Domain]
     end
     
     USER-->R53
     R53-->CF
     CF-->S3
     ACM-->CF
+    R53-.->S3R
     
     style S3 fill:#FF9900
     style CF fill:#FF4B4B
     style R53 fill:#9D5AAE
     style ACM fill:#FF9900
+    style S3R fill:#FFB366
 ```
 
 ## Prerequisites
@@ -97,10 +99,15 @@ echo "WWW bucket: $WWW_BUCKET"
    Amazon S3 static website hosting provides a cost-effective foundation for serving static content. Unlike traditional web servers, S3 eliminates server management overhead while offering 99.999999999% (11 9's) durability and virtually unlimited scalability. This step establishes the primary content origin that will serve your website files to users globally.
 
    ```bash
-   # Create the main website bucket
-   aws s3api create-bucket \
-       --bucket "$WWW_BUCKET" \
-       --region "$AWS_REGION"
+   # Create the main website bucket (handle us-east-1 special case)
+   if [ "$AWS_REGION" = "us-east-1" ]; then
+       aws s3api create-bucket --bucket "$WWW_BUCKET"
+   else
+       aws s3api create-bucket \
+           --bucket "$WWW_BUCKET" \
+           --region "$AWS_REGION" \
+           --create-bucket-configuration LocationConstraint="$AWS_REGION"
+   fi
    
    # Configure bucket for static website hosting
    aws s3 website "s3://$WWW_BUCKET/" \
@@ -118,9 +125,14 @@ echo "WWW bucket: $WWW_BUCKET"
 
    ```bash
    # Create the root domain bucket for redirect
-   aws s3api create-bucket \
-       --bucket "$ROOT_BUCKET" \
-       --region "$AWS_REGION"
+   if [ "$AWS_REGION" = "us-east-1" ]; then
+       aws s3api create-bucket --bucket "$ROOT_BUCKET"
+   else
+       aws s3api create-bucket \
+           --bucket "$ROOT_BUCKET" \
+           --region "$AWS_REGION" \
+           --create-bucket-configuration LocationConstraint="$AWS_REGION"
+   fi
    
    # Configure bucket to redirect to www subdomain
    cat > redirect-config.json << EOF
@@ -254,7 +266,7 @@ echo "WWW bucket: $WWW_BUCKET"
    echo "Certificate ARN: $CERT_ARN"
    echo "✅ Requested SSL certificate for both domains"
    
-   # Wait a moment for certificate to be created
+   # Wait for certificate to be created
    sleep 10
    ```
 
@@ -272,32 +284,58 @@ echo "WWW bucket: $WWW_BUCKET"
    
    echo "Hosted Zone ID: $HOSTED_ZONE_ID"
    
-   # Get certificate validation records
+   # Get certificate validation records and create DNS records automatically
    aws acm describe-certificate \
        --certificate-arn "$CERT_ARN" \
        --region us-east-1 \
-       --query 'Certificate.DomainValidationOptions[*].[DomainName,ResourceRecord.Name,ResourceRecord.Value]' \
-       --output table
+       --query 'Certificate.DomainValidationOptions' --output json > cert-validation.json
    
-   echo "✅ Add the CNAME records above to your DNS for certificate validation"
-   echo "Waiting 2 minutes for DNS propagation..."
-   sleep 120
+   # Extract validation data and create Route 53 records
+   for domain in $(cat cert-validation.json | jq -r '.[].DomainName'); do
+       validation_name=$(cat cert-validation.json | jq -r --arg domain "$domain" '.[] | select(.DomainName == $domain) | .ResourceRecord.Name')
+       validation_value=$(cat cert-validation.json | jq -r --arg domain "$domain" '.[] | select(.DomainName == $domain) | .ResourceRecord.Value')
+       
+       cat > validation-record-${domain}.json << EOF
+   {
+       "Changes": [
+           {
+               "Action": "UPSERT",
+               "ResourceRecordSet": {
+                   "Name": "$validation_name",
+                   "Type": "CNAME",
+                   "TTL": 300,
+                   "ResourceRecords": [
+                       {
+                           "Value": "$validation_value"
+                       }
+                   ]
+               }
+           }
+       ]
+   }
+   EOF
+       
+       aws route53 change-resource-record-sets \
+           --hosted-zone-id "$HOSTED_ZONE_ID" \
+           --change-batch file://validation-record-${domain}.json
+   done
+   
+   echo "✅ Created DNS validation records"
+   echo "Waiting for certificate validation..."
+   aws acm wait certificate-validated \
+       --certificate-arn "$CERT_ARN" \
+       --region us-east-1
+   echo "✅ Certificate validated successfully"
    ```
 
-   The DNS validation records are now configured and propagating across the global DNS network. Certificate validation typically completes within minutes once DNS records are properly configured, enabling secure HTTPS connections for your website traffic.
+   The DNS validation records are now configured and the certificate has been validated. This automated approach eliminates manual DNS record creation and ensures the certificate is ready for use with CloudFront.
 
 7. **Create CloudFront distribution for www subdomain**:
 
    CloudFront's global edge network spans 400+ locations worldwide, dramatically reducing latency by serving content from the nearest geographic location to each user. The CDN also provides DDoS protection, request/response transformation capabilities, and advanced caching strategies that can reduce origin load by 85% or more. This configuration enforces HTTPS connections and enables compression for optimal performance.
 
    ```bash
-   # Get S3 website endpoint
-   export S3_WEBSITE_ENDPOINT=$(aws s3api get-bucket-website \
-       --bucket "$WWW_BUCKET" \
-       --query 'RedirectAllRequestsTo.HostName' --output text 2>/dev/null || \
-       echo "${WWW_BUCKET}.s3-website-${AWS_REGION}.amazonaws.com")
-   
-   # Create CloudFront distribution
+   # Create CloudFront distribution configuration
    cat > cloudfront-config.json << EOF
    {
        "CallerReference": "$(date +%s)-$WWW_BUCKET",
@@ -325,7 +363,18 @@ echo "WWW bucket: $WWW_BUCKET"
            "TargetOriginId": "$WWW_BUCKET-origin",
            "ViewerProtocolPolicy": "redirect-to-https",
            "Compress": true,
-           "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+           "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+           "TrustedSigners": {
+               "Enabled": false,
+               "Quantity": 0
+           },
+           "ForwardedValues": {
+               "QueryString": false,
+               "Cookies": {
+                   "Forward": "none"
+               }
+           },
+           "MinTTL": 0
        },
        "Enabled": true,
        "PriceClass": "PriceClass_100",
@@ -344,24 +393,103 @@ echo "WWW bucket: $WWW_BUCKET"
    
    echo "CloudFront Distribution ID: $CF_DISTRIBUTION_ID"
    echo "✅ Created CloudFront distribution"
+   echo "Distribution deployment may take 10-15 minutes..."
    ```
 
    The CloudFront distribution is now deploying across AWS's global edge network, which typically takes 10-15 minutes to complete. Once deployed, your website will benefit from sub-second loading times globally, automatic content compression, and enterprise-grade security features including DDoS protection.
 
-8. **Get CloudFront domain name and create Route 53 records**:
+8. **Create CloudFront distribution for root domain redirect**:
+
+   Creating a separate CloudFront distribution for the root domain ensures consistent HTTPS redirect behavior and maintains professional URL standards. This approach provides reliable redirection at the edge while maintaining the same SSL certificate and security posture as the main website distribution.
+
+   ```bash
+   # Create CloudFront distribution for root domain redirect
+   cat > cloudfront-redirect-config.json << EOF
+   {
+       "CallerReference": "$(date +%s)-$ROOT_BUCKET",
+       "Comment": "CloudFront distribution for $DOMAIN_NAME redirect",
+       "Aliases": {
+           "Quantity": 1,
+           "Items": ["$DOMAIN_NAME"]
+       },
+       "Origins": {
+           "Quantity": 1,
+           "Items": [
+               {
+                   "Id": "$ROOT_BUCKET-origin",
+                   "DomainName": "${ROOT_BUCKET}.s3-website-${AWS_REGION}.amazonaws.com",
+                   "CustomOriginConfig": {
+                       "HTTPPort": 80,
+                       "HTTPSPort": 443,
+                       "OriginProtocolPolicy": "http-only"
+                   }
+               }
+           ]
+       },
+       "DefaultCacheBehavior": {
+           "TargetOriginId": "$ROOT_BUCKET-origin",
+           "ViewerProtocolPolicy": "redirect-to-https",
+           "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+           "TrustedSigners": {
+               "Enabled": false,
+               "Quantity": 0
+           },
+           "ForwardedValues": {
+               "QueryString": false,
+               "Cookies": {
+                   "Forward": "none"
+               }
+           },
+           "MinTTL": 0
+       },
+       "Enabled": true,
+       "PriceClass": "PriceClass_100",
+       "ViewerCertificate": {
+           "ACMCertificateArn": "$CERT_ARN",
+           "SSLSupportMethod": "sni-only",
+           "MinimumProtocolVersion": "TLSv1.2_2021"
+       }
+   }
+   EOF
+   
+   # Create CloudFront distribution for redirect
+   export CF_REDIRECT_ID=$(aws cloudfront create-distribution \
+       --distribution-config file://cloudfront-redirect-config.json \
+       --query 'Distribution.Id' --output text)
+   
+   echo "CloudFront Redirect Distribution ID: $CF_REDIRECT_ID"
+   echo "✅ Created CloudFront redirect distribution"
+   ```
+
+   The redirect distribution is now deploying, providing consistent HTTPS redirect behavior from the root domain to the www subdomain. This ensures users accessing either domain variant will receive the same secure, fast experience.
+
+9. **Create Route 53 DNS records**:
 
    Route 53 alias records provide seamless integration with CloudFront distributions without exposing underlying IP addresses. This approach enables automatic failover capabilities and eliminates the need for manual DNS updates when AWS modifies CloudFront infrastructure. The alias record also provides better performance than CNAME records by resolving directly to optimal endpoints.
 
    ```bash
-   # Get CloudFront domain name
+   # Wait for distributions to be deployed
+   echo "Waiting for CloudFront distributions to deploy..."
+   aws cloudfront wait distribution-deployed \
+       --id "$CF_DISTRIBUTION_ID"
+   aws cloudfront wait distribution-deployed \
+       --id "$CF_REDIRECT_ID"
+   echo "✅ CloudFront distributions deployed"
+   
+   # Get CloudFront domain names
    export CF_DOMAIN_NAME=$(aws cloudfront get-distribution \
        --id "$CF_DISTRIBUTION_ID" \
        --query 'Distribution.DomainName' --output text)
    
-   echo "CloudFront Domain: $CF_DOMAIN_NAME"
+   export CF_REDIRECT_DOMAIN=$(aws cloudfront get-distribution \
+       --id "$CF_REDIRECT_ID" \
+       --query 'Distribution.DomainName' --output text)
    
-   # Create DNS records for www subdomain (A record alias to CloudFront)
-   cat > www-dns-change.json << EOF
+   echo "CloudFront WWW Domain: $CF_DOMAIN_NAME"
+   echo "CloudFront Redirect Domain: $CF_REDIRECT_DOMAIN"
+   
+   # Create DNS records for both domains
+   cat > dns-records.json << EOF
    {
        "Changes": [
            {
@@ -375,32 +503,44 @@ echo "WWW bucket: $WWW_BUCKET"
                        "HostedZoneId": "Z2FDTNDATAQYW2"
                    }
                }
+           },
+           {
+               "Action": "UPSERT",  
+               "ResourceRecordSet": {
+                   "Name": "$DOMAIN_NAME",
+                   "Type": "A",
+                   "AliasTarget": {
+                       "DNSName": "$CF_REDIRECT_DOMAIN",
+                       "EvaluateTargetHealth": false,
+                       "HostedZoneId": "Z2FDTNDATAQYW2"
+                   }
+               }
            }
        ]
    }
    EOF
    
-   # Apply DNS change
+   # Apply DNS changes
    aws route53 change-resource-record-sets \
        --hosted-zone-id "$HOSTED_ZONE_ID" \
-       --change-batch file://www-dns-change.json \
-       --query 'ChangeInfo.Id' --output text
+       --change-batch file://dns-records.json
    
-   echo "✅ Created DNS record for $SUBDOMAIN"
+   echo "✅ Created DNS records for both domains"
    ```
 
-   The DNS configuration is now complete with alias records pointing to your CloudFront distribution. DNS propagation typically takes 1-5 minutes globally, after which your website will be accessible via your custom domain with full SSL encryption and global CDN acceleration.
+   The DNS configuration is now complete with alias records pointing to your CloudFront distributions. DNS propagation typically takes 1-5 minutes globally, after which your website will be accessible via both your root domain and www subdomain with full SSL encryption and global CDN acceleration.
 
 ## Validation & Testing
 
-1. **Check S3 website endpoint**:
+1. **Check S3 website endpoints**:
 
    ```bash
-   # Test S3 website endpoint directly
+   # Test S3 website endpoints directly
    curl -I "http://${WWW_BUCKET}.s3-website-${AWS_REGION}.amazonaws.com"
+   curl -I "http://${ROOT_BUCKET}.s3-website-${AWS_REGION}.amazonaws.com"
    ```
 
-   Expected output: HTTP 200 OK response
+   Expected output: HTTP 200 OK for www bucket, HTTP 301 redirect for root bucket
 
 2. **Verify CloudFront distribution status**:
 
@@ -409,9 +549,13 @@ echo "WWW bucket: $WWW_BUCKET"
    aws cloudfront get-distribution \
        --id "$CF_DISTRIBUTION_ID" \
        --query 'Distribution.Status' --output text
+   
+   aws cloudfront get-distribution \
+       --id "$CF_REDIRECT_ID" \
+       --query 'Distribution.Status' --output text
    ```
 
-   Expected output: "Deployed" (may take 10-15 minutes)
+   Expected output: "Deployed" for both distributions
 
 3. **Test SSL certificate validation**:
 
@@ -428,38 +572,26 @@ echo "WWW bucket: $WWW_BUCKET"
 4. **Test website accessibility**:
 
    ```bash
-   # Test website via CloudFront (may take time for DNS propagation)
+   # Test website via CloudFront
    curl -I "https://$SUBDOMAIN"
    
    # Test redirect from root domain
    curl -I "https://$DOMAIN_NAME"
+   
+   # Test SSL certificate
+   openssl s_client -connect "$SUBDOMAIN:443" -servername "$SUBDOMAIN" \
+       -verify_return_error < /dev/null
    ```
 
-   Expected: HTTP 200 for subdomain, HTTP 301 redirect for root domain
+   Expected: HTTP 200 for subdomain, HTTP 301 redirect for root domain, valid SSL certificate
 
 ## Cleanup
 
-1. **Delete CloudFront distribution**:
+1. **Delete Route 53 DNS records**:
 
    ```bash
-   # Disable CloudFront distribution first
-   aws cloudfront get-distribution-config \
-       --id "$CF_DISTRIBUTION_ID" \
-       --query 'DistributionConfig' > cf-config-disable.json
-   
-   # Modify config to disable (this is simplified - you'd need to edit the JSON)
-   # Then update the distribution
-   # aws cloudfront update-distribution --id "$CF_DISTRIBUTION_ID" \
-   #     --distribution-config file://cf-config-disable.json --if-match ...
-   
-   echo "Manual step: Disable and delete CloudFront distribution in console"
-   ```
-
-2. **Delete Route 53 records**:
-
-   ```bash
-   # Delete the A record for www subdomain
-   cat > delete-www-dns.json << EOF
+   # Delete DNS records
+   cat > delete-dns-records.json << EOF
    {
        "Changes": [
            {
@@ -473,6 +605,18 @@ echo "WWW bucket: $WWW_BUCKET"
                        "HostedZoneId": "Z2FDTNDATAQYW2"
                    }
                }
+           },
+           {
+               "Action": "DELETE",
+               "ResourceRecordSet": {
+                   "Name": "$DOMAIN_NAME",
+                   "Type": "A",
+                   "AliasTarget": {
+                       "DNSName": "$CF_REDIRECT_DOMAIN",
+                       "EvaluateTargetHealth": false,
+                       "HostedZoneId": "Z2FDTNDATAQYW2"
+                   }
+               }
            }
        ]
    }
@@ -480,12 +624,106 @@ echo "WWW bucket: $WWW_BUCKET"
    
    aws route53 change-resource-record-sets \
        --hosted-zone-id "$HOSTED_ZONE_ID" \
-       --change-batch file://delete-www-dns.json
+       --change-batch file://delete-dns-records.json
    
    echo "✅ Deleted DNS records"
    ```
 
-3. **Delete SSL certificate**:
+2. **Delete CloudFront distributions**:
+
+   ```bash
+   # Disable and delete CloudFront distributions
+   aws cloudfront get-distribution-config \
+       --id "$CF_DISTRIBUTION_ID" > cf-config.json
+   
+   ETAG=$(aws cloudfront get-distribution-config \
+       --id "$CF_DISTRIBUTION_ID" \
+       --query 'ETag' --output text)
+   
+   # Update distribution config to disabled (simplified JSON editing)
+   cat cf-config.json | jq '.DistributionConfig.Enabled = false' > cf-config-disabled.json
+   
+   aws cloudfront update-distribution \
+       --id "$CF_DISTRIBUTION_ID" \
+       --distribution-config file://cf-config-disabled.json \
+       --if-match "$ETAG"
+   
+   # Wait for distribution to be disabled, then delete
+   aws cloudfront wait distribution-deployed --id "$CF_DISTRIBUTION_ID"
+   
+   ETAG_DISABLED=$(aws cloudfront get-distribution \
+       --id "$CF_DISTRIBUTION_ID" \
+       --query 'ETag' --output text)
+   
+   aws cloudfront delete-distribution \
+       --id "$CF_DISTRIBUTION_ID" \
+       --if-match "$ETAG_DISABLED"
+   
+   # Repeat for redirect distribution
+   aws cloudfront get-distribution-config \
+       --id "$CF_REDIRECT_ID" > cf-redirect-config.json
+   
+   ETAG_REDIRECT=$(aws cloudfront get-distribution-config \
+       --id "$CF_REDIRECT_ID" \
+       --query 'ETag' --output text)
+   
+   cat cf-redirect-config.json | jq '.DistributionConfig.Enabled = false' > cf-redirect-disabled.json
+   
+   aws cloudfront update-distribution \
+       --id "$CF_REDIRECT_ID" \
+       --distribution-config file://cf-redirect-disabled.json \
+       --if-match "$ETAG_REDIRECT"
+   
+   aws cloudfront wait distribution-deployed --id "$CF_REDIRECT_ID"
+   
+   ETAG_REDIRECT_DISABLED=$(aws cloudfront get-distribution \
+       --id "$CF_REDIRECT_ID" \
+       --query 'ETag' --output text)
+   
+   aws cloudfront delete-distribution \
+       --id "$CF_REDIRECT_ID" \
+       --if-match "$ETAG_REDIRECT_DISABLED"
+   
+   echo "✅ Deleted CloudFront distributions"
+   ```
+
+3. **Delete SSL certificate validation records**:
+
+   ```bash
+   # Delete certificate validation records
+   for domain in $(cat cert-validation.json | jq -r '.[].DomainName'); do
+       validation_name=$(cat cert-validation.json | jq -r --arg domain "$domain" '.[] | select(.DomainName == $domain) | .ResourceRecord.Name')
+       validation_value=$(cat cert-validation.json | jq -r --arg domain "$domain" '.[] | select(.DomainName == $domain) | .ResourceRecord.Value')
+       
+       cat > delete-validation-${domain}.json << EOF
+   {
+       "Changes": [
+           {
+               "Action": "DELETE",
+               "ResourceRecordSet": {
+                   "Name": "$validation_name",
+                   "Type": "CNAME",
+                   "TTL": 300,
+                   "ResourceRecords": [
+                       {
+                           "Value": "$validation_value"
+                       }
+                   ]
+               }
+           }
+       ]
+   }
+   EOF
+       
+       aws route53 change-resource-record-sets \
+           --hosted-zone-id "$HOSTED_ZONE_ID" \
+           --change-batch file://delete-validation-${domain}.json
+   done
+   
+   echo "✅ Deleted certificate validation records"
+   ```
+
+4. **Delete SSL certificate**:
 
    ```bash
    # Delete SSL certificate (only after CloudFront is deleted)
@@ -496,7 +734,7 @@ echo "WWW bucket: $WWW_BUCKET"
    echo "✅ Deleted SSL certificate"
    ```
 
-4. **Delete S3 buckets and content**:
+5. **Delete S3 buckets and content**:
 
    ```bash
    # Delete website content
@@ -509,9 +747,10 @@ echo "WWW bucket: $WWW_BUCKET"
    
    # Clean up local files
    rm -f index.html error.html bucket-policy.json
-   rm -f redirect-config.json cloudfront-config.json
-   rm -f www-dns-change.json delete-www-dns.json
-   rm -f cf-config-disable.json
+   rm -f redirect-config.json cloudfront-config.json cloudfront-redirect-config.json
+   rm -f dns-records.json delete-dns-records.json
+   rm -f cert-validation.json validation-record-*.json delete-validation-*.json
+   rm -f cf-config.json cf-config-disabled.json cf-redirect-config.json cf-redirect-disabled.json
    
    echo "✅ Deleted S3 buckets and cleaned up files"
    ```
@@ -520,23 +759,25 @@ echo "WWW bucket: $WWW_BUCKET"
 
 This static website hosting architecture provides several key advantages over traditional web hosting solutions. Amazon S3 offers virtually unlimited storage capacity with 99.999999999% (11 9's) durability, making it ideal for hosting static assets. The integration with CloudFront provides global content delivery through AWS's extensive edge network, dramatically reducing latency for users worldwide while also providing DDoS protection and traffic encryption.
 
-The combination of Route 53 and Certificate Manager enables seamless SSL/TLS certificate management with automatic renewal, eliminating the complexity of manual certificate updates. Route 53's health checks and failover capabilities ensure high availability, while its integration with other AWS services provides superior performance compared to external DNS providers. The architecture scales automatically to handle traffic spikes without any manual intervention.
+The combination of Route 53 and Certificate Manager enables seamless SSL/TLS certificate management with automatic renewal, eliminating the complexity of manual certificate updates. Route 53's health checks and failover capabilities ensure high availability, while its integration with other AWS services provides superior performance compared to external DNS providers. The architecture scales automatically to handle traffic spikes without any manual intervention, following [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles.
 
-Cost optimization is achieved through CloudFront's edge caching, which reduces origin requests to S3, and S3's pay-per-use pricing model. For most small to medium websites, monthly costs typically range from $0.50 to $5.00, significantly lower than traditional hosting solutions. The architecture also supports modern development workflows with easy integration into CI/CD pipelines for automated deployments.
+Cost optimization is achieved through CloudFront's edge caching, which reduces origin requests to S3, and S3's pay-per-use pricing model. For most small to medium websites, monthly costs typically range from $0.50 to $5.00, significantly lower than traditional hosting solutions. The architecture also supports modern development workflows with easy integration into CI/CD pipelines for automated deployments. According to [AWS CloudFront pricing](https://aws.amazon.com/cloudfront/pricing/), the first 1TB of data transfer out is free each month, making this solution extremely cost-effective for most use cases.
+
+Security is built into every layer of this architecture. S3 bucket policies enforce least privilege access, CloudFront provides DDoS protection and WAF integration capabilities, and ACM provides automatic SSL/TLS certificate management with strong encryption standards. The solution also supports advanced security features like [AWS WAF integration](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/distribution-web-awswaf.html) for additional protection against common web exploits.
 
 > **Warning**: Ensure your domain's DNS is properly configured in Route 53 before requesting SSL certificates, as validation failures can delay deployment.
 
-> **Tip**: Enable CloudFront access logging to analyze visitor patterns and optimize caching strategies for better performance.
+> **Tip**: Enable CloudFront access logging to analyze visitor patterns and optimize caching strategies for better performance. See the [CloudFront logging documentation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/AccessLogs.html) for details.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Add CloudFront Functions for URL rewriting** - Implement client-side routing for single-page applications by redirecting all requests to index.html
-2. **Implement automated deployments with CodePipeline** - Create a CI/CD pipeline that automatically deploys changes from a Git repository to S3 and invalidates CloudFront cache
-3. **Add security headers with Lambda@Edge** - Implement security best practices by adding HTTP security headers like CSP, HSTS, and X-Frame-Options
-4. **Set up monitoring and alerting** - Create CloudWatch dashboards and alarms for monitoring website performance, error rates, and costs
-5. **Implement multi-environment deployment** - Create separate staging and production environments with different S3 buckets and CloudFront distributions
+1. **Add CloudFront Functions for URL rewriting** - Implement client-side routing for single-page applications by redirecting all requests to index.html using [CloudFront Functions](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/cloudfront-functions.html)
+2. **Implement automated deployments with CodePipeline** - Create a CI/CD pipeline that automatically deploys changes from a Git repository to S3 and invalidates CloudFront cache using [AWS CodePipeline](https://docs.aws.amazon.com/codepipeline/latest/userguide/welcome.html)
+3. **Add security headers with Lambda@Edge** - Implement security best practices by adding HTTP security headers like CSP, HSTS, and X-Frame-Options using [Lambda@Edge](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/lambda-at-the-edge.html)
+4. **Set up monitoring and alerting** - Create CloudWatch dashboards and alarms for monitoring website performance, error rates, and costs using [CloudWatch](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/)
+5. **Implement multi-environment deployment** - Create separate staging and production environments with different S3 buckets and CloudFront distributions using [AWS Organizations](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_introduction.html) for account separation
 
 ## Infrastructure Code
 

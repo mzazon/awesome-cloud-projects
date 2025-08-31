@@ -6,10 +6,10 @@ difficulty: 400
 subject: azure
 services: Azure Firewall Premium, Azure ExpressRoute, Azure Virtual Network Gateway, Azure Monitor
 estimated-time: 150 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: hybrid-network, security, firewall, expressroute, threat-protection, monitoring
 recipe-generator-version: 1.3
@@ -81,7 +81,7 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with appropriate permissions for creating networking and security resources
-2. Azure CLI v2.55.0 or later installed and configured (or Azure Cloud Shell)
+2. Azure CLI v2.60.0 or later installed and configured (or Azure Cloud Shell)
 3. Existing on-premises network infrastructure with BGP routing capabilities
 4. ExpressRoute circuit already provisioned through a connectivity provider
 5. Understanding of hybrid networking concepts, BGP routing, and Azure security principles
@@ -250,12 +250,6 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --sku Premium \
        --threat-intel-mode Alert \
        --enable-dns-proxy true \
-       --enable-explicit-proxy false
-
-   # Configure IDPS (Intrusion Detection and Prevention System)
-   az network firewall policy update \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${FIREWALL_POLICY_NAME} \
        --idps-mode Alert
 
    echo "✅ Azure Firewall Premium public IP and policy created"
@@ -554,11 +548,12 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 3. **Validate network routing configuration**:
 
    ```bash
-   # Check effective routes for workload subnet
-   az network nic show-effective-route-table \
-       --resource-group ${RESOURCE_GROUP} \
-       --name nic-test-vm \
-       --query "value[?addressPrefix[0]=='0.0.0.0/0' || addressPrefix[0]=='192.168.0.0/16']"
+   # Check effective routes for workload subnet (requires test VM)
+   echo "Deploy a test VM first, then run:"
+   echo "az network nic show-effective-route-table \\"
+   echo "    --resource-group ${RESOURCE_GROUP} \\"
+   echo "    --name nic-test-vm \\"
+   echo "    --query \"value[?addressPrefix[0]=='0.0.0.0/0' || addressPrefix[0]=='192.168.0.0/16']\""
 
    # Verify route table association
    az network vnet subnet show \
@@ -613,7 +608,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    az network vpn-connection delete \
        --resource-group ${RESOURCE_GROUP} \
        --name connection-expressroute \
-       --no-wait
+       --no-wait || echo "No connection to delete"
 
    # Delete ExpressRoute Gateway
    az network vnet-gateway delete \
@@ -680,9 +675,9 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
 Azure Firewall Premium and ExpressRoute create a robust hybrid network security architecture that addresses the complex requirements of modern enterprise environments. This solution provides advanced threat protection capabilities including intrusion detection and prevention (IDPS), URL filtering, and TLS inspection while maintaining high-performance private connectivity through ExpressRoute circuits. The architecture follows Azure Well-Architected Framework principles by implementing defense-in-depth security, centralized policy management, and comprehensive monitoring capabilities.
 
-The hub-and-spoke network design enables centralized security controls while providing scalable connectivity patterns for multiple workloads and environments. Azure Firewall Premium's advanced features, including threat intelligence integration and signature-based detection, provide protection against sophisticated threats that traditional network security appliances might miss. For detailed implementation guidance, refer to the [Azure Firewall Premium documentation](https://docs.microsoft.com/en-us/azure/firewall/premium-features) and [ExpressRoute planning guide](https://docs.microsoft.com/en-us/azure/expressroute/expressroute-workflows).
+The hub-and-spoke network design enables centralized security controls while providing scalable connectivity patterns for multiple workloads and environments. Azure Firewall Premium's advanced features, including threat intelligence integration and signature-based detection, provide protection against sophisticated threats that traditional network security appliances might miss. For detailed implementation guidance, refer to the [Azure Firewall Premium documentation](https://learn.microsoft.com/en-us/azure/firewall/premium-features) and [ExpressRoute planning guide](https://learn.microsoft.com/en-us/azure/expressroute/expressroute-workflows).
 
-From a cost optimization perspective, this architecture provides significant value through reduced complexity, centralized management, and elimination of traditional network security hardware. Azure Firewall Premium's consumption-based pricing model and ExpressRoute's predictable bandwidth costs enable accurate financial planning and cost control. The integrated monitoring and logging capabilities reduce operational overhead while providing the visibility needed for security operations and compliance reporting. For cost optimization strategies, review the [Azure Firewall cost optimization guide](https://docs.microsoft.com/en-us/azure/firewall/firewall-faq#how-can-i-stop-and-start-azure-firewall) and [ExpressRoute pricing documentation](https://azure.microsoft.com/pricing/details/expressroute/).
+From a cost optimization perspective, this architecture provides significant value through reduced complexity, centralized management, and elimination of traditional network security hardware. Azure Firewall Premium's consumption-based pricing model and ExpressRoute's predictable bandwidth costs enable accurate financial planning and cost control. The integrated monitoring and logging capabilities reduce operational overhead while providing the visibility needed for security operations and compliance reporting. For cost optimization strategies, review the [Azure Firewall cost optimization guide](https://learn.microsoft.com/en-us/azure/firewall/firewall-faq#how-can-i-stop-and-start-azure-firewall) and [ExpressRoute pricing documentation](https://azure.microsoft.com/pricing/details/expressroute/).
 
 The monitoring and observability capabilities provided by Azure Monitor, Log Analytics, and Azure Firewall Workbooks enable proactive security management and incident response. These tools provide real-time visibility into network traffic patterns, security events, and performance metrics essential for maintaining a secure hybrid environment. The structured logging format enables integration with SIEM systems and security orchestration platforms for automated threat response and compliance reporting.
 

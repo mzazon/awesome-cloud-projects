@@ -1,0 +1,798 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Service Performance Cost Analytics with VPC Lattice and CloudWatch Insights
+  Creates an advanced analytics system that correlates VPC Lattice service mesh 
+  performance metrics with AWS costs using CloudWatch Insights and Cost Explorer API.
+  Includes automated dashboards, Lambda functions for analysis, and EventBridge scheduling.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Service Configuration"
+        Parameters:
+          - ServiceNetworkName
+          - SampleServiceName
+          - LogRetentionDays
+      - Label:
+          default: "Analytics Configuration"
+        Parameters:
+          - AnalyticsScheduleRate
+          - CostAnalysisDays
+          - PerformanceAnalysisHours
+      - Label:
+          default: "Cost Anomaly Detection"
+        Parameters:
+          - EnableCostAnomalyDetection
+          - CostAnomalyThreshold
+          - NotificationEmail
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+
+Parameters:
+  ServiceNetworkName:
+    Type: String
+    Default: analytics-mesh
+    Description: Name for the VPC Lattice service network
+    MinLength: 3
+    MaxLength: 63
+    ConstraintDescription: Must be between 3 and 63 characters
+
+  SampleServiceName:
+    Type: String
+    Default: sample-analytics-service
+    Description: Name for the sample VPC Lattice service for testing
+    MinLength: 3
+    MaxLength: 63
+    ConstraintDescription: Must be between 3 and 63 characters
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: CloudWatch Logs retention period in days
+
+  AnalyticsScheduleRate:
+    Type: String
+    Default: "rate(6 hours)"
+    AllowedValues: 
+      - "rate(1 hour)"
+      - "rate(6 hours)"
+      - "rate(12 hours)"
+      - "rate(1 day)"
+    Description: Schedule expression for automated analytics execution
+
+  CostAnalysisDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 30
+    Description: Number of days to analyze for cost correlation (1-30)
+
+  PerformanceAnalysisHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 168
+    Description: Number of hours to analyze for performance metrics (1-168)
+
+  EnableCostAnomalyDetection:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable AWS Cost Anomaly Detection for VPC services
+
+  CostAnomalyThreshold:
+    Type: Number
+    Default: 50.0
+    MinValue: 1.0
+    MaxValue: 1000.0
+    Description: Cost anomaly detection threshold in USD
+
+  NotificationEmail:
+    Type: String
+    Default: admin@example.com
+    Description: Email address for cost anomaly notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  ResourcePrefix:
+    Type: String
+    Default: lattice-analytics
+    Description: Prefix for resource names to ensure uniqueness
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: ^[a-z][a-z0-9-]*$
+    ConstraintDescription: Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens
+
+  Environment:
+    Type: String
+    Default: demo
+    AllowedValues: [dev, test, staging, prod, demo]
+    Description: Environment designation for resource tagging
+
+Conditions:
+  CreateCostAnomalyDetection: !Equals [!Ref EnableCostAnomalyDetection, "true"]
+
+Resources:
+  # CloudWatch Log Group for VPC Lattice access logs
+  VPCLatticeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/vpclattice/${ResourcePrefix}-performance-analytics"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Purpose
+          Value: VPCLatticePerformanceAnalytics
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: Analytics
+
+  # IAM Role for Lambda functions with comprehensive permissions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-lambda-role-${AWS::AccountId}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: CostExplorerAnalyticsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetDimensionValues
+                  - ce:GetMetricsAndUsage
+                  - ce:ListCostCategoryDefinitions
+                  - ce:GetUsageReport
+                  - ce:GetAnomalyDetectors
+                  - ce:GetAnomalySubscriptions
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - logs:StartQuery
+                  - logs:GetQueryResults
+                  - vpc-lattice:GetService
+                  - vpc-lattice:GetServiceNetwork
+                  - vpc-lattice:ListServices
+                  - vpc-lattice:ListServiceNetworks
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: 
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourcePrefix}-performance-analyzer"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourcePrefix}-cost-correlator"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourcePrefix}-report-generator"
+      Tags:
+        - Key: Purpose
+          Value: VPCLatticePerformanceAnalytics
+        - Key: Environment
+          Value: !Ref Environment
+
+  # VPC Lattice Service Network
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub "${ServiceNetworkName}-${AWS::AccountId}"
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Purpose
+          Value: PerformanceCostAnalytics
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: Analytics
+
+  # Access Log Subscription for VPC Lattice Service Network
+  ServiceNetworkAccessLogSubscription:
+    Type: AWS::VpcLattice::AccessLogSubscription
+    Properties:
+      ResourceIdentifier: !Ref ServiceNetwork
+      DestinationArn: !GetAtt VPCLatticeLogGroup.Arn
+      Tags:
+        - Key: Purpose
+          Value: PerformanceAnalytics
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Sample VPC Lattice Service for testing
+  SampleService:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Sub "${SampleServiceName}-${AWS::AccountId}"
+      Tags:
+        - Key: Purpose
+          Value: AnalyticsDemo
+        - Key: CostCenter
+          Value: Analytics
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Service Network Service Association
+  ServiceNetworkServiceAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      ServiceIdentifier: !Ref SampleService
+      Tags:
+        - Key: Purpose
+          Value: AnalyticsDemo
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function: Performance Metrics Analyzer
+  PerformanceAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-performance-analyzer"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 90
+      MemorySize: 256
+      Environment:
+        Variables:
+          LOG_GROUP_NAME: !Ref VPCLatticeLogGroup
+          PERFORMANCE_ANALYSIS_HOURS: !Ref PerformanceAnalysisHours
+      Description: Analyzes VPC Lattice performance metrics using CloudWatch Insights
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+          import os
+          from datetime import datetime, timedelta
+          
+          def lambda_handler(event, context):
+              logs_client = boto3.client('logs')
+              cloudwatch = boto3.client('cloudwatch')
+              
+              try:
+                  # Calculate time range for analysis
+                  hours = int(os.environ.get('PERFORMANCE_ANALYSIS_HOURS', '24'))
+                  end_time = datetime.now()
+                  start_time = end_time - timedelta(hours=hours)
+                  
+                  # CloudWatch Insights query for VPC Lattice performance
+                  query = """
+                  fields @timestamp, sourceVpc, targetService, responseTime, requestSize, responseSize
+                  | filter @message like /requestId/
+                  | stats avg(responseTime) as avgResponseTime, 
+                          sum(requestSize) as totalRequests,
+                          sum(responseSize) as totalBytes,
+                          count() as requestCount by targetService
+                  | sort avgResponseTime desc
+                  """
+                  
+                  log_group = event.get('log_group', os.environ.get('LOG_GROUP_NAME'))
+                  
+                  # Start CloudWatch Insights query
+                  query_response = logs_client.start_query(
+                      logGroupName=log_group,
+                      startTime=int(start_time.timestamp()),
+                      endTime=int(end_time.timestamp()),
+                      queryString=query
+                  )
+                  
+                  query_id = query_response['queryId']
+                  
+                  # Wait for query completion
+                  for attempt in range(30):  # Wait up to 30 seconds
+                      query_status = logs_client.get_query_results(queryId=query_id)
+                      if query_status['status'] == 'Complete':
+                          break
+                      elif query_status['status'] == 'Failed':
+                          raise Exception(f"Query failed: {query_status.get('statistics', {})}")
+                      time.sleep(1)
+                  else:
+                      raise Exception("Query timeout after 30 seconds")
+                  
+                  # Process results and publish custom metrics
+                  performance_data = []
+                  for result in query_status.get('results', []):
+                      service_metrics = {}
+                      for field in result:
+                          service_metrics[field['field']] = field['value']
+                      
+                      if service_metrics:
+                          performance_data.append(service_metrics)
+                          
+                          # Publish custom CloudWatch metrics
+                          if 'targetService' in service_metrics and 'avgResponseTime' in service_metrics:
+                              try:
+                                  cloudwatch.put_metric_data(
+                                      Namespace='VPCLattice/Performance',
+                                      MetricData=[
+                                          {
+                                              'MetricName': 'AverageResponseTime',
+                                              'Dimensions': [
+                                                  {
+                                                      'Name': 'ServiceName',
+                                                      'Value': service_metrics['targetService']
+                                                  }
+                                              ],
+                                              'Value': float(service_metrics['avgResponseTime']),
+                                              'Unit': 'Milliseconds',
+                                              'Timestamp': datetime.now()
+                                          }
+                                      ]
+                                  )
+                              except Exception as metric_error:
+                                  print(f"Error publishing metrics: {metric_error}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Performance analysis completed',
+                          'services_analyzed': len(performance_data),
+                          'performance_data': performance_data,
+                          'query_id': query_id,
+                          'analysis_period_hours': hours
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in performance analysis: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Performance analysis failed'
+                      })
+                  }
+      Tags:
+        - Key: Purpose
+          Value: VPCLatticePerformanceAnalytics
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function: Cost Correlator
+  CostCorrelatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-cost-correlator"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          COST_ANALYSIS_DAYS: !Ref CostAnalysisDays
+      Description: Correlates VPC Lattice performance with AWS costs using Cost Explorer API
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          def lambda_handler(event, context):
+              ce_client = boto3.client('ce')
+              
+              try:
+                  # Calculate date range for cost analysis
+                  days = int(os.environ.get('COST_ANALYSIS_DAYS', '7'))
+                  end_date = datetime.now()
+                  start_date = end_date - timedelta(days=days)
+                  
+                  # Get cost and usage data for VPC Lattice and related services
+                  cost_response = ce_client.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': start_date.strftime('%Y-%m-%d'),
+                          'End': end_date.strftime('%Y-%m-%d')
+                      },
+                      Granularity='DAILY',
+                      Metrics=['BlendedCost', 'UsageQuantity'],
+                      GroupBy=[
+                          {
+                              'Type': 'DIMENSION',
+                              'Key': 'SERVICE'
+                          }
+                      ],
+                      Filter={
+                          'Dimensions': {
+                              'Key': 'SERVICE',
+                              'Values': ['Amazon Virtual Private Cloud', 'Amazon Elastic Compute Cloud - Compute', 'AWS Lambda'],
+                              'MatchOptions': ['EQUALS']
+                          }
+                      }
+                  )
+                  
+                  # Process cost data
+                  cost_analysis = {}
+                  total_cost = 0.0
+                  
+                  for result_by_time in cost_response['ResultsByTime']:
+                      date = result_by_time['TimePeriod']['Start']
+                      cost_analysis[date] = {}
+                      
+                      for group in result_by_time['Groups']:
+                          service = group['Keys'][0]
+                          cost = float(group['Metrics']['BlendedCost']['Amount'])
+                          usage = float(group['Metrics']['UsageQuantity']['Amount'])
+                          
+                          cost_analysis[date][service] = {
+                              'cost': cost,
+                              'usage': usage,
+                              'cost_per_unit': cost / usage if usage > 0 else 0
+                          }
+                          total_cost += cost
+                  
+                  # Correlate with performance data from event
+                  performance_data = event.get('performance_data', [])
+                  
+                  correlations = []
+                  for service_perf in performance_data:
+                      service_name = service_perf.get('targetService', 'unknown')
+                      avg_response_time = float(service_perf.get('avgResponseTime', 0)) if service_perf.get('avgResponseTime') else 0
+                      request_count = int(service_perf.get('requestCount', 0)) if service_perf.get('requestCount') else 0
+                      
+                      # Calculate cost efficiency metric
+                      vpc_cost = sum(
+                          day_data.get('Amazon Virtual Private Cloud', {}).get('cost', 0) 
+                          for day_data in cost_analysis.values()
+                      )
+                      
+                      if request_count > 0 and avg_response_time > 0:
+                          cost_per_request = vpc_cost / request_count if request_count > 0 else 0
+                          # Efficiency score: higher is better (inverse relationship with cost and response time)
+                          efficiency_score = 1000 / (avg_response_time * (cost_per_request + 0.001)) if (avg_response_time > 0 and cost_per_request >= 0) else 0
+                      else:
+                          cost_per_request = 0
+                          efficiency_score = 0
+                      
+                      correlations.append({
+                          'service': service_name,
+                          'avg_response_time': avg_response_time,
+                          'request_count': request_count,
+                          'estimated_cost': vpc_cost,
+                          'cost_per_request': cost_per_request,
+                          'efficiency_score': efficiency_score
+                      })
+                  
+                  # Sort by efficiency score to identify optimization opportunities
+                  correlations.sort(key=lambda x: x['efficiency_score'], reverse=True)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'cost_analysis': cost_analysis,
+                          'total_cost_analyzed': total_cost,
+                          'service_correlations': correlations,
+                          'optimization_candidates': [
+                              corr for corr in correlations 
+                              if corr['efficiency_score'] < 50  # Low efficiency threshold
+                          ],
+                          'analysis_period_days': days
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in cost correlation: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Cost correlation analysis failed'
+                      })
+                  }
+      Tags:
+        - Key: Purpose
+          Value: VPCLatticePerformanceAnalytics
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function: Report Generator (Orchestrator)
+  ReportGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-report-generator"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 180
+      MemorySize: 256
+      Environment:
+        Variables:
+          PERFORMANCE_ANALYZER_FUNCTION: !Ref PerformanceAnalyzerFunction
+          COST_CORRELATOR_FUNCTION: !Ref CostCorrelatorFunction
+          LOG_GROUP_NAME: !Ref VPCLatticeLogGroup
+      Description: Orchestrates performance and cost analysis reporting
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              lambda_client = boto3.client('lambda')
+              
+              try:
+                  log_group = event.get('log_group', os.environ.get('LOG_GROUP_NAME'))
+                  
+                  # Invoke performance analyzer
+                  perf_response = lambda_client.invoke(
+                      FunctionName=os.environ['PERFORMANCE_ANALYZER_FUNCTION'],
+                      InvocationType='RequestResponse',
+                      Payload=json.dumps({
+                          'log_group': log_group
+                      })
+                  )
+                  
+                  perf_data = json.loads(perf_response['Payload'].read())
+                  
+                  # Check for errors in performance analysis
+                  if perf_data.get('statusCode') != 200:
+                      raise Exception(f"Performance analysis failed: {perf_data.get('body', 'Unknown error')}")
+                  
+                  perf_body = json.loads(perf_data.get('body', '{}'))
+                  
+                  # Invoke cost correlator with performance data
+                  cost_response = lambda_client.invoke(
+                      FunctionName=os.environ['COST_CORRELATOR_FUNCTION'],
+                      InvocationType='RequestResponse',
+                      Payload=json.dumps({
+                          'performance_data': perf_body.get('performance_data', [])
+                      })
+                  )
+                  
+                  cost_data = json.loads(cost_response['Payload'].read())
+                  
+                  # Check for errors in cost analysis
+                  if cost_data.get('statusCode') != 200:
+                      raise Exception(f"Cost analysis failed: {cost_data.get('body', 'Unknown error')}")
+                  
+                  cost_body = json.loads(cost_data.get('body', '{}'))
+                  
+                  # Generate comprehensive report
+                  optimization_candidates = cost_body.get('optimization_candidates', [])
+                  
+                  report = {
+                      'timestamp': datetime.now().isoformat(),
+                      'summary': {
+                          'services_analyzed': perf_body.get('services_analyzed', 0),
+                          'optimization_opportunities': len(optimization_candidates),
+                          'total_cost_analyzed': cost_body.get('total_cost_analyzed', 0),
+                          'analysis_period': f"{perf_body.get('analysis_period_hours', 24)} hours (performance) / {cost_body.get('analysis_period_days', 7)} days (cost)"
+                      },
+                      'performance_insights': perf_body.get('performance_data', []),
+                      'cost_correlations': cost_body.get('service_correlations', []),
+                      'optimization_recommendations': optimization_candidates
+                  }
+                  
+                  # Generate actionable recommendations
+                  recommendations = []
+                  for candidate in optimization_candidates:
+                      service_name = candidate.get('service', 'unknown')
+                      avg_response_time = candidate.get('avg_response_time', 0)
+                      cost_per_request = candidate.get('cost_per_request', 0)
+                      
+                      if avg_response_time > 500:  # High response time threshold
+                          recommendations.append(f"Service {service_name}: Consider optimizing for performance (avg response time: {avg_response_time:.2f}ms)")
+                      
+                      if cost_per_request > 0.01:  # High cost per request threshold
+                          recommendations.append(f"Service {service_name}: Review resource allocation (cost per request: ${cost_per_request:.4f})")
+                      
+                      if candidate.get('efficiency_score', 0) < 10:  # Very low efficiency
+                          recommendations.append(f"Service {service_name}: Critical efficiency review needed (efficiency score: {candidate.get('efficiency_score', 0):.2f})")
+                  
+                  if not recommendations:
+                      recommendations.append("No critical optimization opportunities identified. Continue monitoring for trends.")
+                  
+                  report['actionable_recommendations'] = recommendations
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(report, default=str, indent=2)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in report generation: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Report generation failed',
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+      Tags:
+        - Key: Purpose
+          Value: VPCLatticePerformanceAnalytics
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Rule for Scheduled Analytics
+  AnalyticsScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ResourcePrefix}-analytics-scheduler"
+      Description: Trigger VPC Lattice performance cost analytics on schedule
+      ScheduleExpression: !Ref AnalyticsScheduleRate
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ReportGeneratorFunction.Arn
+          Id: "ReportGeneratorTarget"
+          Input: !Sub |
+            {
+              "log_group": "${VPCLatticeLogGroup}",
+              "environment": "${Environment}"
+            }
+
+  # Permission for EventBridge to invoke Lambda
+  AnalyticsSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReportGeneratorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AnalyticsScheduleRule.Arn
+
+  # CloudWatch Dashboard for Performance Cost Analytics
+  PerformanceCostDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ResourcePrefix}-performance-cost-analytics"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/VPCLattice", "NewConnectionCount", "ServiceNetwork", "${ServiceNetwork}" ],
+                  [ ".", "ActiveConnectionCount", ".", "." ],
+                  [ "VPCLattice/Performance", "AverageResponseTime", "ServiceName", "${SampleService}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "VPC Lattice Performance Metrics",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${VPCLatticeLogGroup}' | fields @timestamp, targetService, responseTime, requestSize\n| filter @message like /requestId/\n| stats avg(responseTime) as avgResponseTime by targetService\n| sort avgResponseTime desc",
+                "region": "${AWS::Region}",
+                "title": "Service Response Time Analysis",
+                "view": "table"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${VPCLatticeLogGroup}' | fields @timestamp, responseCode\n| filter @message like /requestId/\n| stats count() as requestCount by responseCode\n| sort requestCount desc",
+                "region": "${AWS::Region}",
+                "title": "Response Code Distribution",
+                "view": "pie"
+              }
+            }
+          ]
+        }
+
+  # Cost Anomaly Detector (Conditional)
+  CostAnomalyDetector:
+    Type: AWS::CE::AnomalyDetector
+    Condition: CreateCostAnomalyDetection
+    Properties:
+      AnomalyDetectorName: !Sub "${ResourcePrefix}-vpc-cost-anomalies"
+      MonitorType: DIMENSIONAL
+      DimensionKey: SERVICE
+      MonitorSpecification:
+        DimensionKey: SERVICE
+        MatchOptions: 
+          - EQUALS
+        Values: 
+          - "Amazon Virtual Private Cloud"
+
+  # Cost Anomaly Subscription (Conditional)
+  CostAnomalySubscription:
+    Type: AWS::CE::AnomalySubscription
+    Condition: CreateCostAnomalyDetection
+    Properties:
+      AnomalySubscriptionName: !Sub "${ResourcePrefix}-cost-alerts"
+      MonitorArnList: 
+        - !GetAtt CostAnomalyDetector.AnomalyDetectorArn
+      Frequency: DAILY
+      Threshold: !Ref CostAnomalyThreshold
+      Subscribers:
+        - Address: !Ref NotificationEmail
+          Type: EMAIL
+
+Outputs:
+  ServiceNetworkId:
+    Description: VPC Lattice Service Network ID
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceNetworkId"
+
+  ServiceNetworkArn:
+    Description: VPC Lattice Service Network ARN
+    Value: !GetAtt ServiceNetwork.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceNetworkArn"
+
+  SampleServiceId:
+    Description: Sample VPC Lattice Service ID
+    Value: !Ref SampleService
+    Export:
+      Name: !Sub "${AWS::StackName}-SampleServiceId"
+
+  LogGroupName:
+    Description: CloudWatch Log Group for VPC Lattice access logs
+    Value: !Ref VPCLatticeLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroupName"
+
+  PerformanceAnalyzerFunctionArn:
+    Description: Performance Analyzer Lambda Function ARN
+    Value: !GetAtt PerformanceAnalyzerFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-PerformanceAnalyzerFunctionArn"
+
+  CostCorrelatorFunctionArn:
+    Description: Cost Correlator Lambda Function ARN
+    Value: !GetAtt CostCorrelatorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CostCorrelatorFunctionArn"
+
+  ReportGeneratorFunctionArn:
+    Description: Report Generator Lambda Function ARN
+    Value: !GetAtt ReportGeneratorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ReportGeneratorFunctionArn"
+
+  DashboardUrl:
+    Description: CloudWatch Dashboard URL for performance analytics
+    Value: !Sub "https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-performance-cost-analytics"
+
+  ScheduleRuleArn:
+    Description: EventBridge Rule ARN for analytics scheduling
+    Value: !GetAtt AnalyticsScheduleRule.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ScheduleRuleArn"
+
+  CostAnomalyDetectorArn:
+    Condition: CreateCostAnomalyDetection
+    Description: Cost Anomaly Detector ARN
+    Value: !GetAtt CostAnomalyDetector.AnomalyDetectorArn
+    Export:
+      Name: !Sub "${AWS::StackName}-CostAnomalyDetectorArn"
+
+  TestInvocationCommand:
+    Description: AWS CLI command to test the analytics pipeline
+    Value: !Sub |
+      aws lambda invoke --function-name ${ReportGeneratorFunction} --payload '{"log_group":"${VPCLatticeLogGroup}","environment":"${Environment}"}' --cli-binary-format raw-in-base64-out response.json && cat response.json | jq '.'

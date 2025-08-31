@@ -1,0 +1,685 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure Monitoring Setup with Systems Manager and CloudWatch.
+  This template establishes comprehensive monitoring, compliance, and 
+  operational visibility across EC2 infrastructure using AWS native services.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - Environment
+          - MonitoringPrefix
+          - EnableAlerts
+          - NotificationEmail
+      - Label:
+          default: "CloudWatch Settings"
+        Parameters:
+          - CPUThreshold
+          - DiskThreshold
+          - SystemLogRetention
+          - ApplicationLogRetention
+      - Label:
+          default: "Compliance Configuration"
+        Parameters:
+          - InventorySchedule
+          - PatchScanSchedule
+          - EnableComplianceScanning
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      MonitoringPrefix:
+        default: "Resource Prefix"
+      EnableAlerts:
+        default: "Enable CloudWatch Alarms"
+      NotificationEmail:
+        default: "Alert Notification Email"
+      CPUThreshold:
+        default: "CPU Utilization Threshold"
+      DiskThreshold:
+        default: "Disk Usage Threshold"
+      SystemLogRetention:
+        default: "System Log Retention (Days)"
+      ApplicationLogRetention:
+        default: "Application Log Retention (Days)"
+      InventorySchedule:
+        default: "Inventory Collection Schedule"
+      PatchScanSchedule:
+        default: "Patch Scanning Schedule"
+      EnableComplianceScanning:
+        default: "Enable Compliance Scanning"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    Description: Environment name for resource tagging and targeting
+    AllowedValues:
+      - development
+      - staging
+      - production
+      - testing
+    ConstraintDescription: Must be development, staging, production, or testing
+
+  MonitoringPrefix:
+    Type: String
+    Default: infra-monitoring
+    Description: Prefix for monitoring resource names
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with letter, contain only alphanumeric characters and hyphens
+
+  EnableAlerts:
+    Type: String
+    Default: 'true'
+    Description: Enable CloudWatch alarms for critical metrics
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for alarm notifications (optional)
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+  CPUThreshold:
+    Type: Number
+    Default: 80
+    Description: CPU utilization threshold percentage for alarms
+    MinValue: 50
+    MaxValue: 95
+    ConstraintDescription: Must be between 50 and 95
+
+  DiskThreshold:
+    Type: Number
+    Default: 85
+    Description: Disk usage threshold percentage for alarms
+    MinValue: 70
+    MaxValue: 95
+    ConstraintDescription: Must be between 70 and 95
+
+  SystemLogRetention:
+    Type: Number
+    Default: 30
+    Description: System log retention period in days
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    ConstraintDescription: Must be a valid CloudWatch Logs retention period
+
+  ApplicationLogRetention:
+    Type: Number
+    Default: 14
+    Description: Application log retention period in days
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    ConstraintDescription: Must be a valid CloudWatch Logs retention period
+
+  InventorySchedule:
+    Type: String
+    Default: 'rate(1 day)'
+    Description: Schedule expression for inventory collection
+    AllowedValues:
+      - 'rate(12 hours)'
+      - 'rate(1 day)'
+      - 'rate(2 days)'
+      - 'rate(7 days)'
+    ConstraintDescription: Must be a valid CloudWatch Events schedule expression
+
+  PatchScanSchedule:
+    Type: String
+    Default: 'rate(7 days)'
+    Description: Schedule expression for patch scanning
+    AllowedValues:
+      - 'rate(1 day)'
+      - 'rate(3 days)'
+      - 'rate(7 days)'
+      - 'rate(14 days)'
+    ConstraintDescription: Must be a valid CloudWatch Events schedule expression
+
+  EnableComplianceScanning:
+    Type: String
+    Default: 'true'
+    Description: Enable Systems Manager compliance scanning
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  CreateAlerts: !Equals [!Ref EnableAlerts, 'true']
+  CreateNotifications: !And
+    - !Condition CreateAlerts
+    - !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableCompliance: !Equals [!Ref EnableComplianceScanning, 'true']
+
+Resources:
+  # IAM Role for Systems Manager Service
+  SSMServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${MonitoringPrefix}-SSMServiceRole-${AWS::Region}'
+      Description: Service role for Systems Manager monitoring and compliance operations
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Path: /
+      Tags:
+        - Key: Name
+          Value: !Sub '${MonitoringPrefix}-SSMServiceRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: InfrastructureMonitoring
+
+  # CloudWatch Agent Configuration Parameter
+  CloudWatchAgentConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${MonitoringPrefix}/cloudwatch-agent/config'
+      Type: String
+      Description: CloudWatch Agent configuration for enhanced system metrics
+      Value: !Sub |
+        {
+          "metrics": {
+            "namespace": "CWAgent",
+            "metrics_collected": {
+              "cpu": {
+                "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+                "metrics_collection_interval": 60,
+                "totalcpu": false
+              },
+              "disk": {
+                "measurement": ["used_percent", "inodes_free"],
+                "metrics_collection_interval": 60,
+                "resources": ["*"]
+              },
+              "diskio": {
+                "measurement": ["io_time", "read_bytes", "write_bytes", "reads", "writes"],
+                "metrics_collection_interval": 60,
+                "resources": ["*"]
+              },
+              "mem": {
+                "measurement": ["mem_used_percent"],
+                "metrics_collection_interval": 60
+              },
+              "netstat": {
+                "measurement": ["tcp_established", "tcp_time_wait"],
+                "metrics_collection_interval": 60
+              },
+              "swap": {
+                "measurement": ["swap_used_percent"],
+                "metrics_collection_interval": 60
+              }
+            }
+          },
+          "logs": {
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  {
+                    "file_path": "/var/log/messages",
+                    "log_group_name": "/aws/systems-manager/infrastructure-${Environment}",
+                    "log_stream_name": "{instance_id}/var/log/messages"
+                  },
+                  {
+                    "file_path": "/var/log/secure",
+                    "log_group_name": "/aws/systems-manager/infrastructure-${Environment}",
+                    "log_stream_name": "{instance_id}/var/log/secure"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      Tags:
+        Name: !Sub '${MonitoringPrefix}-CloudWatchAgentConfig'
+        Environment: !Ref Environment
+        Purpose: InfrastructureMonitoring
+
+  # CloudWatch Log Group for System Logs
+  SystemLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/systems-manager/infrastructure-${Environment}'
+      RetentionInDays: !Ref SystemLogRetention
+      Tags:
+        - Key: Name
+          Value: !Sub '${MonitoringPrefix}-SystemLogs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SystemLogging
+
+  # CloudWatch Log Group for Application Logs
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/application-logs-${Environment}'
+      RetentionInDays: !Ref ApplicationLogRetention
+      Tags:
+        - Key: Name
+          Value: !Sub '${MonitoringPrefix}-ApplicationLogs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ApplicationLogging
+
+  # CloudWatch Log Stream for Run Command Outputs
+  RunCommandLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref SystemLogGroup
+      LogStreamName: run-command-outputs
+
+  # SNS Topic for Alarm Notifications (conditional)
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotifications
+    Properties:
+      TopicName: !Sub '${MonitoringPrefix}-infrastructure-alerts'
+      DisplayName: Infrastructure Monitoring Alerts
+      Tags:
+        - Key: Name
+          Value: !Sub '${MonitoringPrefix}-AlarmTopic'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: AlertNotifications
+
+  # SNS Subscription for Email Notifications (conditional)
+  EmailNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateNotifications
+    Properties:
+      TopicArn: !Ref AlarmNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Dashboard for Infrastructure Monitoring
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${MonitoringPrefix}-Infrastructure-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/EC2", "CPUUtilization"],
+                  [".", "NetworkIn"],
+                  [".", "NetworkOut"],
+                  [".", "DiskReadOps"],
+                  [".", "DiskWriteOps"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "EC2 Instance Performance",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SSM-RunCommand", "CommandsSucceeded"],
+                  [".", "CommandsFailed"],
+                  [".", "CommandsTimedOut"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Systems Manager Operations",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["CWAgent", "mem_used_percent"],
+                  [".", "swap_used_percent"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Memory and Swap Utilization",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["CWAgent", "used_percent", "device", "/dev/xvda1"],
+                  [".", ".", ".", "/dev/nvme0n1p1"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Disk Usage Percentage",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/systems-manager/infrastructure-${Environment}'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent System Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CPU Utilization Alarm (conditional)
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlerts
+    Properties:
+      AlarmName: !Sub '${MonitoringPrefix}-High-CPU-Utilization'
+      AlarmDescription: !Sub 'Alert when CPU exceeds ${CPUThreshold}%'
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref CPUThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [CreateNotifications, !Ref AlarmNotificationTopic, !Ref 'AWS::NoValue']
+      OKActions:
+        - !If [CreateNotifications, !Ref AlarmNotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${MonitoringPrefix}-HighCPUAlarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: PerformanceMonitoring
+
+  # Disk Usage Alarm (conditional)
+  HighDiskUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlerts
+    Properties:
+      AlarmName: !Sub '${MonitoringPrefix}-High-Disk-Usage'
+      AlarmDescription: !Sub 'Alert when disk usage exceeds ${DiskThreshold}%'
+      MetricName: used_percent
+      Namespace: CWAgent
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref DiskThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [CreateNotifications, !Ref AlarmNotificationTopic, !Ref 'AWS::NoValue']
+      OKActions:
+        - !If [CreateNotifications, !Ref AlarmNotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${MonitoringPrefix}-HighDiskAlarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CapacityMonitoring
+
+  # Memory Usage Alarm (conditional)
+  HighMemoryUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlerts
+    Properties:
+      AlarmName: !Sub '${MonitoringPrefix}-High-Memory-Usage'
+      AlarmDescription: Alert when memory usage exceeds 90%
+      MetricName: mem_used_percent
+      Namespace: CWAgent
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [CreateNotifications, !Ref AlarmNotificationTopic, !Ref 'AWS::NoValue']
+      OKActions:
+        - !If [CreateNotifications, !Ref AlarmNotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${MonitoringPrefix}-HighMemoryAlarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CapacityMonitoring
+
+  # Systems Manager Association for Software Inventory (conditional)
+  SoftwareInventoryAssociation:
+    Type: AWS::SSM::Association
+    Condition: EnableCompliance
+    Properties:
+      AssociationName: !Sub '${MonitoringPrefix}-Daily-Inventory-Collection'
+      Name: AWS-GatherSoftwareInventory
+      ScheduleExpression: !Ref InventorySchedule
+      Targets:
+        - Key: tag:Environment
+          Values:
+            - !Ref Environment
+      Parameters:
+        applications: Enabled
+        awsComponents: Enabled
+        customInventory: Enabled
+        instanceDetailedInformation: Enabled
+        networkConfig: Enabled
+        services: Enabled
+        windowsRoles: Enabled
+        windowsUpdates: Enabled
+      ComplianceSeverity: MEDIUM
+      MaxConcurrency: '10'
+      MaxErrors: '5'
+      WaitForSuccessTimeoutSeconds: 3600
+
+  # Systems Manager Association for Patch Baseline Scanning (conditional)
+  PatchBaselineAssociation:
+    Type: AWS::SSM::Association
+    Condition: EnableCompliance
+    Properties:
+      AssociationName: !Sub '${MonitoringPrefix}-Weekly-Patch-Scanning'
+      Name: AWS-RunPatchBaseline
+      ScheduleExpression: !Ref PatchScanSchedule
+      Targets:
+        - Key: tag:Environment
+          Values:
+            - !Ref Environment
+      Parameters:
+        Operation: Scan
+      ComplianceSeverity: HIGH
+      MaxConcurrency: '10'
+      MaxErrors: '5'
+      WaitForSuccessTimeoutSeconds: 7200
+      OutputLocation:
+        S3Location:
+          OutputS3BucketName: !Ref ComplianceOutputBucket
+          OutputS3KeyPrefix: !Sub '${MonitoringPrefix}/patch-compliance/'
+
+  # S3 Bucket for Compliance Output Storage (conditional)
+  ComplianceOutputBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableCompliance
+    Properties:
+      BucketName: !Sub '${MonitoringPrefix}-compliance-output-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldComplianceReports
+            Status: Enabled
+            ExpirationInDays: 90
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref SystemLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${MonitoringPrefix}-ComplianceOutput'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ComplianceStorage
+
+  # Systems Manager Association for CloudWatch Agent Installation
+  CloudWatchAgentAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub '${MonitoringPrefix}-CloudWatch-Agent-Installation'
+      Name: AmazonCloudWatch-ManageAgent
+      ScheduleExpression: 'rate(1 day)'
+      Targets:
+        - Key: tag:Environment
+          Values:
+            - !Ref Environment
+      Parameters:
+        action: configure
+        mode: ec2
+        optionalConfigurationSource: ssm
+        optionalConfigurationLocation: !Ref CloudWatchAgentConfig
+        optionalRestart: 'yes'
+      ComplianceSeverity: HIGH
+      MaxConcurrency: '10'
+      MaxErrors: '5'
+      WaitForSuccessTimeoutSeconds: 1800
+
+Outputs:
+  SSMServiceRoleArn:
+    Description: ARN of the Systems Manager service role
+    Value: !GetAtt SSMServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SSMServiceRoleArn'
+
+  CloudWatchAgentConfigParameter:
+    Description: Systems Manager parameter for CloudWatch Agent configuration
+    Value: !Ref CloudWatchAgentConfig
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchAgentConfig'
+
+  SystemLogGroupName:
+    Description: CloudWatch Log Group for system logs
+    Value: !Ref SystemLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SystemLogGroup'
+
+  ApplicationLogGroupName:
+    Description: CloudWatch Log Group for application logs
+    Value: !Ref ApplicationLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationLogGroup'
+
+  MonitoringDashboardURL:
+    Description: URL to the CloudWatch monitoring dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${MonitoringPrefix}-Infrastructure-Dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  AlarmNotificationTopicArn:
+    Condition: CreateNotifications
+    Description: ARN of the SNS topic for alarm notifications
+    Value: !Ref AlarmNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmTopic'
+
+  ComplianceOutputBucketName:
+    Condition: EnableCompliance
+    Description: S3 bucket for compliance output storage
+    Value: !Ref ComplianceOutputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceBucket'
+
+  InventoryAssociationId:
+    Condition: EnableCompliance
+    Description: Systems Manager association ID for inventory collection
+    Value: !Ref SoftwareInventoryAssociation
+    Export:
+      Name: !Sub '${AWS::StackName}-InventoryAssociation'
+
+  PatchScanAssociationId:
+    Condition: EnableCompliance
+    Description: Systems Manager association ID for patch scanning
+    Value: !Ref PatchBaselineAssociation
+    Export:
+      Name: !Sub '${AWS::StackName}-PatchScanAssociation'
+
+  CloudWatchAgentAssociationId:
+    Description: Systems Manager association ID for CloudWatch Agent management
+    Value: !Ref CloudWatchAgentAssociation
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchAgentAssociation'
+
+  StackRegion:
+    Description: AWS Region where the stack was deployed
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  StackName:
+    Description: Name of this CloudFormation stack
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${AWS::StackName}-Name'

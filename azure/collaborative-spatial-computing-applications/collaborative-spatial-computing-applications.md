@@ -4,12 +4,12 @@ id: a7d4e9f2
 category: spatial-computing
 difficulty: 300
 subject: azure
-services: Azure Remote Rendering, Azure Spatial Anchors, Azure Mixed Reality Toolkit, Azure Object Anchors
+services: Azure Remote Rendering, Azure Spatial Anchors, Azure Blob Storage, Azure Active Directory
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: spatial-computing, mixed-reality, 3d-rendering, holographic-applications, cross-platform-collaboration
 recipe-generator-version: 1.3
@@ -89,7 +89,7 @@ graph TB
 5. HoloLens 2 device or Windows Mixed Reality simulator for testing
 6. Basic understanding of 3D graphics, coordinate systems, and mixed reality concepts
 
-> **Warning**: Azure Remote Rendering will be retired on September 30, 2025, and Azure Spatial Anchors on November 20, 2024. This recipe demonstrates current capabilities before retirement. Consider Azure Object Anchors and alternative rendering solutions for future implementations.
+> **Warning**: Azure Remote Rendering will be retired on September 30, 2025, and Azure Spatial Anchors on November 20, 2024. Azure Object Anchors was already retired on May 20, 2024. This recipe demonstrates current capabilities before retirement. Consider alternative rendering solutions and spatial mapping approaches for future implementations.
 
 ## Preparation
 
@@ -144,19 +144,19 @@ export STORAGE_KEY
 
    ```bash
    # Create Remote Rendering account
-   az mixed-reality remote-rendering-account create \
+   az remote-rendering-account create \
        --name ${ARR_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --sku S1
    
    # Get account credentials for application integration
-   ARR_ACCOUNT_ID=$(az mixed-reality remote-rendering-account show \
+   ARR_ACCOUNT_ID=$(az remote-rendering-account show \
        --name ${ARR_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query accountId --output tsv)
    
-   ARR_ACCOUNT_DOMAIN=$(az mixed-reality remote-rendering-account show \
+   ARR_ACCOUNT_DOMAIN=$(az remote-rendering-account show \
        --name ${ARR_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query accountDomain --output tsv)
@@ -174,19 +174,19 @@ export STORAGE_KEY
 
    ```bash
    # Create Spatial Anchors account
-   az mixed-reality spatial-anchors-account create \
+   az spatial-anchors-account create \
        --name ${ASA_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --sku S1
    
    # Get account credentials
-   ASA_ACCOUNT_ID=$(az mixed-reality spatial-anchors-account show \
+   ASA_ACCOUNT_ID=$(az spatial-anchors-account show \
        --name ${ASA_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query accountId --output tsv)
    
-   ASA_ACCOUNT_DOMAIN=$(az mixed-reality spatial-anchors-account show \
+   ASA_ACCOUNT_DOMAIN=$(az spatial-anchors-account show \
        --name ${ASA_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query accountDomain --output tsv)
@@ -235,7 +235,7 @@ export STORAGE_KEY
    # Create service principal for application authentication
    SP_DETAILS=$(az ad sp create-for-rbac \
        --name "sp-spatialapp-${RANDOM_SUFFIX}" \
-       --role "Mixed Reality Administrator" \
+       --role "Contributor" \
        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}" \
        --sdk-auth)
    
@@ -469,21 +469,21 @@ export STORAGE_KEY
 
    ```bash
    # Check Remote Rendering account status
-   az mixed-reality remote-rendering-account show \
+   az remote-rendering-account show \
        --name ${ARR_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query "{Name:name,Status:status,Location:location}" \
+       --query "{Name:name,Location:location}" \
        --output table
    
    # Check Spatial Anchors account status  
-   az mixed-reality spatial-anchors-account show \
+   az spatial-anchors-account show \
        --name ${ASA_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query "{Name:name,Status:status,Location:location}" \
+       --query "{Name:name,Location:location}" \
        --output table
    ```
 
-   Expected output: Both accounts should show "Active" status and correct location.
+   Expected output: Both accounts should be successfully created in the correct location.
 
 2. **Test Storage Container Access**:
 
@@ -510,8 +510,8 @@ export STORAGE_KEY
        --password ${SP_CLIENT_SECRET} \
        --tenant ${SP_TENANT_ID}
    
-   # Verify Mixed Reality access
-   az mixed-reality remote-rendering-account list \
+   # Verify Remote Rendering access
+   az remote-rendering-account list \
        --resource-group ${RESOURCE_GROUP} \
        --query "[].name" --output tsv
    
@@ -538,11 +538,11 @@ export STORAGE_KEY
 
 ## Cleanup
 
-1. **Remove Azure Mixed Reality Services**:
+1. **Remove Azure Remote Rendering Account**:
 
    ```bash
    # Delete Remote Rendering account
-   az mixed-reality remote-rendering-account delete \
+   az remote-rendering-account delete \
        --name ${ARR_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --yes
@@ -554,7 +554,7 @@ export STORAGE_KEY
 
    ```bash
    # Delete Spatial Anchors account
-   az mixed-reality spatial-anchors-account delete \
+   az spatial-anchors-account delete \
        --name ${ASA_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --yes
@@ -612,7 +612,7 @@ Cross-platform spatial synchronization through Spatial Anchors enables truly col
 
 From a cost optimization perspective, the consumption-based pricing model requires careful session management and model optimization strategies. Azure Remote Rendering charges for active rendering time, making it essential to implement proper session lifecycle management and model level-of-detail systems. The [performance optimization guide](https://docs.microsoft.com/en-us/azure/remote-rendering/overview/features/performance-queries) provides detailed strategies for balancing visual quality with cost efficiency.
 
-> **Note**: Both Azure Remote Rendering and Azure Spatial Anchors are scheduled for retirement (September 2025 and November 2024, respectively). Organizations should plan migration to Azure Object Anchors and alternative rendering solutions. The [service retirement documentation](https://azure.microsoft.com/updates/v2/azure-remote-rendering-retirement/) provides migration guidance and timeline considerations.
+> **Note**: Azure Remote Rendering is scheduled for retirement on September 30, 2025, and Azure Spatial Anchors on November 20, 2024. Azure Object Anchors has already been retired as of May 20, 2024. Organizations should plan migration to alternative rendering solutions and consider using Unity's built-in XR and spatial mapping capabilities. The [service retirement documentation](https://azure.microsoft.com/updates/v2/azure-remote-rendering-retirement/) provides migration guidance and timeline considerations.
 
 ## Challenge
 

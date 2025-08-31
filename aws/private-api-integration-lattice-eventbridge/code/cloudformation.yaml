@@ -1,0 +1,778 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Private API Integration with VPC Lattice and EventBridge
+  This template creates a secure event-driven architecture using VPC Lattice Resource Configurations
+  to enable direct private API access from EventBridge and Step Functions without Lambda proxies.
+  
+  Author: AWS CloudFormation Team
+  Version: 1.0
+  Recipe: private-api-integration-lattice-eventbridge
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - Subnet1Cidr
+          - Subnet2Cidr
+          - AvailabilityZone1
+          - AvailabilityZone2
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - Environment
+          - ProjectName
+          - ResourceSuffix
+      - Label:
+          default: "API Configuration"
+        Parameters:
+          - ApiStageName
+          - EnableApiLogging
+    ParameterLabels:
+      VpcCidr:
+        default: "VPC CIDR Block"
+      Subnet1Cidr:
+        default: "First Subnet CIDR"
+      Subnet2Cidr:
+        default: "Second Subnet CIDR"
+      Environment:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: demo
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+      - demo
+    Description: Environment name for resource tagging and naming
+    ConstraintDescription: Must be one of dev, test, staging, prod, or demo
+
+  ProjectName:
+    Type: String
+    Default: private-api-integration
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: ^[a-z0-9-]+$
+    Description: Project name used for resource naming (lowercase, hyphens allowed)
+    ConstraintDescription: Must be 3-30 characters, lowercase letters, numbers, and hyphens only
+
+  ResourceSuffix:
+    Type: String
+    Default: !Sub "${AWS::StackName}"
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: ^[a-z0-9-]+$
+    Description: Unique suffix for resource names (defaults to stack name)
+    ConstraintDescription: Must be 3-20 characters, lowercase letters, numbers, and hyphens only
+
+  VpcCidr:
+    Type: String
+    Default: 10.1.0.0/16
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: CIDR block for the target VPC
+    ConstraintDescription: Must be a valid CIDR notation (e.g., 10.1.0.0/16)
+
+  Subnet1Cidr:
+    Type: String
+    Default: 10.1.1.0/24
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: CIDR block for the first subnet
+    ConstraintDescription: Must be a valid CIDR notation within the VPC CIDR
+
+  Subnet2Cidr:
+    Type: String
+    Default: 10.1.2.0/24
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: CIDR block for the second subnet
+    ConstraintDescription: Must be a valid CIDR notation within the VPC CIDR
+
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: First Availability Zone for subnet placement
+
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Second Availability Zone for subnet placement
+
+  ApiStageName:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    Description: API Gateway deployment stage name
+    ConstraintDescription: Must be one of dev, test, staging, or prod
+
+  EnableApiLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable CloudWatch logging for API Gateway
+
+Conditions:
+  EnableLogging: !Equals [!Ref EnableApiLogging, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # ==========================================
+  # VPC and Networking Infrastructure
+  # ==========================================
+
+  TargetVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-target-vpc-${ResourceSuffix}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: private-api-integration
+        - Key: Project
+          Value: !Ref ProjectName
+
+  TargetSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TargetVpc
+      CidrBlock: !Ref Subnet1Cidr
+      AvailabilityZone: !Ref AvailabilityZone1
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-target-subnet-1-${ResourceSuffix}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AZ
+          Value: !Ref AvailabilityZone1
+
+  TargetSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TargetVpc
+      CidrBlock: !Ref Subnet2Cidr
+      AvailabilityZone: !Ref AvailabilityZone2
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-target-subnet-2-${ResourceSuffix}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AZ
+          Value: !Ref AvailabilityZone2
+
+  # ==========================================
+  # VPC Endpoint for API Gateway
+  # ==========================================
+
+  ApiGatewayVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref TargetVpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.execute-api"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref TargetSubnet1
+        - !Ref TargetSubnet2
+      SecurityGroupIds:
+        - !Ref ApiGatewayVpcEndpointSecurityGroup
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - execute-api:Invoke
+              - execute-api:InvalidateCache
+            Resource: '*'
+      PrivateDnsEnabled: true
+
+  ApiGatewayVpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for API Gateway VPC Endpoint
+      VpcId: !Ref TargetVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS access from VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound to API Gateway
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpce-sg-${ResourceSuffix}"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================
+  # IAM Roles and Policies
+  # ==========================================
+
+  EventBridgeStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-eventbridge-stepfunctions-role-${ResourceSuffix}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+                - states.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEventBridgeInvokeLambdaRole
+      Policies:
+        - PolicyName: VPCLatticeConnectionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:CreateConnection
+                  - events:UpdateConnection
+                  - events:InvokeApiDestination
+                  - execute-api:Invoke
+                  - vpc-lattice:GetResourceConfiguration
+                  - vpc-lattice:GetServiceNetworkResourceAssociation
+                  - states:StartExecution
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref 'AWS::Region'
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-iam-role-${ResourceSuffix}"
+        - Key: Environment
+          Value: !Ref Environment
+
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-apigateway-role-${ResourceSuffix}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================
+  # CloudWatch Log Groups
+  # ==========================================
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-${ResourceSuffix}"
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: api-gateway-logs
+
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/stepfunctions/${ProjectName}-${ResourceSuffix}"
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: step-functions-logs
+
+  # ==========================================
+  # API Gateway Private API
+  # ==========================================
+
+  PrivateRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-private-api-${ResourceSuffix}"
+      Description: Private API Gateway for VPC Lattice integration demo
+      EndpointConfiguration:
+        Types:
+          - PRIVATE
+        VpcEndpointIds:
+          - !Ref ApiGatewayVpcEndpoint
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*/*"
+            Condition:
+              StringEquals:
+                'aws:sourceVpce': !Ref ApiGatewayVpcEndpoint
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-api-${ResourceSuffix}"
+        - Key: Environment
+          Value: !Ref Environment
+
+  OrdersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PrivateRestApi
+      ParentId: !GetAtt PrivateRestApi.RootResourceId
+      PathPart: orders
+
+  OrdersPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PrivateRestApi
+      ResourceId: !Ref OrdersResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      RequestParameters:
+        method.request.header.Content-Type: true
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseTemplates:
+              application/json: |
+                {
+                  "orderId": "order-$util.escapeJavaScript($context.requestId)",
+                  "status": "created",
+                  "timestamp": "$context.requestTime",
+                  "customerId": "$input.path('$.customerId')",
+                  "orderItems": $input.path('$.orderItems')
+                }
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: Empty
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - OrdersPostMethod
+    Properties:
+      RestApiId: !Ref PrivateRestApi
+      StageName: !Ref ApiStageName
+      StageDescription: !Sub "Deployment stage for ${Environment} environment"
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Condition: EnableLogging
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayRole.Arn
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref PrivateRestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref ApiStageName
+      Description: !Sub "${Environment} stage for private API"
+      AccessLogSetting: !If
+        - EnableLogging
+        - DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+          Format: >
+            {
+              "requestId": "$context.requestId",
+              "ip": "$context.identity.sourceIp",
+              "caller": "$context.identity.caller",
+              "user": "$context.identity.user",
+              "requestTime": "$context.requestTime",
+              "httpMethod": "$context.httpMethod",
+              "resourcePath": "$context.resourcePath",
+              "status": "$context.status",
+              "protocol": "$context.protocol",
+              "responseLength": "$context.responseLength"
+            }
+        - !Ref 'AWS::NoValue'
+      MethodSettings:
+        - ResourcePath: /*
+          HttpMethod: '*'
+          LoggingLevel: !If [EnableLogging, INFO, 'OFF']
+          DataTraceEnabled: !If [EnableLogging, true, false]
+          MetricsEnabled: true
+          ThrottlingRateLimit: 100
+          ThrottlingBurstLimit: 200
+
+  # ==========================================
+  # VPC Lattice Service Network
+  # ==========================================
+
+  VpcLatticeServiceNetwork:
+    Type: AWS::VPCLattice::ServiceNetwork
+    Properties:
+      Name: !Sub "${ProjectName}-service-network-${ResourceSuffix}"
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-service-network-${ResourceSuffix}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: private-api-integration
+
+  # ==========================================
+  # VPC Lattice Resource Gateway
+  # ==========================================
+
+  VpcLatticeResourceGateway:
+    Type: AWS::VPCLattice::ResourceGateway
+    Properties:
+      Name: !Sub "${ProjectName}-resource-gateway-${ResourceSuffix}"
+      VpcIdentifier: !Ref TargetVpc
+      SubnetIds:
+        - !Ref TargetSubnet1
+        - !Ref TargetSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-resource-gateway-${ResourceSuffix}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: private-api-access
+
+  # ==========================================
+  # VPC Lattice Resource Configuration
+  # ==========================================
+
+  VpcLatticeResourceConfiguration:
+    Type: AWS::VPCLattice::ResourceConfiguration
+    Properties:
+      Name: !Sub "${ProjectName}-resource-config-${ResourceSuffix}"
+      Type: SINGLE
+      ResourceGatewayIdentifier: !Ref VpcLatticeResourceGateway
+      ResourceConfigurationDefinition:
+        Type: RESOURCE
+        ResourceIdentifier: !Ref ApiGatewayVpcEndpoint
+        PortRanges:
+          - FromPort: 443
+            ToPort: 443
+            Protocol: TCP
+      AllowAssociationToShareableServiceNetwork: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-resource-config-${ResourceSuffix}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: private-api-integration
+
+  # ==========================================
+  # VPC Lattice Service Network Resource Association
+  # ==========================================
+
+  ServiceNetworkResourceAssociation:
+    Type: AWS::VPCLattice::ServiceNetworkResourceAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref VpcLatticeServiceNetwork
+      ResourceConfigurationIdentifier: !Ref VpcLatticeResourceConfiguration
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-sn-resource-assoc-${ResourceSuffix}"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================
+  # EventBridge Custom Bus
+  # ==========================================
+
+  EventBridgeCustomBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "${ProjectName}-custom-bus-${ResourceSuffix}"
+      Description: Custom event bus for private API integration
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-custom-bus-${ResourceSuffix}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: event-driven-integration
+
+  # ==========================================
+  # EventBridge Connection
+  # ==========================================
+
+  EventBridgeConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      Name: !Sub "${ProjectName}-private-api-connection-${ResourceSuffix}"
+      Description: Connection to private API Gateway via VPC Lattice
+      AuthorizationType: INVOCATION_HTTP_PARAMETERS
+      AuthParameters:
+        InvocationHttpParameters:
+          HeaderParameters:
+            Content-Type: application/json
+            Authorization: !Sub "AWS4-HMAC-SHA256 Credential=${AWS::AccountId}/${AWS::Region}/execute-api/aws4_request"
+
+  # ==========================================
+  # Step Functions State Machine
+  # ==========================================
+
+  StepFunctionsStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-workflow-${ResourceSuffix}"
+      RoleArn: !GetAtt EventBridgeStepFunctionsRole.Arn
+      StateMachineType: STANDARD
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Workflow that invokes private API via VPC Lattice",
+          "StartAt": "ProcessOrder",
+          "States": {
+            "ProcessOrder": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::http:invoke",
+              "Parameters": {
+                "ApiEndpoint": "${EventBridgeConnection}",
+                "Method": "POST",
+                "RequestBody": {
+                  "customerId.$": "$.customerId",
+                  "orderItems.$": "$.orderItems",
+                  "timestamp.$": "$$.State.EnteredTime"
+                },
+                "Headers": {
+                  "Content-Type": "application/json"
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.Http.StatusCodeFailure"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "Next": "HandleError",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "ProcessSuccess"
+            },
+            "ProcessSuccess": {
+              "Type": "Pass",
+              "Result": {
+                "status": "success",
+                "message": "Order processed successfully via private API"
+              },
+              "End": true
+            },
+            "HandleError": {
+              "Type": "Pass",
+              "Result": {
+                "status": "error",
+                "message": "Order processing failed"
+              },
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-step-functions-${ResourceSuffix}"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================
+  # EventBridge Rule
+  # ==========================================
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-trigger-workflow-${ResourceSuffix}"
+      Description: Rule to trigger Step Functions workflow for order events
+      EventBusName: !Ref EventBridgeCustomBus
+      EventPattern:
+        source:
+          - demo.application
+        detail-type:
+          - Order Received
+      State: ENABLED
+      Targets:
+        - Id: StepFunctionsTarget
+          Arn: !GetAtt StepFunctionsStateMachine.Arn
+          RoleArn: !GetAtt EventBridgeStepFunctionsRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              orderId: "$.detail.orderId"
+              customerId: "$.detail.customerId"
+            InputTemplate: |
+              {
+                "orderId": "<orderId>",
+                "customerId": "<customerId>",
+                "orderItems": ["item1", "item2"],
+                "source": "eventbridge",
+                "timestamp": "$$.State.EnteredTime"
+              }
+
+# ==========================================
+# Outputs
+# ==========================================
+
+Outputs:
+  VpcId:
+    Description: ID of the target VPC
+    Value: !Ref TargetVpc
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcId"
+
+  VpcLatticeServiceNetworkId:
+    Description: ID of the VPC Lattice Service Network
+    Value: !Ref VpcLatticeServiceNetwork
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceNetworkId"
+
+  VpcLatticeServiceNetworkArn:
+    Description: ARN of the VPC Lattice Service Network
+    Value: !GetAtt VpcLatticeServiceNetwork.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceNetworkArn"
+
+  ResourceGatewayId:
+    Description: ID of the VPC Lattice Resource Gateway
+    Value: !Ref VpcLatticeResourceGateway
+    Export:
+      Name: !Sub "${AWS::StackName}-ResourceGatewayId"
+
+  ResourceGatewayArn:
+    Description: ARN of the VPC Lattice Resource Gateway
+    Value: !GetAtt VpcLatticeResourceGateway.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ResourceGatewayArn"
+
+  ResourceConfigurationArn:
+    Description: ARN of the VPC Lattice Resource Configuration
+    Value: !GetAtt VpcLatticeResourceConfiguration.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ResourceConfigurationArn"
+
+  PrivateApiId:
+    Description: ID of the private API Gateway
+    Value: !Ref PrivateRestApi
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateApiId"
+
+  PrivateApiEndpoint:
+    Description: Endpoint URL of the private API Gateway
+    Value: !Sub "https://${PrivateRestApi}-${ApiGatewayVpcEndpoint}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateApiEndpoint"
+
+  VpcEndpointId:
+    Description: ID of the API Gateway VPC Endpoint
+    Value: !Ref ApiGatewayVpcEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcEndpointId"
+
+  EventBridgeBusName:
+    Description: Name of the custom EventBridge bus
+    Value: !Ref EventBridgeCustomBus
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBridgeBusName"
+
+  EventBridgeBusArn:
+    Description: ARN of the custom EventBridge bus
+    Value: !GetAtt EventBridgeCustomBus.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBridgeBusArn"
+
+  EventBridgeConnectionArn:
+    Description: ARN of the EventBridge connection
+    Value: !GetAtt EventBridgeConnection.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBridgeConnectionArn"
+
+  StepFunctionsStateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !GetAtt StepFunctionsStateMachine.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-StepFunctionsArn"
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule
+    Value: !GetAtt EventBridgeRule.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBridgeRuleArn"
+
+  IAMRoleArn:
+    Description: ARN of the IAM role for EventBridge and Step Functions
+    Value: !GetAtt EventBridgeStepFunctionsRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-IAMRoleArn"
+
+  TestCommand:
+    Description: AWS CLI command to test the solution by sending an event
+    Value: !Sub |
+      aws events put-events --entries '[{
+        "Source": "demo.application",
+        "DetailType": "Order Received",
+        "Detail": "{\"orderId\": \"test-123\", \"customerId\": \"cust-456\"}",
+        "EventBusName": "${EventBridgeCustomBus}"
+      }]'
+
+  ValidationCommands:
+    Description: Commands to validate the deployment
+    Value: !Sub |
+      # Check VPC Lattice Service Network
+      aws vpc-lattice get-service-network --service-network-identifier ${VpcLatticeServiceNetwork}
+      
+      # Check Resource Gateway
+      aws vpc-lattice get-resource-gateway --resource-gateway-identifier ${VpcLatticeResourceGateway}
+      
+      # Check Step Functions executions
+      aws stepfunctions list-executions --state-machine-arn ${StepFunctionsStateMachine}
+
+  CleanupInstructions:
+    Description: Instructions for manual cleanup if needed
+    Value: |
+      1. Delete the CloudFormation stack: aws cloudformation delete-stack --stack-name [STACK-NAME]
+      2. Wait for deletion to complete: aws cloudformation wait stack-delete-complete --stack-name [STACK-NAME]
+      3. Verify all resources are removed: aws cloudformation describe-stacks --stack-name [STACK-NAME] (should return error)

@@ -1,0 +1,506 @@
+# Infrastructure Manager Configuration for Weather API with Cloud Functions
+# This configuration deploys a serverless weather API using Google Cloud Functions
+# Following Google Cloud best practices for Infrastructure Manager
+
+# Template metadata and version constraints
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: weather-api-cloud-functions
+  annotations:
+    config.kubernetes.io/local-config: "true"
+spec:
+  info:
+    title: Weather API with Cloud Functions
+    source:
+      repo: https://github.com/GoogleCloudPlatform/cloud-foundation-toolkit
+      sourceType: git
+    version: 1.0.0
+    actuationTool:
+      flavor: Terraform
+      version: ">= 1.3"
+    description:
+      tagline: Deploy a serverless weather API using Cloud Functions
+      detailed: |
+        This Infrastructure Manager configuration creates a complete serverless
+        weather API solution using Google Cloud Functions. The deployment includes
+        the function itself, required APIs, IAM permissions, and monitoring setup.
+  content:
+    # Define input variables for customization
+    parameters:
+      - name: project_id
+        description: Google Cloud Project ID
+        varType: string
+        required: true
+      
+      - name: region
+        description: Google Cloud region for function deployment
+        varType: string
+        defaultValue: us-central1
+      
+      - name: function_name
+        description: Name for the Cloud Function
+        varType: string
+        defaultValue: weather-api
+      
+      - name: source_archive_bucket
+        description: GCS bucket for function source code
+        varType: string
+        required: true
+      
+      - name: source_archive_object
+        description: GCS object path for function source code zip
+        varType: string
+        required: true
+      
+      - name: memory_mb
+        description: Memory allocation for the function in MB
+        varType: number
+        defaultValue: 256
+      
+      - name: timeout_seconds
+        description: Function timeout in seconds
+        varType: number
+        defaultValue: 60
+      
+      - name: environment_variables
+        description: Environment variables for the function
+        varType: map(string)
+        defaultValue: {}
+
+---
+
+# Terraform configuration for the weather API infrastructure
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: weather-api-terraform-config
+data:
+  main.tf: |
+    # Configure the Google Cloud provider
+    terraform {
+      required_version = ">= 1.3"
+      required_providers {
+        google = {
+          source  = "hashicorp/google"
+          version = "~> 5.0"
+        }
+        google-beta = {
+          source  = "hashicorp/google-beta"
+          version = "~> 5.0"
+        }
+      }
+    }
+
+    # Configure the Google Cloud Provider
+    provider "google" {
+      project = var.project_id
+      region  = var.region
+    }
+
+    provider "google-beta" {
+      project = var.project_id
+      region  = var.region
+    }
+
+    # Local values for resource naming and configuration
+    locals {
+      # Generate unique suffix for resources to avoid naming conflicts
+      resource_suffix = substr(sha256("${var.project_id}-${var.function_name}"), 0, 8)
+      
+      # Function configuration
+      function_name_full = "${var.function_name}-${local.resource_suffix}"
+      
+      # Required APIs for Cloud Functions
+      required_apis = [
+        "cloudfunctions.googleapis.com",
+        "cloudbuild.googleapis.com",
+        "artifactregistry.googleapis.com",
+        "logging.googleapis.com",
+        "monitoring.googleapis.com"
+      ]
+      
+      # Default environment variables for the function
+      default_env_vars = {
+        GOOGLE_CLOUD_PROJECT = var.project_id
+        FUNCTION_REGION     = var.region
+      }
+      
+      # Merge default and custom environment variables
+      merged_env_vars = merge(local.default_env_vars, var.environment_variables)
+    }
+
+    # Enable required Google Cloud APIs
+    resource "google_project_service" "required_apis" {
+      for_each = toset(local.required_apis)
+      
+      project = var.project_id
+      service = each.value
+      
+      # Prevent accidental deletion of APIs
+      disable_dependent_services = false
+      disable_on_destroy        = false
+    }
+
+    # Create a service account for the Cloud Function
+    resource "google_service_account" "function_sa" {
+      account_id   = "${var.function_name}-sa-${local.resource_suffix}"
+      display_name = "Service Account for ${var.function_name} Cloud Function"
+      description  = "Service account used by the weather API Cloud Function"
+      project      = var.project_id
+      
+      depends_on = [google_project_service.required_apis]
+    }
+
+    # Grant basic permissions to the function service account
+    resource "google_project_iam_member" "function_sa_permissions" {
+      for_each = toset([
+        "roles/logging.logWriter",
+        "roles/monitoring.metricWriter",
+        "roles/cloudtrace.agent"
+      ])
+      
+      project = var.project_id
+      role    = each.value
+      member  = "serviceAccount:${google_service_account.function_sa.email}"
+    }
+
+    # Deploy the Cloud Function (2nd generation)
+    resource "google_cloudfunctions2_function" "weather_api" {
+      name        = local.function_name_full
+      location    = var.region
+      project     = var.project_id
+      description = "Serverless weather API function"
+      
+      build_config {
+        runtime     = "python313"
+        entry_point = "weather_api"
+        
+        source {
+          storage_source {
+            bucket = var.source_archive_bucket
+            object = var.source_archive_object
+          }
+        }
+        
+        # Environment variables for build process
+        environment_variables = {
+          BUILD_CONFIG_TEST = "true"
+        }
+      }
+      
+      service_config {
+        max_instance_count = 100
+        min_instance_count = 0
+        
+        available_memory   = "${var.memory_mb}M"
+        timeout_seconds    = var.timeout_seconds
+        
+        # Use custom service account
+        service_account_email = google_service_account.function_sa.email
+        
+        # Environment variables for runtime
+        environment_variables = local.merged_env_vars
+        
+        # Ingress and egress settings
+        ingress_settings               = "ALLOW_ALL"
+        all_traffic_on_latest_revision = true
+        
+        # VPC connector (optional - uncomment if VPC access needed)
+        # vpc_connector                 = var.vpc_connector
+        # vpc_connector_egress_settings = "PRIVATE_RANGES_ONLY"
+      }
+      
+      # Labels for resource management
+      labels = {
+        deployment-tool = "infrastructure-manager"
+        function-type   = "weather-api"
+        environment     = "development"
+      }
+      
+      depends_on = [
+        google_project_service.required_apis,
+        google_service_account.function_sa
+      ]
+    }
+
+    # Create IAM policy to allow unauthenticated access (for demo purposes)
+    resource "google_cloudfunctions2_function_iam_member" "public_access" {
+      project        = var.project_id
+      location       = var.region
+      cloud_function = google_cloudfunctions2_function.weather_api.name
+      role           = "roles/cloudfunctions.invoker"
+      member         = "allUsers"
+    }
+
+    # Create log-based metrics for monitoring function performance
+    resource "google_logging_metric" "function_errors" {
+      name   = "${local.function_name_full}-errors"
+      filter = <<-EOT
+        resource.type="cloud_function"
+        resource.labels.function_name="${local.function_name_full}"
+        severity>=ERROR
+      EOT
+      
+      metric_descriptor {
+        metric_kind = "GAUGE"
+        value_type  = "INT64"
+        display_name = "Weather API Function Errors"
+      }
+      
+      depends_on = [google_cloudfunctions2_function.weather_api]
+    }
+
+    # Create monitoring alert policy for function errors
+    resource "google_monitoring_alert_policy" "function_error_alert" {
+      display_name = "${local.function_name_full} Error Alert"
+      combiner     = "OR"
+      
+      conditions {
+        display_name = "Function error rate too high"
+        
+        condition_threshold {
+          filter          = "resource.type=\"cloud_function\" AND resource.labels.function_name=\"${local.function_name_full}\""
+          duration        = "300s"
+          comparison      = "COMPARISON_GREATER_THAN"
+          threshold_value = 5
+          
+          aggregations {
+            alignment_period   = "60s"
+            per_series_aligner = "ALIGN_RATE"
+          }
+        }
+      }
+      
+      # Notification channels can be added here
+      # notification_channels = [var.notification_channel_id]
+      
+      depends_on = [
+        google_cloudfunctions2_function.weather_api,
+        google_logging_metric.function_errors
+      ]
+    }
+
+  variables.tf: |
+    # Input variable definitions for the weather API infrastructure
+
+    variable "project_id" {
+      description = "The Google Cloud Project ID where resources will be created"
+      type        = string
+      
+      validation {
+        condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.project_id))
+        error_message = "Project ID must be 6-30 characters, start with a letter, and contain only lowercase letters, numbers, and hyphens."
+      }
+    }
+
+    variable "region" {
+      description = "The Google Cloud region where the Cloud Function will be deployed"
+      type        = string
+      default     = "us-central1"
+      
+      validation {
+        condition = contains([
+          "us-central1", "us-east1", "us-east4", "us-west1", "us-west2", "us-west3", "us-west4",
+          "europe-central2", "europe-north1", "europe-west1", "europe-west2", "europe-west3",
+          "europe-west4", "europe-west6", "asia-east1", "asia-east2", "asia-northeast1",
+          "asia-northeast2", "asia-northeast3", "asia-south1", "asia-southeast1", "asia-southeast2"
+        ], var.region)
+        error_message = "Region must be a valid Google Cloud region that supports Cloud Functions."
+      }
+    }
+
+    variable "function_name" {
+      description = "Base name for the Cloud Function (will have suffix added for uniqueness)"
+      type        = string
+      default     = "weather-api"
+      
+      validation {
+        condition     = can(regex("^[a-z][a-z0-9-]*[a-z0-9]$", var.function_name))
+        error_message = "Function name must start with a letter, contain only lowercase letters, numbers, and hyphens, and end with a letter or number."
+      }
+    }
+
+    variable "source_archive_bucket" {
+      description = "Google Cloud Storage bucket containing the function source code"
+      type        = string
+      
+      validation {
+        condition     = can(regex("^[a-z0-9][a-z0-9._-]*[a-z0-9]$", var.source_archive_bucket))
+        error_message = "Bucket name must follow Google Cloud Storage naming conventions."
+      }
+    }
+
+    variable "source_archive_object" {
+      description = "Path to the function source code zip file in the GCS bucket"
+      type        = string
+      
+      validation {
+        condition     = can(regex(".*\\.zip$", var.source_archive_object))
+        error_message = "Source archive object must be a zip file."
+      }
+    }
+
+    variable "memory_mb" {
+      description = "Memory allocation for the Cloud Function in MB"
+      type        = number
+      default     = 256
+      
+      validation {
+        condition = contains([
+          128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768
+        ], var.memory_mb)
+        error_message = "Memory must be one of: 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768 MB."
+      }
+    }
+
+    variable "timeout_seconds" {
+      description = "Maximum execution time for the function in seconds"
+      type        = number
+      default     = 60
+      
+      validation {
+        condition     = var.timeout_seconds >= 1 && var.timeout_seconds <= 3600
+        error_message = "Timeout must be between 1 and 3600 seconds."
+      }
+    }
+
+    variable "environment_variables" {
+      description = "Environment variables to set for the Cloud Function"
+      type        = map(string)
+      default     = {}
+      
+      validation {
+        condition = alltrue([
+          for k, v in var.environment_variables : can(regex("^[A-Z_][A-Z0-9_]*$", k))
+        ])
+        error_message = "Environment variable names must contain only uppercase letters, numbers, and underscores, and start with a letter or underscore."
+      }
+    }
+
+  outputs.tf: |
+    # Output values for the weather API infrastructure deployment
+
+    output "function_name" {
+      description = "Name of the deployed Cloud Function"
+      value       = google_cloudfunctions2_function.weather_api.name
+    }
+
+    output "function_url" {
+      description = "HTTP trigger URL for the Cloud Function"
+      value       = google_cloudfunctions2_function.weather_api.service_config[0].uri
+    }
+
+    output "function_id" {
+      description = "Fully qualified identifier for the Cloud Function"
+      value       = google_cloudfunctions2_function.weather_api.id
+    }
+
+    output "function_location" {
+      description = "Location/region where the function is deployed"
+      value       = google_cloudfunctions2_function.weather_api.location
+    }
+
+    output "service_account_email" {
+      description = "Email address of the service account used by the function"
+      value       = google_service_account.function_sa.email
+    }
+
+    output "service_account_id" {
+      description = "Unique identifier of the service account"
+      value       = google_service_account.function_sa.unique_id
+    }
+
+    output "enabled_apis" {
+      description = "List of Google Cloud APIs enabled for this deployment"
+      value       = [for api in google_project_service.required_apis : api.service]
+    }
+
+    output "function_state" {
+      description = "Current state of the Cloud Function"
+      value       = google_cloudfunctions2_function.weather_api.state
+    }
+
+    output "function_update_time" {
+      description = "Timestamp of the last function update"
+      value       = google_cloudfunctions2_function.weather_api.update_time
+    }
+
+    output "monitoring_alert_policy_name" {
+      description = "Name of the monitoring alert policy for function errors"
+      value       = google_monitoring_alert_policy.function_error_alert.name
+    }
+
+    # Outputs for integration with other systems
+    output "curl_test_command" {
+      description = "Sample curl command to test the deployed function"
+      value       = "curl -s '${google_cloudfunctions2_function.weather_api.service_config[0].uri}?city=London' | jq ."
+    }
+
+    output "function_logs_command" {
+      description = "Google Cloud CLI command to view function logs"
+      value       = "gcloud functions logs read ${google_cloudfunctions2_function.weather_api.name} --region=${var.region} --gen2 --limit=20"
+    }
+
+    output "deployment_summary" {
+      description = "Summary of the deployed resources"
+      value = {
+        function_name      = google_cloudfunctions2_function.weather_api.name
+        function_url       = google_cloudfunctions2_function.weather_api.service_config[0].uri
+        region            = var.region
+        runtime           = "python313"
+        memory_mb         = var.memory_mb
+        timeout_seconds   = var.timeout_seconds
+        service_account   = google_service_account.function_sa.email
+        monitoring_enabled = true
+      }
+    }
+
+  versions.tf: |
+    # Terraform and provider version constraints for the weather API infrastructure
+
+    terraform {
+      # Minimum Terraform version required
+      required_version = ">= 1.3"
+      
+      # Required providers with version constraints
+      required_providers {
+        google = {
+          source  = "hashicorp/google"
+          version = "~> 5.0"
+        }
+        
+        google-beta = {
+          source  = "hashicorp/google-beta"
+          version = "~> 5.0"
+        }
+      }
+      
+      # Optional: Configure remote state backend
+      # Uncomment and modify as needed for your environment
+      /*
+      backend "gcs" {
+        bucket = "your-terraform-state-bucket"
+        prefix = "weather-api-cloud-functions"
+      }
+      */
+    }
+
+    # Optional: Configure provider features and default labels
+    provider "google" {
+      # Default labels applied to all resources
+      default_labels = {
+        managed-by    = "infrastructure-manager"
+        project-name  = "weather-api"
+        created-by    = "terraform"
+      }
+    }
+
+    provider "google-beta" {
+      # Default labels applied to all resources
+      default_labels = {
+        managed-by    = "infrastructure-manager"
+        project-name  = "weather-api"
+        created-by    = "terraform"
+      }
+    }

@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: dms,rds,vpc,iam
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: migration,database,data
 recipe-generator-version: 1.3
 ---
 
 # Database Migration with AWS DMS
-
 
 ## Problem
 
@@ -74,7 +73,7 @@ graph TB
 5. Understanding of database administration and networking concepts
 6. Estimated cost: $50-200/month for replication instance and storage
 
-> **Note**: This recipe assumes you have an existing source database and target RDS instance. If you need to create these resources, refer to the AWS RDS documentation for setup instructions.
+> **Note**: This recipe assumes you have an existing source database and target RDS instance. If you need to create these resources, refer to the [AWS RDS User Guide](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/) for setup instructions.
 
 ## Preparation
 
@@ -210,7 +209,7 @@ echo "SNS Topic ARN: $SNS_TOPIC_ARN"
        --endpoint-identifier "$DMS_TARGET_ENDPOINT_ID" \
        --endpoint-type target \
        --engine-name mysql \
-       --server-name "your-rds-instance.region.rds.amazonaws.com" \
+       --server-name "your-rds-instance.${AWS_REGION}.rds.amazonaws.com" \
        --port 3306 \
        --database-name "targetdb" \
        --username "admin" \
@@ -307,7 +306,7 @@ echo "SNS Topic ARN: $SNS_TOPIC_ARN"
    The migration task is the core DMS component that orchestrates the actual data migration process. This task configuration combines full load migration (copying all existing data) with change data capture (CDC) to maintain real-time synchronization after the initial load completes. Full load migration transfers all existing data from source to target tables, while CDC captures and applies ongoing changes (inserts, updates, deletes) to keep databases synchronized during the migration window. This dual-phase approach minimizes downtime by allowing applications to continue running against the source database while changes are continuously replicated to the target.
 
    ```bash
-   # Create migration task
+   # Create migration task with comprehensive settings
    aws dms create-replication-task \
        --replication-task-identifier "$DMS_TASK_ID" \
        --source-endpoint-arn "$SOURCE_ENDPOINT_ARN" \
@@ -516,15 +515,16 @@ echo "SNS Topic ARN: $SNS_TOPIC_ARN"
     aws cloudwatch put-metric-alarm \
         --alarm-name "DMS-Task-Failure-${RANDOM_SUFFIX}" \
         --alarm-description "Alert when DMS task fails" \
-        --metric-name "ReplicationTaskStatus" \
+        --metric-name "TaskState" \
         --namespace "AWS/DMS" \
-        --statistic Average \
+        --statistic Maximum \
         --period 300 \
-        --threshold 1 \
-        --comparison-operator GreaterThanOrEqualToThreshold \
+        --threshold 0 \
+        --comparison-operator LessThanThreshold \
         --evaluation-periods 1 \
         --alarm-actions "$SNS_TOPIC_ARN" \
-        --dimensions Name=ReplicationTaskIdentifier,Value="$DMS_TASK_ID"
+        --dimensions Name=ReplicationInstanceIdentifier,Value="$DMS_REPLICATION_INSTANCE_ID" \
+        Name=ReplicationTaskIdentifier,Value="$DMS_TASK_ID"
     
     # Create alarm for high latency
     aws cloudwatch put-metric-alarm \
@@ -538,7 +538,8 @@ echo "SNS Topic ARN: $SNS_TOPIC_ARN"
         --comparison-operator GreaterThanThreshold \
         --evaluation-periods 2 \
         --alarm-actions "$SNS_TOPIC_ARN" \
-        --dimensions Name=ReplicationTaskIdentifier,Value="$DMS_TASK_ID"
+        --dimensions Name=ReplicationInstanceIdentifier,Value="$DMS_REPLICATION_INSTANCE_ID" \
+        Name=ReplicationTaskIdentifier,Value="$DMS_TASK_ID"
     
     echo "✅ CloudWatch alarms configured for migration monitoring"
     ```
@@ -625,7 +626,8 @@ echo "SNS Topic ARN: $SNS_TOPIC_ARN"
    aws cloudwatch get-metric-statistics \
        --namespace "AWS/DMS" \
        --metric-name "CDCLatencySource" \
-       --dimensions Name=ReplicationTaskIdentifier,Value="$DMS_TASK_ID" \
+       --dimensions Name=ReplicationInstanceIdentifier,Value="$DMS_REPLICATION_INSTANCE_ID" \
+       Name=ReplicationTaskIdentifier,Value="$DMS_TASK_ID" \
        --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
        --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
        --period 300 \
@@ -723,31 +725,31 @@ echo "SNS Topic ARN: $SNS_TOPIC_ARN"
 
 ## Discussion
 
-AWS Database Migration Service provides enterprise-grade capabilities for migrating databases with minimal downtime through its sophisticated replication architecture. The service operates through a dedicated replication instance that maintains separate connections to source and target databases, enabling continuous data synchronization while the source database remains operational.
+AWS Database Migration Service provides enterprise-grade capabilities for migrating databases with minimal downtime through its sophisticated replication architecture. The service operates through a dedicated replication instance that maintains separate connections to source and target databases, enabling continuous data synchronization while the source database remains operational following [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles.
 
-The migration process follows a two-phase approach: full load migration transfers existing data, followed by change data capture (CDC) that replicates ongoing transactions. This architecture ensures data consistency while minimizing business disruption. DMS supports both homogeneous migrations (same database engine) and heterogeneous migrations (different engines), with built-in schema conversion capabilities for complex transformations.
+The migration process follows a two-phase approach: full load migration transfers existing data, followed by change data capture (CDC) that replicates ongoing transactions. This architecture ensures data consistency while minimizing business disruption. DMS supports both homogeneous migrations (same database engine) and heterogeneous migrations (different engines), with built-in schema conversion capabilities for complex transformations using AWS Schema Conversion Tool (SCT) when needed.
 
 Critical design decisions include replication instance sizing, which directly impacts migration performance and cost. Multi-AZ deployment provides high availability but increases costs, while single-AZ deployment offers cost savings with acceptable risk for many use cases. The table mappings configuration allows fine-grained control over which data gets migrated, enabling selective migration strategies and data transformation during transit.
 
-Data validation is essential for mission-critical migrations, providing automated verification that source and target data remain consistent. The service supports both row-level and column-level validation, with configurable failure thresholds and automated remediation capabilities. Performance monitoring through CloudWatch metrics enables proactive identification of bottlenecks and optimization opportunities.
+Data validation is essential for mission-critical migrations, providing automated verification that source and target data remain consistent. The service supports both row-level and column-level validation, with configurable failure thresholds and automated remediation capabilities. Performance monitoring through CloudWatch metrics enables proactive identification of bottlenecks and optimization opportunities, following [AWS monitoring best practices](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/WhatIsCloudWatch.html).
 
-> **Warning**: Database migration can impact source database performance during full load phases. Always test migration procedures in non-production environments and plan for adequate source database resources.
+> **Warning**: Database migration can impact source database performance during full load phases. Always test migration procedures in non-production environments and plan for adequate source database resources following [AWS DMS best practices](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_BestPractices.html).
 
-For more information on DMS best practices, refer to the [AWS DMS Best Practices Guide](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_BestPractices.html) and [AWS DMS Troubleshooting Guide](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Troubleshooting.html).
+For more information on DMS implementation guidance, refer to the [AWS DMS User Guide](https://docs.aws.amazon.com/dms/latest/userguide/) and [AWS DMS Troubleshooting Guide](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Troubleshooting.html).
 
 ## Challenge
 
 Extend this solution by implementing these advanced migration scenarios:
 
-1. **Implement Schema Conversion with AWS SCT** - Set up AWS Schema Conversion Tool for heterogeneous migrations between different database engines (e.g., Oracle to PostgreSQL), including stored procedure conversion and data type mappings.
+1. **Implement Schema Conversion with AWS SCT** - Set up AWS Schema Conversion Tool for heterogeneous migrations between different database engines (e.g., Oracle to PostgreSQL), including stored procedure conversion and data type mappings using the [AWS SCT User Guide](https://docs.aws.amazon.com/SchemaConversionTool/latest/userguide/).
 
-2. **Configure Multi-Region Migration Strategy** - Design a migration architecture that spans multiple AWS regions with cross-region replication, including failover mechanisms and disaster recovery procedures.
+2. **Configure Multi-Region Migration Strategy** - Design a migration architecture that spans multiple AWS regions with cross-region replication, including failover mechanisms and disaster recovery procedures using [AWS DMS cross-region capabilities](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_ReplicationInstance.html).
 
-3. **Build Automated Migration Validation Pipeline** - Create a comprehensive data validation framework using AWS Lambda and Step Functions that compares source and target data integrity, generates validation reports, and triggers automated remediation.
+3. **Build Automated Migration Validation Pipeline** - Create a comprehensive data validation framework using AWS Lambda and Step Functions that compares source and target data integrity, generates validation reports, and triggers automated remediation workflows.
 
-4. **Implement Blue-Green Migration with Application Cutover** - Design a complete migration strategy that includes application endpoint switching, DNS failover, and rollback procedures using AWS Route 53 and Application Load Balancer.
+4. **Implement Blue-Green Migration with Application Cutover** - Design a complete migration strategy that includes application endpoint switching, DNS failover, and rollback procedures using AWS Route 53 and Application Load Balancer for zero-downtime transitions.
 
-5. **Create Advanced Monitoring and Alerting System** - Build a comprehensive monitoring solution using Amazon QuickSight dashboards, custom CloudWatch metrics, and automated alerting for migration KPIs including latency, throughput, and error rates.
+5. **Create Advanced Monitoring and Alerting System** - Build a comprehensive monitoring solution using Amazon QuickSight dashboards, custom CloudWatch metrics, and automated alerting for migration KPIs including latency, throughput, and error rates with custom Lambda functions for enhanced analytics.
 
 ## Infrastructure Code
 

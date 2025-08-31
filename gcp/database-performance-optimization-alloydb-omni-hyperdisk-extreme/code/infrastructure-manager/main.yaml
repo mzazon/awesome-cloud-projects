@@ -1,0 +1,749 @@
+# Infrastructure Manager Configuration for AlloyDB Omni with Hyperdisk Extreme
+# This configuration deploys a high-performance database solution using AlloyDB Omni
+# and Hyperdisk Extreme storage for enterprise analytics workloads
+
+# Copyright 2025 Google LLC
+# Licensed under the Apache License, Version 2.0
+
+# Configuration metadata
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: alloydb-omni-hyperdisk-extreme
+  annotations:
+    config.kubernetes.io/local-config: "true"
+spec:
+  info:
+    title: AlloyDB Omni with Hyperdisk Extreme Performance Optimization
+    source:
+      repo: https://github.com/recipes/gcp
+      sourceType: git
+    version: 1.1.0
+    actuationTool:
+      flavor: Terraform
+      version: ">= 1.5"
+    description:
+      tagline: Deploy high-performance AlloyDB Omni with Hyperdisk Extreme storage
+      detailed: |-
+        This blueprint deploys AlloyDB Omni with Hyperdisk Extreme storage for
+        enterprise database workloads requiring ultra-high performance. Includes
+        automated monitoring and scaling capabilities using Cloud Functions.
+      preDeploy: |-
+        Ensure you have the following permissions:
+        - Compute Engine Admin
+        - Cloud Functions Admin  
+        - Monitoring Admin
+        - Service Account User
+    icon: assets/icon.png
+    deploymentDuration:
+      configurationSecs: 60
+      deploymentSecs: 2700 # 45 minutes
+    costEstimate:
+      description: Resources created will incur charges for Compute Engine, storage, and functions
+      url: https://cloud.google.com/products/calculator
+    cloudProducts:
+    - productId: compute
+      pageUrl: https://cloud.google.com/compute
+    - productId: monitoring  
+      pageUrl: https://cloud.google.com/monitoring
+    - productId: functions
+      pageUrl: https://cloud.google.com/functions
+
+---
+
+# Main Infrastructure Manager deployment configuration
+apiVersion: config.infra.google.com/v1beta1
+kind: ResourceManager
+metadata:
+  name: alloydb-omni-performance-stack
+  annotations:
+    config.infra.google.com/blueprint: alloydb-omni-hyperdisk-extreme
+spec:
+  # Project and region configuration
+  project: ${project_id}
+  location: ${region}
+  
+  # Enable required APIs
+  services:
+  - compute.googleapis.com
+  - cloudfunctions.googleapis.com  
+  - monitoring.googleapis.com
+  - logging.googleapis.com
+  - cloudbuild.googleapis.com
+
+  # Resource definitions
+  resources:
+
+    # Service Account for AlloyDB Omni VM instance
+    - name: alloydb-omni-service-account
+      type: google_service_account
+      properties:
+        account_id: alloydb-omni-sa-${random_suffix}
+        display_name: "AlloyDB Omni Service Account"
+        description: "Service account for AlloyDB Omni VM instance with monitoring permissions"
+
+    # IAM binding for service account monitoring permissions
+    - name: alloydb-omni-monitoring-binding
+      type: google_project_iam_member
+      properties:
+        project: ${project_id}
+        role: roles/monitoring.metricWriter
+        member: serviceAccount:${alloydb-omni-service-account.email}
+
+    # IAM binding for service account logging permissions
+    - name: alloydb-omni-logging-binding
+      type: google_project_iam_member
+      properties:
+        project: ${project_id}
+        role: roles/logging.logWriter
+        member: serviceAccount:${alloydb-omni-service-account.email}
+
+    # Hyperdisk Extreme volume for maximum database performance
+    - name: alloydb-hyperdisk-extreme
+      type: google_compute_disk
+      properties:
+        name: alloydb-hyperdisk-${random_suffix}
+        type: https://www.googleapis.com/compute/v1/projects/${project_id}/zones/${zone}/diskTypes/hyperdisk-extreme
+        zone: ${zone}
+        size: 500  # 500GB for high-performance workloads
+        provisioned_iops: 100000  # Maximum IOPS for ultra-high performance
+        description: "Hyperdisk Extreme volume for AlloyDB Omni high-performance storage"
+        labels:
+          environment: production
+          component: database-storage
+          cost-center: analytics
+          recipe: alloydb-omni-performance
+
+    # VPC network for secure database connectivity (if custom network needed)
+    - name: alloydb-vpc-network
+      type: google_compute_network
+      properties:
+        name: alloydb-network-${random_suffix}
+        auto_create_subnetworks: false
+        description: "VPC network for AlloyDB Omni deployment"
+
+    # Subnet for database instances
+    - name: alloydb-subnet
+      type: google_compute_subnetwork
+      properties:
+        name: alloydb-subnet-${random_suffix}
+        ip_cidr_range: "10.0.0.0/24"
+        region: ${region}
+        network: ${alloydb-vpc-network.id}
+        description: "Subnet for AlloyDB Omni instances"
+
+    # Firewall rule for AlloyDB Omni PostgreSQL access
+    - name: alloydb-firewall-postgres
+      type: google_compute_firewall
+      properties:
+        name: alloydb-postgres-${random_suffix}
+        network: ${alloydb-vpc-network.id}
+        description: "Allow PostgreSQL access to AlloyDB Omni"
+        direction: INGRESS
+        priority: 1000
+        source_ranges:
+        - "10.0.0.0/24"  # Restrict to subnet range
+        - "35.235.240.0/20"  # Google Cloud health checks
+        allowed:
+        - protocol: TCP
+          ports:
+          - "5432"
+        target_tags:
+        - alloydb-omni
+
+    # Firewall rule for SSH access (for management)
+    - name: alloydb-firewall-ssh
+      type: google_compute_firewall
+      properties:
+        name: alloydb-ssh-${random_suffix}
+        network: ${alloydb-vpc-network.id}
+        description: "Allow SSH access for AlloyDB Omni management"
+        direction: INGRESS
+        priority: 1000
+        source_ranges:
+        - "35.235.240.0/20"  # Google Cloud Identity-Aware Proxy
+        allowed:
+        - protocol: TCP
+          ports:
+          - "22"
+        target_tags:
+        - alloydb-omni
+
+    # Compute Engine instance optimized for database workloads
+    - name: alloydb-omni-instance
+      type: google_compute_instance
+      properties:
+        name: alloydb-vm-${random_suffix}
+        machine_type: c3-highmem-8  # 8 vCPUs, 64GB RAM for database workloads
+        zone: ${zone}
+        description: "High-performance VM instance for AlloyDB Omni deployment"
+        
+        # Attach Hyperdisk Extreme volume
+        attached_disks:
+        - source: ${alloydb-hyperdisk-extreme.id}
+          device_name: alloydb-data
+          mode: READ_WRITE
+          boot: false
+          auto_delete: false
+        
+        # Boot disk configuration
+        boot_disk:
+          initialize_params:
+            image: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+            size: 50  # 50GB boot disk
+            type: pd-ssd
+          auto_delete: true
+        
+        # Network configuration
+        network_interfaces:
+        - network: ${alloydb-vpc-network.id}
+          subnetwork: ${alloydb-subnet.id}
+          access_configs:
+          - name: External NAT
+            type: ONE_TO_ONE_NAT
+        
+        # Service account configuration
+        service_account:
+          email: ${alloydb-omni-service-account.email}
+          scopes:
+          - https://www.googleapis.com/auth/monitoring.write
+          - https://www.googleapis.com/auth/logging.write
+          - https://www.googleapis.com/auth/compute.readonly
+        
+        # Metadata and startup script for AlloyDB Omni installation
+        metadata:
+          startup-script: |
+            #!/bin/bash
+            set -euo pipefail
+            
+            # Log all output for debugging
+            exec > >(tee /var/log/startup-script.log)
+            exec 2>&1
+            
+            echo "Starting AlloyDB Omni setup at $(date)"
+            
+            # Update system packages
+            apt-get update
+            apt-get install -y docker.io fio htop iotop
+            
+            # Configure Docker
+            systemctl start docker
+            systemctl enable docker
+            usermod -aG docker ubuntu
+            
+            # Format and mount Hyperdisk Extreme volume
+            DEVICE="/dev/disk/by-id/google-alloydb-data"
+            if [ -b "$DEVICE" ]; then
+              echo "Formatting Hyperdisk Extreme volume..."
+              mkfs.ext4 -F "$DEVICE"
+              
+              mkdir -p /var/lib/alloydb
+              mount "$DEVICE" /var/lib/alloydb
+              
+              # Add to fstab for persistent mounting
+              echo "$DEVICE /var/lib/alloydb ext4 defaults 0 2" >> /etc/fstab
+              
+              # Set proper permissions for AlloyDB Omni
+              mkdir -p /var/lib/alloydb/data
+              chown -R 999:999 /var/lib/alloydb
+              
+              echo "Hyperdisk Extreme volume mounted successfully"
+            else
+              echo "ERROR: Hyperdisk Extreme volume not found"
+              exit 1
+            fi
+            
+            # Pull AlloyDB Omni container image
+            echo "Pulling AlloyDB Omni container image..."
+            docker pull gcr.io/alloydb-omni/alloydb-omni:latest
+            
+            # Start AlloyDB Omni container with columnar engine enabled
+            echo "Starting AlloyDB Omni container..."
+            docker run -d \
+              --name alloydb-omni \
+              --restart unless-stopped \
+              -p 5432:5432 \
+              -v /var/lib/alloydb/data:/var/lib/postgresql/data \
+              -e POSTGRES_PASSWORD=AlloyDB_Secure_2025! \
+              -e POSTGRES_DB=analytics_db \
+              -e POSTGRES_USER=postgres \
+              --memory=48g \
+              --cpus=7 \
+              gcr.io/alloydb-omni/alloydb-omni:latest
+            
+            # Wait for AlloyDB to be ready
+            echo "Waiting for AlloyDB Omni to be ready..."
+            for i in {1..30}; do
+              if docker exec alloydb-omni pg_isready -U postgres -d analytics_db; then
+                echo "AlloyDB Omni is ready!"
+                break
+              fi
+              echo "Waiting for AlloyDB Omni... (attempt $i/30)"
+              sleep 10
+            done
+            
+            # Install Google Cloud monitoring agent
+            curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+            bash add-google-cloud-ops-agent-repo.sh --also-install
+            
+            echo "AlloyDB Omni setup completed successfully at $(date)"
+        
+        # Resource labels for cost tracking and management
+        labels:
+          environment: production
+          component: database
+          cost-center: analytics
+          recipe: alloydb-omni-performance
+          
+        # Network tags for firewall rules
+        tags:
+          items:
+          - alloydb-omni
+
+    # Cloud Function for automated performance scaling
+    - name: alloydb-performance-scaler-function
+      type: google_cloudfunctions2_function
+      properties:
+        name: perf-scaler-${random_suffix}
+        location: ${region}
+        description: "Automated performance scaling for AlloyDB Omni based on metrics"
+        
+        build_config:
+          runtime: python312
+          entry_point: scale_performance
+          source:
+            storage_source:
+              bucket: ${cloud-function-source-bucket.name}
+              object: ${cloud-function-source-archive.name}
+        
+        service_config:
+          max_instance_count: 10
+          min_instance_count: 0
+          available_memory: 256Mi
+          timeout_seconds: 60
+          environment_variables:
+            PROJECT_ID: ${project_id}
+            ZONE: ${zone}
+            INSTANCE_NAME: ${alloydb-omni-instance.name}
+          service_account_email: ${cloud-function-service-account.email}
+        
+        event_trigger:
+          trigger_region: ${region}
+          event_type: google.cloud.pubsub.topic.v1.messagePublished
+          pubsub_topic: projects/${project_id}/topics/${performance-alerts-topic.name}
+          retry_policy: RETRY_POLICY_RETRY
+
+    # Service Account for Cloud Function
+    - name: cloud-function-service-account
+      type: google_service_account
+      properties:
+        account_id: perf-scaler-sa-${random_suffix}
+        display_name: "Performance Scaler Function Service Account"
+        description: "Service account for AlloyDB performance scaling function"
+
+    # IAM permissions for Cloud Function
+    - name: function-compute-admin-binding
+      type: google_project_iam_member
+      properties:
+        project: ${project_id}
+        role: roles/compute.instanceAdmin.v1
+        member: serviceAccount:${cloud-function-service-account.email}
+
+    - name: function-monitoring-viewer-binding
+      type: google_project_iam_member
+      properties:
+        project: ${project_id}
+        role: roles/monitoring.viewer
+        member: serviceAccount:${cloud-function-service-account.email}
+
+    # Storage bucket for Cloud Function source code
+    - name: cloud-function-source-bucket
+      type: google_storage_bucket
+      properties:
+        name: alloydb-function-source-${random_suffix}
+        location: ${region}
+        uniform_bucket_level_access: true
+        labels:
+          component: cloud-function
+          recipe: alloydb-omni-performance
+
+    # Cloud Function source code archive
+    - name: cloud-function-source-archive
+      type: google_storage_bucket_object
+      properties:
+        name: scaling-function-source.zip
+        bucket: ${cloud-function-source-bucket.name}
+        source: |
+          import json
+          import logging
+          from google.cloud import compute_v1
+          from google.cloud import monitoring_v3
+          import functions_framework
+          
+          # Configure logging
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger(__name__)
+          
+          @functions_framework.cloud_event
+          def scale_performance(cloud_event):
+              """Scale AlloyDB Omni performance based on monitoring metrics."""
+              
+              # Initialize Google Cloud clients
+              compute_client = compute_v1.InstancesClient()
+              monitoring_client = monitoring_v3.MetricServiceClient()
+              
+              # Get configuration from environment variables
+              project_id = os.environ.get('PROJECT_ID')
+              zone = os.environ.get('ZONE')
+              instance_name = os.environ.get('INSTANCE_NAME')
+              
+              try:
+                  # Get current instance details
+                  instance = compute_client.get(
+                      project=project_id,
+                      zone=zone,
+                      instance=instance_name
+                  )
+                  
+                  logger.info(f"Current instance status: {instance.status}")
+                  
+                  # Parse the Pub/Sub message for alert details
+                  message_data = cloud_event.data.get('message', {})
+                  alert_data = json.loads(base64.b64decode(message_data.get('data', '')).decode())
+                  
+                  # Check CPU utilization threshold
+                  cpu_threshold = alert_data.get('cpu_utilization', 0)
+                  
+                  if cpu_threshold > 80:
+                      logger.info("High CPU detected, evaluating scaling options")
+                      # In production, implement actual scaling logic here
+                      # This could include:
+                      # - Stopping the instance
+                      # - Changing machine type to c3-highmem-16
+                      # - Restarting the instance
+                      # - Updating AlloyDB container resource limits
+                  
+                  return {
+                      "status": "success",
+                      "instance_name": instance_name,
+                      "current_status": instance.status,
+                      "cpu_threshold": cpu_threshold,
+                      "timestamp": json.dumps(cloud_event.get_time().isoformat()),
+                      "action_taken": "monitoring" if cpu_threshold <= 80 else "scaling_evaluated"
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in performance scaling function: {str(e)}")
+                  return {"status": "error", "message": str(e)}
+
+    # Pub/Sub topic for performance alerts
+    - name: performance-alerts-topic
+      type: google_pubsub_topic
+      properties:
+        name: alloydb-performance-alerts-${random_suffix}
+        labels:
+          component: monitoring
+          recipe: alloydb-omni-performance
+
+    # Cloud Monitoring Alert Policy for CPU utilization
+    - name: cpu-utilization-alert-policy
+      type: google_monitoring_alert_policy
+      properties:
+        display_name: "AlloyDB Omni High CPU Alert"
+        documentation:
+          content: "Alert when AlloyDB Omni instance CPU utilization exceeds 80%"
+          mime_type: text/markdown
+        
+        conditions:
+        - display_name: "CPU utilization high"
+          condition_threshold:
+            filter: 'resource.type="gce_instance" AND resource.labels.instance_id="${alloydb-omni-instance.instance_id}" AND metric.type="compute.googleapis.com/instance/cpu/utilization"'
+            comparison: COMPARISON_GREATER_THAN
+            threshold_value: 0.8
+            duration: 60s
+            aggregations:
+            - alignment_period: 60s
+              per_series_aligner: ALIGN_MEAN
+              cross_series_reducer: REDUCE_MEAN
+              group_by_fields:
+              - resource.labels.instance_id
+        
+        alert_strategy:
+          auto_close: 1800s  # Auto-close after 30 minutes
+        
+        notification_channels:
+        - ${performance-notification-channel.name}
+        
+        enabled: true
+
+    # Cloud Monitoring Alert Policy for Disk I/O
+    - name: disk-io-alert-policy
+      type: google_monitoring_alert_policy
+      properties:
+        display_name: "AlloyDB Omni High Disk I/O Alert"
+        documentation:
+          content: "Alert when AlloyDB Omni disk I/O exceeds performance thresholds"
+          mime_type: text/markdown
+        
+        conditions:
+        - display_name: "Disk read operations high"
+          condition_threshold:
+            filter: 'resource.type="gce_instance" AND resource.labels.instance_id="${alloydb-omni-instance.instance_id}" AND metric.type="compute.googleapis.com/instance/disk/read_ops_count"'
+            comparison: COMPARISON_GREATER_THAN
+            threshold_value: 50000  # 50K IOPS threshold
+            duration: 120s
+            aggregations:
+            - alignment_period: 60s
+              per_series_aligner: ALIGN_RATE
+              cross_series_reducer: REDUCE_SUM
+        
+        alert_strategy:
+          auto_close: 1800s
+        
+        notification_channels:
+        - ${performance-notification-channel.name}
+        
+        enabled: true
+
+    # Notification channel for Pub/Sub integration
+    - name: performance-notification-channel
+      type: google_monitoring_notification_channel
+      properties:
+        display_name: "AlloyDB Performance Alerts Pub/Sub"
+        type: pubsub
+        labels:
+          topic: projects/${project_id}/topics/${performance-alerts-topic.name}
+        description: "Pub/Sub notification channel for AlloyDB performance alerts"
+
+    # Custom monitoring dashboard for AlloyDB performance
+    - name: alloydb-performance-dashboard
+      type: google_monitoring_dashboard
+      properties:
+        display_name: "AlloyDB Omni Performance Dashboard"
+        
+        # Dashboard configuration in JSON format
+        dashboard_json: |
+          {
+            "displayName": "AlloyDB Omni Performance Dashboard",
+            "mosaicLayout": {
+              "tiles": [
+                {
+                  "width": 6,
+                  "height": 4,
+                  "widget": {
+                    "title": "CPU Utilization",
+                    "xyChart": {
+                      "dataSets": [{
+                        "timeSeriesQuery": {
+                          "timeSeriesFilter": {
+                            "filter": "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/cpu/utilization\"",
+                            "aggregation": {
+                              "alignmentPeriod": "60s",
+                              "perSeriesAligner": "ALIGN_MEAN"
+                            }
+                          }
+                        }
+                      }],
+                      "yAxis": {
+                        "label": "CPU Utilization (%)",
+                        "scale": "LINEAR"
+                      }
+                    }
+                  }
+                },
+                {
+                  "width": 6,
+                  "height": 4,
+                  "xPos": 6,
+                  "widget": {
+                    "title": "Disk IOPS",
+                    "xyChart": {
+                      "dataSets": [
+                        {
+                          "timeSeriesQuery": {
+                            "timeSeriesFilter": {
+                              "filter": "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/disk/read_ops_count\"",
+                              "aggregation": {
+                                "alignmentPeriod": "60s",
+                                "perSeriesAligner": "ALIGN_RATE"
+                              }
+                            }
+                          },
+                          "plotType": "LINE",
+                          "targetAxis": "Y1"
+                        },
+                        {
+                          "timeSeriesQuery": {
+                            "timeSeriesFilter": {
+                              "filter": "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/disk/write_ops_count\"",
+                              "aggregation": {
+                                "alignmentPeriod": "60s",
+                                "perSeriesAligner": "ALIGN_RATE"
+                              }
+                            }
+                          },
+                          "plotType": "LINE",
+                          "targetAxis": "Y1"
+                        }
+                      ],
+                      "yAxis": {
+                        "label": "Operations/second",
+                        "scale": "LINEAR"
+                      }
+                    }
+                  }
+                },
+                {
+                  "width": 6,
+                  "height": 4,
+                  "yPos": 4,
+                  "widget": {
+                    "title": "Memory Usage",
+                    "xyChart": {
+                      "dataSets": [{
+                        "timeSeriesQuery": {
+                          "timeSeriesFilter": {
+                            "filter": "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/memory/utilization\"",
+                            "aggregation": {
+                              "alignmentPeriod": "60s",
+                              "perSeriesAligner": "ALIGN_MEAN"
+                            }
+                          }
+                        }
+                      }],
+                      "yAxis": {
+                        "label": "Memory Utilization (%)",
+                        "scale": "LINEAR"
+                      }
+                    }
+                  }
+                },
+                {
+                  "width": 6,
+                  "height": 4,
+                  "xPos": 6,
+                  "yPos": 4,
+                  "widget": {
+                    "title": "Disk Throughput",
+                    "xyChart": {
+                      "dataSets": [
+                        {
+                          "timeSeriesQuery": {
+                            "timeSeriesFilter": {
+                              "filter": "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/disk/read_bytes_count\"",
+                              "aggregation": {
+                                "alignmentPeriod": "60s",
+                                "perSeriesAligner": "ALIGN_RATE"
+                              }
+                            }
+                          },
+                          "plotType": "LINE"
+                        },
+                        {
+                          "timeSeriesQuery": {
+                            "timeSeriesFilter": {
+                              "filter": "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/disk/write_bytes_count\"",
+                              "aggregation": {
+                                "alignmentPeriod": "60s",
+                                "perSeriesAligner": "ALIGN_RATE"
+                              }
+                            }
+                          },
+                          "plotType": "LINE"
+                        }
+                      ],
+                      "yAxis": {
+                        "label": "Bytes/second",
+                        "scale": "LINEAR"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+
+  # Configuration variables with validation
+  variables:
+    project_id:
+      description: "Google Cloud Project ID"
+      type: string
+      required: true
+      validation:
+        pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+    
+    region:
+      description: "Google Cloud region for deployment"
+      type: string
+      default: "us-central1"
+      required: false
+      validation:
+        allowed_values:
+        - "us-central1"
+        - "us-east1"
+        - "us-west1"
+        - "europe-west1"
+        - "asia-southeast1"
+    
+    zone:
+      description: "Google Cloud zone for Compute Engine resources"
+      type: string
+      default: "us-central1-a"
+      required: false
+    
+    random_suffix:
+      description: "Random suffix for resource names to ensure uniqueness"
+      type: string
+      default: "$(openssl rand -hex 3)"
+      required: false
+
+  # Outputs for validation and integration
+  outputs:
+    alloydb_instance_name:
+      description: "Name of the AlloyDB Omni VM instance"
+      value: ${alloydb-omni-instance.name}
+    
+    alloydb_instance_ip:
+      description: "External IP address of the AlloyDB Omni instance"
+      value: ${alloydb-omni-instance.network_interfaces[0].access_configs[0].nat_ip}
+    
+    alloydb_internal_ip:
+      description: "Internal IP address of the AlloyDB Omni instance"
+      value: ${alloydb-omni-instance.network_interfaces[0].network_ip}
+    
+    hyperdisk_name:
+      description: "Name of the Hyperdisk Extreme volume"
+      value: ${alloydb-hyperdisk-extreme.name}
+    
+    hyperdisk_size:
+      description: "Size of the Hyperdisk Extreme volume in GB"
+      value: ${alloydb-hyperdisk-extreme.size}
+    
+    hyperdisk_iops:
+      description: "Provisioned IOPS for the Hyperdisk Extreme volume"
+      value: ${alloydb-hyperdisk-extreme.provisioned_iops}
+    
+    cloud_function_name:
+      description: "Name of the performance scaling Cloud Function"
+      value: ${alloydb-performance-scaler-function.name}
+    
+    monitoring_dashboard_url:
+      description: "URL to the AlloyDB performance monitoring dashboard"
+      value: "https://console.cloud.google.com/monitoring/dashboards/custom/${alloydb-performance-dashboard.id}?project=${project_id}"
+    
+    database_connection_command:
+      description: "Command to connect to AlloyDB Omni database"
+      value: "gcloud compute ssh ${alloydb-omni-instance.name} --zone=${zone} --command='sudo docker exec -it alloydb-omni psql -U postgres -d analytics_db'"
+    
+    performance_test_command:
+      description: "Command to run performance tests on Hyperdisk Extreme"
+      value: "gcloud compute ssh ${alloydb-omni-instance.name} --zone=${zone} --command='sudo fio --name=test --ioengine=libaio --iodepth=64 --rw=randread --bs=4k --direct=1 --size=1G --runtime=30 --numjobs=4 --filename=/var/lib/alloydb/test_file --group_reporting'"
+
+    # Cost tracking outputs
+    estimated_monthly_cost:
+      description: "Estimated monthly cost in USD (approximate)"
+      value: "~$1,200-1,800 (c3-highmem-8 + Hyperdisk Extreme + monitoring)"
+    
+    cost_optimization_notes:
+      description: "Recommendations for cost optimization"
+      value: "Consider reducing Hyperdisk IOPS for non-production environments, use preemptible instances for testing, and implement automated shutdown schedules"

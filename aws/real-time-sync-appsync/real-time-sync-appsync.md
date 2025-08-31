@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: appsync,dynamodb,iam,cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: aws,appsync,dynamodb,iam,cloudwatch
 recipe-generator-version: 1.3
@@ -88,7 +88,7 @@ graph TB
 4. Understanding of real-time application architecture patterns
 5. Estimated cost: $10-15 for resources created (delete resources after completion)
 
-> **Note**: This recipe creates production-ready resources. Monitor costs and clean up resources when testing is complete.
+> **Note**: This recipe creates production-ready resources. Monitor costs and clean up resources when testing is complete to avoid unexpected charges.
 
 > **Warning**: DynamoDB streams and AppSync subscriptions incur charges based on usage. Ensure proper cleanup after testing to avoid unexpected costs.
 
@@ -480,6 +480,36 @@ echo "Role Name: ${ROLE_NAME}"
    # Create updateTask resolver with optimistic locking
    cat > updateTask-request.vtl << 'EOF'
    #set($updatedAt = $util.time.nowISO8601())
+   #set($updateExpr = "SET #updatedAt = :updatedAt, #version = #version + :incr")
+   #set($exprNames = {"#updatedAt": "updatedAt", "#version": "version"})
+   #set($exprValues = {":updatedAt": $util.dynamodb.toDynamoDBJson($updatedAt), ":incr": $util.dynamodb.toDynamoDBJson(1), ":expectedVersion": $util.dynamodb.toDynamoDBJson($ctx.args.input.version)})
+   
+   #if($ctx.args.input.title)
+       #set($updateExpr = "$updateExpr, #title = :title")
+       $util.qr($exprNames.put("#title", "title"))
+       $util.qr($exprValues.put(":title", $util.dynamodb.toDynamoDBJson($ctx.args.input.title)))
+   #end
+   #if($ctx.args.input.description)
+       #set($updateExpr = "$updateExpr, #description = :description")
+       $util.qr($exprNames.put("#description", "description"))
+       $util.qr($exprValues.put(":description", $util.dynamodb.toDynamoDBJson($ctx.args.input.description)))
+   #end
+   #if($ctx.args.input.status)
+       #set($updateExpr = "$updateExpr, #status = :status")
+       $util.qr($exprNames.put("#status", "status"))
+       $util.qr($exprValues.put(":status", $util.dynamodb.toDynamoDBJson($ctx.args.input.status)))
+   #end
+   #if($ctx.args.input.priority)
+       #set($updateExpr = "$updateExpr, #priority = :priority")
+       $util.qr($exprNames.put("#priority", "priority"))
+       $util.qr($exprValues.put(":priority", $util.dynamodb.toDynamoDBJson($ctx.args.input.priority)))
+   #end
+   #if($ctx.args.input.assignedTo)
+       #set($updateExpr = "$updateExpr, #assignedTo = :assignedTo")
+       $util.qr($exprNames.put("#assignedTo", "assignedTo"))
+       $util.qr($exprValues.put(":assignedTo", $util.dynamodb.toDynamoDBJson($ctx.args.input.assignedTo)))
+   #end
+   
    {
        "version": "2018-05-29",
        "operation": "UpdateItem",
@@ -487,16 +517,9 @@ echo "Role Name: ${ROLE_NAME}"
            "id": $util.dynamodb.toDynamoDBJson($ctx.args.input.id)
        },
        "update": {
-           "expression": "SET #updatedAt = :updatedAt, #version = #version + :incr",
-           "expressionNames": {
-               "#updatedAt": "updatedAt",
-               "#version": "version"
-           },
-           "expressionValues": {
-               ":updatedAt": $util.dynamodb.toDynamoDBJson($updatedAt),
-               ":incr": $util.dynamodb.toDynamoDBJson(1),
-               ":expectedVersion": $util.dynamodb.toDynamoDBJson($ctx.args.input.version)
-           }
+           "expression": "$updateExpr",
+           "expressionNames": $util.toJson($exprNames),
+           "expressionValues": $util.toJson($exprValues)
        },
        "condition": {
            "expression": "#version = :expectedVersion",
@@ -508,38 +531,6 @@ echo "Role Name: ${ROLE_NAME}"
            }
        }
    }
-   
-   #if($ctx.args.input.title)
-       $util.qr($ctx.stash.put("title", $ctx.args.input.title))
-   #end
-   #if($ctx.args.input.description)
-       $util.qr($ctx.stash.put("description", $ctx.args.input.description))
-   #end
-   #if($ctx.args.input.status)
-       $util.qr($ctx.stash.put("status", $ctx.args.input.status))
-   #end
-   #if($ctx.args.input.priority)
-       $util.qr($ctx.stash.put("priority", $ctx.args.input.priority))
-   #end
-   #if($ctx.args.input.assignedTo)
-       $util.qr($ctx.stash.put("assignedTo", $ctx.args.input.assignedTo))
-   #end
-   
-   #foreach($key in $ctx.stash.keySet())
-       $util.qr($ctx.args.update.update.expressionNames.put("#$key", $key))
-       $util.qr($ctx.args.update.update.expressionValues.put(":$key", $util.dynamodb.toDynamoDBJson($ctx.stash.get($key))))
-       #if($foreach.hasNext)
-           #set($expression = "$ctx.args.update.update.expression, #$key = :$key")
-       #else
-           #set($expression = "$ctx.args.update.update.expression, #$key = :$key")
-       #end
-   #end
-   
-   #if($ctx.stash.keySet().size() > 0)
-       $util.qr($ctx.args.update.update.put("expression", $expression))
-   #end
-   
-   $util.toJson($ctx.args.update)
    EOF
    
    cat > updateTask-response.vtl << 'EOF'
@@ -758,7 +749,7 @@ echo "Role Name: ${ROLE_NAME}"
    echo "✅ Created task with ID: ${TASK_ID}"
    ```
 
-2. **Test Real-time Subscription (Basic)**:
+2. **Test Task Listing**:
 
    ```bash
    # Test listing tasks
@@ -834,7 +825,7 @@ echo "Role Name: ${ROLE_NAME}"
        --descending \
        --limit 1
    
-   echo "✅ CloudWatch logs verified - check console for detailed logs"
+   echo "✅ CloudWatch logs verified - check AWS Console for detailed logs"
    ```
 
 ## Cleanup
@@ -883,29 +874,29 @@ echo "Role Name: ${ROLE_NAME}"
 
 ## Discussion
 
-AWS AppSync provides a powerful foundation for building real-time collaborative applications by combining GraphQL APIs with managed WebSocket subscriptions. The key architectural decisions in this solution include using DynamoDB Streams to trigger real-time updates, implementing optimistic locking for conflict resolution, and designing a schema that supports both individual operations and bulk updates.
+AWS AppSync provides a powerful foundation for building real-time collaborative applications by combining GraphQL APIs with managed WebSocket subscriptions. The key architectural decisions in this solution include using DynamoDB Streams to trigger real-time updates, implementing optimistic locking for conflict resolution, and designing a schema that supports both individual operations and bulk updates. This approach follows AWS Well-Architected Framework principles for reliability and operational excellence.
 
-The subscription mechanism in AppSync automatically handles connection management, reconnection on network failures, and message delivery guarantees. When a mutation is executed, AppSync automatically pushes the changes to all connected clients that have subscribed to the relevant event types. This eliminates the need for complex WebSocket management or polling mechanisms.
+The subscription mechanism in AppSync automatically handles connection management, reconnection on network failures, and message delivery guarantees. When a mutation is executed, AppSync automatically pushes the changes to all connected clients that have subscribed to the relevant event types. This eliminates the need for complex WebSocket management or polling mechanisms while providing enterprise-grade scalability and reliability.
 
-Conflict resolution is handled through optimistic concurrency control using version numbers. When multiple clients attempt to update the same item simultaneously, only the first update succeeds, and subsequent updates receive a conditional check failure. This prevents data corruption while maintaining high performance for the common case of non-conflicting updates.
+Conflict resolution is handled through optimistic concurrency control using version numbers. When multiple clients attempt to update the same item simultaneously, only the first update succeeds, and subsequent updates receive a conditional check failure. This prevents data corruption while maintaining high performance for the common case of non-conflicting updates, following database transaction isolation principles.
 
-The solution also demonstrates best practices for security through API key authentication, IAM role-based access control, and proper error handling. For production deployments, consider implementing more sophisticated authentication using Amazon Cognito User Pools and fine-grained authorization rules.
+The solution demonstrates security best practices through API key authentication for development, IAM role-based access control for service authorization, and proper error handling. For production deployments, implement more sophisticated authentication using Amazon Cognito User Pools and fine-grained authorization rules as described in the [AWS AppSync security documentation](https://docs.aws.amazon.com/appsync/latest/devguide/security-authz.html).
 
-> **Tip**: Use GraphQL subscriptions selectively for data that truly requires real-time updates. Overuse of subscriptions can increase costs and complexity without providing user value. See [AWS AppSync documentation](https://docs.aws.amazon.com/appsync/latest/devguide/real-time-data.html) for subscription best practices.
+> **Tip**: Use GraphQL subscriptions selectively for data that truly requires real-time updates. Overuse of subscriptions can increase costs and complexity without providing user value. See [AWS AppSync real-time data documentation](https://docs.aws.amazon.com/appsync/latest/devguide/aws-appsync-real-time-data.html) for subscription best practices and cost optimization strategies.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Add User Authentication**: Integrate Amazon Cognito User Pools for user management and implement user-specific subscriptions that only receive updates for tasks assigned to them.
+1. **Add User Authentication**: Integrate Amazon Cognito User Pools for user management and implement user-specific subscriptions that only receive updates for tasks assigned to them using subscription filters.
 
 2. **Implement Advanced Conflict Resolution**: Create custom conflict resolution logic using AWS Lambda resolvers that can merge changes intelligently based on field-level conflicts rather than rejecting entire updates.
 
-3. **Add Offline Support**: Implement client-side caching and offline mutation queuing using AWS AppSync client SDKs to handle network connectivity issues gracefully.
+3. **Add Offline Support**: Implement client-side caching and offline mutation queuing using AWS AppSync client SDKs to handle network connectivity issues gracefully with automatic synchronization when connectivity is restored.
 
-4. **Create Real-time Analytics**: Build a real-time dashboard that shows task completion rates, user activity, and system metrics using additional subscriptions and CloudWatch metrics.
+4. **Create Real-time Analytics**: Build a real-time dashboard that shows task completion rates, user activity, and system metrics using additional subscriptions and CloudWatch metrics integration.
 
-5. **Scale for High Throughput**: Implement DynamoDB auto-scaling, AppSync caching, and connection throttling to handle thousands of concurrent users with minimal latency.
+5. **Scale for High Throughput**: Implement DynamoDB auto-scaling, AppSync caching, and connection throttling to handle thousands of concurrent users with minimal latency while optimizing costs.
 
 ## Infrastructure Code
 

@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: Cloud Storage FUSE, Parallelstore, Cloud Dataproc, BigQuery
 estimated-time: 150 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: 2025-07-17
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: high-performance-computing, analytics, storage, data-processing, machine-learning
 recipe-generator-version: 1.3
@@ -290,7 +290,7 @@ echo "✅ APIs enabled for high-performance analytics"
        --master-machine-type=c2-standard-4 \
        --boot-disk-size=200GB \
        --boot-disk-type=pd-ssd \
-       --image-version=2.1-ubuntu20 \
+       --image-version=2.2-ubuntu20 \
        --enable-cloud-sql-hive-metastore \
        --metadata="parallel-store-ip=${PARALLELSTORE_IP}" \
        --initialization-actions=\
@@ -454,7 +454,7 @@ echo "✅ APIs enabled for high-performance analytics"
    EOF
    
    # Create monitoring policy
-   gcloud monitoring policies create \
+   gcloud alpha monitoring policies create \
        --policy-from-file=monitoring_policy.json
    
    # Set up custom metrics for performance tracking

@@ -1,21 +1,21 @@
 ---
-title: AI Content Moderation with Bedrock
+title: AI Content Moderation with Bedrock and EventBridge
 id: 3f7a8b2e
 category: machine-learning
 difficulty: 200
 subject: aws
 services: Amazon Bedrock, Amazon EventBridge, AWS Lambda, Amazon S3
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: content-moderation, ai-safety, event-driven, serverless, automation
 recipe-generator-version: 1.3
 ---
 
-# AI Content Moderation with Bedrock
+# AI Content Moderation with Bedrock and EventBridge
 
 ## Problem
 
@@ -170,7 +170,7 @@ echo "✅ S3 buckets created with security features enabled"
 
    ```bash
    # Trust policy for Lambda execution
-   cat > lambda-trust-policy.json << EOF
+   cat > lambda-trust-policy.json << 'EOF'
    {
        "Version": "2012-10-17",
        "Statement": [
@@ -232,6 +232,49 @@ echo "✅ S3 buckets created with security features enabled"
        --role-name ContentAnalysisLambdaRole \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
    
+   # Create separate role for workflow functions
+   aws iam create-role \
+       --role-name WorkflowLambdaRole \
+       --assume-role-policy-document file://lambda-trust-policy.json
+   
+   # Create policy for workflow functions (S3 and SNS access)
+   cat > workflow-policy.json << EOF
+   {
+       "Version": "2012-10-17",
+       "Statement": [
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "s3:GetObject",
+                   "s3:PutObject",
+                   "s3:CopyObject"
+               ],
+               "Resource": [
+                   "arn:aws:s3:::${CONTENT_BUCKET}/*",
+                   "arn:aws:s3:::${APPROVED_BUCKET}/*",
+                   "arn:aws:s3:::${REJECTED_BUCKET}/*"
+               ]
+           },
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "sns:Publish"
+               ],
+               "Resource": "${SNS_TOPIC_ARN}"
+           }
+       ]
+   }
+   EOF
+   
+   aws iam put-role-policy \
+       --role-name WorkflowLambdaRole \
+       --policy-name WorkflowPolicy \
+       --policy-document file://workflow-policy.json
+   
+   aws iam attach-role-policy \
+       --role-name WorkflowLambdaRole \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+   
    echo "✅ IAM roles created with appropriate permissions"
    ```
 
@@ -258,28 +301,26 @@ echo "✅ S3 buckets created with security features enabled"
        try:
            # Parse S3 event
            bucket = event['Records'][0]['s3']['bucket']['name']
-           key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'])
+           key = urllib.parse.unquote_plus(
+               event['Records'][0]['s3']['object']['key'])
            
            # Get content from S3
            response = s3.get_object(Bucket=bucket, Key=key)
            content = response['Body'].read().decode('utf-8')
            
            # Prepare moderation prompt
-           prompt = f"""
-           Human: Please analyze the following content for policy violations. 
-           Consider harmful content including hate speech, violence, harassment, 
-           inappropriate sexual content, misinformation, and spam.
-           
-           Content to analyze:
-           {content[:2000]}  # Limit content length
-           
-           Respond with a JSON object containing:
-           - "decision": "approved", "rejected", or "review"
-           - "confidence": score from 0.0 to 1.0
-           - "reason": brief explanation
-           - "categories": array of policy categories if violations found
-           
-           Assistant: """
+           prompt = f"""Please analyze the following content for policy violations. 
+   Consider harmful content including hate speech, violence, harassment, 
+   inappropriate sexual content, misinformation, and spam.
+   
+   Content to analyze:
+   {content[:2000]}
+   
+   Respond with a JSON object containing:
+   - "decision": "approved", "rejected", or "review"
+   - "confidence": score from 0.0 to 1.0  
+   - "reason": brief explanation
+   - "categories": array of policy categories if violations found"""
            
            # Invoke Bedrock Claude model
            body = json.dumps({
@@ -297,7 +338,21 @@ echo "✅ S3 buckets created with security features enabled"
            )
            
            response_body = json.loads(bedrock_response['body'].read())
-           moderation_result = json.loads(response_body['content'][0]['text'])
+           
+           # Extract the response text
+           response_text = response_body['content'][0]['text']
+           
+           # Parse JSON from response
+           try:
+               moderation_result = json.loads(response_text)
+           except json.JSONDecodeError:
+               # Fallback if response isn't valid JSON
+               moderation_result = {
+                   "decision": "review",
+                   "confidence": 0.5,
+                   "reason": "Unable to parse moderation response",
+                   "categories": ["parsing_error"]
+               }
            
            # Publish event to EventBridge
            event_detail = {
@@ -343,7 +398,7 @@ echo "✅ S3 buckets created with security features enabled"
    
    CONTENT_ANALYSIS_FUNCTION_ARN=$(aws lambda create-function \
        --function-name ContentAnalysisFunction \
-       --runtime python3.9 \
+       --runtime python3.11 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/ContentAnalysisLambdaRole \
        --handler index.lambda_handler \
        --zip-file fileb://content-analysis.zip \
@@ -385,7 +440,7 @@ echo "✅ S3 buckets created with security features enabled"
            target_bucket = {
                'approved': '${APPROVED_BUCKET}',
                'rejected': '${REJECTED_BUCKET}',
-               'review': '${REJECTED_BUCKET}'  # Review items go to rejected bucket with special prefix
+               'review': '${REJECTED_BUCKET}'
            }['${workflow}']
            
            target_key = f"${workflow}/{datetime.utcnow().strftime('%Y/%m/%d')}/{source_key}"
@@ -427,7 +482,7 @@ echo "✅ S3 buckets created with security features enabled"
            return {
                'statusCode': 200,
                'body': json.dumps({
-                   'message': f'Content processed for {workflow}',
+                   'message': f'Content processed for ${workflow}',
                    'target_location': f's3://{target_bucket}/{target_key}'
                })
            }
@@ -446,8 +501,8 @@ echo "✅ S3 buckets created with security features enabled"
        
        aws lambda create-function \
            --function-name ${workflow^}HandlerFunction \
-           --runtime python3.9 \
-           --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/ContentAnalysisLambdaRole \
+           --runtime python3.11 \
+           --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/WorkflowLambdaRole \
            --handler index.lambda_handler \
            --zip-file fileb://${workflow}-handler.zip \
            --timeout 30 \
@@ -523,7 +578,7 @@ echo "✅ S3 buckets created with security features enabled"
        # Add Lambda target to rule
        aws events put-targets \
            --rule ${decision}-content-rule \
-           --event-bus-name ${CUSTOM_BUS_NAME \
+           --event-bus-name ${CUSTOM_BUS_NAME} \
            --targets Id=1,Arn=arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${decision^}HandlerFunction
        
        # Grant EventBridge permission to invoke Lambda
@@ -668,6 +723,9 @@ echo "✅ S3 buckets created with security features enabled"
    
    echo "Rejected content:"
    aws s3 ls s3://${REJECTED_BUCKET}/rejected/ --recursive
+   
+   echo "Review content:"
+   aws s3 ls s3://${REJECTED_BUCKET}/review/ --recursive
    ```
 
 4. **Verify SNS Notifications**:
@@ -687,7 +745,7 @@ echo "✅ S3 buckets created with security features enabled"
    ```bash
    # Delete Lambda functions
    for function in ContentAnalysisFunction ApprovedHandlerFunction RejectedHandlerFunction ReviewHandlerFunction; do
-       aws lambda delete-function --function-name ${function}
+       aws lambda delete-function --function-name ${function} 2>/dev/null || true
    done
    
    echo "✅ Lambda functions deleted"
@@ -701,15 +759,15 @@ echo "✅ S3 buckets created with security features enabled"
        aws events remove-targets \
            --rule ${decision}-content-rule \
            --event-bus-name ${CUSTOM_BUS_NAME} \
-           --ids 1
+           --ids 1 2>/dev/null || true
        
        aws events delete-rule \
            --name ${decision}-content-rule \
-           --event-bus-name ${CUSTOM_BUS_NAME}
+           --event-bus-name ${CUSTOM_BUS_NAME} 2>/dev/null || true
    done
    
    # Delete custom event bus
-   aws events delete-event-bus --name ${CUSTOM_BUS_NAME}
+   aws events delete-event-bus --name ${CUSTOM_BUS_NAME} 2>/dev/null || true
    
    echo "✅ EventBridge resources deleted"
    ```
@@ -719,8 +777,8 @@ echo "✅ S3 buckets created with security features enabled"
    ```bash
    # Empty and delete S3 buckets
    for bucket in ${CONTENT_BUCKET} ${APPROVED_BUCKET} ${REJECTED_BUCKET}; do
-       aws s3 rm s3://${bucket} --recursive
-       aws s3 rb s3://${bucket}
+       aws s3 rm s3://${bucket} --recursive 2>/dev/null || true
+       aws s3 rb s3://${bucket} 2>/dev/null || true
    done
    
    echo "✅ S3 buckets deleted"
@@ -729,16 +787,29 @@ echo "✅ S3 buckets created with security features enabled"
 4. **Remove IAM Roles and Policies**:
 
    ```bash
-   # Detach and delete policies
+   # Detach and delete policies for ContentAnalysisLambdaRole
    aws iam detach-role-policy \
        --role-name ContentAnalysisLambdaRole \
-       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole \
+       2>/dev/null || true
    
    aws iam delete-role-policy \
        --role-name ContentAnalysisLambdaRole \
-       --policy-name ContentAnalysisPolicy
+       --policy-name ContentAnalysisPolicy 2>/dev/null || true
    
-   aws iam delete-role --role-name ContentAnalysisLambdaRole
+   aws iam delete-role --role-name ContentAnalysisLambdaRole 2>/dev/null || true
+   
+   # Detach and delete policies for WorkflowLambdaRole
+   aws iam detach-role-policy \
+       --role-name WorkflowLambdaRole \
+       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole \
+       2>/dev/null || true
+   
+   aws iam delete-role-policy \
+       --role-name WorkflowLambdaRole \
+       --policy-name WorkflowPolicy 2>/dev/null || true
+   
+   aws iam delete-role --role-name WorkflowLambdaRole 2>/dev/null || true
    
    echo "✅ IAM roles and policies deleted"
    ```
@@ -747,13 +818,14 @@ echo "✅ S3 buckets created with security features enabled"
 
    ```bash
    # Delete SNS topic
-   aws sns delete-topic --topic-arn ${SNS_TOPIC_ARN}
+   aws sns delete-topic --topic-arn ${SNS_TOPIC_ARN} 2>/dev/null || true
    
    # Delete Bedrock guardrail
-   aws bedrock delete-guardrail --guardrail-identifier ${GUARDRAIL_ID}
+   aws bedrock delete-guardrail \
+       --guardrail-identifier ${GUARDRAIL_ID} 2>/dev/null || true
    
    # Clean up local files
-   rm -rf lambda-functions/ *.json *.txt
+   rm -rf lambda-functions/ *.json *.txt 2>/dev/null || true
    
    echo "✅ All resources cleaned up"
    ```

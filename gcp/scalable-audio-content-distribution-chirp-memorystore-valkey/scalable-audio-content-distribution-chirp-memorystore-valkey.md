@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Text-to-Speech, Memorystore for Valkey, Cloud Storage, Cloud CDN
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: audio-distribution, voice-synthesis, caching, cdn, performance-optimization
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Enterprise podcast platforms and audiobook services face significant challenges 
 
 ## Solution
 
-This solution leverages Google Cloud's Chirp 3 instant custom voice technology to generate personalized audio content in real-time, caches frequently accessed audio files using Memorystore for Valkey's high-performance in-memory storage, and delivers content globally through Cloud CDN. The architecture provides enterprise-scale audio distribution with microsecond-latency caching, intelligent content optimization, and cost-effective global delivery that scales automatically with demand.
+This solution leverages Google Cloud's Chirp 3 HD voices technology to generate high-quality audio content in real-time, caches frequently accessed audio files using Memorystore for Valkey's high-performance in-memory storage, and delivers content globally through Cloud CDN. The architecture provides enterprise-scale audio distribution with microsecond-latency caching, intelligent content optimization, and cost-effective global delivery that scales automatically with demand.
 
 ## Architecture Diagram
 
@@ -51,7 +51,7 @@ graph TB
     
     subgraph "AI Services"
         TTS[Text-to-Speech API]
-        CHIRP[Chirp 3 Custom Voice]
+        CHIRP[Chirp 3 HD Voices]
     end
     
     subgraph "Storage Layer"
@@ -80,12 +80,12 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud Project with billing enabled and appropriate quotas
-2. gcloud CLI installed and configured (version 450.0.0 or later)
+2. gcloud CLI installed and configured (version 455.0.0 or later)
 3. Basic understanding of REST APIs, audio processing, and caching strategies
-4. Access to Chirp 3 instant custom voice (allowlist required - contact Google Cloud sales)
+4. Access to Chirp 3 HD voices (generally available in global, us, eu, and asia-southeast1 regions)
 5. Estimated cost: $50-200/month depending on audio generation volume and cache usage
 
-> **Note**: Chirp 3 instant custom voice requires allowlist approval due to safety considerations. Contact Google Cloud sales to be added to the allowlist before proceeding with voice cloning features.
+> **Note**: Chirp 3 HD voices are generally available and provide enhanced audio quality with support for 8 speakers across 31 locales. These voices offer real-time streaming and batch processing capabilities.
 
 ## Preparation
 
@@ -108,11 +108,12 @@ gcloud config set compute/zone ${ZONE}
 
 # Enable required APIs
 gcloud services enable texttospeech.googleapis.com
-gcloud services enable memcache.googleapis.com
+gcloud services enable memorystore.googleapis.com
 gcloud services enable storage.googleapis.com
 gcloud services enable cloudfunctions.googleapis.com
-gcloud services enable cloudcdn.googleapis.com
 gcloud services enable compute.googleapis.com
+gcloud services enable cloudbuild.googleapis.com
+gcloud services enable run.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled and environment variables set"
@@ -182,37 +183,36 @@ echo "✅ APIs enabled and environment variables set"
        --range 10.0.0.0/24 \
        --region ${REGION}
    
-   # Create Memorystore for Valkey instance with cluster mode
-   gcloud memcache instances create ${VALKEY_INSTANCE} \
-       --size 2 \
+   # Create Memorystore for Valkey instance
+   gcloud memorystore instances create ${VALKEY_INSTANCE} \
        --region ${REGION} \
-       --network audio-network \
-       --node-count 3 \
-       --enable-auth \
-       --valkey-version 8.0
+       --network projects/${PROJECT_ID}/global/networks/audio-network \
+       --node-type shared-core-nano \
+       --shard-count 1 \
+       --replica-count 0
    
    # Wait for instance to be ready
    echo "⏳ Waiting for Valkey instance to be ready..."
-   while [[ $(gcloud memcache instances describe ${VALKEY_INSTANCE} \
+   while [[ $(gcloud memorystore instances describe ${VALKEY_INSTANCE} \
        --region ${REGION} --format="value(state)") != "READY" ]]; do
      sleep 30
      echo "Still creating Valkey instance..."
    done
    
    # Get connection details
-   export VALKEY_HOST=$(gcloud memcache instances describe ${VALKEY_INSTANCE} \
-       --region ${REGION} --format="value(host)")
+   export VALKEY_HOST=$(gcloud memorystore instances describe ${VALKEY_INSTANCE} \
+       --region ${REGION} --format="value(discoveryEndpoints[0].address)")
    export VALKEY_PORT=6379
    
    echo "✅ Memorystore for Valkey instance created successfully"
    echo "Connection: ${VALKEY_HOST}:${VALKEY_PORT}"
    ```
 
-   The Valkey cluster is now operational with authentication enabled and distributed across multiple zones for high availability. This caching layer provides the performance foundation needed to serve audio content with microsecond latencies while supporting horizontal scaling as demand grows.
+   The Valkey instance is now operational with distributed architecture for high availability. This caching layer provides the performance foundation needed to serve audio content with microsecond latencies while supporting horizontal scaling as demand grows.
 
 3. **Configure Text-to-Speech API with Chirp 3**:
 
-   Cloud Text-to-Speech with Chirp 3 enables real-time generation of high-quality, personalized audio content. The instant custom voice capability allows for unique voice characteristics while maintaining the natural flow and emotional expression that distinguishes premium audio content from traditional synthetic speech.
+   Cloud Text-to-Speech with Chirp 3 HD voices enables real-time generation of high-quality, natural-sounding audio content. The HD voices provide enhanced quality with improved naturalness and emotional expression that distinguishes premium audio content from traditional synthetic speech.
 
    ```bash
    # Create service account for Text-to-Speech operations
@@ -232,13 +232,13 @@ echo "✅ APIs enabled and environment variables set"
    gcloud iam service-accounts keys create tts-key.json \
        --iam-account="tts-service-account@${PROJECT_ID}.iam.gserviceaccount.com"
    
-   # Test Text-to-Speech API connectivity
+   # Test Text-to-Speech API connectivity with Chirp 3 HD voice
    curl -X POST \
        -H "Authorization: Bearer $(gcloud auth print-access-token)" \
        -H "Content-Type: application/json" \
        -d '{
-         "input": {"text": "Testing Chirp 3 audio generation for scalable content distribution."},
-         "voice": {"languageCode": "en-US", "name": "en-US-Casual"},
+         "input": {"text": "Testing Chirp 3 HD voices for scalable content distribution."},
+         "voice": {"languageCode": "en-US", "name": "en-US-Chirp3-HD-Charon"},
          "audioConfig": {"audioEncoding": "MP3", "sampleRateHertz": 24000}
        }' \
        "https://texttospeech.googleapis.com/v1/text:synthesize" \
@@ -247,7 +247,7 @@ echo "✅ APIs enabled and environment variables set"
    echo "✅ Text-to-Speech API configured and tested successfully"
    ```
 
-   The Text-to-Speech service is now configured with appropriate permissions and tested for connectivity. This setup enables the system to generate high-quality audio content on-demand while maintaining secure access patterns through proper service account management.
+   The Text-to-Speech service is now configured with appropriate permissions and tested for connectivity. This setup enables the system to generate high-quality audio content on-demand using Chirp 3 HD voices while maintaining secure access patterns through proper service account management.
 
 4. **Deploy Audio Processing Cloud Function**:
 
@@ -315,13 +315,13 @@ echo "✅ APIs enabled and environment variables set"
          });
        }
        
-       // Generate new audio content
+       // Generate new audio content with Chirp 3 HD voice
        const startTime = Date.now();
        const request = {
          input: { text },
          voice: {
            languageCode: voiceConfig.languageCode || 'en-US',
-           name: voiceConfig.voiceName || 'en-US-Casual',
+           name: voiceConfig.voiceName || 'en-US-Chirp3-HD-Charon',
            ssmlGender: voiceConfig.gender || 'NEUTRAL'
          },
          audioConfig: {
@@ -574,14 +574,14 @@ echo "✅ APIs enabled and environment variables set"
    export SERVICE_URL=$(gcloud run services describe audio-management-service \
        --platform managed --region ${REGION} --format="value(status.url)")
    
-   # Test single audio generation
+   # Test single audio generation with Chirp 3 HD voice
    curl -X POST "${SERVICE_URL}/api/audio/generate" \
        -H "Content-Type: application/json" \
        -d '{
          "text": "Welcome to our scalable audio content distribution platform powered by Google Cloud.",
          "voiceConfig": {
            "languageCode": "en-US",
-           "voiceName": "en-US-Casual"
+           "voiceName": "en-US-Chirp3-HD-Charon"
          }
        }' | jq .
    ```
@@ -598,7 +598,7 @@ echo "✅ APIs enabled and environment variables set"
          "text": "Welcome to our scalable audio content distribution platform powered by Google Cloud.",
          "voiceConfig": {
            "languageCode": "en-US",
-           "voiceName": "en-US-Casual"
+           "voiceName": "en-US-Chirp3-HD-Charon"
          }
        }' | jq '.cached, .processingTime'
    ```
@@ -619,7 +619,7 @@ echo "✅ APIs enabled and environment variables set"
          ],
          "voiceConfig": {
            "languageCode": "en-US",
-           "voiceName": "en-US-Casual"
+           "voiceName": "en-US-Chirp3-HD-Leda"
          }
        }' | jq '.processed'
    ```
@@ -667,7 +667,7 @@ echo "✅ APIs enabled and environment variables set"
 
    ```bash
    # Delete Valkey instance
-   gcloud memcache instances delete ${VALKEY_INSTANCE} \
+   gcloud memorystore instances delete ${VALKEY_INSTANCE} \
        --region ${REGION} --quiet
    
    # Remove Cloud Storage bucket
@@ -697,7 +697,7 @@ echo "✅ APIs enabled and environment variables set"
 
 ## Discussion
 
-This architecture demonstrates how modern cloud services can be orchestrated to solve complex enterprise audio distribution challenges. The combination of Chirp 3's instant custom voice capabilities with Memorystore for Valkey's high-performance caching creates a system that can generate personalized audio content in real-time while serving millions of concurrent users with sub-millisecond response times.
+This architecture demonstrates how modern Google Cloud services can be orchestrated to solve complex enterprise audio distribution challenges. The combination of Chirp 3 HD voices with Memorystore for Valkey's high-performance caching creates a system that can generate natural-sounding audio content in real-time while serving millions of concurrent users with sub-millisecond response times.
 
 The strategic use of Cloud CDN provides global edge caching that dramatically reduces both latency and bandwidth costs. By implementing intelligent cache hierarchies—from Valkey's in-memory storage for hot content to CDN edge locations for geographic distribution—the system optimizes performance at every layer. This approach is particularly valuable for podcast platforms and audiobook services where content popularity follows predictable patterns, enabling aggressive caching strategies that improve both user experience and operational efficiency.
 
@@ -707,19 +707,19 @@ Security considerations are built into every layer, from IAM service accounts wi
 
 > **Tip**: Monitor cache hit ratios using Cloud Monitoring to optimize cache TTL values and identify opportunities for content pre-generation during low-demand periods.
 
-The architecture showcases several Google Cloud best practices, including the use of managed services to reduce operational overhead, implementation of proper resource lifecycle management through Cloud Storage lifecycle policies, and integration of monitoring and observability features. For detailed implementation guidance, refer to the [Google Cloud Text-to-Speech documentation](https://cloud.google.com/text-to-speech/docs), [Memorystore for Valkey best practices](https://cloud.google.com/memorystore/docs/valkey/best-practices), [Cloud CDN optimization guide](https://cloud.google.com/cdn/docs/best-practices), and the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) for enterprise-scale system design principles.
+The architecture showcases several Google Cloud best practices, including the use of managed services to reduce operational overhead, implementation of proper resource lifecycle management through Cloud Storage lifecycle policies, and integration of monitoring and observability features. For detailed implementation guidance, refer to the [Google Cloud Text-to-Speech documentation](https://cloud.google.com/text-to-speech/docs), [Memorystore for Valkey documentation](https://cloud.google.com/memorystore/docs/valkey), [Cloud CDN optimization guide](https://cloud.google.com/cdn/docs/best-practices), and the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) for enterprise-scale system design principles.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Implement voice cloning workflows** using Chirp 3 instant custom voice with proper consent management and voice model versioning for enterprise podcast creators.
+1. **Implement voice customization workflows** using Chirp 3 HD voice controls for pace, pause, and custom pronunciations to create unique brand-specific audio experiences.
 
-2. **Add real-time audio streaming capabilities** using Cloud Pub/Sub and WebRTC for live podcast generation and interactive audio experiences.
+2. **Add real-time audio streaming capabilities** using WebSockets and streaming Text-to-Speech API for live podcast generation and interactive audio experiences.
 
 3. **Integrate machine learning analytics** with BigQuery and Vertex AI to analyze audio content performance, optimize voice characteristics, and predict content popularity.
 
-4. **Develop multi-language audio localization** by combining Cloud Translation API with Chirp 3's multilingual capabilities for automated content globalization.
+4. **Develop multi-language audio localization** by combining Cloud Translation API with Chirp 3's multilingual capabilities for automated content globalization across 31 supported locales.
 
 5. **Create advanced audio processing pipelines** using Dataflow for batch audio enhancement, normalization, and metadata extraction at enterprise scale.
 

@@ -4,12 +4,12 @@ id: 7f3a2b8c
 category: devops
 difficulty: 200
 subject: gcp
-services: Cloud Deploy, Cloud Build, Cloud Storage, Cloud Logging
+services: Cloud Deploy, Cloud Build, Cloud Storage, GKE
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: devops, ci-cd, progressive-delivery, multi-environment, deployment-automation
 recipe-generator-version: 1.3
@@ -36,7 +36,7 @@ graph TB
     
     subgraph "CI/CD Pipeline"
         BUILD[Cloud Build]
-        ARTIFACTS[Container Registry]
+        ARTIFACTS[Artifact Registry]
         DEPLOY[Cloud Deploy]
     end
     
@@ -109,13 +109,21 @@ gcloud services enable container.googleapis.com \
     clouddeploy.googleapis.com \
     storage.googleapis.com \
     logging.googleapis.com \
-    monitoring.googleapis.com
+    monitoring.googleapis.com \
+    artifactregistry.googleapis.com
+
+# Create Artifact Registry repository for container images
+gcloud artifacts repositories create ${APP_NAME}-repo \
+    --repository-format=docker \
+    --location=${REGION} \
+    --description="Container images for ${APP_NAME}"
 
 # Create Cloud Storage bucket for build artifacts
 gsutil mb gs://${PROJECT_ID}-build-artifacts
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Required APIs enabled"
+echo "✅ Artifact Registry repository created"
 echo "✅ Storage bucket created for build artifacts"
 ```
 
@@ -207,6 +215,13 @@ echo "✅ Storage bucket created for build artifacts"
      res.status(200).json({ status: 'healthy' });
    });
    
+   app.get('/version', (req, res) => {
+     res.json({
+       version: process.env.APP_VERSION || '1.0.0',
+       environment: environment
+     });
+   });
+   
    app.listen(port, () => {
      console.log(`Server running on port ${port} in ${environment} environment`);
    });
@@ -267,12 +282,14 @@ echo "✅ Storage bucket created for build artifacts"
        spec:
          containers:
          - name: webapp
-           image: gcr.io/${PROJECT_ID}/${APP_NAME}:latest
+           image: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${APP_NAME}-repo/${APP_NAME}:latest
            ports:
            - containerPort: 3000
            env:
            - name: NODE_ENV
              value: "production"
+           - name: APP_VERSION
+             value: "1.0.0"
            livenessProbe:
              httpGet:
                path: /health
@@ -420,18 +437,18 @@ echo "✅ Storage bucket created for build artifacts"
    steps:
    # Build the container image
    - name: 'gcr.io/cloud-builders/docker'
-     args: ['build', '-t', 'gcr.io/${PROJECT_ID}/${APP_NAME}:\$SHORT_SHA', '.']
+     args: ['build', '-t', '${REGION}-docker.pkg.dev/${PROJECT_ID}/${APP_NAME}-repo/${APP_NAME}:\$SHORT_SHA', '.']
    
-   # Push the image to Container Registry
+   # Push the image to Artifact Registry
    - name: 'gcr.io/cloud-builders/docker'
-     args: ['push', 'gcr.io/${PROJECT_ID}/${APP_NAME}:\$SHORT_SHA']
+     args: ['push', '${REGION}-docker.pkg.dev/${PROJECT_ID}/${APP_NAME}-repo/${APP_NAME}:\$SHORT_SHA']
    
    # Update image tag in manifests
    - name: 'gcr.io/cloud-builders/gke-deploy'
      args:
      - prepare
      - --filename=k8s/overlays/dev
-     - --image=gcr.io/${PROJECT_ID}/${APP_NAME}:\$SHORT_SHA
+     - --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/${APP_NAME}-repo/${APP_NAME}:\$SHORT_SHA
      - --app=${APP_NAME}
      - --version=\$SHORT_SHA
      - --namespace=default
@@ -449,7 +466,7 @@ echo "✅ Storage bucket created for build artifacts"
      - --source=output
    
    images:
-   - 'gcr.io/${PROJECT_ID}/${APP_NAME}:\$SHORT_SHA'
+   - '${REGION}-docker.pkg.dev/${PROJECT_ID}/${APP_NAME}-repo/${APP_NAME}:\$SHORT_SHA'
    
    options:
      logging: CLOUD_LOGGING_ONLY
@@ -585,16 +602,9 @@ echo "✅ Storage bucket created for build artifacts"
    git add .
    git commit -m "Initial commit: Multi-environment deployment setup"
    
-   # Create Cloud Build trigger (manual trigger for demo)
-   gcloud builds triggers create manual \
-       --name="${APP_NAME}-trigger" \
-       --repo-type=GITHUB \
-       --branch-pattern="main" \
-       --build-config="cloudbuild.yaml" \
-       --substitutions=_CLOUDDEPLOY_SA_EMAIL="clouddeploy-sa@${PROJECT_ID}.iam.gserviceaccount.com"
-   
    # Grant Cloud Build service account necessary permissions
    PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} --format="value(projectNumber)")
+   
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
        --role="roles/clouddeploy.releaser"
@@ -603,7 +613,11 @@ echo "✅ Storage bucket created for build artifacts"
        --member="serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
        --role="roles/container.admin"
    
-   echo "✅ Cloud Build trigger created and permissions configured"
+   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+       --member="serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
+       --role="roles/artifactregistry.writer"
+   
+   echo "✅ Cloud Build permissions configured"
    ```
 
 10. **Execute Initial Build and Deployment**:
@@ -622,7 +636,7 @@ echo "✅ Storage bucket created for build artifacts"
     
     # Wait for build completion
     echo "Waiting for build to complete..."
-    sleep 60
+    sleep 90
     
     # Check Cloud Deploy pipeline status
     gcloud deploy delivery-pipelines describe ${PIPELINE_NAME} \
@@ -659,18 +673,21 @@ echo "✅ Storage bucket created for build artifacts"
    kubectl config use-context dev-context
    kubectl get pods -l app=${APP_NAME}
    DEV_IP=$(kubectl get service dev-${APP_NAME}-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+   echo "Development environment IP: ${DEV_IP}"
    curl -s http://${DEV_IP}/ | jq .
    
    # Test staging environment
    kubectl config use-context staging-context
    kubectl get pods -l app=${APP_NAME}
    STAGING_IP=$(kubectl get service staging-${APP_NAME}-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+   echo "Staging environment IP: ${STAGING_IP}"
    curl -s http://${STAGING_IP}/ | jq .
    
    # Test production environment
    kubectl config use-context prod-context
    kubectl get pods -l app=${APP_NAME}
    PROD_IP=$(kubectl get service prod-${APP_NAME}-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+   echo "Production environment IP: ${PROD_IP}"
    curl -s http://${PROD_IP}/ | jq .
    ```
 
@@ -691,6 +708,7 @@ echo "✅ Storage bucket created for build artifacts"
    kubectl get deployment prod-${APP_NAME} -o jsonpath='{.spec.replicas}'
    
    # Verify environment variables
+   echo -e "\n=== Environment Variable Verification ==="
    kubectl config use-context dev-context
    kubectl get deployment dev-${APP_NAME} -o jsonpath='{.spec.template.spec.containers[0].env[0].value}'
    ```
@@ -704,10 +722,10 @@ echo "✅ Storage bucket created for build artifacts"
        --region=${REGION} \
        --format="table(name,createTime,state)"
    
-   # Simulate rollback (if needed)
-   # gcloud deploy rollouts cancel ROLLOUT_NAME \
-   #     --delivery-pipeline=${PIPELINE_NAME} \
-   #     --region=${REGION}
+   # View deployment history
+   gcloud deploy targets list \
+       --region=${REGION} \
+       --format="table(name,gke.cluster)"
    ```
 
 ## Cleanup
@@ -745,15 +763,12 @@ echo "✅ Storage bucket created for build artifacts"
 3. **Clean up Cloud Build Resources**:
 
    ```bash
-   # Delete Cloud Build trigger
-   gcloud builds triggers delete ${APP_NAME}-trigger --quiet
+   # Delete Artifact Registry repository
+   gcloud artifacts repositories delete ${APP_NAME}-repo \
+       --location=${REGION} \
+       --quiet
    
-   # Delete container images
-   gcloud container images list-tags gcr.io/${PROJECT_ID}/${APP_NAME} \
-       --format="get(digest)" | xargs -I {} gcloud container images delete \
-       gcr.io/${PROJECT_ID}/${APP_NAME}@{} --quiet
-   
-   echo "✅ Cloud Build resources cleaned up"
+   echo "✅ Artifact Registry repository deleted"
    ```
 
 4. **Remove Service Accounts and Storage**:

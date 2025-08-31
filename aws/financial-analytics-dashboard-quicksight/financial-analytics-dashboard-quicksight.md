@@ -6,10 +6,10 @@ difficulty: 400
 subject: aws
 services: QuickSight, Cost Explorer, S3, Lambda
 estimated-time: 300 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: financial-analytics, quicksight, cost-explorer, dashboard, analytics
 recipe-generator-version: 1.3
@@ -175,9 +175,9 @@ for BUCKET in ${RAW_DATA_BUCKET} ${PROCESSED_DATA_BUCKET} ${REPORTS_BUCKET} ${AN
 done
 
 echo "✅ Created foundational S3 buckets with lifecycle policies"
+```
 
 > **Note**: S3 lifecycle policies automatically transition older cost data to lower-cost storage classes, reducing storage costs by up to 68% for infrequently accessed data. Learn more about [S3 lifecycle configurations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-configuration-examples.html).
-```
 
 ## Steps
 
@@ -214,9 +214,9 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
    }
    
    echo "✅ Verified QuickSight and Cost Explorer setup"
+   ```
 
    This setup enables your organization to access both real-time cost data through the [Cost Explorer API](https://docs.aws.amazon.com/cost-management/latest/userguide/ce-api.html) and advanced visualization capabilities through QuickSight. The integration supports enterprise-scale analytics with the ability to process terabytes of billing data and serve interactive dashboards to hundreds of users simultaneously.
-   ```
 
 2. **Create IAM Role for Lambda Data Processing**:
 
@@ -349,11 +349,11 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
    export LAMBDA_ANALYTICS_ROLE_ARN
    
    echo "✅ Created Lambda role for financial analytics"
+   ```
 
    The Lambda execution role now provides secure access to all required AWS services for financial data processing. This foundation enables automated cost data collection and transformation while maintaining security boundaries between different components of your analytics pipeline. The role follows [AWS IAM security best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html) for financial data access.
 
    > **Warning**: This IAM role has comprehensive access to Cost Explorer APIs and S3 buckets. In production environments, implement more granular permissions following [AWS security best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html).
-   ```
 
 3. **Deploy Cost Data Collector Lambda Function**:
 
@@ -380,11 +380,8 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
        end_date = date.today()
        start_date = end_date - timedelta(days=90)  # Last 90 days
        
-       # Collect comprehensive cost and usage data
-       data_collections = []
-       
        try:
-           # 1. Daily cost by service
+           # 1. Daily cost by service with pagination support
            daily_cost_response = ce.get_cost_and_usage(
                TimePeriod={
                    'Start': start_date.strftime('%Y-%m-%d'),
@@ -399,19 +396,23 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
            )
            
            # 2. Monthly cost by department (tag-based)
-           monthly_dept_response = ce.get_cost_and_usage(
-               TimePeriod={
-                   'Start': (start_date.replace(day=1)).strftime('%Y-%m-%d'),
-                   'End': end_date.strftime('%Y-%m-%d')
-               },
-               Granularity='MONTHLY',
-               Metrics=['BlendedCost'],
-               GroupBy=[
-                   {'Type': 'TAG', 'Key': 'Department'},
-                   {'Type': 'TAG', 'Key': 'Project'},
-                   {'Type': 'TAG', 'Key': 'Environment'}
-               ]
-           )
+           try:
+               monthly_dept_response = ce.get_cost_and_usage(
+                   TimePeriod={
+                       'Start': (start_date.replace(day=1)).strftime('%Y-%m-%d'),
+                       'End': end_date.strftime('%Y-%m-%d')
+                   },
+                   Granularity='MONTHLY',
+                   Metrics=['BlendedCost'],
+                   GroupBy=[
+                       {'Type': 'TAG', 'Key': 'Department'},
+                       {'Type': 'TAG', 'Key': 'Project'},
+                       {'Type': 'TAG', 'Key': 'Environment'}
+                   ]
+               )
+           except Exception as e:
+               logger.warning(f"Tag-based cost collection failed: {str(e)}")
+               monthly_dept_response = {'ResultsByTime': []}
            
            # 3. Reserved Instance utilization
            ri_utilization_response = ce.get_reservation_utilization(
@@ -423,18 +424,26 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
            )
            
            # 4. Savings Plans utilization
-           savings_plans_response = ce.get_savings_plans_utilization(
-               TimePeriod={
-                   'Start': start_date.strftime('%Y-%m-%d'),
-                   'End': end_date.strftime('%Y-%m-%d')
-               },
-               Granularity='MONTHLY'
-           )
+           try:
+               savings_plans_response = ce.get_savings_plans_utilization(
+                   TimePeriod={
+                       'Start': start_date.strftime('%Y-%m-%d'),
+                       'End': end_date.strftime('%Y-%m-%d')
+                   },
+                   Granularity='MONTHLY'
+               )
+           except Exception as e:
+               logger.warning(f"Savings Plans utilization collection failed: {str(e)}")
+               savings_plans_response = {'SavingsPlansUtilizationsByTime': []}
            
            # 5. Rightsizing recommendations
-           rightsizing_response = ce.get_rightsizing_recommendation(
-               Service='AmazonEC2'
-           )
+           try:
+               rightsizing_response = ce.get_rightsizing_recommendation(
+                   Service='AmazonEC2'
+               )
+           except Exception as e:
+               logger.warning(f"Rightsizing recommendations collection failed: {str(e)}")
+               rightsizing_response = {'RightsizingRecommendations': []}
            
            # Store all collected data
            collections = {
@@ -497,7 +506,7 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
    
    COST_COLLECTOR_ARN=$(aws lambda create-function \
        --function-name "CostDataCollector" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ANALYTICS_ROLE_ARN} \
        --handler cost_data_collector.lambda_handler \
        --zip-file fileb://cost-data-collector.zip \
@@ -509,9 +518,9 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
    export COST_COLLECTOR_ARN
    
    echo "✅ Deployed cost data collector Lambda"
+   ```
 
    The cost data collector is now operational and ready to gather comprehensive billing information from across your AWS organization. This automated system will collect data on daily spending patterns, service utilization, and cost optimization opportunities, providing the raw intelligence needed for advanced financial analytics and business decision-making.
-   ```
 
 4. **Deploy Data Transformation Lambda Function**:
 
@@ -627,14 +636,29 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
                    service = group['Keys'][0] if len(group['Keys']) > 0 else 'Unknown'
                    account = group['Keys'][1] if len(group['Keys']) > 1 else 'Unknown'
                    
+                   # Add error handling for missing metric data
+                   blended_cost = 0.0
+                   unblended_cost = 0.0
+                   usage_quantity = 0.0
+                   currency = 'USD'
+                   
+                   if 'Metrics' in group:
+                       if 'BlendedCost' in group['Metrics']:
+                           blended_cost = float(group['Metrics']['BlendedCost'].get('Amount', 0))
+                           currency = group['Metrics']['BlendedCost'].get('Unit', 'USD')
+                       if 'UnblendedCost' in group['Metrics']:
+                           unblended_cost = float(group['Metrics']['UnblendedCost'].get('Amount', 0))
+                       if 'UsageQuantity' in group['Metrics']:
+                           usage_quantity = float(group['Metrics']['UsageQuantity'].get('Amount', 0))
+                   
                    daily_costs.append({
                        'date': date,
                        'service': service,
                        'account_id': account,
-                       'blended_cost': float(group['Metrics']['BlendedCost']['Amount']),
-                       'unblended_cost': float(group['Metrics']['UnblendedCost']['Amount']),
-                       'usage_quantity': float(group['Metrics']['UsageQuantity']['Amount']),
-                       'currency': group['Metrics']['BlendedCost']['Unit']
+                       'blended_cost': blended_cost,
+                       'unblended_cost': unblended_cost,
+                       'usage_quantity': usage_quantity,
+                       'currency': currency
                    })
            
            transformed['daily_costs'] = daily_costs
@@ -651,13 +675,19 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
                    project = keys[1] if len(keys) > 1 else 'Untagged'
                    environment = keys[2] if len(keys) > 2 else 'Untagged'
                    
+                   cost = 0.0
+                   currency = 'USD'
+                   if 'Metrics' in group and 'BlendedCost' in group['Metrics']:
+                       cost = float(group['Metrics']['BlendedCost'].get('Amount', 0))
+                       currency = group['Metrics']['BlendedCost'].get('Unit', 'USD')
+                   
                    dept_costs.append({
                        'month': start_date,
                        'department': department,
                        'project': project,
                        'environment': environment,
-                       'cost': float(group['Metrics']['BlendedCost']['Amount']),
-                       'currency': group['Metrics']['BlendedCost']['Unit']
+                       'cost': cost,
+                       'currency': currency
                    })
            
            transformed['department_costs'] = dept_costs
@@ -666,12 +696,13 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
        if 'ri_utilization' in raw_data:
            ri_util = []
            for util_period in raw_data['ri_utilization'].get('UtilizationsByTime', []):
+               total_data = util_period.get('Total', {})
                ri_util.append({
                    'month': util_period['TimePeriod']['Start'],
-                   'utilization_percentage': float(util_period['Total']['UtilizationPercentage']),
-                   'purchased_hours': float(util_period['Total']['PurchasedHours']),
-                   'used_hours': float(util_period['Total']['UsedHours']),
-                   'unused_hours': float(util_period['Total']['UnusedHours'])
+                   'utilization_percentage': float(total_data.get('UtilizationPercentage', 0)),
+                   'purchased_hours': float(total_data.get('PurchasedHours', 0)),
+                   'used_hours': float(total_data.get('UsedHours', 0)),
+                   'unused_hours': float(total_data.get('UnusedHours', 0))
                })
            
            transformed['ri_utilization'] = ri_util
@@ -708,7 +739,7 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
        except glue_client.exceptions.AlreadyExistsException:
            pass
        
-       # Define table schemas
+       # Define table schemas with proper Parquet configuration
        tables = {
            'daily_costs': {
                'StorageDescriptor': {
@@ -722,10 +753,10 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
                        {'Name': 'currency', 'Type': 'string'}
                    ],
                    'Location': f's3://{bucket}/processed-data-parquet/daily_costs/',
-                   'InputFormat': 'org.apache.hadoop.mapred.TextInputFormat',
-                   'OutputFormat': 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat',
+                   'InputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat',
+                   'OutputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat',
                    'SerdeInfo': {
-                       'SerializationLibrary': 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
+                       'SerializationLibrary': 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
                    }
                }
            }
@@ -746,13 +777,14 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
                logger.info(f"Table {table_name} already exists")
    EOF
    
-   # Package and deploy data transformer
-   pip install pandas pyarrow -t ./
-   zip -r data-transformer.zip data_transformer.py pandas pyarrow numpy
+   # Install dependencies and package Lambda
+   pip install pandas pyarrow -t ./lambda-deps
+   cd lambda-deps && zip -r ../data-transformer.zip . && cd ..
+   zip data-transformer.zip data_transformer.py
    
    DATA_TRANSFORMER_ARN=$(aws lambda create-function \
        --function-name "DataTransformer" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ANALYTICS_ROLE_ARN} \
        --handler data_transformer.lambda_handler \
        --zip-file fileb://data-transformer.zip \
@@ -764,9 +796,9 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
    export DATA_TRANSFORMER_ARN
    
    echo "✅ Deployed data transformation Lambda"
+   ```
 
    The data transformation pipeline is now established to process raw cost data into optimized analytical formats. This system automatically creates structured datasets that support both real-time dashboard queries and complex analytical workloads, enabling fast insights across your entire cost landscape while maintaining query performance as data volumes grow.
-   ```
 
 5. **Create EventBridge Schedules for Automated Data Collection**:
 
@@ -777,13 +809,13 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
    aws events put-rule \
        --name "DailyCostDataCollection" \
        --description "Daily collection of cost data for analytics" \
-       --schedule-expression "cron(0 6 * * ? *)"  # Daily at 6 AM UTC
+       --schedule-expression "cron(0 6 * * ? *)"
    
    # Create weekly data transformation schedule
    aws events put-rule \
        --name "WeeklyDataTransformation" \
        --description "Weekly transformation of cost data" \
-       --schedule-expression "cron(0 7 ? * SUN *)"  # Weekly on Sunday at 7 AM UTC
+       --schedule-expression "cron(0 7 ? * SUN *)"
    
    # Add Lambda targets to collection schedule
    aws events put-targets \
@@ -823,9 +855,9 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
        --source-arn "arn:aws:events:${AWS_REGION}:${AWS_ACCOUNT_ID}:rule/WeeklyDataTransformation"
    
    echo "✅ Configured automated data collection and transformation schedules"
+   ```
 
    Your financial analytics pipeline now operates autonomously with daily cost data collection and weekly data processing. This automation ensures consistent, reliable data availability for real-time dashboards and eliminates manual data management overhead while maintaining data freshness for business decision-making and compliance reporting.
-   ```
 
 6. **Set Up Athena for Data Queries**:
 
@@ -890,9 +922,9 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
    EOF
    
    echo "✅ Set up Athena workgroup and sample queries"
+   ```
 
    Athena is now configured with predefined queries and workgroup settings that enable sophisticated cost analytics. The SQL-based query interface allows finance teams to perform complex analysis like cost trend analysis, departmental chargeback calculations, and ROI modeling using familiar business intelligence tools and existing SQL skills.
-   ```
 
 7. **Configure QuickSight Data Sources and Datasets**:
 
@@ -980,9 +1012,9 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
        ]'
    
    echo "✅ Configured QuickSight data sources"
+   ```
 
    QuickSight now has secure, optimized connections to your financial data through both S3 and Athena integrations. These data sources provide the foundation for interactive dashboards that can serve real-time cost insights to executive teams and departmental managers across your organization while maintaining appropriate access controls and data governance.
-   ```
 
 8. **Create QuickSight Datasets**:
 
@@ -1069,9 +1101,9 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
        ]'
    
    echo "✅ Created QuickSight datasets"
+   ```
 
    The financial analytics datasets are now ready to support interactive dashboards and self-service analysis. These pre-configured datasets include business-friendly field names, calculated metrics, and optimized performance settings that enable fast, intuitive financial reporting across your organization while supporting both executive-level summaries and detailed operational analysis.
-   ```
 
 9. **Run Initial Data Collection and Processing**:
 
@@ -1102,9 +1134,9 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
    cat transformation-response.json
    
    echo "✅ Completed initial data collection and processing"
+   ```
 
    Your financial analytics platform now contains processed cost data ready for dashboard creation and analysis. The successful pipeline execution validates that all security permissions, data transformations, and storage configurations are working correctly to support ongoing automated operations and reliable financial reporting.
-   ```
 
 10. **Create QuickSight Analysis and Dashboard Templates**:
 
@@ -1188,9 +1220,9 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
     echo "✅ Created analysis template. Dashboard creation requires manual setup in QuickSight console."
     echo "Navigate to: https://quicksight.aws.amazon.com/"
     echo "Use the datasets created to build interactive dashboards."
+    ```
 
     The QuickSight analysis foundation is established with properly configured datasets and data sources. You can now create interactive dashboards that provide executive-level cost insights, departmental chargeback reports, and optimization recommendations through QuickSight's intuitive drag-and-drop interface, enabling self-service analytics for finance teams.
-    ```
 
 ## Validation & Testing
 
@@ -1323,7 +1355,7 @@ echo "✅ Created foundational S3 buckets with lifecycle policies"
    
    # Remove local files
    rm -f *.py *.zip *.json *.sql
-   rm -rf pandas pyarrow numpy
+   rm -rf lambda-deps
    
    # Unset environment variables
    unset RAW_DATA_BUCKET PROCESSED_DATA_BUCKET REPORTS_BUCKET ANALYTICS_BUCKET
@@ -1339,6 +1371,8 @@ This advanced financial analytics solution transforms raw AWS billing data into 
 The solution's strength lies in its multi-layered approach that combines real-time data processing with historical trend analysis, enabling both operational cost monitoring and strategic financial forecasting. By integrating Cost Explorer APIs with QuickSight's advanced visualization capabilities, organizations gain unprecedented visibility into their cloud spending patterns, department-level cost allocation, and optimization opportunities.
 
 The automated data pipeline ensures consistent, reliable reporting while the interactive dashboards provide self-service analytics capabilities for different stakeholder groups. Executive dashboards focus on high-level trends and budget performance, while operational teams can drill down into service-specific costs and resource utilization patterns. The integration with Athena enables complex analytical queries and custom reporting that extends beyond standard AWS cost reporting capabilities.
+
+The solution follows AWS Well-Architected Framework principles across all five pillars. Operational excellence is achieved through automated data collection and processing, security through IAM role-based access controls, reliability through serverless architectures, performance efficiency through optimized data formats and query patterns, and cost optimization through S3 lifecycle policies and serverless compute models. For more guidance, see the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
 > **Tip**: Implement data governance policies for financial data access and establish regular review cycles for dashboard accuracy. Consider implementing row-level security in QuickSight for sensitive departmental cost data and explore [QuickSight security features](https://docs.aws.amazon.com/quicksight/latest/user/security.html).
 

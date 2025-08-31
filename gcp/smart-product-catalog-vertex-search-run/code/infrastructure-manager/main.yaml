@@ -1,0 +1,502 @@
+# Google Cloud Infrastructure Manager Configuration
+# Recipe: Smart Product Catalog Management with Vertex AI Search and Cloud Run
+# This configuration deploys a complete AI-powered product catalog system
+
+imports:
+- path: https://www.googleapis.com/storage/v1/b/bucket
+  name: storage
+- path: https://discovery-engine.googleapis.com/v1/projects/*/locations/global/collections/default_collection/dataStores
+  name: discovery-datastore
+- path: https://discovery-engine.googleapis.com/v1/projects/*/locations/global/collections/default_collection/engines
+  name: discovery-engine
+- path: https://run.googleapis.com/v1/namespaces/*/services
+  name: cloud-run
+- path: https://firestore.googleapis.com/v1/projects/*/databases
+  name: firestore
+
+# Configuration variables
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    
+  region:
+    type: string
+    description: "Primary deployment region"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Primary deployment zone"
+    default: "us-central1-a"
+    
+  # Resource naming
+  app_name:
+    type: string
+    description: "Application name for Cloud Run service"
+    default: "product-catalog"
+    
+  search_app_id:
+    type: string
+    description: "Vertex AI Search application identifier"
+    default: "catalog-search"
+    
+  datastore_id:
+    type: string
+    description: "Vertex AI Search data store identifier"
+    default: "products"
+    
+  bucket_suffix:
+    type: string
+    description: "Unique suffix for Cloud Storage bucket"
+    default: "product-data"
+    
+  # Application configuration
+  container_image:
+    type: string
+    description: "Container image for Cloud Run service"
+    default: "gcr.io/cloudrun/hello"  # Placeholder - will be updated during deployment
+    
+  memory_limit:
+    type: string
+    description: "Memory limit for Cloud Run service"
+    default: "1Gi"
+    
+  cpu_limit:
+    type: string
+    description: "CPU limit for Cloud Run service"
+    default: "1"
+    
+  max_instances:
+    type: integer
+    description: "Maximum number of Cloud Run instances"
+    default: 100
+    
+  min_instances:
+    type: integer
+    description: "Minimum number of Cloud Run instances"
+    default: 0
+
+# Required API services
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.get-project.projectId)/services/run.googleapis.com
+      consumerId: projects/$(ref.get-project.projectId)
+    metadata:
+      dependsOn:
+        - get-project
+        
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.get-project.projectId)/services/cloudbuild.googleapis.com
+      consumerId: projects/$(ref.get-project.projectId)
+    metadata:
+      dependsOn:
+        - get-project
+        
+  - name: enable-firestore-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.get-project.projectId)/services/firestore.googleapis.com
+      consumerId: projects/$(ref.get-project.projectId)
+    metadata:
+      dependsOn:
+        - get-project
+        
+  - name: enable-discoveryengine-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.get-project.projectId)/services/discoveryengine.googleapis.com
+      consumerId: projects/$(ref.get-project.projectId)
+    metadata:
+      dependsOn:
+        - get-project
+        
+  - name: enable-artifactregistry-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.get-project.projectId)/services/artifactregistry.googleapis.com
+      consumerId: projects/$(ref.get-project.projectId)
+    metadata:
+      dependsOn:
+        - get-project
+
+  # Get current project information
+  - name: get-project
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(var.project_id)
+
+  # Cloud Storage bucket for product data and search content
+  - name: product-data-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.project_id)-$(var.bucket_suffix)
+      location: $(var.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Delete objects older than 1 year
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 30   # Move to coldline after 30 days
+      uniformBucketLevelAccess:
+        enabled: true
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Firestore database for real-time product storage
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/$(var.project_id)
+      databaseId: (default)
+      type: FIRESTORE_NATIVE
+      locationId: $(var.region)
+      concurrencyMode: OPTIMISTIC
+      appEngineIntegrationMode: DISABLED
+      pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_ENABLED
+      deleteProtectionState: DELETE_PROTECTION_DISABLED
+    metadata:
+      dependsOn:
+        - enable-firestore-api
+
+  # Vertex AI Search data store for product indexing
+  - name: vertex-ai-datastore
+    type: gcp-types/discoveryengine-v1:projects.locations.collections.dataStores
+    properties:
+      parent: projects/$(var.project_id)/locations/global/collections/default_collection
+      dataStoreId: $(var.datastore_id)
+      dataStore:
+        displayName: Product Catalog Data Store
+        industryVertical: GENERIC
+        solutionTypes:
+          - SOLUTION_TYPE_SEARCH
+        contentConfig: CONTENT_REQUIRED
+        defaultSchemaId: default_schema
+    metadata:
+      dependsOn:
+        - enable-discoveryengine-api
+        - product-data-bucket
+
+  # Vertex AI Search engine for semantic search capabilities
+  - name: vertex-ai-search-engine
+    type: gcp-types/discoveryengine-v1:projects.locations.collections.engines
+    properties:
+      parent: projects/$(var.project_id)/locations/global/collections/default_collection
+      engineId: $(var.search_app_id)
+      engine:
+        displayName: Product Catalog Search Engine
+        industryVertical: GENERIC
+        solutionType: SOLUTION_TYPE_SEARCH
+        dataStoreIds:
+          - $(ref.vertex-ai-datastore.name)
+        searchEngineConfig:
+          searchTier: SEARCH_TIER_STANDARD
+          searchAddOns:
+            - SEARCH_ADD_ON_LLM
+    metadata:
+      dependsOn:
+        - vertex-ai-datastore
+
+  # IAM service account for Cloud Run application
+  - name: cloud-run-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(var.app_name)-sa
+      serviceAccount:
+        displayName: Cloud Run Service Account for Product Catalog
+        description: Service account for Cloud Run service with AI and database access
+    metadata:
+      dependsOn:
+        - get-project
+
+  # IAM bindings for service account permissions
+  - name: cloud-run-sa-discoveryengine-user
+    type: gcp-types/cloudresourcemanager-v1:projects/iam-bindings
+    properties:
+      resource: $(var.project_id)
+      role: roles/discoveryengine.viewer
+      members:
+        - serviceAccount:$(ref.cloud-run-service-account.email)
+    metadata:
+      dependsOn:
+        - cloud-run-service-account
+
+  - name: cloud-run-sa-firestore-user
+    type: gcp-types/cloudresourcemanager-v1:projects/iam-bindings
+    properties:
+      resource: $(var.project_id)
+      role: roles/datastore.user
+      members:
+        - serviceAccount:$(ref.cloud-run-service-account.email)
+    metadata:
+      dependsOn:
+        - cloud-run-service-account
+
+  - name: cloud-run-sa-storage-viewer
+    type: gcp-types/cloudresourcemanager-v1:projects/iam-bindings
+    properties:
+      resource: $(var.project_id)
+      role: roles/storage.objectViewer
+      members:
+        - serviceAccount:$(ref.cloud-run-service-account.email)
+    metadata:
+      dependsOn:
+        - cloud-run-service-account
+
+  # Artifact Registry repository for container images
+  - name: artifact-registry
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      repositoryId: $(var.app_name)-repo
+      repository:
+        format: DOCKER
+        description: Container repository for product catalog application
+        dockerConfig:
+          immutableTags: false
+    metadata:
+      dependsOn:
+        - enable-artifactregistry-api
+
+  # Cloud Run service for the product catalog API
+  - name: cloud-run-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/$(var.project_id)
+      location: $(var.region)
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: $(var.app_name)
+        namespace: $(var.project_id)
+        annotations:
+          run.googleapis.com/ingress: all
+          run.googleapis.com/ingress-status: all
+        labels:
+          app: $(var.app_name)
+          version: "1.0"
+      spec:
+        template:
+          metadata:
+            annotations:
+              autoscaling.knative.dev/maxScale: "$(var.max_instances)"
+              autoscaling.knative.dev/minScale: "$(var.min_instances)"
+              run.googleapis.com/cpu-throttling: "true"
+              run.googleapis.com/execution-environment: gen2
+          spec:
+            serviceAccountName: $(ref.cloud-run-service-account.email)
+            containerConcurrency: 80
+            timeoutSeconds: 300
+            containers:
+              - image: $(var.container_image)
+                name: product-catalog-container
+                ports:
+                  - name: http1
+                    containerPort: 8080
+                    protocol: TCP
+                env:
+                  - name: PROJECT_ID
+                    value: $(var.project_id)
+                  - name: SEARCH_APP_ID
+                    value: $(var.search_app_id)
+                  - name: DATASTORE_ID
+                    value: $(var.datastore_id)
+                  - name: BUCKET_NAME
+                    value: $(ref.product-data-bucket.name)
+                  - name: PORT
+                    value: "8080"
+                resources:
+                  limits:
+                    cpu: $(var.cpu_limit)
+                    memory: $(var.memory_limit)
+                  requests:
+                    cpu: 100m
+                    memory: 256Mi
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8080
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8080
+                  initialDelaySeconds: 10
+                  periodSeconds: 5
+                  timeoutSeconds: 3
+                  failureThreshold: 3
+        traffic:
+          - percent: 100
+            latestRevision: true
+    metadata:
+      dependsOn:
+        - cloud-run-service-account
+        - vertex-ai-search-engine
+        - firestore-database
+        - artifact-registry
+
+  # IAM policy to allow unauthenticated access to Cloud Run service
+  - name: cloud-run-iam-policy
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/$(var.project_id)/locations/$(var.region)/services/$(var.app_name)
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - cloud-run-service
+
+  # Cloud Build trigger for automated deployments (optional)
+  - name: cloud-build-trigger
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      name: $(var.app_name)-deploy-trigger
+      description: Automated deployment trigger for product catalog service
+      disabled: true  # Disabled by default, can be enabled manually
+      github:
+        owner: your-github-username  # Replace with actual GitHub username
+        name: your-repo-name          # Replace with actual repository name
+        push:
+          branch: ^main$
+      build:
+        steps:
+          - name: gcr.io/cloud-builders/docker
+            args:
+              - build
+              - -t
+              - $(var.region)-docker.pkg.dev/$(var.project_id)/$(var.app_name)-repo/$(var.app_name):$COMMIT_SHA
+              - .
+          - name: gcr.io/cloud-builders/docker
+            args:
+              - push
+              - $(var.region)-docker.pkg.dev/$(var.project_id)/$(var.app_name)-repo/$(var.app_name):$COMMIT_SHA
+          - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+            entrypoint: gcloud
+            args:
+              - run
+              - deploy
+              - $(var.app_name)
+              - --image
+              - $(var.region)-docker.pkg.dev/$(var.project_id)/$(var.app_name)-repo/$(var.app_name):$COMMIT_SHA
+              - --region
+              - $(var.region)
+              - --platform
+              - managed
+              - --allow-unauthenticated
+        options:
+          logging: CLOUD_LOGGING_ONLY
+    metadata:
+      dependsOn:
+        - enable-cloudbuild-api
+        - artifact-registry
+
+# Output values for reference and integration
+outputs:
+  # Project information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(var.project_id)
+    
+  region:
+    description: "Deployment region"
+    value: $(var.region)
+
+  # Storage resources
+  bucket_name:
+    description: "Cloud Storage bucket name for product data"
+    value: $(ref.product-data-bucket.name)
+    
+  bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: gs://$(ref.product-data-bucket.name)
+
+  # Database resources
+  firestore_database:
+    description: "Firestore database identifier"
+    value: $(ref.firestore-database.name)
+
+  # Vertex AI Search resources
+  datastore_id:
+    description: "Vertex AI Search data store ID"
+    value: $(ref.vertex-ai-datastore.name)
+    
+  search_engine_id:
+    description: "Vertex AI Search engine ID"
+    value: $(ref.vertex-ai-search-engine.name)
+    
+  search_serving_config:
+    description: "Vertex AI Search serving configuration"
+    value: projects/$(var.project_id)/locations/global/collections/default_collection/engines/$(var.search_app_id)/servingConfigs/default_config
+
+  # Cloud Run service information
+  service_name:
+    description: "Cloud Run service name"
+    value: $(ref.cloud-run-service.metadata.name)
+    
+  service_url:
+    description: "Cloud Run service URL"
+    value: $(ref.cloud-run-service.status.url)
+    
+  service_account_email:
+    description: "Service account email for Cloud Run"
+    value: $(ref.cloud-run-service-account.email)
+
+  # Container registry
+  artifact_registry_url:
+    description: "Artifact Registry repository URL"
+    value: $(var.region)-docker.pkg.dev/$(var.project_id)/$(var.app_name)-repo
+
+  # API endpoints for testing
+  health_endpoint:
+    description: "Health check endpoint"
+    value: $(ref.cloud-run-service.status.url)/health
+    
+  search_endpoint:
+    description: "Product search API endpoint"
+    value: $(ref.cloud-run-service.status.url)/search
+    
+  recommendation_endpoint:
+    description: "Product recommendation API endpoint"
+    value: $(ref.cloud-run-service.status.url)/recommend
+
+# Deployment metadata
+metadata:
+  version: "1.0"
+  description: "Smart Product Catalog Management with Vertex AI Search and Cloud Run"
+  author: "Google Cloud Infrastructure Manager"
+  created: "2025-07-12"
+  tags:
+    - ai-search
+    - product-catalog
+    - semantic-search
+    - e-commerce
+    - recommendations
+    - vertex-ai
+    - cloud-run
+    - firestore
+  estimated_deployment_time: "15-20 minutes"
+  estimated_cost_per_month: "$15-25 (varies by usage)"

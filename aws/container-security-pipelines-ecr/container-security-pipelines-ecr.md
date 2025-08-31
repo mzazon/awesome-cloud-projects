@@ -6,16 +6,16 @@ difficulty: 300
 subject: aws
 services: ECR, Inspector, CodeBuild, EventBridge
 estimated-time: 150 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: container-security, vulnerability-scanning, ecr, security-pipelines, compliance
 recipe-generator-version: 1.3
 ---
 
-# Container Security Scanning Pipelines
+# Container Security Scanning Pipelines with ECR, Inspector, CodeBuild, and EventBridge
 
 ## Problem
 
@@ -267,7 +267,8 @@ echo "✅ Environment prepared with project name: ${PROJECT_NAME}"
      pre_build:
        commands:
          - echo Logging in to Amazon ECR...
-         - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_URI
+         - aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
+           docker login --username AWS --password-stdin $ECR_URI
          - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}
          - echo Build started on `date`
          - echo Building the Docker image...
@@ -280,11 +281,13 @@ echo "✅ Environment prepared with project name: ${PROJECT_NAME}"
          
          # Run Snyk container security scan
          - echo "Running Snyk container scan..."
-         - snyk container test $ECR_REPO_NAME:$IMAGE_TAG --severity-threshold=high --json > snyk-results.json || true
+         - snyk container test $ECR_REPO_NAME:$IMAGE_TAG \
+           --severity-threshold=high --json > snyk-results.json || true
          
          # Run Prisma Cloud/Twistlock scan (if configured)
          - echo "Running Prisma Cloud scan..."
-         - twistcli images scan --details $ECR_REPO_NAME:$IMAGE_TAG --output-file prisma-results.json || true
+         - twistcli images scan --details $ECR_REPO_NAME:$IMAGE_TAG \
+           --output-file prisma-results.json || true
          
      post_build:
        commands:
@@ -297,7 +300,9 @@ echo "✅ Environment prepared with project name: ${PROJECT_NAME}"
          - sleep 30
          
          # Get ECR scan results
-         - aws ecr describe-image-scan-findings --repository-name $ECR_REPO_NAME --image-id imageTag=$IMAGE_TAG > ecr-scan-results.json || true
+         - aws ecr describe-image-scan-findings \
+           --repository-name $ECR_REPO_NAME \
+           --image-id imageTag=$IMAGE_TAG > ecr-scan-results.json || true
          
          # Process and combine scan results
          - echo "Processing security scan results..."
@@ -313,13 +318,14 @@ echo "✅ Environment prepared with project name: ${PROJECT_NAME}"
        --name "${CODEBUILD_PROJECT_NAME}" \
        --source type=GITHUB,location="https://github.com/your-org/your-repo.git" \
        --artifacts type=NO_ARTIFACTS \
-       --environment type=LINUX_CONTAINER,image=aws/codebuild/standard:5.0,computeType=BUILD_GENERAL1_MEDIUM,privilegedMode=true \
+       --environment \
+         type=LINUX_CONTAINER,image=aws/codebuild/amazonlinux-x86_64-standard:5.0,computeType=BUILD_GENERAL1_MEDIUM,privilegedMode=true \
        --service-role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/ECRSecurityScanningRole-${RANDOM_SUFFIX}"
    
    echo "✅ Multi-stage security scanning pipeline created"
    ```
 
-   The CodeBuild project is now configured with privileged mode enabled, which is necessary for Docker-in-Docker operations required by container scanning tools. This multi-stage approach ensures that security scanning occurs at multiple points in the CI/CD pipeline, providing defense-in-depth security coverage. The pipeline will automatically correlate results from different scanners, providing a comprehensive security assessment that can inform deployment decisions and risk management processes.
+   The CodeBuild project is now configured with privileged mode enabled, which is necessary for Docker-in-Docker operations required by container scanning tools. The project uses the latest Amazon Linux 2023 image (5.0) which provides optimal performance and security features. This multi-stage approach ensures that security scanning occurs at multiple points in the CI/CD pipeline, providing defense-in-depth security coverage. The pipeline will automatically correlate results from different scanners, providing a comprehensive security assessment that can inform deployment decisions and risk management processes.
 
 5. **Create Security Scan Result Processing Lambda**:
 
@@ -421,7 +427,7 @@ echo "✅ Environment prepared with project name: ${PROJECT_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name "SecurityScanProcessor-${RANDOM_SUFFIX}" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/SecurityScanLambdaRole-${RANDOM_SUFFIX}" \
        --handler scan_processor.lambda_handler \
        --zip-file fileb:///tmp/scan_processor.zip \
@@ -432,7 +438,7 @@ echo "✅ Environment prepared with project name: ${PROJECT_NAME}"
    echo "✅ Security scan processing Lambda created"
    ```
 
-   The Lambda function is now deployed and ready to process security scan events from EventBridge. This serverless architecture ensures that scan results are processed immediately upon completion, enabling real-time security responses and maintaining continuous security monitoring. The function will automatically forward high-priority findings to Security Hub for centralized security management and trigger appropriate notifications based on risk levels. For more information about Security Hub findings format, refer to the [AWS Security Hub findings documentation](https://docs.aws.amazon.com/securityhub/latest/userguide/securityhub-findings.html).
+   The Lambda function is now deployed with Python 3.12 runtime and ready to process security scan events from EventBridge. This serverless architecture ensures that scan results are processed immediately upon completion, enabling real-time security responses and maintaining continuous security monitoring. The function will automatically forward high-priority findings to Security Hub for centralized security management and trigger appropriate notifications based on risk levels. For more information about Security Hub findings format, refer to the [AWS Security Hub findings documentation](https://docs.aws.amazon.com/securityhub/latest/userguide/securityhub-findings.html).
 
 6. **Configure EventBridge Rules for Scan Events**:
 
@@ -880,11 +886,11 @@ echo "✅ Environment prepared with project name: ${PROJECT_NAME}"
 
 This comprehensive container security scanning pipeline addresses the critical need for multi-layered vulnerability detection in modern containerized applications. The architecture combines AWS-native services with third-party security tools to provide comprehensive coverage across operating system vulnerabilities, application dependencies, and configuration issues. Amazon ECR's enhanced scanning, powered by Amazon Inspector, offers continuous monitoring and automatic vulnerability database updates, while integration with tools like Snyk and Prisma Cloud provides specialized scanning capabilities for specific programming languages and compliance frameworks.
 
-The EventBridge-driven automation ensures immediate response to security findings, enabling organizations to implement policy-based controls that can automatically block deployments of vulnerable images or trigger remediation workflows. This approach is particularly valuable for organizations with stringent compliance requirements, such as those in financial services or healthcare, where container security is paramount to maintaining regulatory compliance and protecting sensitive data.
+The EventBridge-driven automation ensures immediate response to security findings, enabling organizations to implement policy-based controls that can automatically block deployments of vulnerable images or trigger remediation workflows. This approach is particularly valuable for organizations with stringent compliance requirements, such as those in financial services or healthcare, where container security is paramount to maintaining regulatory compliance and protecting sensitive data. The solution follows AWS Well-Architected Framework principles, emphasizing security, reliability, and operational excellence.
 
-The solution's integration with AWS Security Hub provides centralized security findings management, enabling security teams to correlate container vulnerabilities with other security events across their AWS infrastructure. The automated reporting and notification capabilities ensure that security teams are immediately alerted to critical vulnerabilities, reducing the mean time to remediation and minimizing exposure to potential security threats.
+The solution's integration with AWS Security Hub provides centralized security findings management, enabling security teams to correlate container vulnerabilities with other security events across their AWS infrastructure. The automated reporting and notification capabilities ensure that security teams are immediately alerted to critical vulnerabilities, reducing the mean time to remediation and minimizing exposure to potential security threats. The implementation leverages the latest AWS services and runtime versions to ensure optimal performance and security.
 
-Performance considerations include the scanning duration for large images and the cost implications of continuous scanning. Organizations should evaluate their scanning frequency requirements and implement appropriate filtering to balance security coverage with operational costs. The architecture supports both scan-on-push and continuous scanning modes, allowing organizations to optimize their security posture based on their specific risk tolerance and operational requirements.
+Performance considerations include the scanning duration for large images and the cost implications of continuous scanning. Organizations should evaluate their scanning frequency requirements and implement appropriate filtering to balance security coverage with operational costs. The architecture supports both scan-on-push and continuous scanning modes, allowing organizations to optimize their security posture based on their specific risk tolerance and operational requirements. For detailed guidance on cost optimization, refer to the [AWS Cost Optimization Hub](https://aws.amazon.com/aws-cost-management/aws-cost-optimization-hub/).
 
 > **Tip**: Configure scan filters to optimize costs by focusing enhanced scanning on production and staging repositories while using basic scanning for development environments.
 

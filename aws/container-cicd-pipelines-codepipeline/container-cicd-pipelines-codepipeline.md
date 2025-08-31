@@ -6,10 +6,10 @@ difficulty: 400
 subject: aws
 services: CodePipeline, CodeDeploy, CodeBuild, ECS
 estimated-time: 210 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cicd, containers, codepipeline, codedeploy, blue-green
 recipe-generator-version: 1.3
@@ -980,18 +980,18 @@ echo "✅ Environment variables set, S3 bucket created, and parameters stored"
         name: 'security-scan'
     EOF
     
-    # Create CodeBuild project
+    # Create CodeBuild project with current supported image
     aws codebuild create-project \
         --name ${BUILD_PROJECT_NAME} \
         --source type=CODEPIPELINE,buildspec=buildspec.yml \
         --artifacts type=CODEPIPELINE \
-        --environment type=LINUX_CONTAINER,image=aws/codebuild/amazonlinux2-x86_64-standard:3.0,computeType=BUILD_GENERAL1_MEDIUM,privilegedMode=true \
+        --environment type=LINUX_CONTAINER,image=aws/codebuild/amazonlinux-x86_64-standard:5.0,computeType=BUILD_GENERAL1_MEDIUM,privilegedMode=true \
         --service-role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}-codebuild-role
     
     echo "✅ Advanced CodeBuild project created with security scanning"
     ```
 
-    The CodeBuild project now includes comprehensive security scanning, automated testing, and artifact generation for deployment. The buildspec configuration ensures consistent, repeatable builds while integrating security scanning as a quality gate in the deployment pipeline.
+    The CodeBuild project now includes comprehensive security scanning, automated testing, and artifact generation for deployment. The buildspec configuration ensures consistent, repeatable builds while integrating security scanning as a quality gate in the deployment pipeline. The project uses the latest supported Amazon Linux 2023 image for optimal performance and security updates.
 
 11. **Create CloudWatch Alarms for Monitoring**:
 

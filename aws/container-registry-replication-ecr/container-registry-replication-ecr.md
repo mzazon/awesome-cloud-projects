@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: ECR, Lambda, CloudWatch, EventBridge
 estimated-time: 70 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ecr, container-registry, replication, multi-region, disaster-recovery
 recipe-generator-version: 1.3
 ---
 
 # Container Registry Replication with ECR
-
 
 ## Problem
 
@@ -139,8 +138,6 @@ echo "✅ Environment configured with suffix: ${RANDOM_SUFFIX}"
    ```
 
    The repositories are now created with specific security configurations. The production repository uses `IMMUTABLE` tag mutability to prevent accidental overwrites of production images, while the testing repository allows `MUTABLE` tags for development flexibility. Image scanning is enabled on both repositories to automatically detect vulnerabilities upon image push, providing an essential security layer for your container supply chain.
-
-   > **Note**: ECR automatically scans images for vulnerabilities using the Common Vulnerabilities and Exposures (CVE) database. Learn more about [ECR image scanning](https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-scanning.html).
 
 2. **Configure cross-region replication rules**:
 
@@ -329,7 +326,7 @@ echo "✅ Environment configured with suffix: ${RANDOM_SUFFIX}"
    echo "✅ Applied repository policy to production repository"
    ```
 
-   The repository policy is now enforced, creating a security boundary that controls access to production container images. This policy implements role-based access control where only specific IAM roles can perform read or write operations, preventing unauthorized access to critical production assets. The separation of permissions ensures that deployment processes can pull images while restricting push operations to authorized CI/CD pipelines. For more details on repository policies, refer to the [ECR repository policies documentation](https://docs.aws.amazon.com/AmazonECR/latest/userguide/repository-policies.html).
+   The repository policy is now enforced, creating a security boundary that controls access to production container images. This policy implements role-based access control where only specific IAM roles can perform read or write operations, preventing unauthorized access to critical production assets. The separation of permissions ensures that deployment processes can pull images while restricting push operations to authorized CI/CD pipelines.
 
 6. **Create and push test images**:
 
@@ -441,15 +438,14 @@ echo "✅ Environment configured with suffix: ${RANDOM_SUFFIX}"
        ecr_client = boto3.client('ecr')
        
        # Get all repositories with specific prefix
-       repos = ecr_client.describe_repositories(
-           repositoryNames=[
-               repo for repo in ecr_client.describe_repositories()['repositories']
-               if repo['repositoryName'].startswith('${REPO_PREFIX}')
-           ]
-       )
+       repos = ecr_client.describe_repositories()
        
        for repo in repos['repositories']:
            repo_name = repo['repositoryName']
+           
+           # Skip if repository doesn't match prefix
+           if not repo_name.startswith('${REPO_PREFIX}'):
+               continue
            
            # Get images older than 30 days
            images = ecr_client.describe_images(
@@ -463,7 +459,7 @@ echo "✅ Environment configured with suffix: ${RANDOM_SUFFIX}"
            cutoff_date = datetime.now() - timedelta(days=30)
            
            for image in images['imageDetails']:
-               if image['imagePushedAt'] < cutoff_date:
+               if image['imagePushedAt'].replace(tzinfo=None) < cutoff_date:
                    old_images.append({'imageDigest': image['imageDigest']})
            
            # Delete old images
@@ -586,12 +582,12 @@ echo "✅ Environment configured with suffix: ${RANDOM_SUFFIX}"
        aws ecr batch-delete-image \
            --region $region \
            --repository-name $PROD_REPO \
-           --image-ids imageTag=prod-1.0
+           --image-ids imageTag=prod-1.0 2>/dev/null || true
        
        aws ecr batch-delete-image \
            --region $region \
            --repository-name $TEST_REPO \
-           --image-ids imageTag=test-latest
+           --image-ids imageTag=test-latest 2>/dev/null || true
    done
    
    echo "✅ Deleted test images from all regions"
@@ -605,12 +601,12 @@ echo "✅ Environment configured with suffix: ${RANDOM_SUFFIX}"
        aws ecr delete-repository \
            --region $region \
            --repository-name $PROD_REPO \
-           --force
+           --force 2>/dev/null || true
        
        aws ecr delete-repository \
            --region $region \
            --repository-name $TEST_REPO \
-           --force
+           --force 2>/dev/null || true
    done
    
    echo "✅ Deleted repositories from all regions"
@@ -666,13 +662,15 @@ echo "✅ Environment configured with suffix: ${RANDOM_SUFFIX}"
 
 ## Discussion
 
-Amazon ECR's replication capabilities provide a robust foundation for enterprise container distribution strategies. The automated replication system ensures that container images are consistently available across multiple regions, reducing deployment latency and improving disaster recovery capabilities. This approach is particularly valuable for organizations with global application deployments or strict business continuity requirements. For detailed information about replication capabilities, refer to the [ECR private image replication documentation](https://docs.aws.amazon.com/AmazonECR/latest/userguide/replication.html).
+Amazon ECR's replication capabilities provide a robust foundation for enterprise container distribution strategies. The automated replication system ensures that container images are consistently available across multiple regions, reducing deployment latency and improving disaster recovery capabilities. This approach is particularly valuable for organizations with global application deployments or strict business continuity requirements. The service creates a service-linked IAM role automatically to handle replication operations, eliminating the need for manual role configuration. For detailed information about replication capabilities, refer to the [ECR private image replication documentation](https://docs.aws.amazon.com/AmazonECR/latest/userguide/replication.html).
 
-The implementation demonstrates several key architectural patterns. Repository filtering allows selective replication based on naming conventions, enabling different policies for production and development images. Lifecycle policies automatically manage storage costs by cleaning up old or unused images, while repository policies provide fine-grained access control. The combination of these features creates a comprehensive governance framework for container image management. For more details on lifecycle policies, see the [ECR lifecycle policies documentation](https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html).
+The implementation demonstrates several key architectural patterns that follow AWS Well-Architected Framework principles. Repository filtering allows selective replication based on naming conventions, enabling different policies for production and development images. Lifecycle policies automatically manage storage costs by cleaning up old or unused images, while repository policies provide fine-grained access control. The combination of these features creates a comprehensive governance framework for container image management that ensures both security and cost optimization. For more details on lifecycle policies, see the [ECR lifecycle policies documentation](https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html).
 
-Performance considerations include replication latency, which typically ranges from 5-30 minutes depending on image size and network conditions. Organizations should factor this delay into their deployment pipelines and implement appropriate monitoring to detect replication failures. Cost optimization through lifecycle policies is essential, as cross-region storage and data transfer can become expensive without proper management.
+Performance considerations include replication latency, which typically ranges from 5-30 minutes depending on image size and network conditions. Organizations should factor this delay into their deployment pipelines and implement appropriate monitoring to detect replication failures. Cost optimization through lifecycle policies is essential, as cross-region storage and data transfer can become expensive without proper management. The monitoring solution provides visibility into replication performance and enables proactive issue detection.
 
-The monitoring and alerting components provide visibility into replication health and performance metrics. CloudWatch dashboards enable teams to track repository activity, while automated alarms ensure prompt notification of issues. For additional insights, consider implementing custom metrics using Lambda functions to track replication success rates and image pull patterns across regions. Repository creation templates can automatically apply consistent settings like lifecycle policies and security configurations to newly created repositories.
+The monitoring and alerting components provide visibility into replication health and performance metrics. CloudWatch dashboards enable teams to track repository activity, while automated alarms ensure prompt notification of issues. For additional insights, consider implementing custom metrics using Lambda functions to track replication success rates and image pull patterns across regions. The automation capabilities demonstrated through Lambda functions can be extended to implement sophisticated repository management workflows that adapt to business requirements and usage patterns.
+
+> **Tip**: Use ECR's enhanced scanning features to automatically detect vulnerabilities in replicated images. Combined with replication filters, you can ensure only secure images are distributed globally.
 
 ## Challenge
 

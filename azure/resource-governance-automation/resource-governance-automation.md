@@ -4,12 +4,12 @@ id: 4f8c9e2a
 category: devops
 difficulty: 200
 subject: azure
-services: Azure Policy, Azure Resource Graph, Azure Monitor, Azure CLI
+services: Azure Policy, Azure Resource Graph, Azure Monitor, Log Analytics
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23  
 passed-qa: null
 tags: governance, compliance, tagging, automation, policy
 recipe-generator-version: 1.3
@@ -93,14 +93,14 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for consistent resource management
-export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
+# Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-governance-demo"
 export LOCATION="eastus"
-export LOG_ANALYTICS_WORKSPACE="law-governance-${RANDOM}"
+export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
-# Generate unique identifiers for resources
+# Generate unique suffix for resource names  
 RANDOM_SUFFIX=$(openssl rand -hex 3)
+export LOG_ANALYTICS_WORKSPACE="law-governance-${RANDOM_SUFFIX}"
 export POLICY_INITIATIVE_NAME="mandatory-tagging-initiative-${RANDOM_SUFFIX}"
 export POLICY_ASSIGNMENT_NAME="enforce-mandatory-tags-${RANDOM_SUFFIX}"
 
@@ -349,20 +349,10 @@ echo "✅ Environment prepared with resource group: ${RESOURCE_GROUP}"
    az monitor diagnostic-settings create \
        --name "policy-compliance-logs" \
        --resource "/subscriptions/${SUBSCRIPTION_ID}" \
-       --workspace ${WORKSPACE_ID} \
+       --workspace "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${LOG_ANALYTICS_WORKSPACE}" \
        --logs '[
            {
-               "category": "Policy",
-               "enabled": true,
-               "retentionPolicy": {
-                   "enabled": true,
-                   "days": 30
-               }
-           }
-       ]' \
-       --metrics '[
-           {
-               "category": "AllMetrics",
+               "categoryGroup": "audit",
                "enabled": true,
                "retentionPolicy": {
                    "enabled": true,
@@ -370,17 +360,6 @@ echo "✅ Environment prepared with resource group: ${RESOURCE_GROUP}"
                }
            }
        ]'
-   
-   # Create alert rule for policy violations
-   az monitor metrics alert create \
-       --name "tag-policy-violations" \
-       --resource-group ${RESOURCE_GROUP} \
-       --condition "count 'policyEvaluations' > 5" \
-       --description "Alert when tag policy violations exceed threshold" \
-       --evaluation-frequency "5m" \
-       --window-size "15m" \
-       --severity 2 \
-       --action-group-ids "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/actionGroups/governance-alerts"
    
    echo "✅ Azure Monitor integration configured for compliance tracking"
    ```
@@ -392,13 +371,6 @@ echo "✅ Environment prepared with resource group: ${RESOURCE_GROUP}"
    Automated dashboards provide stakeholders with real-time visibility into governance metrics. This dashboard consolidates compliance data from multiple sources, presenting actionable insights for governance teams to maintain continuous oversight of tagging compliance across the Azure environment.
 
    ```bash
-   # Create Azure Dashboard for compliance monitoring
-   az portal dashboard create \
-       --resource-group ${RESOURCE_GROUP} \
-       --name "tag-compliance-dashboard" \
-       --input-path dashboard-config.json \
-       --location ${LOCATION}
-   
    # Create dashboard configuration with compliance widgets
    cat > dashboard-config.json << 'EOF'
    {
@@ -421,7 +393,7 @@ echo "✅ Environment prepared with resource group: ${RESOURCE_GROUP}"
                                },
                                {
                                    "name": "query",
-                                   "value": "PolicyInsights | where ComplianceState == 'NonCompliant' | summarize count() by ResourceType | order by count_ desc"
+                                   "value": "AzureActivity | where CategoryValue == 'Policy' | summarize count() by ResultType"
                                }
                            ],
                            "type": "Extension/Microsoft_OperationsManagementSuite_Workspace/PartType/LogsDashboardPart"
@@ -531,7 +503,7 @@ echo "✅ Environment prepared with resource group: ${RESOURCE_GROUP}"
    
    # Create resource with required tags (should succeed)
    az storage account create \
-       --name "testsa${RANDOM_SUFFIX}" \
+       --name "testsa${RANDOM_SUFFIX}compliant" \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --sku Standard_LRS \
@@ -570,8 +542,7 @@ echo "✅ Environment prepared with resource group: ${RESOURCE_GROUP}"
    
    # Delete remediation task
    az policy remediation delete \
-       --name "remediate-missing-tags-${RANDOM_SUFFIX}" \
-       --policy-assignment ${POLICY_ASSIGNMENT_NAME}
+       --name "remediate-missing-tags-${RANDOM_SUFFIX}"
    
    echo "✅ Policy assignments and remediation tasks deleted"
    ```

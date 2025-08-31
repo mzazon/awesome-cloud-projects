@@ -1,0 +1,443 @@
+# Infrastructure Manager Configuration for Automated File Backup with Storage and Scheduler
+# This configuration deploys a complete automated backup solution using Google Cloud services
+# Version: 1.0
+# Last Updated: 2025-07-12
+
+metadata:
+  version: 1.0.0
+  description: "Automated daily backup system using Cloud Storage, Cloud Functions, and Cloud Scheduler"
+  author: "Google Cloud Infrastructure Manager"
+  tags:
+    - backup
+    - automation  
+    - storage
+    - scheduling
+    - data-protection
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  region:
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+  
+  primary_bucket_name:
+    description: "Name for the primary storage bucket"
+    type: string
+    required: true
+  
+  backup_bucket_name:
+    description: "Name for the backup storage bucket"
+    type: string
+    required: true
+  
+  function_name:
+    description: "Name for the Cloud Function"
+    type: string
+    default: "backup-function"
+  
+  scheduler_job_name:
+    description: "Name for the Cloud Scheduler job"
+    type: string
+    default: "backup-daily-job"
+  
+  backup_schedule:
+    description: "Cron schedule for backup job (default: daily at 2 AM UTC)"
+    type: string
+    default: "0 2 * * *"
+  
+  enable_versioning:
+    description: "Enable versioning on storage buckets"
+    type: boolean
+    default: true
+  
+  function_memory:
+    description: "Memory allocation for Cloud Function (MB)"
+    type: string
+    default: "256M"
+  
+  function_timeout:
+    description: "Timeout for Cloud Function execution (seconds)"
+    type: string
+    default: "60s"
+
+# Required APIs to be enabled
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/storage.googleapis.com
+      parent: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: enable-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudfunctions.googleapis.com
+      parent: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: enable-scheduler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudscheduler.googleapis.com
+      parent: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/logging.googleapis.com
+      parent: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: enable-build-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudbuild.googleapis.com
+      parent: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Project reference for API operations
+  - name: project_id
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(var.project_id)
+
+  # Primary storage bucket for active data
+  - name: primary-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.primary_bucket_name)
+      location: $(var.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: $(var.enable_versioning)
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Delete objects older than 1 year
+              isLive: false  # Only delete non-current versions
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      logging:
+        logBucket: $(ref.backup-bucket.name)
+        logObjectPrefix: "access-logs/"
+    metadata:
+      dependsOn:
+        - enable-storage-api
+        - project_id
+
+  # Backup storage bucket with cost-optimized storage class
+  - name: backup-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.backup_bucket_name)
+      location: $(var.region)
+      storageClass: NEARLINE  # Cost-optimized for infrequent access
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: $(var.enable_versioning)
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 30  # Move to coldline after 30 days
+          - action:
+              type: SetStorageClass
+              storageClass: ARCHIVE
+            condition:
+              age: 90  # Move to archive after 90 days
+          - action:
+              type: Delete
+            condition:
+              age: 2555  # Delete after 7 years (2555 days)
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+    metadata:
+      dependsOn:
+        - enable-storage-api
+        - project_id
+
+  # Service account for Cloud Function execution
+  - name: backup-function-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: backup-function-sa
+      displayName: "Backup Function Service Account"
+      description: "Service account for automated backup Cloud Function"
+      serviceAccount:
+        displayName: "Backup Function Service Account"
+    metadata:
+      dependsOn:
+        - project_id
+
+  # IAM binding for Cloud Function service account - Storage Object Admin
+  - name: function-storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(var.project_id)
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.backup-function-sa.email)
+    metadata:
+      dependsOn:
+        - backup-function-sa
+
+  # IAM binding for Cloud Function service account - Logging Write
+  - name: function-logging-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(var.project_id)
+      policy:
+        bindings:
+          - role: roles/logging.logWriter
+            members:
+              - serviceAccount:$(ref.backup-function-sa.email)
+    metadata:
+      dependsOn:
+        - backup-function-sa
+
+  # Cloud Storage bucket for Cloud Function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.project_id)-function-source
+      location: $(var.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+    metadata:
+      dependsOn:
+        - enable-storage-api
+        - project_id
+
+  # Upload Cloud Function source code to storage
+  - name: function-source-object
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.function-source-bucket.name)
+      name: backup-function-source.zip
+      # Note: In a real deployment, you would upload the actual source code archive
+      # This is a placeholder for the Infrastructure Manager configuration
+      metadata:
+        description: "Backup function source code archive"
+    metadata:
+      dependsOn:
+        - function-source-bucket
+
+  # Cloud Function for backup logic (2nd generation)
+  - name: backup-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      functionId: $(var.function_name)
+      function:
+        description: "Automated backup function for copying files between storage buckets"
+        buildConfig:
+          runtime: python311
+          entryPoint: backup_files
+          source:
+            storageSource:
+              bucket: $(ref.function-source-bucket.name)
+              object: $(ref.function-source-object.name)
+          environmentVariables:
+            PRIMARY_BUCKET: $(var.primary_bucket_name)
+            BACKUP_BUCKET: $(var.backup_bucket_name)
+        serviceConfig:
+          serviceAccountEmail: $(ref.backup-function-sa.email)
+          availableMemory: $(var.function_memory)
+          timeout: $(var.function_timeout)
+          maxInstanceCount: 10
+          minInstanceCount: 0
+          ingressSettings: ALLOW_INTERNAL_ONLY
+          environmentVariables:
+            PRIMARY_BUCKET: $(var.primary_bucket_name)
+            BACKUP_BUCKET: $(var.backup_bucket_name)
+        labels:
+          purpose: automated-backup
+          environment: production
+    metadata:
+      dependsOn:
+        - enable-functions-api
+        - backup-function-sa
+        - function-source-object
+        - primary-bucket
+        - backup-bucket
+
+  # Cloud Scheduler job for daily backup automation
+  - name: backup-scheduler-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      name: projects/$(var.project_id)/locations/$(var.region)/jobs/$(var.scheduler_job_name)
+      description: "Daily automated backup job that triggers the backup Cloud Function"
+      schedule: $(var.backup_schedule)
+      timeZone: "UTC"
+      httpTarget:
+        uri: $(ref.backup-function.serviceConfig.uri)
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: "{}"
+        oidcToken:
+          serviceAccountEmail: $(ref.backup-function-sa.email)
+          audience: $(ref.backup-function.serviceConfig.uri)
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 1800s  # 30 minutes
+        minBackoffDuration: 5s
+        maxBackoffDuration: 300s  # 5 minutes
+        maxDoublings: 5
+      attemptDeadline: 320s  # 5 minutes and 20 seconds
+    metadata:
+      dependsOn:
+        - enable-scheduler-api
+        - backup-function
+        - backup-function-sa
+
+  # Cloud Logging sink for backup function logs
+  - name: backup-function-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/$(var.project_id)
+      uniqueWriterIdentity: true
+      sink:
+        name: backup-function-logs
+        description: "Log sink for backup function operations and monitoring"
+        destination: storage.googleapis.com/$(ref.backup-bucket.name)/logs
+        filter: |
+          resource.type="cloud_function"
+          resource.labels.function_name="$(var.function_name)"
+          resource.labels.region="$(var.region)"
+        includeChildren: true
+    metadata:
+      dependsOn:
+        - enable-logging-api
+        - backup-function
+        - backup-bucket
+
+  # Monitoring alert policy for backup function failures
+  - name: backup-failure-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(var.project_id)
+      alertPolicy:
+        displayName: "Backup Function Failure Alert"
+        documentation:
+          content: "Alert triggered when backup function encounters errors or failures"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "Backup function error rate"
+            conditionThreshold:
+              filter: |
+                resource.type="cloud_function"
+                resource.labels.function_name="$(var.function_name)"
+                severity="ERROR"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0
+              duration: 60s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+                  groupByFields:
+                    - resource.labels.function_name
+        combiner: OR
+        enabled: true
+        notificationChannels: []  # Add notification channels as needed
+    metadata:
+      dependsOn:
+        - backup-function
+
+# Output values for reference and integration
+outputs:
+  primary_bucket_name:
+    description: "Name of the primary storage bucket"
+    value: $(ref.primary-bucket.name)
+  
+  backup_bucket_name:
+    description: "Name of the backup storage bucket"
+    value: $(ref.backup-bucket.name)
+  
+  function_name:
+    description: "Name of the backup Cloud Function"
+    value: $(ref.backup-function.name)
+  
+  function_trigger_url:
+    description: "HTTP trigger URL for the backup function"
+    value: $(ref.backup-function.serviceConfig.uri)
+  
+  scheduler_job_name:
+    description: "Name of the Cloud Scheduler job"
+    value: $(ref.backup-scheduler-job.name)
+  
+  service_account_email:
+    description: "Email of the backup function service account"
+    value: $(ref.backup-function-sa.email)
+  
+  primary_bucket_url:
+    description: "URL of the primary storage bucket"
+    value: "gs://$(ref.primary-bucket.name)"
+  
+  backup_bucket_url:
+    description: "URL of the backup storage bucket"
+    value: "gs://$(ref.backup-bucket.name)"
+  
+  function_logs_url:
+    description: "URL to view Cloud Function logs"
+    value: "https://console.cloud.google.com/functions/details/$(var.region)/$(var.function_name)?project=$(var.project_id)"
+  
+  scheduler_logs_url:
+    description: "URL to view Cloud Scheduler logs"
+    value: "https://console.cloud.google.com/cloudscheduler?project=$(var.project_id)"
+
+# Deployment configuration and metadata
+deployment:
+  description: |
+    This Infrastructure Manager configuration deploys a complete automated backup solution
+    that includes:
+    
+    1. Primary and backup Cloud Storage buckets with appropriate lifecycle policies
+    2. Cloud Function (2nd generation) for backup logic with proper IAM permissions
+    3. Cloud Scheduler job for daily automated execution
+    4. Comprehensive logging and monitoring setup
+    5. Service account with least-privilege permissions
+    
+    The solution automatically backs up files from the primary bucket to the backup bucket
+    daily at 2 AM UTC (configurable), with built-in retry logic, error handling, and monitoring.
+  
+  labels:
+    solution: automated-backup
+    category: storage
+    difficulty: beginner
+    provider: gcp
+    services: storage,functions,scheduler
+    version: "1.0"

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud IAM, Service Directory, Cloud Functions, Secret Manager
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: identity-federation, workload-identity, service-discovery, enterprise-security, multi-cloud
 recipe-generator-version: 1.3
@@ -118,6 +118,7 @@ gcloud services enable servicedirectory.googleapis.com
 gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable secretmanager.googleapis.com
 gcloud services enable cloudbuild.googleapis.com
+gcloud services enable dns.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 ```
@@ -295,6 +296,8 @@ echo "✅ Project configured: ${PROJECT_ID}"
    cat > main.py << 'EOF'
 import json
 import logging
+import os
+from datetime import datetime
 from google.cloud import secretmanager
 from google.cloud import servicedirectory
 from google.cloud import iam_credentials_v1
@@ -323,7 +326,7 @@ def provision_identity(request):
         
         # Retrieve federation configuration
         project_id = os.environ.get('GCP_PROJECT')
-        config_secret = f"projects/{project_id}/secrets/federation-config/versions/latest"
+        config_secret = f"projects/{project_id}/secrets/federation-config-{os.environ.get('RANDOM_SUFFIX', 'default')}/versions/latest"
         
         response = secret_client.access_secret_version(request={"name": config_secret})
         config = json.loads(response.payload.data.decode("UTF-8"))
@@ -348,7 +351,8 @@ def provision_identity(request):
             'status': 'success',
             'user_identity': user_identity,
             'service': service_name,
-            'access_level': access_level
+            'access_level': access_level,
+            'timestamp': str(datetime.utcnow())
         }, 200
         
     except Exception as e:
@@ -358,10 +362,10 @@ EOF
    
    # Create requirements.txt
    cat > requirements.txt << 'EOF'
-google-cloud-secret-manager==2.16.4
-google-cloud-service-directory==1.8.1
-google-cloud-iam==2.12.1
-functions-framework==3.4.0
+google-cloud-secret-manager==2.18.4
+google-cloud-service-directory==1.11.5
+google-cloud-iam==2.15.2
+functions-framework==3.5.0
 EOF
    
    # Deploy the Cloud Function
@@ -373,7 +377,7 @@ EOF
        --entry-point provision_identity \
        --memory 256MB \
        --timeout 60s \
-       --set-env-vars "GCP_PROJECT=${PROJECT_ID},REGION=${REGION}"
+       --set-env-vars "GCP_PROJECT=${PROJECT_ID},REGION=${REGION},RANDOM_SUFFIX=${RANDOM_SUFFIX}"
    
    cd ..
    
@@ -394,10 +398,13 @@ EOF
        --visibility=private \
        --networks=default
    
+   # Get the DNS zone name for Service Directory integration
+   DNS_ZONE_NAME="projects/${PROJECT_ID}/managedZones/enterprise-services-${RANDOM_SUFFIX}"
+   
    # Configure Service Directory DNS integration
    gcloud service-directory namespaces update ${NAMESPACE_NAME} \
        --location=${REGION} \
-       --dns-zone="projects/${PROJECT_ID}/managedZones/enterprise-services-${RANDOM_SUFFIX}"
+       --dns-zone="${DNS_ZONE_NAME}"
    
    # Create sample DNS records for services
    gcloud dns record-sets transaction start \
@@ -446,8 +453,8 @@ EOF
        --location=${REGION} \
        --format="table(name,metadata)"
    
-   # Test DNS resolution
-   nslookup user-mgmt.services.${PROJECT_ID}.internal
+   # Test DNS resolution (run from a Compute Engine instance)
+   # nslookup user-mgmt.services.${PROJECT_ID}.internal
    ```
 
    Expected output: Services should be listed with metadata, and DNS resolution should return service directory endpoints.
@@ -601,7 +608,7 @@ The automated provisioning workflow implemented through Cloud Functions demonstr
 
 > **Tip**: Implement conditional access policies using CEL expressions in workload identity pool providers to enforce organizational policies based on external identity attributes, group memberships, and environmental context.
 
-The architecture supports compliance requirements through comprehensive audit logging via Cloud Audit Logs, which tracks all identity federation events, service discovery requests, and automated provisioning activities. This audit trail provides the visibility required for enterprise security monitoring and compliance reporting while supporting forensic analysis capabilities that meet regulatory requirements for identity and access management systems.
+The architecture supports compliance requirements through comprehensive audit logging via Cloud Audit Logs, which tracks all identity federation events, service discovery requests, and automated provisioning activities. This audit trail provides the visibility required for enterprise security monitoring and compliance reporting while supporting forensic analysis capabilities that meet regulatory requirements for identity and access management systems. For detailed security guidance, see the [Google Cloud security documentation](https://cloud.google.com/security/best-practices) and [IAM best practices](https://cloud.google.com/iam/docs/best-practices).
 
 ## Challenge
 

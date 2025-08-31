@@ -5,11 +5,11 @@ category: security
 difficulty: 200
 subject: aws
 services: ec2, iam, cloudtrail
-estimated-time: 30 minutes
-recipe-version: 1.2
+estimated-time: 45 minutes
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: security, ec2, ssh, instance-connect, remote-access
 recipe-generator-version: 1.3
@@ -74,7 +74,7 @@ graph TB
 4. Understanding of VPC networking and security groups
 5. Estimated cost: $0.50-$2.00 per hour for EC2 instances during testing
 
-> **Note**: EC2 Instance Connect is available at no additional cost and supports most AWS regions except Asia Pacific (Taipei), Asia Pacific (Thailand), and Mexico (Central). For complete region availability, see [AWS Regional Services](https://aws.amazon.com/about-aws/global-infrastructure/regional-product-services/).
+> **Note**: EC2 Instance Connect is available at no additional cost and supports most AWS regions. For complete region availability, see [AWS Regional Services](https://aws.amazon.com/about-aws/global-infrastructure/regional-product-services/).
 
 ## Preparation
 
@@ -91,10 +91,8 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
     --output text --query RandomPassword)
 
 # Set resource names
-export KEY_PAIR_NAME="ec2-connect-key-${RANDOM_SUFFIX}"
 export INSTANCE_NAME="ec2-connect-test-${RANDOM_SUFFIX}"
 export POLICY_NAME="EC2InstanceConnectPolicy-${RANDOM_SUFFIX}"
-export ROLE_NAME="EC2InstanceConnectRole-${RANDOM_SUFFIX}"
 export USER_NAME="ec2-connect-user-${RANDOM_SUFFIX}"
 
 # Get default VPC and subnet information
@@ -138,7 +136,7 @@ echo "✅ Environment prepared with VPC: ${VPC_ID}"
                "Effect": "Allow",
                "Action": [
                    "ec2:DescribeInstances",
-                   "ec2:DescribeVpcs"
+                   "ec2:DescribeInstanceConnectEndpoints"
                ],
                "Resource": "*"
            }
@@ -276,7 +274,9 @@ echo "✅ Environment prepared with VPC: ${VPC_ID}"
        --ssh-public-key file://temp-key.pub
    
    # Connect using the private key (within 60 seconds)
-   ssh -i temp-key ec2-user@"${INSTANCE_IP}"
+   ssh -i temp-key -o ConnectTimeout=10 \
+       -o StrictHostKeyChecking=no \
+       ec2-user@"${INSTANCE_IP}"
    
    echo "✅ SSH connection successful"
    ```
@@ -364,7 +364,7 @@ echo "✅ Environment prepared with VPC: ${VPC_ID}"
                "Effect": "Allow",
                "Action": [
                    "ec2:DescribeInstances",
-                   "ec2:DescribeVpcs"
+                   "ec2:DescribeInstanceConnectEndpoints"
                ],
                "Resource": "*"
            }
@@ -393,6 +393,39 @@ echo "✅ Environment prepared with VPC: ${VPC_ID}"
     
     # Create S3 bucket for CloudTrail logs
     aws s3 mb s3://"${BUCKET_NAME}" --region "${AWS_REGION}"
+    
+    # Add bucket policy for CloudTrail
+    cat > cloudtrail-bucket-policy.json << EOF
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AWSCloudTrailAclCheck",
+                "Effect": "Allow",
+                "Principal": {"Service": "cloudtrail.amazonaws.com"},
+                "Action": "s3:GetBucketAcl",
+                "Resource": "arn:aws:s3:::${BUCKET_NAME}"
+            },
+            {
+                "Sid": "AWSCloudTrailWrite",
+                "Effect": "Allow",
+                "Principal": {"Service": "cloudtrail.amazonaws.com"},
+                "Action": "s3:PutObject",
+                "Resource": "arn:aws:s3:::${BUCKET_NAME}/*",
+                "Condition": {
+                    "StringEquals": {
+                        "s3:x-amz-acl": "bucket-owner-full-control"
+                    }
+                }
+            }
+        ]
+    }
+    EOF
+    
+    # Apply bucket policy
+    aws s3api put-bucket-policy \
+        --bucket "${BUCKET_NAME}" \
+        --policy file://cloudtrail-bucket-policy.json
     
     # Create CloudTrail
     aws cloudtrail create-trail \
@@ -443,10 +476,10 @@ echo "✅ Environment prepared with VPC: ${VPC_ID}"
 
    ```bash
    # Check recent CloudTrail events for Instance Connect
-   aws logs filter-log-events \
-       --log-group-name CloudTrail/EC2InstanceConnect \
-       --start-time $(date -d '1 hour ago' +%s)000 \
-       --filter-pattern "{ $.eventName = SendSSHPublicKey }"
+   aws cloudtrail lookup-events \
+       --lookup-attributes AttributeKey=EventName,AttributeValue=SendSSHPublicKey \
+       --start-time $(date -d '1 hour ago' -u +%Y-%m-%dT%H:%M:%SZ) \
+       --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ)
    ```
 
 4. **Test Instance Connect Endpoint functionality**:
@@ -524,7 +557,8 @@ echo "✅ Environment prepared with VPC: ${VPC_ID}"
    
    # Delete policies
    aws iam delete-policy --policy-arn "${POLICY_ARN}"
-   aws iam delete-policy --policy-arn "${POLICY_ARN}-restrictive"
+   aws iam delete-policy \
+       --policy-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${POLICY_NAME}-restrictive"
    
    echo "✅ IAM resources cleaned up"
    ```
@@ -544,7 +578,7 @@ echo "✅ Environment prepared with VPC: ${VPC_ID}"
    
    # Clean up temporary files
    rm -f temp-key temp-key.pub ec2-connect-policy.json \
-       ec2-connect-restrictive-policy.json
+       ec2-connect-restrictive-policy.json cloudtrail-bucket-policy.json
    
    echo "✅ All resources cleaned up"
    ```
@@ -555,9 +589,9 @@ EC2 Instance Connect revolutionizes SSH access management by eliminating the tra
 
 The key architectural benefit lies in the temporary nature of SSH keys. Unlike traditional SSH keys that remain valid indefinitely, EC2 Instance Connect generates ephemeral keys that expire after 60 seconds. This dramatically reduces the attack surface and eliminates the risk of compromised long-term credentials. The service supports both direct connections to public instances and private instance access through EC2 Instance Connect Endpoints, providing flexibility for various network architectures.
 
-From a security perspective, EC2 Instance Connect enables fine-grained access control through IAM policies. Organizations can implement resource-level permissions, time-based access controls, and conditional access based on user attributes or network locations. The integration with AWS Identity Center (formerly SSO) allows for centralized identity management across multiple AWS accounts, simplifying access governance in enterprise environments.
+From a security perspective, EC2 Instance Connect enables fine-grained access control through IAM policies. Organizations can implement resource-level permissions, time-based access controls, and conditional access based on user attributes or network locations. The integration with AWS Identity Center (formerly SSO) allows for centralized identity management across multiple AWS accounts, simplifying access governance in enterprise environments. For more information on implementing enterprise-scale access management, see the [AWS Identity Center documentation](https://docs.aws.amazon.com/singlesignon/latest/userguide/what-is.html).
 
-The service also addresses operational efficiency by providing multiple connection methods - AWS CLI, console-based SSH, and programmatic API access. This flexibility allows organizations to integrate EC2 Instance Connect into existing workflows and automation pipelines while maintaining security best practices.
+The service also addresses operational efficiency by providing multiple connection methods - AWS CLI, console-based SSH, and programmatic API access. This flexibility allows organizations to integrate EC2 Instance Connect into existing workflows and automation pipelines while maintaining security best practices. The AWS Well-Architected Framework security pillar emphasizes the importance of implementing defense in depth, and EC2 Instance Connect supports this by providing multiple layers of access control and comprehensive audit logging.
 
 > **Warning**: EC2 Instance Connect Endpoints create network interfaces in your VPC and may incur additional charges. Monitor your AWS billing dashboard and set up cost alerts to track spending. For current pricing, see [EC2 Instance Connect Pricing](https://aws.amazon.com/ec2/pricing/on-demand/).
 

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Monitoring, Cloud Trace, Cloud Functions, Pub/Sub
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: monitoring, performance, observability, automation, alerting
 recipe-generator-version: 1.3
@@ -82,10 +82,13 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for GCP resources
+# Create a new project with unique identifier
 export PROJECT_ID="monitoring-demo-$(date +%s)"
 export REGION="us-central1"
 export ZONE="us-central1-a"
+
+# Create the project first
+gcloud projects create ${PROJECT_ID} --name="Monitoring Demo"
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
@@ -93,7 +96,7 @@ export INSTANCE_NAME="web-app-${RANDOM_SUFFIX}"
 export PUBSUB_TOPIC="performance-alerts-${RANDOM_SUFFIX}"
 export FUNCTION_NAME="performance-optimizer-${RANDOM_SUFFIX}"
 
-# Set default project and region
+# Set default project and region after project creation
 gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
 gcloud config set compute/zone ${ZONE}
@@ -105,10 +108,6 @@ gcloud services enable pubsub.googleapis.com
 gcloud services enable monitoring.googleapis.com
 gcloud services enable cloudtrace.googleapis.com
 gcloud services enable logging.googleapis.com
-
-# Create project and verify setup
-gcloud projects create ${PROJECT_ID} --name="Monitoring Demo"
-gcloud config set project ${PROJECT_ID}
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled for monitoring infrastructure"
@@ -166,7 +165,7 @@ echo "✅ APIs enabled for monitoring infrastructure"
    
    # Initialize monitoring client
    monitoring_client = monitoring_v3.MetricServiceClient()
-   project_name = f"projects/{os.environ.get('GOOGLE_CLOUD_PROJECT')}"
+   project_name = f"projects/{os.environ.get('GOOGLE_CLOUD_PROJECT', os.popen('curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/project/project-id').read())}"
    
    @app.route('/api/data')
    def get_data():
@@ -260,7 +259,8 @@ echo "✅ APIs enabled for monitoring infrastructure"
    EOF
    
    # Create the alert policy
-   gcloud alpha monitoring policies create --policy-from-file=alert-policy.json
+   gcloud alpha monitoring policies create \
+       --policy-from-file=alert-policy.json
    
    echo "✅ Alert policy configured for performance monitoring"
    ```
@@ -351,9 +351,9 @@ echo "✅ APIs enabled for monitoring infrastructure"
    functions-framework>=3.0.0
    EOF
    
-   # Deploy the Cloud Function
+   # Deploy the Cloud Function with updated Python runtime
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python39 \
+       --runtime python311 \
        --trigger-topic ${PUBSUB_TOPIC} \
        --entry-point performance_optimizer \
        --memory 256MB \
@@ -500,7 +500,8 @@ echo "✅ APIs enabled for monitoring infrastructure"
    EOF
    
    # Create the dashboard
-   gcloud monitoring dashboards create --config-from-file=dashboard.json
+   gcloud monitoring dashboards create \
+       --config-from-file=dashboard.json
    
    echo "✅ Custom monitoring dashboard created"
    ```
@@ -578,9 +579,10 @@ echo "✅ APIs enabled for monitoring infrastructure"
        --filter="displayName:'High API Response Time Alert'"
    
    # Check alert policy status
-   gcloud alpha monitoring policies describe $(gcloud alpha monitoring policies list \
-       --filter="displayName='High API Response Time Alert'" \
-       --format="value(name)")
+   gcloud alpha monitoring policies describe \
+       $(gcloud alpha monitoring policies list \
+           --filter="displayName='High API Response Time Alert'" \
+           --format="value(name)")
    ```
 
 3. **Test Cloud Function Response**:

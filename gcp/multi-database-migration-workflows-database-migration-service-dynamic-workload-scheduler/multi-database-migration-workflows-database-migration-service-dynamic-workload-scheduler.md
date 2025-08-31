@@ -4,14 +4,14 @@ id: d8b4f7c2
 category: databases
 difficulty: 300
 subject: gcp
-services: Database Migration Service, Dynamic Workload Scheduler, Cloud SQL, AlloyDB
+services: Database Migration Service, Cloud Functions, Cloud SQL, AlloyDB
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-24
 passed-qa: null
-tags: database-migration, workload-optimization, cost-efficiency, multi-database, continuous-migration
+tags: database-migration, workload optimization, cost-efficiency, multi-database, continuous-migration
 recipe-generator-version: 1.3
 ---
 
@@ -23,7 +23,7 @@ Enterprise organizations managing large-scale database migrations face significa
 
 ## Solution
 
-Build an intelligent database migration orchestration system that leverages Google Cloud's Database Migration Service for continuous, minimal-downtime database transfers combined with Dynamic Workload Scheduler's flex-start provisioning model. This approach automatically optimizes compute costs by dynamically allocating resources based on migration workload demands while ensuring high-priority migrations receive guaranteed capacity through calendar mode scheduling.
+Build an intelligent database migration orchestration system that leverages Google Cloud's Database Migration Service for continuous, minimal-downtime database transfers combined with compute resource optimization through managed instance groups and automated scaling. This approach optimizes compute costs by dynamically allocating resources based on migration workload demands while ensuring high-priority migrations receive guaranteed capacity through reservation-based scheduling.
 
 ## Architecture Diagram
 
@@ -36,13 +36,13 @@ graph TB
     end
     
     subgraph "Google Cloud Migration Platform"
-        DWS[Dynamic Workload Scheduler]
         DMS[Database Migration Service]
+        CF[Cloud Functions]
         
         subgraph "Migration Workers"
-            FLEX1[Flex-Start VM Pool]
-            FLEX2[Calendar Reserved VMs]
+            MIG[Managed Instance Group]
             WORKERS[Migration Worker Nodes]
+            RESERV[Compute Reservations]
         end
         
         subgraph "Target Databases"
@@ -53,7 +53,7 @@ graph TB
         subgraph "Monitoring & Control"
             MON[Cloud Monitoring]
             LOG[Cloud Logging]
-            SCHED[Migration Scheduler]
+            STORAGE[Cloud Storage]
         end
     end
     
@@ -61,34 +61,33 @@ graph TB
     SRC2 --> DMS
     SRC3 --> DMS
     
-    DMS --> DWS
-    DWS --> FLEX1
-    DWS --> FLEX2
-    FLEX1 --> WORKERS
-    FLEX2 --> WORKERS
+    DMS --> CF
+    CF --> MIG
+    MIG --> WORKERS
+    RESERV --> WORKERS
     
     WORKERS --> CSQL
     WORKERS --> ALLOY
     
     DMS --> MON
     WORKERS --> LOG
-    SCHED --> DWS
+    CF --> STORAGE
     
-    style DWS fill:#4285f4
     style DMS fill:#34a853
-    style FLEX1 fill:#fbbc04
+    style CF fill:#4285f4
+    style MIG fill:#fbbc04
     style ALLOY fill:#ea4335
 ```
 
 ## Prerequisites
 
-1. Google Cloud Project with billing enabled and appropriate IAM permissions
-2. gcloud CLI v2 installed and configured (or Google Cloud Shell)
-3. Source databases accessible from Google Cloud (VPN, interconnect, or public internet)
-4. Basic understanding of database migration concepts and Google Cloud networking
+1. Google Cloud Project with billing enabled and appropriate IAM permissions for Database Migration Service, Cloud SQL, AlloyDB, and Compute Engine
+2. gcloud CLI installed and configured (or Google Cloud Shell)
+3. Source databases accessible from Google Cloud (VPN, Cloud Interconnect, or public internet with firewall rules)
+4. Basic understanding of database migration concepts, Google Cloud networking, and managed instance groups
 5. Estimated cost: $200-500 for 2-hour workshop (varies by database sizes and compute resources)
 
-> **Note**: Dynamic Workload Scheduler and AlloyDB are available in specific regions. Verify [service availability](https://cloud.google.com/about/locations/) for your target regions before proceeding.
+> **Note**: Database Migration Service and AlloyDB are available in specific regions. Verify [service availability](https://cloud.google.com/about/locations/) for your target regions before proceeding.
 
 ## Preparation
 
@@ -117,6 +116,8 @@ gcloud services enable alloydb.googleapis.com
 gcloud services enable datamigration.googleapis.com
 gcloud services enable monitoring.googleapis.com
 gcloud services enable logging.googleapis.com
+gcloud services enable cloudfunctions.googleapis.com
+gcloud services enable servicenetworking.googleapis.com
 
 # Create VPC network for secure migration traffic
 gcloud compute networks create ${NETWORK_NAME} \
@@ -134,9 +135,9 @@ echo "✅ Migration network created: ${NETWORK_NAME}"
 
 ## Steps
 
-1. **Create Dynamic Workload Scheduler Configuration for Migration Workers**:
+1. **Create Compute Instance Template for Migration Workers**:
 
-   Dynamic Workload Scheduler optimizes resource allocation for batch workloads by providing two modes: flex-start for cost optimization and calendar mode for guaranteed capacity. For database migrations, we leverage flex-start mode to reduce costs during low-priority transfers while using calendar mode for time-sensitive migrations that require guaranteed compute resources.
+   Compute Engine instance templates provide a consistent foundation for creating migration worker VMs with standardized configurations. This approach ensures all migration workers have identical software stacks, network settings, and monitoring capabilities, enabling predictable performance and simplified management across the entire migration infrastructure.
 
    ```bash
    # Create instance template for migration workers with optimal configurations
@@ -160,10 +161,10 @@ echo "✅ Migration network created: ${NETWORK_NAME}"
        --size 0 \
        --region ${REGION}
    
-   echo "✅ Migration worker template configured for Dynamic Workload Scheduler"
+   echo "✅ Migration worker template configured for dynamic scaling"
    ```
 
-   The instance template establishes the foundation for migration workers that will be dynamically provisioned by the Dynamic Workload Scheduler. This configuration includes essential database client tools and monitoring capabilities, enabling the workers to handle various database migration tasks while providing observability into the migration process.
+   The instance template establishes the foundation for migration workers that will be dynamically provisioned by the managed instance group. This configuration includes essential database client tools and monitoring capabilities, enabling the workers to handle various database migration tasks while providing observability into the migration process.
 
 2. **Configure Cloud SQL Target Instance with High Availability**:
 
@@ -269,19 +270,12 @@ echo "✅ Migration network created: ${NETWORK_NAME}"
 
    The connection profiles establish secure communication channels between source databases and Google Cloud targets. These profiles encapsulate authentication, network routing, and encryption settings, enabling Database Migration Service to perform continuous replication while maintaining security and compliance requirements.
 
-5. **Create Flex-Start Migration Jobs with Dynamic Workload Scheduler**:
+5. **Configure Managed Instance Group Auto-scaling for Migration Workers**:
 
-   Flex-start mode in Dynamic Workload Scheduler provides cost-optimized resource allocation for batch workloads that can tolerate flexible start times. For database migrations, this mode reduces compute costs by up to 60% while ensuring all required resources are allocated simultaneously when capacity becomes available.
+   Managed instance groups provide automatic scaling capabilities that dynamically adjust compute resources based on workload demands. For database migrations, this ensures optimal resource allocation during peak transfer periods while minimizing costs during low-activity phases through intelligent scaling policies.
 
    ```bash
-   # Create flex-start capacity request for migration workloads
-   gcloud compute future-reservations create migration-flex-capacity \
-       --source-instance-template ${INSTANCE_TEMPLATE} \
-       --total-count 4 \
-       --planning-status PLANNING_STATUS_PLANNED \
-       --zone ${ZONE}
-   
-   # Configure autoscaling for migration workers based on queue depth
+   # Configure autoscaling for migration workers based on CPU utilization
    gcloud compute instance-groups managed set-autoscaling migration-workers \
        --region ${REGION} \
        --max-num-replicas 8 \
@@ -297,10 +291,10 @@ echo "✅ Migration network created: ${NETWORK_NAME}"
        --type CONTINUOUS \
        --dump-path gs://${PROJECT_ID}-migration-bucket/mysql-dumps
    
-   echo "✅ Flex-start migration configuration deployed"
+   echo "✅ Auto-scaling migration configuration deployed"
    ```
 
-   The flex-start configuration optimizes cost efficiency by allowing Google Cloud to schedule migration workloads when capacity is available at reduced rates. This approach maintains migration performance while significantly reducing compute costs for non-time-critical database transfers.
+   The managed instance group configuration optimizes cost efficiency by automatically scaling migration workers based on actual demand. This approach maintains migration performance while significantly reducing compute costs during periods of lower migration activity.
 
 6. **Implement Migration Orchestration with Cloud Functions**:
 
@@ -317,10 +311,9 @@ import os
 import json
 from google.cloud import compute_v1
 from google.cloud import monitoring_v3
-from google.cloud import functions_v1
 
 def orchestrate_migration(request):
-    """Orchestrate database migration workflows with Dynamic Workload Scheduler"""
+    """Orchestrate database migration workflows with managed instance groups"""
     
     # Parse migration request
     request_json = request.get_json()
@@ -345,8 +338,14 @@ def orchestrate_migration(request):
     return {
         'status': 'success',
         'worker_count': worker_count,
-        'migration_mode': 'flex-start' if migration_priority == 'low' else 'calendar'
+        'migration_mode': 'automated' if migration_priority == 'low' else 'priority'
     }
+EOF
+   
+   # Create requirements.txt for Cloud Function dependencies
+   cat > requirements.txt << 'EOF'
+google-cloud-compute==1.19.2
+google-cloud-monitoring==2.21.0
 EOF
    
    # Deploy Cloud Function for migration orchestration
@@ -427,10 +426,10 @@ EOF
 
 8. **Execute Coordinated Multi-Database Migration**:
 
-   The final step orchestrates the complete migration workflow by coordinating multiple database transfers, optimizing resource allocation, and managing migration priorities. This approach ensures efficient utilization of Dynamic Workload Scheduler capabilities while maintaining data consistency and minimizing business disruption.
+   The final step orchestrates the complete migration workflow by coordinating multiple database transfers, optimizing resource allocation, and managing migration priorities. This approach ensures efficient utilization of compute resources while maintaining data consistency and minimizing business disruption.
 
    ```bash
-   # Start MySQL migration with flex-start optimization
+   # Start MySQL migration with automated optimization
    gcloud database-migration migration-jobs start mysql-migration-job \
        --region ${REGION}
    
@@ -461,25 +460,25 @@ EOF
    echo "✅ Multi-database migration workflow initiated"
    ```
 
-   The coordinated migration workflow leverages Dynamic Workload Scheduler's intelligent resource allocation to optimize costs while ensuring timely completion of database transfers. The system automatically adjusts capacity based on migration priorities and workload characteristics, providing both cost efficiency and performance optimization.
+   The coordinated migration workflow leverages managed instance groups' intelligent resource allocation to optimize costs while ensuring timely completion of database transfers. The system automatically adjusts capacity based on migration priorities and workload characteristics, providing both cost efficiency and performance optimization.
 
 ## Validation & Testing
 
-1. **Verify Dynamic Workload Scheduler Resource Allocation**:
+1. **Verify Managed Instance Group Resource Allocation**:
 
    ```bash
-   # Check flex-start capacity reservation status
-   gcloud compute future-reservations describe migration-flex-capacity \
-       --zone ${ZONE} \
-       --format "table(status,specificReservation.count)"
-   
-   # Monitor migration worker scaling
+   # Check managed instance group scaling status
    gcloud compute instance-groups managed describe migration-workers \
        --region ${REGION} \
        --format "table(targetSize,currentActions.creating,currentActions.deleting)"
+   
+   # Monitor autoscaler metrics
+   gcloud compute instance-groups managed describe-autoscaler migration-workers \
+       --region ${REGION} \
+       --format "table(autoscalingPolicy.maxNumReplicas,autoscalingPolicy.minNumReplicas,target)"
    ```
 
-   Expected output: Reservation should show ACTIVE status with allocated capacity, and instance group should show appropriate scaling based on workload demands.
+   Expected output: Instance group should show appropriate scaling based on workload demands, and autoscaler should reflect the configured policies.
 
 2. **Validate Migration Job Progress and Data Consistency**:
 
@@ -489,7 +488,7 @@ EOF
        --region ${REGION} \
        --format "table(state,phase,duration)"
    
-   # Verify data replication lag
+   # Verify data replication lag for PostgreSQL migration
    gcloud database-migration migration-jobs describe postgres-migration-job \
        --region ${REGION} \
        --format "value(replicationCycle.replicationLog.replicationLag)"
@@ -505,10 +504,9 @@ EOF
        --filter "metric.type:compute.googleapis.com/instance" \
        --format "value(metricDescriptor.type)"
    
-   # Check Dynamic Workload Scheduler cost savings
-   gcloud compute operations list \
-       --filter "operationType:compute.futureReservations.create" \
-       --format "table(name,status,progress)"
+   # Check instance group utilization
+   gcloud compute instance-groups managed get-named-ports migration-workers \
+       --region ${REGION}
    ```
 
 ## Cleanup
@@ -528,6 +526,10 @@ EOF
        --region ${REGION} \
        --quiet
    
+   gcloud database-migration migration-jobs delete postgres-migration-job \
+       --region ${REGION} \
+       --quiet
+   
    echo "✅ Migration jobs stopped and removed"
    ```
 
@@ -540,6 +542,14 @@ EOF
        --quiet
    
    gcloud database-migration connection-profiles delete dest-cloudsql \
+       --region ${REGION} \
+       --quiet
+   
+   gcloud database-migration connection-profiles delete source-postgres \
+       --region ${REGION} \
+       --quiet
+   
+   gcloud database-migration connection-profiles delete dest-alloydb \
        --region ${REGION} \
        --quiet
    
@@ -564,11 +574,6 @@ EOF
    
    gcloud compute instance-templates delete ${INSTANCE_TEMPLATE} --quiet
    
-   # Remove future reservations
-   gcloud compute future-reservations delete migration-flex-capacity \
-       --zone ${ZONE} \
-       --quiet
-   
    # Delete Cloud Function
    gcloud functions delete migration-orchestrator --quiet
    
@@ -587,17 +592,17 @@ EOF
 
 ## Discussion
 
-This recipe demonstrates how to leverage Google Cloud's advanced database migration and workload scheduling capabilities to optimize both cost and performance during large-scale database transitions. The combination of Database Migration Service and Dynamic Workload Scheduler provides a sophisticated approach to handling enterprise migration scenarios that traditional methods cannot efficiently address.
+This recipe demonstrates how to leverage Google Cloud's advanced database migration and compute optimization capabilities to optimize both cost and performance during large-scale database transitions. The combination of Database Migration Service and managed instance groups provides a sophisticated approach to handling enterprise migration scenarios that traditional methods cannot efficiently address.
 
 Database Migration Service excels in providing continuous replication with minimal downtime, supporting both homogeneous and heterogeneous migrations. By integrating with Cloud SQL and AlloyDB, organizations can migrate to fully managed database platforms that provide superior performance, scalability, and operational simplicity. The continuous migration approach ensures data consistency while enabling gradual cutover strategies that minimize business disruption.
 
-Dynamic Workload Scheduler revolutionizes resource allocation for batch workloads like database migrations by introducing flex-start and calendar modes. Flex-start mode can reduce compute costs by up to 60% for workloads that can tolerate flexible scheduling, while calendar mode provides guaranteed capacity for time-sensitive operations. This dual approach enables organizations to optimize costs for routine migrations while ensuring critical business migrations receive prioritized resources.
+Managed instance groups revolutionize resource allocation for compute workloads by providing automatic scaling based on demand. This approach can reduce compute costs significantly for workloads with variable demands while ensuring adequate capacity during peak periods. The integration with Cloud Functions provides intelligent orchestration that responds to migration events and automatically adjusts resource allocation based on business priorities.
 
 The architectural pattern implemented in this recipe provides several key benefits beyond cost optimization. The serverless orchestration layer using Cloud Functions enables intelligent workload management based on business priorities and technical requirements. Integration with Cloud Monitoring and Cloud Logging provides comprehensive observability, enabling proactive identification of performance bottlenecks and optimization opportunities. The modular design supports scaling from single database migrations to enterprise-scale programs involving hundreds of databases.
 
-For additional guidance on database migration best practices, refer to the [Google Cloud Database Migration Service documentation](https://cloud.google.com/database-migration/docs), [Dynamic Workload Scheduler overview](https://cloud.google.com/blog/products/compute/introducing-dynamic-workload-scheduler), [Cloud SQL best practices](https://cloud.google.com/sql/docs/mysql/best-practices), [AlloyDB for PostgreSQL documentation](https://cloud.google.com/alloydb/docs), and the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework).
+For additional guidance on database migration best practices, refer to the [Google Cloud Database Migration Service documentation](https://cloud.google.com/database-migration/docs), [Compute Engine managed instance groups](https://cloud.google.com/compute/docs/instance-groups), [Cloud SQL best practices](https://cloud.google.com/sql/docs/mysql/best-practices), [AlloyDB for PostgreSQL documentation](https://cloud.google.com/alloydb/docs), and the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework).
 
-> **Tip**: Monitor your migration costs using Cloud Billing budgets and alerts. Dynamic Workload Scheduler's flex-start mode provides significant cost savings, but understanding your actual usage patterns helps optimize the balance between cost efficiency and migration timeline requirements.
+> **Tip**: Monitor your migration costs using Cloud Billing budgets and alerts. Managed instance group auto-scaling provides significant cost savings, but understanding your actual usage patterns helps optimize the balance between cost efficiency and migration timeline requirements.
 
 ## Challenge
 

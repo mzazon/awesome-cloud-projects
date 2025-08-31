@@ -6,17 +6,16 @@ difficulty: 400
 subject: aws
 services: CloudFront, Kinesis, Lambda, OpenSearch
 estimated-time: 90 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cloudfront, monitoring, analytics, real-time, kinesis, opensearch
 recipe-generator-version: 1.3
 ---
 
 # CloudFront Real-Time Monitoring and Analytics
-
 
 ## Problem
 
@@ -117,7 +116,7 @@ graph TB
 4. Basic knowledge of Elasticsearch/OpenSearch query language
 5. Estimated cost: $50-150/month for testing (varies by traffic volume and retention)
 
-> **Note**: Real-time logs and OpenSearch Service can incur significant costs with high traffic volumes. Monitor usage closely and adjust retention policies as needed.
+> **Note**: Real-time logs and OpenSearch Service can incur significant costs with high traffic volumes. Monitor usage closely and adjust retention policies as needed. For production workloads, consider sampling strategies to control costs while maintaining sufficient data quality.
 
 ## Preparation
 
@@ -238,7 +237,7 @@ echo "✅ Environment prepared with content bucket: ${S3_CONTENT_BUCKET}"
    # Create OpenSearch domain
    aws opensearch create-domain \
        --domain-name ${OPENSEARCH_DOMAIN} \
-       --engine-version "OpenSearch_2.3" \
+       --engine-version "OpenSearch_2.11" \
        --cluster-config "{
            \"InstanceType\": \"t3.small.search\",
            \"InstanceCount\": 1,
@@ -281,7 +280,10 @@ echo "✅ Environment prepared with content bucket: ${S3_CONTENT_BUCKET}"
        "version": "1.0.0",
        "description": "Real-time CloudFront log processor",
        "dependencies": {
-           "aws-sdk": "^2.1000.0",
+           "@aws-sdk/client-cloudwatch": "^3.0.0",
+           "@aws-sdk/client-dynamodb": "^3.0.0",
+           "@aws-sdk/client-kinesis": "^3.0.0",
+           "@aws-sdk/util-dynamodb": "^3.0.0",
            "geoip-lite": "^1.4.0"
        }
    }
@@ -289,12 +291,15 @@ echo "✅ Environment prepared with content bucket: ${S3_CONTENT_BUCKET}"
    
    # Create Lambda function code
    cat > /tmp/lambda-log-processor/index.js << 'EOF'
-   const AWS = require('aws-sdk');
+   const { CloudWatchClient, PutMetricDataCommand } = require('@aws-sdk/client-cloudwatch');
+   const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
+   const { KinesisClient, PutRecordsCommand } = require('@aws-sdk/client-kinesis');
+   const { marshall } = require('@aws-sdk/util-dynamodb');
    const geoip = require('geoip-lite');
    
-   const cloudwatch = new AWS.CloudWatch();
-   const dynamodb = new AWS.DynamoDB.DocumentClient();
-   const kinesis = new AWS.Kinesis();
+   const cloudwatch = new CloudWatchClient();
+   const dynamodb = new DynamoDBClient();
+   const kinesis = new KinesisClient();
    
    const METRICS_TABLE = process.env.METRICS_TABLE;
    const PROCESSED_STREAM = process.env.PROCESSED_STREAM;
@@ -466,10 +471,10 @@ echo "✅ Environment prepared with content bucket: ${S3_CONTENT_BUCKET}"
            }));
            
            try {
-               await kinesis.putRecords({
+               await kinesis.send(new PutRecordsCommand({
                    StreamName: PROCESSED_STREAM,
                    Records: kinesisRecords
-               }).promise();
+               }));
            } catch (error) {
                console.error('Error sending to Kinesis:', error);
            }
@@ -481,9 +486,9 @@ echo "✅ Environment prepared with content bucket: ${S3_CONTENT_BUCKET}"
        const ttl = Math.floor(Date.now() / 1000) + (7 * 24 * 60 * 60); // 7 days
        
        try {
-           await dynamodb.put({
+           await dynamodb.send(new PutItemCommand({
                TableName: METRICS_TABLE,
-               Item: {
+               Item: marshall({
                    MetricId: `metrics-${Date.now()}`,
                    Timestamp: timestamp,
                    TotalRequests: metrics.totalRequests,
@@ -495,8 +500,8 @@ echo "✅ Environment prepared with content bucket: ${S3_CONTENT_BUCKET}"
                    StatusCodes: metrics.statusCodes,
                    UserAgents: metrics.userAgents,
                    TTL: ttl
-               }
-           }).promise();
+               })
+           }));
        } catch (error) {
            console.error('Error storing metrics:', error);
        }
@@ -537,10 +542,10 @@ echo "✅ Environment prepared with content bucket: ${S3_CONTENT_BUCKET}"
        ];
        
        try {
-           await cloudwatch.putMetricData({
+           await cloudwatch.send(new PutMetricDataCommand({
                Namespace: 'CloudFront/RealTime',
                MetricData: metricData
-           }).promise();
+           }));
        } catch (error) {
            console.error('Error sending CloudWatch metrics:', error);
        }
@@ -555,7 +560,7 @@ echo "✅ Environment prepared with content bucket: ${S3_CONTENT_BUCKET}"
    echo "✅ Lambda function package created"
    ```
 
-   The Lambda function implements sophisticated log processing including IP geolocation, user agent categorization, and real-time metric aggregation. It processes each log entry to extract business-relevant information such as geographic distribution, device types, and performance metrics. The function also implements error handling, batch processing for efficiency, and multi-destination routing to send processed data to different storage systems. This real-time processing enables immediate insights and alerting that would be impossible with traditional batch processing approaches.
+   The Lambda function implements sophisticated log processing including IP geolocation, user agent categorization, and real-time metric aggregation. It has been updated to use AWS SDK v3 for improved performance and reduced memory footprint. The function processes each log entry to extract business-relevant information such as geographic distribution, device types, and performance metrics. The function also implements error handling, batch processing for efficiency, and multi-destination routing to send processed data to different storage systems. This real-time processing enables immediate insights and alerting that would be impossible with traditional batch processing approaches.
 
 4. **Create DynamoDB Table for Metrics Storage**:
 
@@ -678,7 +683,7 @@ echo "✅ Environment prepared with content bucket: ${S3_CONTENT_BUCKET}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${PROJECT_NAME}-log-processor \
-       --runtime nodejs18.x \
+       --runtime nodejs20.x \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT_NAME}-lambda-role \
        --handler index.handler \
        --zip-file fileb:///tmp/lambda-log-processor/lambda-log-processor.zip \
@@ -692,7 +697,7 @@ echo "✅ Environment prepared with content bucket: ${S3_CONTENT_BUCKET}"
    echo "✅ Lambda function deployed"
    ```
 
-   The Lambda function is now deployed with the necessary permissions to process CloudFront logs in real-time. The IAM role ensures secure access to all required AWS services while maintaining the principle of least privilege. The function will automatically scale based on incoming log volume and process data with sub-second latency, enabling immediate insights and alerting capabilities. For more information about Lambda and Kinesis integration, see the [AWS Lambda documentation](https://docs.aws.amazon.com/lambda/latest/dg/services-kinesis-create.html).
+   The Lambda function is now deployed with the necessary permissions to process CloudFront logs in real-time. The IAM role ensures secure access to all required AWS services while maintaining the principle of least privilege. The function uses the latest Node.js 20.x runtime and will automatically scale based on incoming log volume, processing data with sub-second latency to enable immediate insights and alerting capabilities. For more information about Lambda and Kinesis integration, see the [AWS Lambda documentation](https://docs.aws.amazon.com/lambda/latest/dg/services-kinesis-create.html).
 
 6. **Create Kinesis Data Firehose for S3 and OpenSearch Delivery**:
 
@@ -1468,27 +1473,27 @@ echo "✅ Environment prepared with content bucket: ${S3_CONTENT_BUCKET}"
 
 This comprehensive CloudFront real-time monitoring solution demonstrates how to build enterprise-grade observability for global content delivery networks using AWS's streaming analytics services. The architecture provides immediate visibility into user behavior, performance metrics, and security events, enabling organizations to respond to issues in real-time rather than waiting for delayed standard logs.
 
-The real-time data pipeline leverages Kinesis Data Streams for high-throughput log ingestion, Lambda functions for intelligent log processing and enrichment, and multiple storage backends optimized for different use cases. The Lambda processing function enriches raw CloudFront logs with geographic information, categorizes user agents, and aggregates metrics in real-time, providing immediate insights into traffic patterns and performance characteristics. This processed data feeds into both operational dashboards for real-time monitoring and analytical systems for deeper insights.
+The real-time data pipeline leverages Kinesis Data Streams for high-throughput log ingestion, Lambda functions for intelligent log processing and enrichment, and multiple storage backends optimized for different use cases. The Lambda processing function has been updated to use AWS SDK v3, providing better performance and reduced memory footprint. It enriches raw CloudFront logs with geographic information, categorizes user agents, and aggregates metrics in real-time, providing immediate insights into traffic patterns and performance characteristics. This processed data feeds into both operational dashboards for real-time monitoring and analytical systems for deeper insights.
 
-The multi-tier storage strategy optimizes costs and performance by storing raw logs in S3 for compliance and long-term analysis, processed metrics in DynamoDB for fast operational queries, and searchable logs in OpenSearch for complex analytics. This approach enables both real-time operational monitoring and historical trend analysis while managing storage costs through appropriate retention policies and data lifecycle management.
+The multi-tier storage strategy optimizes costs and performance by storing raw logs in S3 for compliance and long-term analysis, processed metrics in DynamoDB for fast operational queries, and searchable logs in OpenSearch for complex analytics. This approach enables both real-time operational monitoring and historical trend analysis while managing storage costs through appropriate retention policies and data lifecycle management. The OpenSearch domain has been updated to use version 2.11 for improved security and performance features.
 
 The monitoring and alerting system provides immediate notification of performance anomalies, security threats, and traffic spikes through custom CloudWatch metrics and alarms. The integration with EventBridge and Step Functions enables automated response workflows that can trigger scaling actions, invalidate cached content, or activate failover procedures based on real-time analytics. This automation reduces mean time to resolution and enables proactive scaling based on traffic patterns rather than reactive scaling after performance degradation.
 
-> **Tip**: Monitor the cost of real-time logs carefully, as they can become expensive with high traffic volumes. Consider sampling strategies for cost optimization while maintaining sufficient data for meaningful analysis.
+> **Tip**: Monitor the cost of real-time logs carefully, as they can become expensive with high traffic volumes. Consider sampling strategies for cost optimization while maintaining sufficient data for meaningful analysis. Use AWS Cost Explorer to track expenses and set up billing alerts to avoid unexpected charges.
 
 ## Challenge
 
 Extend this solution by implementing these advanced enhancements:
 
-1. **Implement Machine Learning-Based Anomaly Detection**: Integrate Amazon SageMaker to build models that detect unusual traffic patterns, performance anomalies, and potential security threats in real-time, automatically triggering alerts and response workflows.
+1. **Implement Machine Learning-Based Anomaly Detection**: Integrate Amazon SageMaker to build models that detect unusual traffic patterns, performance anomalies, and potential security threats in real-time, automatically triggering alerts and response workflows using CloudWatch anomaly detection and EventBridge.
 
-2. **Create Geographic Performance Optimization**: Build automated systems that analyze real-time performance data by geographic region and automatically adjust CloudFront cache policies, origin selection, and traffic routing to optimize user experience globally.
+2. **Create Geographic Performance Optimization**: Build automated systems that analyze real-time performance data by geographic region and automatically adjust CloudFront cache policies, origin selection, and traffic routing to optimize user experience globally using Lambda@Edge functions.
 
-3. **Add Advanced Security Analytics**: Implement real-time bot detection, DDoS mitigation triggers, and suspicious traffic pattern analysis using the enriched log data to automatically update WAF rules and implement protective measures.
+3. **Add Advanced Security Analytics**: Implement real-time bot detection, DDoS mitigation triggers, and suspicious traffic pattern analysis using the enriched log data to automatically update WAF rules and implement protective measures through API Gateway and AWS Shield integration.
 
-4. **Build Predictive Scaling System**: Create machine learning models that predict traffic spikes based on historical patterns and real-time indicators, automatically scaling origin infrastructure and adjusting CloudFront configurations before traffic increases.
+4. **Build Predictive Scaling System**: Create machine learning models using Amazon Forecast that predict traffic spikes based on historical patterns and real-time indicators, automatically scaling origin infrastructure and adjusting CloudFront configurations before traffic increases.
 
-5. **Implement Cost Optimization Analytics**: Develop automated analysis of cache hit rates, geographic traffic distribution, and content popularity to recommend CloudFront configuration optimizations, price class adjustments, and content delivery strategies that minimize costs while maintaining performance.
+5. **Implement Cost Optimization Analytics**: Develop automated analysis of cache hit rates, geographic traffic distribution, and content popularity using Amazon QuickSight to recommend CloudFront configuration optimizations, price class adjustments, and content delivery strategies that minimize costs while maintaining performance.
 
 ## Infrastructure Code
 

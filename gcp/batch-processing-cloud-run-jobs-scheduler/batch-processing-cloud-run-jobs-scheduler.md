@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Run Jobs, Cloud Scheduler, Cloud Build, Artifact Registry
 estimated-time: 75 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: 2025-07-17
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: batch-processing, automation, scheduling, containers, cicd
 recipe-generator-version: 1.3

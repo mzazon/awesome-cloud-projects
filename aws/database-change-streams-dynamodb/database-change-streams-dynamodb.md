@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: dynamodb, lambda, cloudwatch, iam
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: dynamodb, streams, lambda, event-driven, real-time, serverless, change-data-capture
 recipe-generator-version: 1.3
@@ -67,7 +67,7 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for DynamoDB, Lambda, IAM, SNS, and S3
+1. AWS account with appropriate permissions for DynamoDB, Lambda, IAM, SNS, SQS, and S3
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Understanding of event-driven architecture and stream processing concepts
 4. Basic knowledge of JSON and serverless computing patterns
@@ -181,10 +181,10 @@ echo "✅ Preparation complete. S3 bucket: ${S3_BUCKET_NAME}, SNS Topic: ${SNS_T
 
 3. **Create Custom IAM Policy for Additional Permissions**:
 
-   Beyond the basic DynamoDB stream permissions, our processing function requires access to SNS for notifications and S3 for audit logging. Custom IAM policies allow fine-grained permission control, ensuring the function can only perform specific actions on designated resources, maintaining security best practices while enabling necessary functionality.
+   Beyond the basic DynamoDB stream permissions, our processing function requires access to SNS for notifications, S3 for audit logging, and SQS for dead letter queue functionality. Custom IAM policies allow fine-grained permission control, ensuring the function can only perform specific actions on designated resources, maintaining security best practices while enabling necessary functionality.
 
    ```bash
-   # Create custom policy for SNS and S3 access
+   # Create custom policy for SNS, S3, and SQS access
    cat > custom-policy.json << EOF
    {
        "Version": "2012-10-17",
@@ -203,6 +203,13 @@ echo "✅ Preparation complete. S3 bucket: ${S3_BUCKET_NAME}, SNS Topic: ${SNS_T
                    "s3:PutObjectAcl"
                ],
                "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}/*"
+           },
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "sqs:SendMessage"
+               ],
+               "Resource": "arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${FUNCTION_NAME}-dlq"
            }
        ]
    }
@@ -220,7 +227,7 @@ echo "✅ Preparation complete. S3 bucket: ${S3_BUCKET_NAME}, SNS Topic: ${SNS_T
    echo "✅ Custom policy attached to role"
    ```
 
-   The custom policy is now attached, providing precise permissions for SNS publishing and S3 object storage. This granular approach ensures the Lambda function operates with exactly the permissions required for its notification and audit logging responsibilities.
+   The custom policy is now attached, providing precise permissions for SNS publishing, S3 object storage, and SQS dead letter queue access. This granular approach ensures the Lambda function operates with exactly the permissions required for its notification, audit logging, and error handling responsibilities.
 
 4. **Create Lambda Function for Stream Processing**:
 
@@ -363,10 +370,10 @@ echo "✅ Preparation complete. S3 bucket: ${S3_BUCKET_NAME}, SNS Topic: ${SNS_T
        --role-name ${ROLE_NAME} \
        --query Role.Arn --output text)
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    aws lambda create-function \
        --function-name ${FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler stream-processor.lambda_handler \
        --zip-file fileb://lambda-function.zip \
@@ -384,7 +391,7 @@ echo "✅ Preparation complete. S3 bucket: ${S3_BUCKET_NAME}, SNS Topic: ${SNS_T
    echo "✅ Lambda function deployed: ${FUNCTION_NAME}"
    ```
 
-   The Lambda function is now deployed and active, ready to process DynamoDB stream events. The function's configuration includes optimized memory and timeout settings for stream processing workloads, ensuring efficient resource utilization and cost control.
+   The Lambda function is now deployed and active using Python 3.12 runtime, ready to process DynamoDB stream events. The function's configuration includes optimized memory and timeout settings for stream processing workloads, ensuring efficient resource utilization and cost control.
 
 6. **Create DynamoDB Stream Event Source Mapping**:
 
@@ -736,31 +743,31 @@ echo "✅ Preparation complete. S3 bucket: ${S3_BUCKET_NAME}, SNS Topic: ${SNS_T
 
 ## Discussion
 
-This implementation demonstrates a comprehensive real-time database change stream processing system that addresses several critical architectural patterns. DynamoDB Streams provide exactly-once delivery guarantees and maintain ordering within each shard, making them ideal for event-driven architectures that require consistency and reliability.
+This implementation demonstrates a comprehensive real-time database change stream processing system that addresses several critical architectural patterns. DynamoDB Streams provide exactly-once delivery guarantees and maintain ordering within each shard, making them ideal for event-driven architectures that require consistency and reliability. The [AWS DynamoDB Streams documentation](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html) provides detailed information about ordering guarantees and best practices for stream processing.
 
-The solution leverages AWS Lambda's event source mapping feature, which automatically polls the DynamoDB stream and invokes the Lambda function with batches of records. This approach provides several advantages over traditional polling mechanisms: it scales automatically based on stream throughput, handles failures with built-in retry logic, and supports parallel processing across multiple shards. The bisect-batch-on-function-error configuration ensures that when processing fails, Lambda can isolate problematic records and continue processing others.
+The solution leverages AWS Lambda's event source mapping feature, which automatically polls the DynamoDB stream and invokes the Lambda function with batches of records. This approach provides several advantages over traditional polling mechanisms: it scales automatically based on stream throughput, handles failures with built-in retry logic, and supports parallel processing across multiple shards. The bisect-batch-on-function-error configuration ensures that when processing fails, Lambda can isolate problematic records and continue processing others, as described in the [AWS Lambda event source mapping documentation](https://docs.aws.amazon.com/lambda/latest/dg/invocation-eventsourcemapping.html).
 
-The architectural pattern implemented here supports various use cases including real-time analytics, data synchronization, and audit logging. The S3 storage component provides durable audit trails for compliance requirements, while SNS notifications enable immediate alerting for critical events. The dead letter queue ensures that failed processing attempts are captured for manual review and reprocessing.
+The architectural pattern implemented here supports various use cases including real-time analytics, data synchronization, and audit logging. The S3 storage component provides durable audit trails for compliance requirements, while SNS notifications enable immediate alerting for critical events. The dead letter queue ensures that failed processing attempts are captured for manual review and reprocessing, following the [AWS Well-Architected Framework reliability pillar](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html) principles.
 
 > **Best Practice**: Always implement proper error handling and monitoring in stream processing applications. DynamoDB Streams have a 24-hour retention period, so failed records must be processed within this timeframe to avoid data loss.
 
-From a cost optimization perspective, this solution is highly efficient because DynamoDB Streams incur no additional charges beyond standard DynamoDB usage, and Lambda functions only run when triggered by stream events. The pay-per-use model scales naturally with application load, making it suitable for both low-volume and high-throughput scenarios.
+From a cost optimization perspective, this solution is highly efficient because DynamoDB Streams incur no additional charges beyond standard DynamoDB usage, and Lambda functions only run when triggered by stream events. The pay-per-use model scales naturally with application load, making it suitable for both low-volume and high-throughput scenarios. The updated Python 3.12 runtime ensures long-term support and access to the latest performance improvements.
 
-> **Tip**: Monitor Lambda concurrent execution metrics to optimize batch size and parallelization factor settings. Fine-tuning these parameters can significantly improve processing throughput and reduce overall costs.
+> **Tip**: Monitor Lambda concurrent execution metrics to optimize batch size and parallelization factor settings. Fine-tuning these parameters can significantly improve processing throughput and reduce overall costs, as detailed in the [AWS Lambda monitoring documentation](https://docs.aws.amazon.com/lambda/latest/dg/lambda-monitoring.html).
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Region Stream Processing**: Configure DynamoDB Global Tables with streams in multiple regions and implement cross-region processing coordination to handle global data consistency scenarios.
+1. **Multi-Region Stream Processing**: Configure DynamoDB Global Tables with streams in multiple regions and implement cross-region processing coordination to handle global data consistency scenarios using [DynamoDB Global Tables](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GlobalTables.html).
 
-2. **Advanced Event Filtering**: Add conditional processing logic to the Lambda function that filters events based on specific criteria, such as processing only high-value transactions or changes to specific attributes.
+2. **Advanced Event Filtering**: Add conditional processing logic to the Lambda function that filters events based on specific criteria, such as processing only high-value transactions or changes to specific attributes, using [Lambda event filtering patterns](https://docs.aws.amazon.com/lambda/latest/dg/invocation-eventfiltering.html).
 
-3. **Stream Analytics Integration**: Connect the stream processing pipeline to Amazon Kinesis Data Analytics to perform real-time aggregations and pattern detection on the change events.
+3. **Stream Analytics Integration**: Connect the stream processing pipeline to Amazon Kinesis Data Analytics to perform real-time aggregations and pattern detection on the change events, enabling advanced analytics workflows.
 
-4. **Batch Processing Integration**: Implement a secondary processing path that batches stream records for more efficient downstream processing using AWS Step Functions or AWS Batch.
+4. **Batch Processing Integration**: Implement a secondary processing path that batches stream records for more efficient downstream processing using AWS Step Functions or AWS Batch for complex data transformation workflows.
 
-5. **Event Replay Capability**: Build a mechanism to replay events from the S3 audit logs by creating a new stream processing pipeline that can reprocess historical data for testing or recovery scenarios.
+5. **Event Replay Capability**: Build a mechanism to replay events from the S3 audit logs by creating a new stream processing pipeline that can reprocess historical data for testing or recovery scenarios, supporting disaster recovery and data consistency validation.
 
 ## Infrastructure Code
 

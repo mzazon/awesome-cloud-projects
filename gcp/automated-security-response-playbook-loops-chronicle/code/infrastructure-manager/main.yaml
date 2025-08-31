@@ -1,0 +1,682 @@
+# Google Cloud Infrastructure Manager Configuration
+# Recipe: Automated Security Response with Playbook Loops and Chronicle
+# Description: Deploys automated security incident response infrastructure using 
+#              Chronicle SOAR, Security Command Center, Cloud Functions, and Pub/Sub
+
+# Import required Terraform providers
+terraform:
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.1"
+
+# Variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID for security automation"
+    type: string
+    
+  region:
+    description: "Primary region for resource deployment"
+    type: string
+    default: "us-central1"
+    
+  zone:
+    description: "Primary zone for resource deployment"
+    type: string
+    default: "us-central1-a"
+    
+  organization_id:
+    description: "Organization ID for Security Command Center configuration"
+    type: string
+    
+  security_tier:
+    description: "Security Command Center tier (STANDARD, PREMIUM)"
+    type: string
+    default: "PREMIUM"
+    validation:
+      condition: contains(["STANDARD", "PREMIUM"], var.security_tier)
+      error_message: "Security tier must be STANDARD or PREMIUM."
+  
+  function_memory:
+    description: "Memory allocation for Cloud Functions"
+    type: string
+    default: "512Mi"
+    
+  function_timeout:
+    description: "Timeout for Cloud Functions in seconds"
+    type: number
+    default: 300
+    
+  notification_filter:
+    description: "Security Command Center notification filter"
+    type: string
+    default: "state=\"ACTIVE\" AND severity=\"HIGH\""
+
+# Random suffix for unique resource naming
+resources:
+  random_suffix:
+    type: random_id
+    properties:
+      byte_length: 3
+      
+  # Enable required Google Cloud APIs
+  security_apis:
+    type: google_project_service
+    properties:
+      for_each:
+        - securitycenter.googleapis.com
+        - cloudfunctions.googleapis.com
+        - pubsub.googleapis.com
+        - cloudresourcemanager.googleapis.com
+        - iam.googleapis.com
+        - cloudbuild.googleapis.com
+        - eventarc.googleapis.com
+        - run.googleapis.com
+        - logging.googleapis.com
+      project: ${var.project_id}
+      service: ${each.value}
+      disable_on_destroy: false
+      
+  # Create service account for security automation
+  security_automation_sa:
+    type: google_service_account
+    properties:
+      account_id: security-automation-sa-${random_suffix.hex}
+      display_name: "Security Automation Service Account"
+      description: "Service account for automated security response functions"
+      project: ${var.project_id}
+    depends_on:
+      - security_apis
+      
+  # IAM roles for security automation service account
+  security_center_role:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/securitycenter.findings.editor"
+      member: "serviceAccount:${security_automation_sa.email}"
+      
+  pubsub_publisher_role:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/pubsub.publisher"
+      member: "serviceAccount:${security_automation_sa.email}"
+      
+  pubsub_subscriber_role:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/pubsub.subscriber"
+      member: "serviceAccount:${security_automation_sa.email}"
+      
+  functions_invoker_role:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/cloudfunctions.invoker"
+      member: "serviceAccount:${security_automation_sa.email}"
+      
+  compute_admin_role:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/compute.instanceAdmin.v1"
+      member: "serviceAccount:${security_automation_sa.email}"
+      
+  logging_writer_role:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/logging.logWriter"
+      member: "serviceAccount:${security_automation_sa.email}"
+      
+  # Create Pub/Sub topics for security event messaging
+  security_events_topic:
+    type: google_pubsub_topic
+    properties:
+      name: security-events-${random_suffix.hex}
+      project: ${var.project_id}
+      labels:
+        component: "security-automation"
+        purpose: "threat-detection"
+    depends_on:
+      - security_apis
+      
+  response_actions_topic:
+    type: google_pubsub_topic
+    properties:
+      name: response-actions-${random_suffix.hex}
+      project: ${var.project_id}
+      labels:
+        component: "security-automation"
+        purpose: "incident-response"
+    depends_on:
+      - security_apis
+      
+  # Create Cloud Storage bucket for function source code
+  function_source_bucket:
+    type: google_storage_bucket
+    properties:
+      name: security-functions-${var.project_id}-${random_suffix.hex}
+      location: ${var.region}
+      project: ${var.project_id}
+      uniform_bucket_level_access: true
+      force_destroy: true
+      labels:
+        component: "security-automation"
+        purpose: "function-source"
+    depends_on:
+      - security_apis
+      
+  # Upload threat enrichment function source
+  threat_enrichment_source:
+    type: google_storage_bucket_object
+    properties:
+      name: "threat-enrichment-source.zip"
+      bucket: ${function_source_bucket.name}
+      source: |
+        data "archive_file" "threat_enrichment_zip" {
+          type        = "zip"
+          output_path = "/tmp/threat-enrichment-source.zip"
+          source {
+            content = <<-EOT
+              import json
+              import base64
+              import requests
+              from google.cloud import pubsub_v1
+              import os
+              import time
+              import hashlib
+              import random
+
+              def threat_enrichment(event, context):
+                  """Enriches security alerts with threat intelligence."""
+                  
+                  try:
+                      # Decode Pub/Sub message
+                      pubsub_message = base64.b64decode(event['data']).decode('utf-8')
+                      alert_data = json.loads(pubsub_message)
+                      
+                      # Extract IOCs from security finding
+                      finding = alert_data.get('finding', {})
+                      source_properties = finding.get('sourceProperties', {})
+                      
+                      # Enrich with threat intelligence (simplified example)
+                      enriched_alert = {
+                          'original_finding': finding,
+                          'severity_score': calculate_severity_score(finding),
+                          'recommended_actions': generate_response_actions(finding),
+                          'entity_list': extract_entities(finding),
+                          'timestamp': finding.get('eventTime'),
+                          'source': finding.get('category'),
+                          'enrichment_id': generate_enrichment_id()
+                      }
+                      
+                      # Publish enriched alert for Chronicle SOAR processing
+                      publisher = pubsub_v1.PublisherClient()
+                      topic_path = publisher.topic_path(
+                          os.environ['GCP_PROJECT'], 
+                          os.environ['RESPONSE_TOPIC']
+                      )
+                      
+                      message_data = json.dumps(enriched_alert).encode('utf-8')
+                      future = publisher.publish(topic_path, message_data)
+                      
+                      print(f"Enriched alert published: {future.result()}")
+                      return {
+                          'status': 'enriched', 
+                          'entities_found': len(enriched_alert['entity_list']),
+                          'enrichment_id': enriched_alert['enrichment_id']
+                      }
+                      
+                  except Exception as e:
+                      print(f"Error processing alert: {str(e)}")
+                      return {'status': 'error', 'message': str(e)}
+
+              def calculate_severity_score(finding):
+                  """Calculate dynamic severity score based on multiple factors."""
+                  severity_map = {'CRITICAL': 10, 'HIGH': 8, 'MEDIUM': 5, 'LOW': 2}
+                  base_score = severity_map.get(finding.get('severity', 'LOW'), 2)
+                  
+                  # Adjust score based on asset criticality
+                  resource_name = finding.get('resourceName', '').lower()
+                  if any(keyword in resource_name for keyword in ['production', 'prod', 'critical']):
+                      base_score += 2
+                  
+                  # Adjust based on finding category
+                  category = finding.get('category', '').lower()
+                  if any(keyword in category for keyword in ['malware', 'intrusion', 'attack']):
+                      base_score += 1
+                  
+                  return min(base_score, 10)
+
+              def generate_response_actions(finding):
+                  """Generate recommended response actions based on finding type."""
+                  category = finding.get('category', '').lower()
+                  actions = []
+                  
+                  if 'malware' in category:
+                      actions.extend(['isolate_host', 'scan_files', 'update_signatures'])
+                  elif 'network' in category or 'intrusion' in category:
+                      actions.extend(['block_ip', 'analyze_traffic', 'update_firewall'])
+                  elif 'data' in category or 'exfiltration' in category:
+                      actions.extend(['revoke_access', 'audit_permissions', 'enable_dlp'])
+                  
+                  # Always include these standard actions
+                  actions.extend(['create_incident_ticket', 'notify_security_team'])
+                  return actions
+
+              def extract_entities(finding):
+                  """Extract security entities for playbook loop processing."""
+                  entities = []
+                  source_props = finding.get('sourceProperties', {})
+                  
+                  # Extract IP addresses from connections
+                  if 'connections' in source_props:
+                      for conn in source_props['connections']:
+                          if 'sourceIp' in conn:
+                              entities.append({'type': 'ip', 'value': conn['sourceIp']})
+                          if 'destinationIp' in conn:
+                              entities.append({'type': 'ip', 'value': conn['destinationIp']})
+                  
+                  # Extract file hashes
+                  if 'files' in source_props:
+                      for file_info in source_props['files']:
+                          for hash_type in ['sha256', 'sha1', 'md5']:
+                              if hash_type in file_info:
+                                  entities.append({'type': 'hash', 'value': file_info[hash_type]})
+                  
+                  # Extract domains
+                  if 'domains' in source_props:
+                      for domain in source_props['domains']:
+                          entities.append({'type': 'domain', 'value': domain})
+                  
+                  return entities
+
+              def generate_enrichment_id():
+                  """Generate unique identifier for enrichment tracking."""
+                  timestamp = str(int(time.time()))
+                  random_part = str(random.randint(1000, 9999))
+                  return f"ENR-{timestamp}-{random_part}"
+            EOT
+            filename = "main.py"
+          }
+          source {
+            content = <<-EOT
+              google-cloud-pubsub==2.25.0
+              requests==2.32.0
+            EOT
+            filename = "requirements.txt"
+          }
+        }
+      
+  # Deploy threat enrichment Cloud Function (Gen 2)
+  threat_enrichment_function:
+    type: google_cloudfunctions2_function
+    properties:
+      name: threat-enrichment-${random_suffix.hex}
+      location: ${var.region}
+      project: ${var.project_id}
+      description: "Enriches security alerts with threat intelligence for Chronicle SOAR"
+      
+      build_config:
+        runtime: "python312"
+        entry_point: "threat_enrichment"
+        source:
+          storage_source:
+            bucket: ${function_source_bucket.name}
+            object: ${threat_enrichment_source.name}
+            
+      service_config:
+        max_instance_count: 100
+        min_instance_count: 0
+        available_memory: ${var.function_memory}
+        timeout_seconds: ${var.function_timeout}
+        service_account_email: ${security_automation_sa.email}
+        environment_variables:
+          GCP_PROJECT: ${var.project_id}
+          RESPONSE_TOPIC: ${response_actions_topic.name}
+          
+      event_trigger:
+        trigger_region: ${var.region}
+        event_type: "google.cloud.pubsub.topic.v1.messagePublished"
+        pubsub_topic: projects/${var.project_id}/topics/${security_events_topic.name}
+        retry_policy: "RETRY_POLICY_RETRY"
+        
+    depends_on:
+      - security_automation_sa
+      - security_events_topic
+      - function_source_bucket
+      
+  # Upload automated response function source
+  automated_response_source:
+    type: google_storage_bucket_object
+    properties:
+      name: "automated-response-source.zip"
+      bucket: ${function_source_bucket.name}
+      source: |
+        data "archive_file" "automated_response_zip" {
+          type        = "zip"
+          output_path = "/tmp/automated-response-source.zip"
+          source {
+            content = <<-EOT
+              import json
+              import base64
+              from google.cloud import compute_v1
+              from google.cloud import logging
+              import os
+              import time
+
+              def automated_response(event, context):
+                  """Executes automated security response actions."""
+                  
+                  try:
+                      # Decode Pub/Sub message from Chronicle SOAR
+                      pubsub_message = base64.b64decode(event['data']).decode('utf-8')
+                      response_data = json.loads(pubsub_message)
+                      
+                      # Initialize logging
+                      logging_client = logging.Client()
+                      logger = logging_client.logger('security-automation')
+                      
+                      # Execute response actions based on playbook decisions
+                      actions_executed = []
+                      
+                      for action in response_data.get('recommended_actions', []):
+                          try:
+                              action_type = action if isinstance(action, str) else action.get('type', action)
+                              target = action.get('target') if isinstance(action, dict) else None
+                              
+                              if action_type == 'isolate_host':
+                                  result = isolate_host(target or 'unknown-host')
+                                  actions_executed.append(f"Host isolation initiated: {target}")
+                                  
+                              elif action_type == 'block_ip':
+                                  result = block_malicious_ip(target or 'unknown-ip')
+                                  actions_executed.append(f"IP blocking initiated: {target}")
+                                  
+                              elif action_type == 'create_incident_ticket':
+                                  details = action.get('details', response_data) if isinstance(action, dict) else response_data
+                                  result = create_incident_ticket(details)
+                                  actions_executed.append(f"Incident ticket created: {result}")
+                                  
+                              elif action_type == 'notify_security_team':
+                                  result = notify_security_team(response_data)
+                                  actions_executed.append(f"Security team notified: {result}")
+                                  
+                              elif action_type == 'update_firewall':
+                                  result = update_firewall_rules(target)
+                                  actions_executed.append(f"Firewall rules updated: {target}")
+                              
+                              # Log successful action
+                              logger.log_struct({
+                                  'action_type': action_type,
+                                  'target': target,
+                                  'status': 'completed',
+                                  'timestamp': response_data.get('timestamp'),
+                                  'enrichment_id': response_data.get('enrichment_id'),
+                                  'severity_score': response_data.get('severity_score')
+                              })
+                              
+                          except Exception as action_error:
+                              error_msg = f"Failed to execute action {action_type}: {str(action_error)}"
+                              logger.error(error_msg)
+                              actions_executed.append(f"ERROR - {action_type}: {str(action_error)}")
+                      
+                      return {
+                          'actions_executed': actions_executed, 
+                          'status': 'completed',
+                          'total_actions': len(response_data.get('recommended_actions', [])),
+                          'successful_actions': len([a for a in actions_executed if not a.startswith('ERROR')])
+                      }
+                      
+                  except Exception as e:
+                      print(f"Error in automated response: {str(e)}")
+                      return {'status': 'error', 'message': str(e)}
+
+              def isolate_host(instance_name):
+                  """Isolate compromised host by applying restrictive network tags."""
+                  try:
+                      # This would implement actual host isolation logic
+                      # For demonstration, we'll simulate the action
+                      print(f"Simulating host isolation for: {instance_name}")
+                      
+                      # In a real implementation, this would:
+                      # 1. Get the instance details
+                      # 2. Add 'quarantine' network tag
+                      # 3. Apply restrictive firewall rules
+                      # 4. Notify administrators
+                      
+                      return f"Host {instance_name} isolation initiated successfully"
+                  except Exception as e:
+                      raise Exception(f"Host isolation failed: {str(e)}")
+
+              def block_malicious_ip(ip_address):
+                  """Add IP address to Cloud Armor security policy."""
+                  try:
+                      print(f"Simulating IP blocking for: {ip_address}")
+                      
+                      # In a real implementation, this would:
+                      # 1. Update Cloud Armor security policy
+                      # 2. Add IP to deny list
+                      # 3. Apply to relevant load balancers
+                      # 4. Log the action
+                      
+                      return f"IP {ip_address} added to security block list"
+                  except Exception as e:
+                      raise Exception(f"IP blocking failed: {str(e)}")
+
+              def create_incident_ticket(details):
+                  """Create incident ticket in ITSM system."""
+                  try:
+                      # Generate ticket ID based on severity and timestamp
+                      severity = details.get('severity_score', 5)
+                      priority = 'P1' if severity >= 8 else 'P2' if severity >= 6 else 'P3'
+                      ticket_id = f"SEC-{priority}-{int(time.time())}"
+                      
+                      print(f"Creating incident ticket: {ticket_id}")
+                      
+                      # In a real implementation, this would integrate with:
+                      # ServiceNow, Jira, PagerDuty, etc.
+                      
+                      return ticket_id
+                  except Exception as e:
+                      raise Exception(f"Ticket creation failed: {str(e)}")
+
+              def notify_security_team(alert_data):
+                  """Send notifications to security team."""
+                  try:
+                      print("Sending security team notifications")
+                      
+                      # In a real implementation, this would:
+                      # 1. Send email notifications
+                      # 2. Post to Slack/Teams channels
+                      # 3. Send SMS for high-severity incidents
+                      # 4. Update security dashboards
+                      
+                      return "Security team notification sent successfully"
+                  except Exception as e:
+                      raise Exception(f"Notification failed: {str(e)}")
+
+              def update_firewall_rules(target_ip):
+                  """Update firewall rules to block malicious traffic."""
+                  try:
+                      print(f"Updating firewall rules for: {target_ip}")
+                      
+                      # In a real implementation, this would:
+                      # 1. Create VPC firewall rule
+                      # 2. Apply to relevant networks
+                      # 3. Set appropriate priority
+                      # 4. Add logging and monitoring
+                      
+                      return f"Firewall rules updated to block {target_ip}"
+                  except Exception as e:
+                      raise Exception(f"Firewall update failed: {str(e)}")
+            EOT
+            filename = "main.py"
+          }
+          source {
+            content = <<-EOT
+              google-cloud-compute==1.20.0
+              google-cloud-logging==3.11.0
+            EOT
+            filename = "requirements.txt"
+          }
+        }
+      
+  # Deploy automated response Cloud Function (Gen 2)
+  automated_response_function:
+    type: google_cloudfunctions2_function
+    properties:
+      name: automated-response-${random_suffix.hex}
+      location: ${var.region}
+      project: ${var.project_id}
+      description: "Executes automated security response actions based on Chronicle SOAR decisions"
+      
+      build_config:
+        runtime: "python312"
+        entry_point: "automated_response"
+        source:
+          storage_source:
+            bucket: ${function_source_bucket.name}
+            object: ${automated_response_source.name}
+            
+      service_config:
+        max_instance_count: 50
+        min_instance_count: 0
+        available_memory: ${var.function_memory}
+        timeout_seconds: ${var.function_timeout}
+        service_account_email: ${security_automation_sa.email}
+        
+      event_trigger:
+        trigger_region: ${var.region}
+        event_type: "google.cloud.pubsub.topic.v1.messagePublished"
+        pubsub_topic: projects/${var.project_id}/topics/${response_actions_topic.name}
+        retry_policy: "RETRY_POLICY_RETRY"
+        
+    depends_on:
+      - security_automation_sa
+      - response_actions_topic
+      - function_source_bucket
+      
+  # Configure Security Command Center notification
+  scc_notification:
+    type: google_scc_notification_config
+    properties:
+      config_id: scc-automation-${random_suffix.hex}
+      organization: ${var.organization_id}
+      description: "Automated security response notification configuration"
+      pubsub_topic: projects/${var.project_id}/topics/${security_events_topic.name}
+      streaming_config:
+        filter: ${var.notification_filter}
+    depends_on:
+      - security_events_topic
+      - security_apis
+      
+  # Create Cloud Armor security policy for IP blocking
+  security_policy:
+    type: google_compute_security_policy
+    properties:
+      name: automated-security-policy-${random_suffix.hex}
+      project: ${var.project_id}
+      description: "Automated security policy for threat response"
+      
+      # Default rule allowing traffic
+      rule:
+        - action: "allow"
+          priority: 2147483647
+          description: "Default allow rule"
+          match:
+            versioned_expr: "SRC_IPS_V1"
+            config:
+              src_ip_ranges: ["*"]
+              
+        # High priority deny rule for malicious IPs (managed by automation)
+        - action: "deny(403)"
+          priority: 1000
+          description: "Block malicious IPs identified by security automation"
+          match:
+            versioned_expr: "SRC_IPS_V1"
+            config:
+              src_ip_ranges: ["203.0.113.0/24"]  # Example malicious IP range
+              
+    depends_on:
+      - security_apis
+      
+  # Create log sink for security automation audit trail
+  security_audit_sink:
+    type: google_logging_project_sink
+    properties:
+      name: security-automation-audit-${random_suffix.hex}
+      project: ${var.project_id}
+      description: "Audit trail for security automation activities"
+      destination: "pubsub.googleapis.com/projects/${var.project_id}/topics/${response_actions_topic.name}"
+      filter: |
+        resource.type="cloud_function"
+        resource.labels.function_name=~"(threat-enrichment|automated-response).*"
+        severity>=WARNING
+        
+      unique_writer_identity: true
+    depends_on:
+      - response_actions_topic
+      
+  # Grant log sink service account publisher permissions
+  audit_sink_pubsub_permission:
+    type: google_pubsub_topic_iam_member
+    properties:
+      topic: ${response_actions_topic.id}
+      role: "roles/pubsub.publisher"
+      member: ${security_audit_sink.writer_identity}
+      project: ${var.project_id}
+    depends_on:
+      - security_audit_sink
+
+# Outputs for validation and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+    
+  security_events_topic:
+    description: "Pub/Sub topic for security events"
+    value: ${security_events_topic.name}
+    
+  response_actions_topic:
+    description: "Pub/Sub topic for response actions"
+    value: ${response_actions_topic.name}
+    
+  threat_enrichment_function:
+    description: "Threat enrichment Cloud Function name"
+    value: ${threat_enrichment_function.name}
+    
+  automated_response_function:
+    description: "Automated response Cloud Function name"
+    value: ${automated_response_function.name}
+    
+  service_account_email:
+    description: "Security automation service account email"
+    value: ${security_automation_sa.email}
+    
+  security_policy_name:
+    description: "Cloud Armor security policy name"
+    value: ${security_policy.name}
+    
+  scc_notification_name:
+    description: "Security Command Center notification configuration"
+    value: ${scc_notification.name}
+    
+  function_source_bucket:
+    description: "Cloud Storage bucket for function source code"
+    value: ${function_source_bucket.name}
+    
+  deployment_region:
+    description: "Primary deployment region"
+    value: ${var.region}

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Domains, Cloud Functions, Cloud Monitoring
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: domain-monitoring, ssl-certificates, dns-health, serverless, automation
 recipe-generator-version: 1.3
@@ -35,6 +35,7 @@ graph TB
         MONITORING[Cloud Monitoring]
         DOMAINS[Cloud Domains]
         STORAGE[Cloud Storage]
+        PUBSUB[Pub/Sub]
     end
     
     subgraph "External Resources"
@@ -54,6 +55,7 @@ graph TB
     FUNCTION-->DOMAIN3
     FUNCTION-->DOMAINS
     FUNCTION-->STORAGE
+    FUNCTION-->PUBSUB
     FUNCTION-->MONITORING
     MONITORING-->EMAIL
     MONITORING-->SLACK
@@ -61,6 +63,7 @@ graph TB
     style FUNCTION fill:#4285F4
     style MONITORING fill:#34A853
     style DOMAINS fill:#EA4335
+    style PUBSUB fill:#FBBC04
 ```
 
 ## Prerequisites
@@ -153,20 +156,19 @@ echo "✅ Required APIs enabled"
    
    # Create requirements.txt for Python dependencies
    cat > requirements.txt << 'EOF'
-   google-cloud-monitoring==2.16.0
-   google-cloud-domains==1.5.0
-   google-cloud-storage==2.10.0
-   google-cloud-pubsub==2.18.0
-   requests==2.31.0
-   ssl==0.0.0
-   cryptography==41.0.4
-   dnspython==2.4.2
-   EOF
+google-cloud-monitoring==2.27.0
+google-cloud-domains==1.6.0
+google-cloud-storage==2.17.0
+google-cloud-pubsub==2.25.0
+requests==2.32.0
+cryptography==42.0.0
+dnspython==2.6.0
+EOF
    
    echo "✅ Function dependencies configured"
    ```
 
-   The Python dependencies enable comprehensive domain health monitoring with Google Cloud service integration, SSL certificate validation, and DNS resolution checking capabilities.
+   The Python dependencies enable comprehensive domain health monitoring with Google Cloud service integration, SSL certificate validation, and DNS resolution checking capabilities using the latest stable library versions.
 
 4. **Implement Domain Health Check Logic**:
 
@@ -224,7 +226,7 @@ def domain_health_check(request):
             result['ssl_valid'] = ssl_info['valid']
             result['ssl_expires'] = ssl_info['expires']
             
-            if ssl_info['days_until_expiry'] < 30:
+            if ssl_info.get('days_until_expiry', 0) < 30:
                 alert_msg = f"SSL certificate for {domain} expires in {ssl_info['days_until_expiry']} days"
                 result['alerts'].append(alert_msg)
                 send_alert(publisher, topic_path, alert_msg)
@@ -350,7 +352,7 @@ EOF
    echo "✅ Domain health check function implemented"
    ```
 
-   The function provides comprehensive domain health monitoring with SSL certificate validation, DNS resolution checking, and HTTP response verification, integrating seamlessly with Google Cloud monitoring and alerting services.
+   The function provides comprehensive domain health monitoring with SSL certificate validation, DNS resolution checking, and HTTP response verification, integrating seamlessly with Google Cloud monitoring and alerting services using modern Python libraries.
 
 5. **Deploy Cloud Function with Scheduled Execution**:
 
@@ -363,24 +365,26 @@ EOF
    
    # Deploy Cloud Function with environment variables
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-http \
        --source . \
        --entry-point domain_health_check \
        --memory 512MB \
        --timeout 300s \
        --set-env-vars="TOPIC_NAME=${TOPIC_NAME_VAR},BUCKET_NAME=${BUCKET_NAME_VAR}" \
-       --allow-unauthenticated
+       --allow-unauthenticated \
+       --region=${REGION}
    
    # Get function URL for scheduler
    FUNCTION_URL=$(gcloud functions describe ${FUNCTION_NAME} \
+       --region=${REGION} \
        --format="value(httpsTrigger.url)")
    
    echo "✅ Cloud Function deployed: ${FUNCTION_NAME}"
    echo "Function URL: ${FUNCTION_URL}"
    ```
 
-   The Cloud Function is now deployed with appropriate environment configuration and resource allocation, ready to perform automated domain health monitoring with secure HTTP trigger access.
+   The Cloud Function is now deployed with the latest Python 3.12 runtime, appropriate environment configuration and resource allocation, ready to perform automated domain health monitoring with secure HTTP trigger access.
 
 6. **Create Cloud Scheduler Job for Automated Monitoring**:
 
@@ -411,28 +415,29 @@ EOF
    ```bash
    # Create alerting policy configuration
    cat > alert-policy.json << 'EOF'
-   {
-     "displayName": "Domain Health Alert Policy",
-     "conditions": [
-       {
-         "displayName": "SSL Certificate Expiring Soon",
-         "conditionThreshold": {
-           "filter": "metric.type=\"custom.googleapis.com/domain/ssl_valid\"",
-           "comparison": "COMPARISON_LESS_THAN",
-           "thresholdValue": 1.0,
-           "duration": "300s"
-         }
-       }
-     ],
-     "alertStrategy": {
-       "autoClose": "1800s"
-     },
-     "enabled": true
-   }
+{
+  "displayName": "Domain Health Alert Policy",
+  "conditions": [
+    {
+      "displayName": "SSL Certificate Expiring Soon",
+      "conditionThreshold": {
+        "filter": "metric.type=\"custom.googleapis.com/domain/ssl_valid\"",
+        "comparison": "COMPARISON_LESS_THAN",
+        "thresholdValue": 1.0,
+        "duration": "300s"
+      }
+    }
+  ],
+  "alertStrategy": {
+    "autoClose": "1800s"
+  },
+  "enabled": true
+}
 EOF
    
    # Create the alerting policy
-   gcloud alpha monitoring policies create --policy-from-file=alert-policy.json
+   gcloud alpha monitoring policies create \
+       --policy-from-file=alert-policy.json
    
    echo "✅ Cloud Monitoring alert policy configured"
    ```
@@ -467,10 +472,13 @@ EOF
    ```bash
    # Check function status and configuration
    gcloud functions describe ${FUNCTION_NAME} \
+       --region=${REGION} \
        --format="table(name,status,runtime,timeout)"
    
    # View function logs
-   gcloud functions logs read ${FUNCTION_NAME} --limit=10
+   gcloud functions logs read ${FUNCTION_NAME} \
+       --region=${REGION} \
+       --limit=10
    ```
 
    Expected output: Function status should show "ACTIVE" with proper runtime and timeout configuration.
@@ -530,7 +538,9 @@ EOF
 
    ```bash
    # Delete the monitoring function
-   gcloud functions delete ${FUNCTION_NAME} --quiet
+   gcloud functions delete ${FUNCTION_NAME} \
+       --region=${REGION} \
+       --quiet
    
    echo "✅ Cloud Function deleted"
    ```

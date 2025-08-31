@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: EventBridge Scheduler, MemoryDB for Redis, Lambda, Cost Explorer
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-optimization, resource-lifecycle, automation, redis, scheduling
 recipe-generator-version: 1.3
@@ -435,7 +435,7 @@ EOF
    # Create Lambda function with enhanced configuration
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb:///tmp/lambda-function.zip \
@@ -533,7 +533,7 @@ EOF
    ```bash
    # Enable Cost Explorer (if not already enabled)
    aws ce get-cost-and-usage \
-       --time-period Start=2025-07-01,End=2025-07-12 \
+       --time-period Start=2025-07-01,End=2025-07-23 \
        --granularity MONTHLY \
        --metrics BlendedCost \
        --group-by Type=DIMENSION,Key=SERVICE > /dev/null 2>&1 || \

@@ -1,15 +1,15 @@
 ---
-title: VMware Workload Migration and Modernization with Google Cloud VMware Engine and Migrate for Anthos
+title: VMware Workload Migration and Modernization with Google Cloud VMware Engine and Migrate to Containers
 id: 7c9a4e2b
 category: migration
 difficulty: 400
 subject: gcp
 services: Google Cloud VMware Engine, Migrate to Containers, Cloud Monitoring, Cloud Operations
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: vmware, migration, containerization, modernization, hybrid-cloud
 recipe-generator-version: 1.3
@@ -83,7 +83,7 @@ graph TB
 1. Google Cloud project with billing enabled and appropriate IAM permissions
 2. VMware vSphere environment (version 6.5 or higher) with network connectivity to Google Cloud
 3. Google Cloud CLI (gcloud) installed and authenticated
-4. Migrate to Containers CLI installed on a local workstation or jumpbox
+4. Docker installed on local machine for Migrate to Containers CLI
 5. Network connectivity between on-premises VMware environment and Google Cloud (VPN or Interconnect)
 6. Estimated cost: $2,000-5,000/month for VMware Engine nodes, plus additional costs for GKE clusters and Cloud Run instances
 
@@ -134,38 +134,60 @@ echo "✅ Networks and subnets created for VMware Engine"
 
 ## Steps
 
-1. **Create Google Cloud VMware Engine Private Cloud**:
+1. **Create VMware Engine Network Resource**:
+
+   VMware Engine networks provide the foundation for private cloud connectivity within Google Cloud. These networks handle routing and firewall rules between your private cloud and other Google Cloud resources, establishing the secure communication channels needed for both migration and ongoing operations.
+
+   ```bash
+   # Create VMware Engine network for private cloud connectivity
+   gcloud vmware networks create ${PRIVATE_CLOUD_NAME}-network \
+       --type=LEGACY \
+       --location=${VMWARE_ENGINE_REGION} \
+       --description="Network for VMware migration private cloud"
+   
+   # Wait for network creation to complete
+   gcloud vmware operations list \
+       --location=${VMWARE_ENGINE_REGION} \
+       --filter="targetType:vmwareengine.googleapis.com/Network" \
+       --format="table(name,status,createTime)"
+   
+   echo "✅ VMware Engine network created successfully"
+   ```
+
+   The VMware Engine network establishes the foundational connectivity layer that enables secure communication between your private cloud, Google Cloud services, and on-premises infrastructure. This network resource automatically configures the necessary routing and firewall rules for seamless integration.
+
+2. **Create Google Cloud VMware Engine Private Cloud**:
 
    Google Cloud VMware Engine provides a fully managed VMware infrastructure that runs natively on Google Cloud, enabling seamless migration of existing VMware workloads without modification. This service maintains compatibility with your existing VMware tools, policies, and procedures while providing the scalability, security, and global reach of Google Cloud's infrastructure.
 
    ```bash
-   # Create VMware Engine private cloud
+   # Create VMware Engine private cloud with initial cluster
    gcloud vmware private-clouds create ${PRIVATE_CLOUD_NAME} \
-       --location=${VMWARE_ENGINE_REGION} \
+       --location=${ZONE} \
        --cluster=initial-cluster \
        --node-type-config=type=standard-72,count=3 \
-       --network=${NETWORK_NAME} \
        --management-range=10.10.0.0/24 \
-       --vmware-engine-network=${PRIVATE_CLOUD_NAME}-network \
-       --description="VMware migration private cloud"
+       --vmware-engine-network=${PRIVATE_CLOUD_NAME}-network
    
-   # Wait for private cloud creation (this can take 30-45 minutes)
-   gcloud vmware private-clouds describe ${PRIVATE_CLOUD_NAME} \
-       --location=${VMWARE_ENGINE_REGION} \
-       --format="value(state)"
+   # Monitor private cloud creation progress (takes 30-45 minutes)
+   while [[ $(gcloud vmware private-clouds describe ${PRIVATE_CLOUD_NAME} \
+       --location=${ZONE} --format="value(state)") != "ACTIVE" ]]; do
+     echo "Private cloud provisioning in progress..."
+     sleep 60
+   done
    
-   echo "✅ VMware Engine private cloud creation initiated"
-   echo "Note: Private cloud provisioning takes 30-45 minutes"
+   echo "✅ VMware Engine private cloud created and active"
+   echo "Note: Private cloud provisioning completed successfully"
    ```
 
    The VMware Engine private cloud provides dedicated ESXi hosts running vSphere, vCenter Server, and NSX-T Data Center, creating an isolated VMware environment within Google Cloud. This foundation enables you to migrate existing workloads using familiar VMware tools while benefiting from Google Cloud's global network and security infrastructure.
 
-2. **Configure Network Connectivity and HCX Setup**:
+3. **Configure Network Connectivity and HCX Setup**:
 
    VMware HCX (Hybrid Cloud Extension) enables seamless workload migration between on-premises VMware environments and Google Cloud VMware Engine. HCX provides advanced migration capabilities including live migration, bulk migration, and network extension, ensuring minimal downtime during the migration process.
 
    ```bash
-   # Create firewall rules for VMware traffic
+   # Create firewall rules for VMware HCX traffic
    gcloud compute firewall-rules create allow-vmware-hcx \
        --network=${NETWORK_NAME} \
        --allow=tcp:443,tcp:8043,tcp:9443,udp:500,udp:4500 \
@@ -177,9 +199,9 @@ echo "✅ Networks and subnets created for VMware Engine"
        --network=${NETWORK_NAME} \
        --region=${REGION}
    
-   # Get private cloud details for HCX configuration
+   # Get private cloud vCenter details for HCX configuration
    PRIVATE_CLOUD_IP=$(gcloud vmware private-clouds describe ${PRIVATE_CLOUD_NAME} \
-       --location=${VMWARE_ENGINE_REGION} \
+       --location=${ZONE} \
        --format="value(vcenter.internalIp)")
    
    echo "✅ Network connectivity configured"
@@ -189,17 +211,17 @@ echo "✅ Networks and subnets created for VMware Engine"
 
    Network connectivity establishes secure communication channels between your on-premises VMware environment and Google Cloud VMware Engine. This setup enables HCX to perform migrations while maintaining network security and ensuring encrypted data transfer throughout the migration process.
 
-3. **Install and Configure Migrate to Containers CLI**:
+4. **Install and Configure Migrate to Containers CLI**:
 
    Migrate to Containers (M2C) analyzes existing virtual machine workloads and automatically generates containerized versions that can run on Google Kubernetes Engine or Cloud Run. This tool bridges the gap between traditional VM-based applications and modern container orchestration platforms.
 
    ```bash
-   # Download and install Migrate to Containers CLI
-   curl -O https://storage.googleapis.com/m2c-cli-release/m2c
-   chmod +x m2c
+   # Download and install Migrate to Containers CLI (latest version)
+   curl -O "https://m2c-cli-release.storage.googleapis.com/$(curl -s https://m2c-cli-release.storage.googleapis.com/latest)/linux/amd64/m2c"
+   chmod +x ./m2c
    sudo mv m2c /usr/local/bin/
    
-   # Verify installation
+   # Verify installation and check version
    m2c version
    
    # Create Artifact Registry repository for container images
@@ -213,7 +235,7 @@ echo "✅ Networks and subnets created for VMware Engine"
    
    # Create GKE cluster for modernized workloads
    gcloud container clusters create ${GKE_CLUSTER_NAME} \
-       --region=${REGION} \
+       --location=${REGION} \
        --num-nodes=2 \
        --enable-autoscaling \
        --min-nodes=1 \
@@ -229,7 +251,7 @@ echo "✅ Networks and subnets created for VMware Engine"
 
    The M2C CLI provides local analysis and containerization capabilities, allowing you to evaluate workloads for modernization potential and generate deployment-ready container artifacts. This approach gives you control over the modernization process while leveraging Google Cloud's managed container services.
 
-4. **Analyze Workloads for Migration Assessment**:
+5. **Analyze Workloads for Migration Assessment**:
 
    Workload analysis is crucial for determining the optimal migration strategy for each application. Some workloads benefit from lift-and-shift to VMware Engine, while others are suitable for containerization and modernization through Migrate to Containers.
 
@@ -241,7 +263,7 @@ echo "✅ Networks and subnets created for VMware Engine"
    # Initialize M2C workspace
    m2c init
    
-   # Create assessment configuration
+   # Create assessment configuration for VMware source
    cat > assessment-config.yaml << EOF
    apiVersion: v1
    kind: Config
@@ -258,7 +280,7 @@ echo "✅ Networks and subnets created for VMware Engine"
        cluster: "${GKE_CLUSTER_NAME}"
    EOF
    
-   # Generate migration plan template
+   # Generate migration plan template for Linux workloads
    m2c generate migration-plan \
        --source-type=vm \
        --os-type=linux \
@@ -270,7 +292,7 @@ echo "✅ Networks and subnets created for VMware Engine"
 
    The assessment phase identifies application dependencies, resource requirements, and modernization candidates. This analysis drives decision-making for the hybrid migration approach, ensuring each workload follows the most appropriate path to Google Cloud.
 
-5. **Execute VMware Workload Migration to VMware Engine**:
+6. **Execute VMware Workload Migration to VMware Engine**:
 
    VMware HCX enables seamless migration of virtual machines from on-premises infrastructure to Google Cloud VMware Engine. This process maintains application state and minimizes downtime while transferring workloads to the cloud environment.
 
@@ -295,9 +317,9 @@ echo "✅ Networks and subnets created for VMware Engine"
          - vm5-secondary-db
    EOF
    
-   # Monitor migration status (simulated for recipe purposes)
+   # Display HCX configuration steps (manual process)
    echo "Migration commands would be executed through HCX Manager:"
-   echo "1. Log into HCX Manager at ${PRIVATE_CLOUD_IP}:9443"
+   echo "1. Log into HCX Manager at https://${PRIVATE_CLOUD_IP}:9443"
    echo "2. Create service mesh between sites"
    echo "3. Configure network profiles and compute profiles"
    echo "4. Execute bulk migrations for web tier"
@@ -330,7 +352,7 @@ echo "✅ Networks and subnets created for VMware Engine"
 
    HCX migration provides multiple options including bulk migration for minimal-downtime scenarios and vMotion for zero-downtime transfers. The choice depends on application criticality and maintenance window availability, ensuring business continuity throughout the migration process.
 
-6. **Identify and Containerize Selected Workloads**:
+7. **Identify and Containerize Selected Workloads**:
 
    After successful migration to VMware Engine, certain workloads can be further modernized through containerization. This selective approach enables gradual modernization while maintaining stability for critical applications that benefit from remaining in VM format.
 
@@ -355,7 +377,7 @@ echo "✅ Networks and subnets created for VMware Engine"
        dependencies: ["rabbitmq", "elasticsearch"]
    EOF
    
-   # Configure M2C for selected workload
+   # Configure M2C migration plan for selected workload
    cat > web-app-migration-plan.yaml << EOF
    apiVersion: migrate.cloud.google.com/v1beta1
    kind: MigrationPlan
@@ -388,14 +410,14 @@ echo "✅ Networks and subnets created for VMware Engine"
 
    Containerization transforms VM-based applications into cloud-native containers that can leverage Kubernetes orchestration capabilities. This process maintains application functionality while enabling features like auto-scaling, rolling updates, and improved resource utilization.
 
-7. **Deploy Modernized Applications to Google Kubernetes Engine**:
+8. **Deploy Modernized Applications to Google Kubernetes Engine**:
 
    Google Kubernetes Engine provides enterprise-grade container orchestration with integrated security, monitoring, and scaling capabilities. Deploying modernized applications to GKE enables cloud-native operational patterns while maintaining compatibility with existing DevOps workflows.
 
    ```bash
    # Get GKE cluster credentials
    gcloud container clusters get-credentials ${GKE_CLUSTER_NAME} \
-       --region=${REGION}
+       --location=${REGION}
    
    # Create namespace for modernized applications
    kubectl create namespace modernized-apps
@@ -462,7 +484,7 @@ echo "✅ Networks and subnets created for VMware Engine"
 
    GKE deployment enables the modernized application to benefit from Kubernetes features like automatic healing, rolling updates, and horizontal scaling. This cloud-native deployment model improves application resilience and operational efficiency compared to traditional VM deployments.
 
-8. **Configure Comprehensive Monitoring and Operations**:
+9. **Configure Comprehensive Monitoring and Operations**:
 
    Google Cloud Operations Suite provides unified monitoring, logging, and alerting across both VMware Engine and containerized workloads. This comprehensive observability ensures operational excellence throughout the hybrid migration journey.
 
@@ -571,12 +593,12 @@ echo "✅ Networks and subnets created for VMware Engine"
    ```bash
    # Check private cloud operational status
    gcloud vmware private-clouds describe ${PRIVATE_CLOUD_NAME} \
-       --location=${VMWARE_ENGINE_REGION} \
+       --location=${ZONE} \
        --format="table(name,state,createTime,managementCluster.nodeTypeConfigs)"
    
    # Verify vCenter accessibility
    VCENTER_IP=$(gcloud vmware private-clouds describe ${PRIVATE_CLOUD_NAME} \
-       --location=${VMWARE_ENGINE_REGION} \
+       --location=${ZONE} \
        --format="value(vcenter.internalIp)")
    
    echo "vCenter Server accessible at: https://${VCENTER_IP}"
@@ -589,7 +611,7 @@ echo "✅ Networks and subnets created for VMware Engine"
    ```bash
    # Verify GKE cluster status
    gcloud container clusters describe ${GKE_CLUSTER_NAME} \
-       --region=${REGION} \
+       --location=${REGION} \
        --format="value(status,currentNodeCount)"
    
    # Check modernized application status
@@ -631,7 +653,7 @@ echo "✅ Networks and subnets created for VMware Engine"
    ```bash
    # Delete GKE cluster
    gcloud container clusters delete ${GKE_CLUSTER_NAME} \
-       --region=${REGION} \
+       --location=${REGION} \
        --quiet
    
    # Remove Artifact Registry repository
@@ -647,7 +669,7 @@ echo "✅ Networks and subnets created for VMware Engine"
    ```bash
    # Delete VMware Engine private cloud
    gcloud vmware private-clouds delete ${PRIVATE_CLOUD_NAME} \
-       --location=${VMWARE_ENGINE_REGION} \
+       --location=${ZONE} \
        --quiet
    
    echo "✅ VMware Engine private cloud deletion initiated"
@@ -661,6 +683,11 @@ echo "✅ Networks and subnets created for VMware Engine"
    gcloud alpha monitoring policies list \
        --format="value(name)" | \
        xargs -I {} gcloud alpha monitoring policies delete {} --quiet
+   
+   # Remove VMware Engine network
+   gcloud vmware networks delete ${PRIVATE_CLOUD_NAME}-network \
+       --location=${VMWARE_ENGINE_REGION} \
+       --quiet
    
    # Delete VPC network and subnets
    gcloud compute networks subnets delete vmware-mgmt-subnet \

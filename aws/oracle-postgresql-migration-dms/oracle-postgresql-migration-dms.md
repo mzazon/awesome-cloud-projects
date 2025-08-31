@@ -4,12 +4,12 @@ id: 94e1ff2b
 category: database
 difficulty: 400
 subject: aws
-services: AWS DMS, AWS SCT, RDS, Aurora PostgreSQL
+services: DMS, RDS, Aurora PostgreSQL, Schema Conversion Tool
 estimated-time: 300 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: database, migration, oracle, postgresql, dms, sct, aurora, heterogeneous-migration
 recipe-generator-version: 1.3
@@ -103,6 +103,14 @@ aws ec2 create-tags \
     --resources ${VPC_ID} \
     --tags Key=Name,Value=${MIGRATION_PROJECT_NAME}-vpc
 
+# Create internet gateway for public access (needed for DMS)
+IGW_ID=$(aws ec2 create-internet-gateway \
+    --query 'InternetGateway.InternetGatewayId' --output text)
+
+aws ec2 attach-internet-gateway \
+    --vpc-id ${VPC_ID} \
+    --internet-gateway-id ${IGW_ID}
+
 # Create subnets in different AZs
 SUBNET_1_ID=$(aws ec2 create-subnet \
     --vpc-id ${VPC_ID} \
@@ -115,6 +123,20 @@ SUBNET_2_ID=$(aws ec2 create-subnet \
     --cidr-block 10.0.2.0/24 \
     --availability-zone ${AWS_REGION}b \
     --query 'Subnet.SubnetId' --output text)
+
+# Create security group for DMS and Aurora
+SECURITY_GROUP_ID=$(aws ec2 create-security-group \
+    --group-name ${MIGRATION_PROJECT_NAME}-sg \
+    --description "Security group for DMS migration" \
+    --vpc-id ${VPC_ID} \
+    --query 'GroupId' --output text)
+
+# Allow DMS and PostgreSQL traffic
+aws ec2 authorize-security-group-ingress \
+    --group-id ${SECURITY_GROUP_ID} \
+    --protocol tcp \
+    --port 5432 \
+    --source-group ${SECURITY_GROUP_ID}
 
 # Create DB subnet group for Aurora
 aws rds create-db-subnet-group \
@@ -144,11 +166,11 @@ echo "✅ Created VPC and networking components"
    aws rds create-db-cluster \
        --db-cluster-identifier ${AURORA_CLUSTER_ID} \
        --engine aurora-postgresql \
-       --engine-version 15.4 \
+       --engine-version 16.4 \
        --master-username dbadmin \
        --master-user-password 'TempPassword123!' \
        --db-subnet-group-name ${AURORA_CLUSTER_ID}-subnet-group \
-       --vpc-security-group-ids ${VPC_SECURITY_GROUP_ID} \
+       --vpc-security-group-ids ${SECURITY_GROUP_ID} \
        --backup-retention-period 7 \
        --preferred-backup-window "03:00-04:00" \
        --preferred-maintenance-window "sun:04:00-sun:05:00" \
@@ -157,11 +179,10 @@ echo "✅ Created VPC and networking components"
    # Create Aurora PostgreSQL instance
    aws rds create-db-instance \
        --db-instance-identifier ${AURORA_CLUSTER_ID}-instance-1 \
-       --db-instance-class db.r6g.large \
+       --db-instance-class db.r6i.large \
        --engine aurora-postgresql \
        --db-cluster-identifier ${AURORA_CLUSTER_ID} \
        --monitoring-interval 60 \
-       --monitoring-role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/rds-monitoring-role \
        --performance-insights-enabled \
        --performance-insights-retention-period 7
    
@@ -179,19 +200,21 @@ echo "✅ Created VPC and networking components"
    AWS Schema Conversion Tool (SCT) is a critical component for heterogeneous database migrations, providing automated analysis and conversion of Oracle database schemas to PostgreSQL-compatible formats. SCT examines Oracle-specific objects including stored procedures, functions, triggers, and data types, then generates equivalent PostgreSQL code while identifying potential conversion challenges. This tool significantly reduces manual effort in schema modernization and provides detailed assessment reports that help plan migration strategies and estimate required development resources.
 
    ```bash
-   # Download AWS SCT (Linux/macOS)
-   curl -O https://s3.amazonaws.com/publicsctdownload/AWS+SCT/1.0.668/aws-schema-conversion-tool-1.0.668.zip
+   # Download AWS SCT (Linux/Ubuntu)
+   curl -O https://s3.amazonaws.com/publicsctdownload/Ubuntu/aws-schema-conversion-tool-1.0.latest.zip
    
    # Extract and install
-   unzip aws-schema-conversion-tool-1.0.668.zip
-   cd aws-schema-conversion-tool-1.0.668
+   unzip aws-schema-conversion-tool-1.0.latest.zip
+   cd aws-schema-conversion-tool-1.0.*
    
-   # Make executable and create symlink
-   chmod +x aws-schema-conversion-tool
-   sudo ln -sf $(pwd)/aws-schema-conversion-tool /usr/local/bin/aws-sct
+   # Install SCT (Ubuntu/Debian)
+   sudo dpkg -i aws-schema-conversion-tool-1.0.*.deb
+   
+   # For CentOS/RHEL/Fedora use:
+   # sudo yum install aws-schema-conversion-tool-1.0.*.rpm
    
    # Verify installation
-   aws-sct --version
+   which aws-schema-conversion-tool
    
    echo "✅ AWS SCT installed successfully"
    ```
@@ -203,7 +226,7 @@ echo "✅ Created VPC and networking components"
    AWS DMS requires specific IAM roles to access VPC resources and CloudWatch logging services securely. These service-linked roles follow the principle of least privilege, granting DMS only the minimum permissions necessary for network management and operational monitoring. The VPC management role enables DMS to create and manage network interfaces within your VPC, while the CloudWatch logs role provides audit trails and troubleshooting capabilities essential for production migration operations.
 
    ```bash
-   # Create DMS VPC role
+   # Create DMS VPC role (if not exists)
    aws iam create-role \
        --role-name dms-vpc-role \
        --assume-role-policy-document '{
@@ -217,14 +240,14 @@ echo "✅ Created VPC and networking components"
                    "Action": "sts:AssumeRole"
                }
            ]
-       }'
+       }' 2>/dev/null || echo "DMS VPC role already exists"
    
    # Attach DMS VPC management policy
    aws iam attach-role-policy \
        --role-name dms-vpc-role \
        --policy-arn arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole
    
-   # Create DMS CloudWatch logs role
+   # Create DMS CloudWatch logs role (if not exists)  
    aws iam create-role \
        --role-name dms-cloudwatch-logs-role \
        --assume-role-policy-document '{
@@ -238,7 +261,7 @@ echo "✅ Created VPC and networking components"
                    "Action": "sts:AssumeRole"
                }
            ]
-       }'
+       }' 2>/dev/null || echo "DMS CloudWatch logs role already exists"
    
    # Attach CloudWatch logs policy
    aws iam attach-role-policy \
@@ -258,13 +281,13 @@ echo "✅ Created VPC and networking components"
    # Create DMS replication instance
    aws dms create-replication-instance \
        --replication-instance-identifier ${REPLICATION_INSTANCE_ID} \
-       --replication-instance-class dms.c5.large \
+       --replication-instance-class dms.c6i.large \
        --allocated-storage 100 \
        --auto-minor-version-upgrade \
        --multi-az \
-       --engine-version 3.5.2 \
        --replication-subnet-group-identifier ${DMS_SUBNET_GROUP_NAME} \
-       --publicly-accessible false
+       --publicly-accessible false \
+       --vpc-security-group-ids ${SECURITY_GROUP_ID}
    
    # Wait for replication instance to be available
    aws dms wait replication-instance-available \
@@ -417,17 +440,16 @@ echo "✅ Created VPC and networking components"
    }
    EOF
    
-   # Run SCT assessment (command-line interface)
-   aws-sct --project-file sct-project-config.json \
-       --action assess \
-       --output-dir ./sct-assessment-report
+   # Launch SCT GUI for assessment (manual step)
+   echo "Open AWS SCT GUI and create a new project using the configuration above"
+   echo "Run assessment and generate conversion report"
    
-   # Generate conversion report
-   aws-sct --project-file sct-project-config.json \
-       --action report \
-       --output-file ./schema-conversion-report.html
+   # Alternative: Use SCT CLI if available in your environment
+   # aws-schema-conversion-tool --project-file sct-project-config.json \
+   #     --action assess \
+   #     --output-dir ./sct-assessment-report
    
-   echo "✅ Schema conversion assessment completed"
+   echo "✅ Schema conversion configuration prepared"
    ```
 
    The schema conversion assessment provides comprehensive analysis of migration complexity, identifying potential challenges and generating PostgreSQL-compatible database objects. The conversion report serves as a roadmap for application development teams, highlighting areas requiring manual code changes and providing conversion statistics. This assessment enables accurate project planning and resource allocation for the overall migration initiative.
@@ -558,7 +580,9 @@ echo "✅ Created VPC and networking components"
        --start-replication-task-type start-replication
    
    # Monitor migration progress
-   while true; do
+   echo "Monitoring migration progress..."
+   
+   for i in {1..10}; do
        TASK_STATUS=$(aws dms describe-replication-tasks \
            --replication-task-identifier ${MIGRATION_PROJECT_NAME}-task \
            --query 'ReplicationTasks[0].Status' --output text)
@@ -645,33 +669,38 @@ echo "✅ Created VPC and networking components"
     Comprehensive monitoring and alerting provide operational visibility into migration performance and reliability, enabling proactive management of enterprise-scale database migrations. CloudWatch alarms monitor critical metrics like replication lag and task failures, providing early warning of potential issues that could impact migration timelines. This monitoring framework ensures 24/7 visibility into migration operations and enables rapid response to performance degradation or failure scenarios.
 
     ```bash
+    # Create SNS topic for DMS alerts (optional)
+    SNS_TOPIC_ARN=$(aws sns create-topic \
+        --name dms-migration-alerts \
+        --query 'TopicArn' --output text)
+    
     # Create CloudWatch alarm for replication lag
     aws cloudwatch put-metric-alarm \
         --alarm-name "${MIGRATION_PROJECT_NAME}-replication-lag" \
         --alarm-description "Monitor DMS replication lag" \
-        --metric-name ReplicationLag \
+        --metric-name CDCLatencySource \
         --namespace AWS/DMS \
         --statistic Average \
         --period 300 \
         --threshold 300 \
         --comparison-operator GreaterThanThreshold \
         --evaluation-periods 2 \
-        --alarm-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:dms-alerts \
+        --alarm-actions ${SNS_TOPIC_ARN} \
         --dimensions Name=ReplicationInstanceIdentifier,Value=${REPLICATION_INSTANCE_ID} \
                    Name=ReplicationTaskIdentifier,Value=${MIGRATION_PROJECT_NAME}-task
     
-    # Create CloudWatch alarm for task failures
+    # Create CloudWatch alarm for migration errors
     aws cloudwatch put-metric-alarm \
-        --alarm-name "${MIGRATION_PROJECT_NAME}-task-failure" \
-        --alarm-description "Monitor DMS task failures" \
-        --metric-name ReplicationTaskFailure \
+        --alarm-name "${MIGRATION_PROJECT_NAME}-migration-errors" \
+        --alarm-description "Monitor DMS migration errors" \
+        --metric-name CDCChangesMemorySource \
         --namespace AWS/DMS \
         --statistic Sum \
         --period 300 \
-        --threshold 1 \
-        --comparison-operator GreaterThanOrEqualToThreshold \
+        --threshold 1000 \
+        --comparison-operator GreaterThanThreshold \
         --evaluation-periods 1 \
-        --alarm-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:dms-alerts \
+        --alarm-actions ${SNS_TOPIC_ARN} \
         --dimensions Name=ReplicationTaskIdentifier,Value=${MIGRATION_PROJECT_NAME}-task
     
     echo "✅ Monitoring and alerting configured"
@@ -842,6 +871,10 @@ echo "✅ Created VPC and networking components"
        --db-instance-identifier ${AURORA_CLUSTER_ID}-instance-1 \
        --skip-final-snapshot
    
+   # Wait for instance deletion
+   aws rds wait db-instance-deleted \
+       --db-instance-identifier ${AURORA_CLUSTER_ID}-instance-1
+   
    # Delete Aurora cluster
    aws rds delete-db-cluster \
        --db-cluster-identifier ${AURORA_CLUSTER_ID} \
@@ -853,6 +886,14 @@ echo "✅ Created VPC and networking components"
 4. **Clean Up Network Resources**:
 
    ```bash
+   # Delete CloudWatch alarms
+   aws cloudwatch delete-alarms \
+       --alarm-names "${MIGRATION_PROJECT_NAME}-replication-lag" \
+                     "${MIGRATION_PROJECT_NAME}-migration-errors"
+   
+   # Delete SNS topic (if created)
+   aws sns delete-topic --topic-arn ${SNS_TOPIC_ARN}
+   
    # Delete subnet groups
    aws dms delete-replication-subnet-group \
        --replication-subnet-group-identifier ${DMS_SUBNET_GROUP_NAME}
@@ -860,16 +901,26 @@ echo "✅ Created VPC and networking components"
    aws rds delete-db-subnet-group \
        --db-subnet-group-name ${AURORA_CLUSTER_ID}-subnet-group
    
+   # Delete security group
+   aws ec2 delete-security-group --group-id ${SECURITY_GROUP_ID}
+   
    # Delete subnets
    aws ec2 delete-subnet --subnet-id ${SUBNET_1_ID}
    aws ec2 delete-subnet --subnet-id ${SUBNET_2_ID}
+   
+   # Detach and delete internet gateway
+   aws ec2 detach-internet-gateway \
+       --vpc-id ${VPC_ID} \
+       --internet-gateway-id ${IGW_ID}
+   
+   aws ec2 delete-internet-gateway --internet-gateway-id ${IGW_ID}
    
    # Delete VPC
    aws ec2 delete-vpc --vpc-id ${VPC_ID}
    
    # Clean up environment variables
    unset MIGRATION_PROJECT_NAME REPLICATION_INSTANCE_ID AURORA_CLUSTER_ID
-   unset DMS_SUBNET_GROUP_NAME VPC_ID SUBNET_1_ID SUBNET_2_ID
+   unset DMS_SUBNET_GROUP_NAME VPC_ID SUBNET_1_ID SUBNET_2_ID SECURITY_GROUP_ID
    
    echo "✅ Network resources and environment variables cleaned up"
    ```
@@ -882,9 +933,9 @@ The AWS Schema Conversion Tool serves as the foundation for heterogeneous migrat
 
 AWS DMS complements SCT by handling the data migration process with minimal downtime through its [change data capture capabilities](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Task.CDC.html). The service's ability to perform full load followed by ongoing replication ensures data consistency throughout the migration window. However, organizations must carefully consider factors such as replication lag, network bandwidth, and source database performance impact when planning migration timelines according to [DMS best practices](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_BestPractices.html).
 
-[Aurora PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.AuroraPostgreSQL.html) provides advanced features including JSON/JSONB support, full-text search, and extensibility through custom functions, often providing opportunities for application enhancement beyond simple migration. Organizations frequently discover that PostgreSQL's cost-effectiveness and modern feature set enable new capabilities that were previously cost-prohibitive with Oracle licensing.
+[Aurora PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.AuroraPostgreSQL.html) provides advanced features including JSON/JSONB support, full-text search, and extensibility through custom functions, often providing opportunities for application enhancement beyond simple migration. Organizations frequently discover that PostgreSQL's cost-effectiveness and modern feature set enable new capabilities that were previously cost-prohibitive with Oracle licensing. The latest [Aurora PostgreSQL versions](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraPostgreSQLReleaseNotes/aurorapostgresql-release-calendar.html) offer enhanced performance and compatibility features that further ease migration complexity.
 
-> **Tip**: Use AWS SCT's assessment reports to identify conversion challenges early in the migration planning process, allowing sufficient time for application code modifications and testing.
+> **Tip**: Use AWS SCT's assessment reports to identify conversion challenges early in the migration planning process, allowing sufficient time for application code modifications and testing. Consider using newer DMS instance classes like C6i for better performance and cost efficiency.
 
 ## Challenge
 

@@ -1,0 +1,377 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cost Monitoring with Cost Explorer and Budgets - Implements comprehensive 
+  cost monitoring using AWS Budgets for proactive alerts and SNS for notifications.
+  Creates a monthly budget with graduated alert thresholds (50%, 75%, 90% actual 
+  and 100% forecasted) to prevent budget overruns.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Budget Configuration"
+        Parameters:
+          - BudgetAmount
+          - BudgetName
+          - BudgetTimeUnit
+      - Label:
+          default: "Notification Settings"
+        Parameters:
+          - NotificationEmail
+          - SNSTopicName
+      - Label:
+          default: "Alert Thresholds"
+        Parameters:
+          - EarlyWarningThreshold
+          - SeriousThreshold
+          - CriticalThreshold
+          - ForecastThreshold
+    ParameterLabels:
+      BudgetAmount:
+        default: "Monthly Budget Amount (USD)"
+      BudgetName:
+        default: "Budget Name"
+      NotificationEmail:
+        default: "Email for Budget Alerts"
+      EarlyWarningThreshold:
+        default: "Early Warning Threshold (%)"
+
+Parameters:
+  BudgetAmount:
+    Type: Number
+    Default: 100.00
+    MinValue: 1.00
+    MaxValue: 1000000.00
+    Description: >
+      Monthly budget amount in USD. This is the total spending limit for your account.
+    ConstraintDescription: Must be a number between 1.00 and 1,000,000.00
+
+  BudgetName:
+    Type: String
+    Default: monthly-cost-budget
+    MinLength: 3
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    Description: >
+      Name for the AWS budget. Must contain only alphanumeric characters, hyphens, and underscores.
+    ConstraintDescription: Budget name must be 3-100 characters and contain only letters, numbers, hyphens, and underscores.
+
+  BudgetTimeUnit:
+    Type: String
+    Default: MONTHLY
+    AllowedValues:
+      - MONTHLY
+      - QUARTERLY
+      - ANNUALLY
+    Description: Time period for budget tracking (Monthly recommended for proactive cost management)
+
+  NotificationEmail:
+    Type: String
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    Description: >
+      Email address to receive budget alert notifications. Must be a valid email format.
+    ConstraintDescription: Must be a valid email address format
+
+  SNSTopicName:
+    Type: String
+    Default: budget-alerts
+    MinLength: 3
+    MaxLength: 256
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    Description: >
+      Name for the SNS topic that delivers budget notifications
+    ConstraintDescription: Topic name must be 3-256 characters and contain only letters, numbers, hyphens, and underscores.
+
+  EarlyWarningThreshold:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 100
+    Description: Early warning alert threshold as percentage of budget (recommended 50%)
+
+  SeriousThreshold:
+    Type: Number
+    Default: 75
+    MinValue: 1
+    MaxValue: 100
+    Description: Serious concern alert threshold as percentage of budget (recommended 75%)
+
+  CriticalThreshold:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 100
+    Description: Critical alert threshold as percentage of budget (recommended 90%)
+
+  ForecastThreshold:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 100
+    Description: Forecasted spending alert threshold as percentage of budget (recommended 100%)
+
+Conditions:
+  # Validate threshold ordering to ensure logical alert progression
+  ValidThresholdOrder: !And
+    - !Not [!Equals [!Ref EarlyWarningThreshold, !Ref SeriousThreshold]]
+    - !Not [!Equals [!Ref SeriousThreshold, !Ref CriticalThreshold]]
+    - !Not [!Equals [!Ref EarlyWarningThreshold, !Ref CriticalThreshold]]
+
+Resources:
+  # SNS Topic for Budget Notifications
+  # This topic delivers real-time budget alerts through multiple channels
+  BudgetNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref SNSTopicName
+      DisplayName: !Sub 'Budget Alerts for ${BudgetName}'
+      Description: >
+        SNS topic for AWS Budget notifications. Delivers graduated alerts 
+        when spending thresholds are exceeded.
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Purpose
+          Value: CostMonitoring
+        - Key: Budget
+          Value: !Ref BudgetName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Email Subscription for Budget Alerts
+  # Automatically subscribes the specified email to receive notifications
+  BudgetNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref BudgetNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      DeliveryPolicy:
+        throttlePolicy:
+          maxReceivesPerSecond: 1
+        healthyRetryPolicy:
+          numRetries: 20
+          minDelayTarget: 20
+          maxDelayTarget: 20
+          numMinDelayRetries: 0
+          numMaxDelayRetries: 0
+          numNoDelayRetries: 0
+
+  # IAM Role for Budget Service
+  # Allows AWS Budgets service to publish to SNS topic
+  BudgetServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'BudgetServiceRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref BudgetNotificationTopic
+      Tags:
+        - Key: Purpose
+          Value: CostMonitoring
+        - Key: Service
+          Value: Budgets
+
+  # Monthly Cost Budget with Comprehensive Configuration
+  # Tracks all cost types including taxes, subscriptions, and recurring charges
+  MonthlyCostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Ref BudgetName
+        BudgetLimit:
+          Amount: !Ref BudgetAmount
+          Unit: USD
+        TimeUnit: !Ref BudgetTimeUnit
+        TimePeriod:
+          Start: !Sub '${AWS::Region}' # Dynamic start date
+          End: '2087-06-15' # Far future end date for continuous monitoring
+        BudgetType: COST
+        CostFilters: {} # No filters - monitor entire account
+        CostTypes:
+          # Comprehensive cost tracking configuration
+          IncludeTax: true              # Include all taxes
+          IncludeSubscription: true     # Include subscription costs
+          UseBlended: false             # Use unblended costs for accuracy
+          IncludeRefund: false          # Exclude refunds from budget
+          IncludeCredit: false          # Exclude credits from budget
+          IncludeUpfront: true          # Include upfront payments
+          IncludeRecurring: true        # Include recurring charges
+          IncludeOtherSubscription: true # Include other subscription costs
+          IncludeSupport: true          # Include support plan costs
+          IncludeDiscount: true         # Include volume discounts
+          UseAmortized: false           # Use actual costs, not amortized
+      # Graduated Alert Notifications
+      # Multiple thresholds provide early warning and escalating urgency
+      NotificationsWithSubscribers:
+        # Early Warning Alert (50% of budget)
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Ref EarlyWarningThreshold
+            ThresholdType: PERCENTAGE
+            NotificationState: ALARM
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetNotificationTopic
+        # Serious Concern Alert (75% of budget)
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Ref SeriousThreshold
+            ThresholdType: PERCENTAGE
+            NotificationState: ALARM
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetNotificationTopic
+        # Critical Alert (90% of budget)
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Ref CriticalThreshold
+            ThresholdType: PERCENTAGE
+            NotificationState: ALARM
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetNotificationTopic
+        # Forecasted Budget Overrun Alert (100% forecasted)
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Ref ForecastThreshold
+            ThresholdType: PERCENTAGE
+            NotificationState: ALARM
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetNotificationTopic
+
+  # CloudWatch Dashboard for Cost Monitoring Visualization
+  # Provides visual representation of budget status and spending trends
+  CostMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'CostMonitoring-${BudgetName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 2,
+              "properties": {
+                "markdown": "# Cost Monitoring Dashboard for ${BudgetName}\n\nThis dashboard provides real-time visibility into AWS spending patterns and budget performance. Monitor actual vs. forecasted costs to maintain financial control.\n\n**Budget Amount:** $${BudgetAmount} ${BudgetTimeUnit}\n**Alert Thresholds:** ${EarlyWarningThreshold}%, ${SeriousThreshold}%, ${CriticalThreshold}% (Actual) | ${ForecastThreshold}% (Forecasted)"
+              }
+            },
+            {
+              "type": "text",
+              "x": 0,
+              "y": 2,
+              "width": 12,
+              "height": 4,
+              "properties": {
+                "markdown": "## Budget Status\n\n- **Early Warning (${EarlyWarningThreshold}%):** Proactive monitoring trigger\n- **Serious Concern (${SeriousThreshold}%):** Immediate attention required\n- **Critical Alert (${CriticalThreshold}%):** Emergency cost reduction needed\n- **Forecast Alert (${ForecastThreshold}%):** Predicted budget overrun\n\n**SNS Topic:** ${BudgetNotificationTopic}\n**Email Notifications:** ${NotificationEmail}"
+              }
+            },
+            {
+              "type": "text",
+              "x": 12,
+              "y": 2,
+              "width": 12,
+              "height": 4,
+              "properties": {
+                "markdown": "## Cost Optimization Actions\n\n1. **Immediate:** Review Cost Explorer for spending spikes\n2. **Short-term:** Implement AWS Cost Anomaly Detection\n3. **Long-term:** Set up service-specific budgets\n4. **Advanced:** Automate responses with Lambda functions\n\n**Resources:**\n- [Cost Explorer Console](https://console.aws.amazon.com/cost-management/home#/)\n- [AWS Budgets Console](https://console.aws.amazon.com/billing/home#/budgets)"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # Budget Configuration Outputs
+  BudgetName:
+    Description: Name of the created AWS budget for cost monitoring
+    Value: !Ref BudgetName
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetName'
+
+  BudgetAmount:
+    Description: Monthly budget amount in USD
+    Value: !Sub '${BudgetAmount} USD'
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetAmount'
+
+  # SNS Configuration Outputs
+  SNSTopicArn:
+    Description: ARN of the SNS topic for budget notifications
+    Value: !Ref BudgetNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  SNSTopicName:
+    Description: Name of the SNS topic for budget notifications
+    Value: !GetAtt BudgetNotificationTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicName'
+
+  # Alert Configuration Outputs
+  AlertThresholds:
+    Description: Configured alert thresholds for budget monitoring
+    Value: !Sub 'Early Warning: ${EarlyWarningThreshold}%, Serious: ${SeriousThreshold}%, Critical: ${CriticalThreshold}%, Forecasted: ${ForecastThreshold}%'
+
+  NotificationEmail:
+    Description: Email address configured for budget alerts
+    Value: !Ref NotificationEmail
+
+  # Monitoring Resources
+  DashboardName:
+    Description: Name of the CloudWatch dashboard for cost monitoring
+    Value: !Sub 'CostMonitoring-${BudgetName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardName'
+
+  DashboardURL:
+    Description: Direct URL to the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=CostMonitoring-${BudgetName}'
+
+  # Service Role Output
+  BudgetServiceRoleArn:
+    Description: ARN of the IAM role used by AWS Budgets service
+    Value: !GetAtt BudgetServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetServiceRoleArn'
+
+  # Cost Explorer Information
+  CostExplorerConsoleURL:
+    Description: Direct URL to AWS Cost Explorer console for detailed cost analysis
+    Value: 'https://console.aws.amazon.com/cost-management/home#/'
+
+  BudgetsConsoleURL:
+    Description: Direct URL to AWS Budgets console for budget management
+    Value: 'https://console.aws.amazon.com/billing/home#/budgets'
+
+  # Setup Instructions
+  SetupInstructions:
+    Description: Next steps after stack deployment
+    Value: >
+      1. Check your email and confirm the SNS subscription to receive budget alerts.
+      2. Access the CloudWatch dashboard to monitor cost trends.
+      3. Use Cost Explorer to analyze current spending patterns.
+      4. Consider setting up additional service-specific budgets for granular monitoring.
+
+  # Cost Information
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for this monitoring solution
+    Value: '$0.01 per Cost Explorer API request (console usage is free)'

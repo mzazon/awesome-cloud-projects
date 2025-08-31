@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Artifact Registry, Cloud Build, Binary Authorization, Security Command Center
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: 2025-07-17
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: container-security, vulnerability-scanning, ci-cd, binary-authorization, security-automation
 recipe-generator-version: 1.3
@@ -76,8 +76,8 @@ graph TB
 
 ## Prerequisites
 
-1. Google Cloud project with billing enabled and appropriate IAM permissions
-2. gcloud CLI v450.0.0 or later installed and configured
+1. Google Cloud project with billing enabled and appropriate IAM permissions (Container Analysis Admin, Artifact Registry Admin, Binary Authorization Admin)
+2. Google Cloud CLI v450.0.0 or later installed and configured
 3. Docker installed locally for container image testing
 4. Basic understanding of Kubernetes, container security, and CI/CD concepts
 5. Estimated cost: $10-30 per month for development workloads (varies by image size and scan frequency)
@@ -131,18 +131,13 @@ echo "✅ Cluster name: ${CLUSTER_NAME}"
        --location=${REGION} \
        --description="Secure container repository with vulnerability scanning"
 
-   # Enable vulnerability scanning for the repository
-   gcloud artifacts repositories update ${REPO_NAME} \
-       --location=${REGION} \
-       --enable-vulnerability-scanning
-
    # Configure Docker authentication for Artifact Registry
    gcloud auth configure-docker ${REGION}-docker.pkg.dev
 
    echo "✅ Artifact Registry repository created with vulnerability scanning enabled"
    ```
 
-   The repository is now configured to automatically scan all pushed container images for vulnerabilities in both OS packages and application dependencies. This scanning happens immediately upon image push and continuously monitors for new vulnerabilities discovered after the initial scan.
+   The repository is now configured to automatically scan all pushed container images for vulnerabilities in both OS packages and application dependencies. Vulnerability scanning is enabled by default for new Docker repositories in Artifact Registry, providing immediate security analysis upon image push with continuous monitoring for newly discovered vulnerabilities.
 
 2. **Create GKE Cluster with Binary Authorization**:
 
@@ -248,7 +243,7 @@ echo "✅ Cluster name: ${CLUSTER_NAME}"
        --purpose=asymmetric-signing \
        --default-algorithm=rsa-sign-pkcs1-4096-sha512
 
-   # Add the KMS key to the attestor
+   # Get the key version and add to the attestor
    gcloud container binauthz attestors public-keys add \
        --attestor=security-attestor \
        --keyversion-project=${PROJECT_ID} \
@@ -278,6 +273,7 @@ echo "✅ Cluster name: ${CLUSTER_NAME}"
    - namePattern: gcr.io/gke-release/*
    - namePattern: gcr.io/google-containers/*
    - namePattern: k8s.gcr.io/*
+   - namePattern: registry.k8s.io/*
    clusterAdmissionRules:
      ${ZONE}.${CLUSTER_NAME}:
        requireAttestationsBy:
@@ -298,11 +294,11 @@ echo "✅ Cluster name: ${CLUSTER_NAME}"
    Cloud Build automates the container building, scanning, and attestation process. This pipeline integrates security scanning results with deployment decisions, creating a fully automated security gate in your CI/CD workflow.
 
    ```bash
-   # Create sample application
+   # Create sample application directory
    mkdir -p /tmp/secure-app
    cd /tmp/secure-app
 
-   # Create simple application
+   # Create simple Flask application
    cat > app.py << EOF
    from flask import Flask
    import os
@@ -323,8 +319,8 @@ echo "✅ Cluster name: ${CLUSTER_NAME}"
 
    # Create requirements file
    cat > requirements.txt << EOF
-   Flask==2.3.3
-   Werkzeug==2.3.7
+   Flask==3.0.0
+   Werkzeug==3.0.1
    EOF
 
    # Create Dockerfile
@@ -416,7 +412,7 @@ echo "✅ Cluster name: ${CLUSTER_NAME}"
        IMAGE_URL="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/secure-app@\$IMAGE_DIGEST"
        
        # Create attestation payload
-       PAYLOAD=\$(echo -n '{"timestamp":"'"\$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","vulnerabilities_checked":true,"policy_compliant":true}' | base64 -w 0)
+       PAYLOAD=\$(echo -n "{\"timestamp\":\"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"vulnerabilities_checked\":true,\"policy_compliant\":true}" | base64 -w 0)
        
        # Create the attestation
        gcloud container binauthz attestations create \
@@ -427,8 +423,9 @@ echo "✅ Cluster name: ${CLUSTER_NAME}"
            --keyring=security-keyring \
            --location=${REGION} \
            --digest-algorithm=sha512 \
-           --input-file=<(echo -n '{"timestamp":"'"\$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","vulnerabilities_checked":true,"policy_compliant":true}') \
-           --format="value(signature)")
+           --input-file=<(echo -n "{\"timestamp\":\"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"vulnerabilities_checked\":true,\"policy_compliant\":true}") \
+           --format="value(signature)") \
+         --payload-file=<(echo -n "{\"timestamp\":\"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"vulnerabilities_checked\":true,\"policy_compliant\":true}")
        
        echo "✅ Security attestation created for image"
 
@@ -551,7 +548,7 @@ echo "✅ Cluster name: ${CLUSTER_NAME}"
 4. **Delete KMS resources**:
 
    ```bash
-   # Delete KMS key and keyring
+   # Delete KMS key and keyring (note: keyrings cannot be deleted, only disabled)
    gcloud kms keys versions destroy 1 \
        --key=security-signing-key \
        --keyring=security-keyring \

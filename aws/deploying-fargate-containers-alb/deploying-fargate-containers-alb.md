@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: ECS, Fargate, ALB, ECR
 estimated-time: 60 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: containers, fargate, serverless, ecs, load-balancer, docker
 recipe-generator-version: 1.3
@@ -19,7 +19,7 @@ recipe-generator-version: 1.3
 
 ## Problem
 
-Your organization wants to deploy containerized applications without managing the underlying infrastructure, servers, or clusters. Traditional container deployments require provisioning and managing EC2 instances, handling cluster scaling, patching, and capacity planning. You need a solution that provides the benefits of containerization while eliminating infrastructure management overhead. Additionally, you want automatic scaling, high availability, and seamless integration with AWS services while maintaining cost efficiency and operational simplicity.
+Your organization wants to deploy containerized applications without managing the underlying infrastructure, servers, or clusters. Traditional container deployments require provisioning and managing EC2 instances, handling cluster scaling, patching, and capacity planning. You need a solution that provides the benefits of containerization while eliminating infrastructure management overhead, with automatic scaling, high availability, and seamless integration with AWS services while maintaining cost efficiency and operational simplicity.
 
 ## Solution
 
@@ -76,10 +76,10 @@ graph TB
     TASKS --> VPC
     TASKS --> SECRETS
     
-    style FARGATE fill:#FF9900
+    style TASKS fill:#FF9900
     style ALB fill:#3F8624
     style ECR fill:#2F67B8
-    style TASKS fill:#E7157B
+    style CLUSTER fill:#E7157B
 ```
 
 ## Prerequisites
@@ -251,6 +251,9 @@ echo "Subnet IDs: ${SUBNET_IDS}"
    cat > Dockerfile << 'EOF'
    FROM node:18-alpine
    
+   # Install curl for health checks
+   RUN apk add --no-cache curl
+   
    # Set working directory
    WORKDIR /app
    
@@ -276,7 +279,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
    
    # Health check
    HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-       CMD node -e "require('http').get('http://localhost:3000/health', (res) => { process.exit(res.statusCode === 200 ? 0 : 1) }).on('error', () => process.exit(1))"
+       CMD curl -f http://localhost:3000/health || exit 1
    
    # Start application
    CMD ["npm", "start"]
@@ -357,13 +360,14 @@ echo "Subnet IDs: ${SUBNET_IDS}"
        --port 3000 \
        --source-group ${ALB_SG_ID}
    
-   # Allow outbound internet access for Fargate tasks
+   # Allow outbound HTTPS traffic for Fargate tasks
    aws ec2 authorize-security-group-egress \
        --group-id ${FARGATE_SG_ID} \
        --protocol tcp \
        --port 443 \
        --cidr 0.0.0.0/0
    
+   # Allow outbound HTTP traffic for Fargate tasks
    aws ec2 authorize-security-group-egress \
        --group-id ${FARGATE_SG_ID} \
        --protocol tcp \
@@ -380,8 +384,8 @@ echo "Subnet IDs: ${SUBNET_IDS}"
    Fargate requires two distinct IAM roles: the task execution role (used by ECS to pull images and write logs) and the task role (used by your application code). This separation follows the principle of least privilege by granting only the minimum permissions necessary for each function.
 
    ```bash
-   # Create task execution role
-   cat > task-execution-role-trust-policy.json << EOF
+   # Create task execution role trust policy
+   cat > task-execution-role-trust-policy.json << 'EOF'
    {
        "Version": "2012-10-17",
        "Statement": [
@@ -413,7 +417,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
        --assume-role-policy-document file://task-execution-role-trust-policy.json
    
    # Create custom policy for task role
-   cat > task-role-policy.json << EOF
+   cat > task-role-policy.json << 'EOF'
    {
        "Version": "2012-10-17",
        "Statement": [
@@ -579,7 +583,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
    aws elbv2 create-listener \
        --load-balancer-arn ${ALB_ARN} \
        --protocol HTTP \
-       --port 80\
+       --port 80 \
        --default-actions Type=forward,TargetGroupArn=${TARGET_GROUP_ARN}
    
    echo "✅ Created Application Load Balancer"
@@ -725,6 +729,8 @@ echo "Subnet IDs: ${SUBNET_IDS}"
    fi
    ```
 
+   Expected output: Shows service as ACTIVE with running tasks having HEALTHY status and correct resource allocations.
+
 2. **Test Application Load Balancer and application**:
 
    ```bash
@@ -755,6 +761,8 @@ echo "Subnet IDs: ${SUBNET_IDS}"
    echo "Application URL: http://${ALB_DNS}"
    ```
 
+   Expected output: Target health shows "healthy" state, and all endpoints return valid JSON responses with container information.
+
 3. **Test container scaling and load distribution**:
 
    ```bash
@@ -771,6 +779,8 @@ echo "Subnet IDs: ${SUBNET_IDS}"
        --query 'services[0].events[0:5].[createdAt,message]' \
        --output table
    ```
+
+   Expected output: Shows requests distributed across multiple container hostnames, demonstrating load balancing functionality.
 
 4. **Verify logging and monitoring**:
 
@@ -796,6 +806,8 @@ echo "Subnet IDs: ${SUBNET_IDS}"
            --query 'events[*].message'
    fi
    ```
+
+   Expected output: Shows log streams for each task and recent application logs indicating successful startup and health check responses.
 
 ## Cleanup
 
@@ -912,27 +924,29 @@ echo "Subnet IDs: ${SUBNET_IDS}"
 
 ## Discussion
 
-AWS Fargate represents a paradigm shift in container deployment, eliminating the complexity of infrastructure management while providing enterprise-grade security and scalability. The serverless container model allows developers to focus entirely on application logic rather than cluster management, patching, or capacity planning. This solution demonstrates how Fargate integrates seamlessly with other AWS services to create a robust, production-ready container platform.
+AWS Fargate represents a paradigm shift in container deployment, eliminating the complexity of infrastructure management while providing enterprise-grade security and scalability. The serverless container model allows developers to focus entirely on application logic rather than cluster management, patching, or capacity planning. This solution demonstrates how Fargate integrates seamlessly with other AWS services to create a robust, production-ready container platform that follows the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles.
 
-The architecture's strength lies in its automatic scaling capabilities and built-in high availability. Fargate tasks run in isolated environments with dedicated CPU, memory, and network resources, providing better security than traditional shared infrastructure. The integration with Application Load Balancer enables sophisticated traffic routing, health checks, and blue-green deployments, while CloudWatch provides comprehensive monitoring and logging without additional configuration.
+The architecture's strength lies in its automatic scaling capabilities and built-in high availability. Fargate tasks run in isolated environments with dedicated CPU, memory, and network resources, providing better security than traditional shared infrastructure. The integration with Application Load Balancer enables sophisticated traffic routing, health checks, and blue-green deployments, while CloudWatch provides comprehensive monitoring and logging without additional configuration. The use of security groups implements defense-in-depth by restricting network access at multiple layers.
 
-Cost optimization comes through Fargate's pay-per-use model where you only pay for the exact CPU and memory resources your containers consume. The ability to mix Fargate and Fargate Spot capacity providers can provide additional savings for fault-tolerant workloads. The automatic scaling ensures you're not paying for idle capacity while maintaining performance during traffic spikes.
+Cost optimization comes through Fargate's pay-per-use model where you only pay for the exact CPU and memory resources your containers consume. The ability to mix Fargate and Fargate Spot capacity providers can provide additional savings for fault-tolerant workloads. The automatic scaling ensures you're not paying for idle capacity while maintaining performance during traffic spikes. For production workloads, consider implementing [cost optimization strategies](https://docs.aws.amazon.com/whitepapers/latest/cost-optimization-pillar/welcome.html) such as right-sizing resources and using reserved capacity when predictable.
 
-> **Tip**: Use Fargate Spot for development environments and fault-tolerant production workloads to achieve up to 70% cost savings compared to regular Fargate pricing. Learn more about [Fargate pricing models](https://aws.amazon.com/fargate/pricing/).
+The solution demonstrates several AWS security best practices including the use of IAM roles with least privilege access, encryption at rest for container images, vulnerability scanning in ECR, and network segmentation through security groups. Container health checks ensure only healthy instances receive traffic, while the circuit breaker pattern prevents cascading failures during deployments.
+
+> **Tip**: Use Fargate Spot for development environments and fault-tolerant production workloads to achieve up to 70% cost savings compared to regular Fargate pricing. Learn more about [Fargate pricing models](https://aws.amazon.com/fargate/pricing/) and [Fargate Spot best practices](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-capacity-providers.html).
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Blue-Green Deployments**: Implement automated blue-green deployment strategies using CodeDeploy and multiple target groups for zero-downtime updates
+1. **Blue-Green Deployments**: Implement automated blue-green deployment strategies using CodeDeploy and multiple target groups for zero-downtime updates with rollback capabilities
 
 2. **Multi-Region Architecture**: Create a global Fargate deployment with cross-region load balancing using Route 53 and CloudFront for improved performance and disaster recovery
 
 3. **Service Mesh Integration**: Add AWS App Mesh to provide advanced traffic management, observability, and security features for microservices communication
 
-4. **CI/CD Pipeline**: Build a complete CI/CD pipeline using CodePipeline, CodeBuild, and CodeDeploy that automatically builds, tests, and deploys container updates
+4. **CI/CD Pipeline**: Build a complete CI/CD pipeline using CodePipeline, CodeBuild, and CodeDeploy that automatically builds, tests, and deploys container updates with quality gates
 
-5. **Advanced Monitoring**: Implement distributed tracing with AWS X-Ray, custom CloudWatch metrics, and automated alerting for comprehensive application observability
+5. **Advanced Monitoring**: Implement distributed tracing with AWS X-Ray, custom CloudWatch metrics, and automated alerting for comprehensive application observability and performance insights
 
 ## Infrastructure Code
 

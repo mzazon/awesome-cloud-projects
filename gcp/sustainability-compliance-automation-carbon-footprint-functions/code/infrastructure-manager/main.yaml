@@ -1,0 +1,676 @@
+# Google Cloud Infrastructure Manager Configuration
+# Sustainability Compliance Automation with Carbon Footprint and Functions
+# 
+# This configuration deploys a complete sustainability compliance automation system
+# using Google Cloud's Carbon Footprint API, BigQuery for analytics, Cloud Functions
+# for processing, and Cloud Scheduler for automation.
+
+# Global configuration and metadata
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: sustainability-compliance-automation
+  annotations:
+    config.kubernetes.io/local-config: "true"
+spec:
+  info:
+    title: Sustainability Compliance Automation
+    description: Automated carbon footprint tracking and ESG compliance reporting
+    version: 1.0.0
+    author:
+      title: Cloud Recipe Generator
+      email: mzazon@google.com
+    documentation:
+      - title: Recipe Documentation
+        url: ./sustainability-compliance-automation-carbon-footprint-functions.md
+  content:
+    examples:
+      - name: basic
+        location: .
+
+---
+
+# Infrastructure Manager deployment configuration
+resources:
+  # Random suffix for unique resource naming
+  - name: random-suffix
+    type: gcp-types/cloudresourcemanager-v1:projects
+    action: create
+    metadata:
+      runtimePolicy:
+        - CREATE
+    properties:
+      # Generate random suffix using timestamp
+      name: $((echo "sustainability-$(date +%s)" | cut -c1-20))
+
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    action: create
+    properties:
+      name: projects/$(ref.random-suffix.projectId)/services
+      services:
+        - name: cloudfunctions.googleapis.com
+        - name: bigquery.googleapis.com
+        - name: cloudscheduler.googleapis.com
+        - name: bigquerydatatransfer.googleapis.com
+        - name: storage.googleapis.com
+        - name: cloudbuild.googleapis.com
+
+  # BigQuery dataset for carbon footprint data
+  - name: carbon-footprint-dataset
+    type: gcp-types/bigquery-v2:datasets
+    action: create
+    metadata:
+      dependsOn:
+        - enable-apis
+    properties:
+      projectId: $(ref.random-suffix.projectId)
+      datasetId: carbon_footprint_$(ref.random-suffix.name | replace('sustainability-', ''))
+      location: us-central1
+      description: Carbon footprint and sustainability data warehouse
+      labels:
+        purpose: sustainability
+        compliance: esg
+        environment: production
+      access:
+        - role: OWNER
+          userByEmail: $(ref.project-info.projectNumber)-compute@developer.gserviceaccount.com
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+
+  # Sustainability metrics table for processed analytics
+  - name: sustainability-metrics-table
+    type: gcp-types/bigquery-v2:tables
+    action: create
+    metadata:
+      dependsOn:
+        - carbon-footprint-dataset
+    properties:
+      projectId: $(ref.random-suffix.projectId)
+      datasetId: $(ref.carbon-footprint-dataset.datasetId)
+      tableId: sustainability_metrics
+      description: Processed sustainability metrics and KPIs
+      labels:
+        purpose: analytics
+        data-type: processed
+      schema:
+        fields:
+          - name: project_id
+            type: STRING
+            mode: REQUIRED
+            description: Google Cloud project identifier
+          - name: month
+            type: DATE
+            mode: REQUIRED
+            description: Reporting month for emissions data
+          - name: total_emissions
+            type: FLOAT
+            mode: NULLABLE
+            description: Total carbon emissions in kg CO2e
+          - name: scope_1
+            type: FLOAT
+            mode: NULLABLE
+            description: Scope 1 emissions (direct emissions)
+          - name: scope_2_location
+            type: FLOAT
+            mode: NULLABLE
+            description: Scope 2 location-based emissions
+          - name: scope_2_market
+            type: FLOAT
+            mode: NULLABLE
+            description: Scope 2 market-based emissions
+          - name: scope_3
+            type: FLOAT
+            mode: NULLABLE
+            description: Scope 3 emissions (indirect emissions)
+          - name: service
+            type: STRING
+            mode: NULLABLE
+            description: Google Cloud service generating emissions
+          - name: region
+            type: STRING
+            mode: NULLABLE
+            description: Geographic region of resource usage
+
+  # Cloud Storage bucket for ESG reports
+  - name: esg-reports-bucket
+    type: gcp-types/storage-v1:buckets
+    action: create
+    metadata:
+      dependsOn:
+        - enable-apis
+    properties:
+      name: esg-reports-$(ref.random-suffix.name | replace('sustainability-', ''))
+      location: us-central1
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        purpose: esg-reporting
+        compliance: regulatory
+        retention: long-term
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 90
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 365
+
+  # Carbon Footprint data transfer configuration
+  - name: carbon-footprint-transfer
+    type: gcp-types/bigquerydatatransfer-v1:projects.locations.transferConfigs
+    action: create
+    metadata:
+      dependsOn:
+        - carbon-footprint-dataset
+        - project-billing-info
+    properties:
+      parent: projects/$(ref.random-suffix.projectId)/locations/us-central1
+      displayName: Carbon Footprint Export
+      dataSourceId: 61cede5a-0000-2440-ad42-883d24f8f7b8
+      destinationDatasetId: $(ref.carbon-footprint-dataset.datasetId)
+      schedule: monthly
+      params:
+        billing_accounts: $(ref.project-billing-info.billingAccountName)
+      notificationPubsubTopic: projects/$(ref.random-suffix.projectId)/topics/carbon-footprint-notifications
+
+  # Pub/Sub topic for carbon footprint notifications
+  - name: carbon-footprint-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    action: create
+    metadata:
+      dependsOn:
+        - enable-apis
+    properties:
+      name: projects/$(ref.random-suffix.projectId)/topics/carbon-footprint-notifications
+      labels:
+        purpose: data-transfer
+        service: carbon-footprint
+
+  # IAM service account for Cloud Functions
+  - name: functions-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    action: create
+    metadata:
+      dependsOn:
+        - enable-apis
+    properties:
+      name: projects/$(ref.random-suffix.projectId)
+      accountId: sustainability-functions-sa
+      serviceAccount:
+        displayName: Sustainability Functions Service Account
+        description: Service account for carbon footprint processing functions
+
+  # IAM bindings for service account
+  - name: service-account-bindings
+    type: gcp-types/cloudresourcemanager-v1:projects
+    action: create
+    metadata:
+      dependsOn:
+        - functions-service-account
+    properties:
+      projectId: $(ref.random-suffix.projectId)
+      policy:
+        bindings:
+          - role: roles/bigquery.dataEditor
+            members:
+              - serviceAccount:$(ref.functions-service-account.email)
+          - role: roles/bigquery.jobUser
+            members:
+              - serviceAccount:$(ref.functions-service-account.email)
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.functions-service-account.email)
+          - role: roles/pubsub.subscriber
+            members:
+              - serviceAccount:$(ref.functions-service-account.email)
+
+  # Cloud Function: Data Processing
+  - name: carbon-data-processing-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    action: create
+    metadata:
+      dependsOn:
+        - enable-apis
+        - functions-service-account
+        - carbon-footprint-dataset
+    properties:
+      name: projects/$(ref.random-suffix.projectId)/locations/us-central1/functions/process-carbon-data
+      description: Process and analyze carbon footprint data
+      sourceArchiveUrl: gs://gcf-sources-$(ref.random-suffix.projectId)-us-central1/carbon-processing.zip
+      entryPoint: process_carbon_data
+      runtime: python312
+      timeout: 300s
+      availableMemoryMb: 512
+      serviceAccountEmail: $(ref.functions-service-account.email)
+      environmentVariables:
+        DATASET_NAME: $(ref.carbon-footprint-dataset.datasetId)
+        PROJECT_ID: $(ref.random-suffix.projectId)
+      httpsTrigger: {}
+      labels:
+        purpose: data-processing
+        service: sustainability
+        runtime: python312
+
+  # Cloud Function: ESG Report Generation
+  - name: esg-report-generation-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    action: create
+    metadata:
+      dependsOn:
+        - enable-apis
+        - functions-service-account
+        - esg-reports-bucket
+    properties:
+      name: projects/$(ref.random-suffix.projectId)/locations/us-central1/functions/generate-esg-report
+      description: Generate comprehensive ESG compliance reports
+      sourceArchiveUrl: gs://gcf-sources-$(ref.random-suffix.projectId)-us-central1/esg-reports.zip
+      entryPoint: generate_esg_report
+      runtime: python312
+      timeout: 300s
+      availableMemoryMb: 512
+      serviceAccountEmail: $(ref.functions-service-account.email)
+      environmentVariables:
+        DATASET_NAME: $(ref.carbon-footprint-dataset.datasetId)
+        PROJECT_ID: $(ref.random-suffix.projectId)
+        BUCKET_NAME: $(ref.esg-reports-bucket.name)
+        RANDOM_SUFFIX: $(ref.random-suffix.name | replace('sustainability-', ''))
+      httpsTrigger: {}
+      labels:
+        purpose: report-generation
+        service: sustainability
+        runtime: python312
+
+  # Cloud Function: Carbon Alerts
+  - name: carbon-alert-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    action: create
+    metadata:
+      dependsOn:
+        - enable-apis
+        - functions-service-account
+        - sustainability-metrics-table
+    properties:
+      name: projects/$(ref.random-suffix.projectId)/locations/us-central1/functions/carbon-alerts
+      description: Monitor carbon emissions and generate alerts
+      sourceArchiveUrl: gs://gcf-sources-$(ref.random-suffix.projectId)-us-central1/carbon-alerts.zip
+      entryPoint: carbon_alerts
+      runtime: python312
+      timeout: 120s
+      availableMemoryMb: 256
+      serviceAccountEmail: $(ref.functions-service-account.email)
+      environmentVariables:
+        DATASET_NAME: $(ref.carbon-footprint-dataset.datasetId)
+        PROJECT_ID: $(ref.random-suffix.projectId)
+        MONTHLY_THRESHOLD: "1000"
+        GROWTH_THRESHOLD: "0.15"
+      httpsTrigger: {}
+      labels:
+        purpose: monitoring
+        service: sustainability
+        runtime: python312
+
+  # Cloud Scheduler: Data Processing Job
+  - name: data-processing-schedule
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    action: create
+    metadata:
+      dependsOn:
+        - enable-apis
+        - carbon-data-processing-function
+    properties:
+      name: projects/$(ref.random-suffix.projectId)/locations/us-central1/jobs/process-carbon-data
+      description: Monthly carbon footprint data processing
+      schedule: "0 9 16 * *"
+      timeZone: UTC
+      httpTarget:
+        uri: $(ref.carbon-data-processing-function.httpsTrigger.url)
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: eyJ0cmlnZ2VyIjoic2NoZWR1bGVkIn0=  # Base64 encoded '{"trigger":"scheduled"}'
+        oidcToken:
+          serviceAccountEmail: $(ref.functions-service-account.email)
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 60s
+        maxBackoffDuration: 300s
+
+  # Cloud Scheduler: ESG Report Generation Job
+  - name: esg-report-schedule
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    action: create
+    metadata:
+      dependsOn:
+        - enable-apis
+        - esg-report-generation-function
+    properties:
+      name: projects/$(ref.random-suffix.projectId)/locations/us-central1/jobs/generate-esg-reports
+      description: Monthly ESG compliance report generation
+      schedule: "0 10 16 * *"
+      timeZone: UTC
+      httpTarget:
+        uri: $(ref.esg-report-generation-function.httpsTrigger.url)
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: eyJ0cmlnZ2VyIjoic2NoZWR1bGVkIn0=  # Base64 encoded '{"trigger":"scheduled"}'
+        oidcToken:
+          serviceAccountEmail: $(ref.functions-service-account.email)
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 60s
+        maxBackoffDuration: 300s
+
+  # Cloud Scheduler: Carbon Alerts Job
+  - name: carbon-alerts-schedule
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    action: create
+    metadata:
+      dependsOn:
+        - enable-apis
+        - carbon-alert-function
+    properties:
+      name: projects/$(ref.random-suffix.projectId)/locations/us-central1/jobs/carbon-alerts-check
+      description: Weekly carbon emissions monitoring and alerts
+      schedule: "0 8 * * 1"
+      timeZone: UTC
+      httpTarget:
+        uri: $(ref.carbon-alert-function.httpsTrigger.url)
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: eyJ0cmlnZ2VyIjoic2NoZWR1bGVkIn0=  # Base64 encoded '{"trigger":"scheduled"}'
+        oidcToken:
+          serviceAccountEmail: $(ref.functions-service-account.email)
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 60s
+        maxBackoffDuration: 300s
+
+  # Cloud Monitoring alert policy for function failures
+  - name: function-failure-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    action: create
+    metadata:
+      dependsOn:
+        - enable-apis
+        - carbon-data-processing-function
+        - esg-report-generation-function
+        - carbon-alert-function
+    properties:
+      name: projects/$(ref.random-suffix.projectId)/alertPolicies/sustainability-function-failures
+      displayName: Sustainability Function Failures
+      documentation:
+        content: Alert when sustainability processing functions fail
+        mimeType: text/markdown
+      conditions:
+        - displayName: Function execution failures
+          conditionThreshold:
+            filter: 'resource.type="cloud_function" AND metric.type="cloudfunctions.googleapis.com/function/execution_count" AND metric.label.status="error"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 1
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+                groupByFields:
+                  - resource.label.function_name
+      alertStrategy:
+        autoClose: 86400s
+      enabled: true
+
+  # Project information resource for billing account reference
+  - name: project-info
+    type: gcp-types/cloudresourcemanager-v1:projects
+    action: create
+    properties:
+      projectId: $(ref.random-suffix.projectId)
+
+  # Project billing information
+  - name: project-billing-info
+    type: gcp-types/cloudbilling-v1:projects
+    action: create
+    metadata:
+      dependsOn:
+        - project-info
+    properties:
+      name: projects/$(ref.random-suffix.projectId)
+
+# Configuration variables for customization
+variables:
+  # Project configuration
+  project_id:
+    description: Google Cloud project ID for sustainability infrastructure
+    type: string
+    default: ""
+    validation:
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+
+  # Regional configuration
+  region:
+    description: Google Cloud region for resource deployment
+    type: string
+    default: "us-central1"
+    validation:
+      enum: ["us-central1", "us-east1", "us-west1", "europe-west1", "asia-east1"]
+
+  # Sustainability monitoring thresholds
+  monthly_emissions_threshold:
+    description: Monthly carbon emissions threshold in kg CO2e for alerts
+    type: number
+    default: 1000
+    validation:
+      minimum: 0
+
+  growth_threshold:
+    description: Month-over-month growth threshold (as decimal) for alerts
+    type: number
+    default: 0.15
+    validation:
+      minimum: 0
+      maximum: 1
+
+  # Data retention settings
+  report_retention_days:
+    description: Number of days to retain ESG reports in Cloud Storage
+    type: number
+    default: 2555  # 7 years for compliance
+    validation:
+      minimum: 365
+
+  # Function configuration
+  processing_timeout:
+    description: Timeout in seconds for data processing functions
+    type: number
+    default: 300
+    validation:
+      minimum: 60
+      maximum: 540
+
+  # Scheduling configuration
+  data_processing_schedule:
+    description: Cron schedule for data processing (monthly on 16th at 9 AM UTC)
+    type: string
+    default: "0 9 16 * *"
+
+  report_generation_schedule:
+    description: Cron schedule for report generation (monthly on 16th at 10 AM UTC)
+    type: string
+    default: "0 10 16 * *"
+
+  alert_monitoring_schedule:
+    description: Cron schedule for alert monitoring (weekly Monday at 8 AM UTC)
+    type: string
+    default: "0 8 * * 1"
+
+# Output values for verification and integration
+outputs:
+  # Project information
+  project_id:
+    description: Google Cloud project ID where resources were deployed
+    value: $(ref.random-suffix.projectId)
+
+  # BigQuery resources
+  dataset_id:
+    description: BigQuery dataset ID for carbon footprint data
+    value: $(ref.carbon-footprint-dataset.datasetId)
+
+  dataset_location:
+    description: BigQuery dataset location
+    value: $(ref.carbon-footprint-dataset.location)
+
+  sustainability_table:
+    description: BigQuery table for processed sustainability metrics
+    value: $(ref.sustainability-metrics-table.tableId)
+
+  # Cloud Storage
+  reports_bucket:
+    description: Cloud Storage bucket for ESG reports
+    value: $(ref.esg-reports-bucket.name)
+
+  reports_bucket_url:
+    description: Cloud Storage bucket URL for ESG reports
+    value: gs://$(ref.esg-reports-bucket.name)
+
+  # Cloud Functions
+  data_processing_function:
+    description: Cloud Function for carbon data processing
+    value: $(ref.carbon-data-processing-function.name)
+
+  data_processing_url:
+    description: HTTPS trigger URL for data processing function
+    value: $(ref.carbon-data-processing-function.httpsTrigger.url)
+
+  report_generation_function:
+    description: Cloud Function for ESG report generation
+    value: $(ref.esg-report-generation-function.name)
+
+  report_generation_url:
+    description: HTTPS trigger URL for report generation function
+    value: $(ref.esg-report-generation-function.httpsTrigger.url)
+
+  alert_function:
+    description: Cloud Function for carbon alerts
+    value: $(ref.carbon-alert-function.name)
+
+  alert_function_url:
+    description: HTTPS trigger URL for alert function
+    value: $(ref.carbon-alert-function.httpsTrigger.url)
+
+  # Cloud Scheduler
+  data_processing_job:
+    description: Cloud Scheduler job for data processing
+    value: $(ref.data-processing-schedule.name)
+
+  report_generation_job:
+    description: Cloud Scheduler job for report generation
+    value: $(ref.esg-report-schedule.name)
+
+  alert_monitoring_job:
+    description: Cloud Scheduler job for alert monitoring
+    value: $(ref.carbon-alerts-schedule.name)
+
+  # Data transfer
+  carbon_footprint_transfer:
+    description: BigQuery Data Transfer configuration for Carbon Footprint
+    value: $(ref.carbon-footprint-transfer.name)
+
+  # Service account
+  service_account_email:
+    description: Service account email for functions
+    value: $(ref.functions-service-account.email)
+
+  # Monitoring
+  alert_policy:
+    description: Cloud Monitoring alert policy for function failures
+    value: $(ref.function-failure-alert.name)
+
+  # Quick start commands
+  manual_triggers:
+    description: Commands to manually trigger functions for testing
+    value: |
+      # Trigger data processing:
+      curl -X POST "$(ref.carbon-data-processing-function.httpsTrigger.url)" -H "Content-Type: application/json" -d '{"test": true}'
+      
+      # Trigger report generation:
+      curl -X POST "$(ref.esg-report-generation-function.httpsTrigger.url)" -H "Content-Type: application/json" -d '{"test": true}'
+      
+      # Trigger alert monitoring:
+      curl -X POST "$(ref.carbon-alert-function.httpsTrigger.url)" -H "Content-Type: application/json" -d '{"test": true}'
+
+  # BigQuery analytics queries
+  sample_queries:
+    description: Sample BigQuery queries for sustainability analytics
+    value: |
+      -- Monthly emissions trend:
+      SELECT usage_month, SUM(total_emissions) as monthly_total
+      FROM `$(ref.random-suffix.projectId).$(ref.carbon-footprint-dataset.datasetId).sustainability_metrics`
+      WHERE usage_month >= DATE_SUB(CURRENT_DATE(), INTERVAL 12 MONTH)
+      GROUP BY usage_month ORDER BY usage_month;
+      
+      -- Service breakdown:
+      SELECT service, SUM(total_emissions) as service_emissions
+      FROM `$(ref.random-suffix.projectId).$(ref.carbon-footprint-dataset.datasetId).sustainability_metrics`
+      WHERE usage_month >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 MONTH)
+      GROUP BY service ORDER BY service_emissions DESC;
+
+# Deployment metadata and labels
+labels:
+  purpose: sustainability-compliance
+  framework: esg-reporting
+  automation: cloud-scheduler
+  compliance: regulatory
+  carbon-tracking: enabled
+  environment: production
+  managed-by: infrastructure-manager
+  recipe-version: "1.1"
+  last-updated: "2025-07-12"
+
+# Additional metadata for Infrastructure Manager
+metadata:
+  name: sustainability-compliance-automation
+  namespace: default
+  labels:
+    app: sustainability-tracking
+    component: carbon-footprint
+    version: "1.1"
+  annotations:
+    # Deployment configuration
+    config.infrastructure-manager.gcp/deployment-name: sustainability-compliance
+    config.infrastructure-manager.gcp/blueprint-source: recipe-generator
+    config.infrastructure-manager.gcp/blueprint-version: "1.1"
+    
+    # Cost and resource management
+    config.infrastructure-manager.gcp/estimated-monthly-cost: "$5-15"
+    config.infrastructure-manager.gcp/resource-count: "15+"
+    config.infrastructure-manager.gcp/cleanup-policy: "manual"
+    
+    # Compliance and governance
+    config.infrastructure-manager.gcp/compliance-framework: "ESG, GHG Protocol"
+    config.infrastructure-manager.gcp/data-classification: "internal"
+    config.infrastructure-manager.gcp/backup-required: "true"
+    config.infrastructure-manager.gcp/monitoring-required: "true"
+    
+    # Security configuration
+    config.infrastructure-manager.gcp/security-review: "required"
+    config.infrastructure-manager.gcp/least-privilege: "enabled"
+    config.infrastructure-manager.gcp/encryption: "default"
+    
+    # Documentation and support
+    documentation.infrastructure-manager.gcp/recipe-url: "./sustainability-compliance-automation-carbon-footprint-functions.md"
+    documentation.infrastructure-manager.gcp/support-contact: "cloud-recipes-team"
+    documentation.infrastructure-manager.gcp/last-reviewed: "2025-07-12"

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Data Catalog, Cloud Workflows, BigQuery, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-discovery, metadata-management, automation, data-governance, enterprise-analytics
 recipe-generator-version: 1.3
@@ -426,10 +426,10 @@ EOF
    
    # Create requirements.txt
    cat > requirements.txt << 'EOF'
-google-cloud-datacatalog==3.19.0
-google-cloud-bigquery==3.21.0
-google-cloud-storage==2.16.0
-functions-framework==3.5.0
+google-cloud-datacatalog==3.20.0
+google-cloud-bigquery==3.25.0
+google-cloud-storage==2.18.0
+functions-framework==3.7.0
 EOF
    
    # Deploy the Cloud Function
@@ -469,14 +469,14 @@ main:
           - discovery_results: {}
           
     - get_function_url:
-        call: googleapis.cloudfunctions.v1.projects.locations.functions.get
+        call: googleapis.cloudfunctions.v2.projects.locations.functions.get
         args:
-          name: ${"projects/" + project_id + "/locations/" + location + "/functions/metadata-extractor-" + input.suffix}
+          name: ${"projects/" + project_id + "/locations/" + location + "/functions/" + input.function_name}
         result: function_info
         
     - extract_function_url:
         assign:
-          - function_url: ${function_info.httpsTrigger.url}
+          - function_url: ${function_info.serviceConfig.uri}
           
     - log_start:
         call: sys.log
@@ -626,7 +626,7 @@ EOF
        --uri="https://workflowexecutions.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/workflows/${WORKFLOW_NAME}/executions" \
        --http-method=POST \
        --headers="Content-Type=application/json" \
-       --message-body="{\"argument\": \"{\\\"suffix\\\": \\\"${RANDOM_SUFFIX}\\\"}\"}" \
+       --message-body="{\"argument\": \"{\\\"function_name\\\": \\\"${FUNCTION_NAME}\\\"}\"}" \
        --oauth-service-account-email="${PROJECT_ID}@appspot.gserviceaccount.com"
    
    # Create additional job for weekly comprehensive discovery
@@ -636,7 +636,7 @@ EOF
        --uri="https://workflowexecutions.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/workflows/${WORKFLOW_NAME}/executions" \
        --http-method=POST \
        --headers="Content-Type=application/json" \
-       --message-body="{\"argument\": \"{\\\"suffix\\\": \\\"${RANDOM_SUFFIX}\\\", \\\"comprehensive\\\": true}\"}" \
+       --message-body="{\"argument\": \"{\\\"function_name\\\": \\\"${FUNCTION_NAME}\\\", \\\"comprehensive\\\": true}\"}" \
        --oauth-service-account-email="${PROJECT_ID}@appspot.gserviceaccount.com"
    
    echo "✅ Cloud Scheduler jobs created successfully"
@@ -692,7 +692,7 @@ EOF
    # Execute the workflow manually for immediate testing
    gcloud workflows run ${WORKFLOW_NAME} \
        --location=${REGION} \
-       --data="{\"suffix\": \"${RANDOM_SUFFIX}\"}"
+       --data="{\"function_name\": \"${FUNCTION_NAME}\"}"
    
    # Get execution results
    EXECUTION_ID=$(gcloud workflows executions list \
@@ -761,7 +761,12 @@ EOF
        --limit=50
    
    # Test function directly
-   curl -X POST https://${REGION}-${PROJECT_ID}.cloudfunctions.net/${FUNCTION_NAME} \
+   FUNCTION_URL=$(gcloud functions describe ${FUNCTION_NAME} \
+       --region=${REGION} \
+       --gen2 \
+       --format="value(serviceConfig.uri)")
+   
+   curl -X POST ${FUNCTION_URL} \
        -H "Content-Type: application/json" \
        -d "{\"project_id\": \"${PROJECT_ID}\", \"location\": \"${REGION}\"}"
    ```
@@ -837,13 +842,13 @@ EOF
 
 ## Discussion
 
-This automated data discovery solution addresses the critical challenge of enterprise data governance by implementing a scalable, intelligent cataloging system that reduces manual effort while improving data discoverability and compliance. The architecture leverages Google Cloud's native integration between Data Catalog, Cloud Workflows, and Cloud Functions to create a comprehensive metadata management platform.
+This automated data discovery solution addresses the critical challenge of enterprise data governance by implementing a scalable, intelligent cataloging system that reduces manual effort while improving data discoverability and compliance. The architecture leverages Google Cloud's native integration between Data Catalog, Cloud Workflows, and Cloud Functions to create a comprehensive metadata management platform that follows Google Cloud best practices and the Well-Architected Framework.
 
-The solution's core strength lies in its automated metadata extraction capabilities, which go beyond simple schema discovery to include intelligent content analysis, sensitivity classification, and data quality assessment. By using Data Catalog's powerful search functionality powered by Google's search technology, organizations can achieve the same intuitive discovery experience users expect from consumer applications while maintaining enterprise-grade security and governance controls.
+The solution's core strength lies in its automated metadata extraction capabilities, which go beyond simple schema discovery to include intelligent content analysis, sensitivity classification, and data quality assessment. By using Data Catalog's powerful search functionality powered by Google's search technology, organizations can achieve the same intuitive discovery experience users expect from consumer applications while maintaining enterprise-grade security and governance controls through IAM policies and organization constraints.
 
-The orchestration layer built with Cloud Workflows provides essential enterprise features including parallel processing, error handling, and retry logic, ensuring reliable operation at scale. The scheduling component enables both regular maintenance of the catalog and on-demand discovery for rapidly changing data landscapes, providing flexibility for different organizational needs and data governance requirements.
+The orchestration layer built with Cloud Workflows provides essential enterprise features including parallel processing, error handling, and retry logic, ensuring reliable operation at scale. The scheduling component enables both regular maintenance of the catalog and on-demand discovery for rapidly changing data landscapes, providing flexibility for different organizational needs and data governance requirements while optimizing costs through intelligent scheduling patterns.
 
-Cost optimization is achieved through intelligent scheduling patterns, serverless architecture, and incremental discovery capabilities that focus computational resources on changed or new data assets. The solution scales automatically with data volume while maintaining predictable operating costs through Google Cloud's consumption-based pricing model.
+Cost optimization is achieved through intelligent scheduling patterns, serverless architecture, and incremental discovery capabilities that focus computational resources on changed or new data assets. The solution scales automatically with data volume while maintaining predictable operating costs through Google Cloud's consumption-based pricing model and built-in resource quotas.
 
 > **Tip**: Implement custom tag templates for industry-specific metadata requirements, such as GDPR compliance fields for European operations or HIPAA classifications for healthcare data, to extend the solution's governance capabilities.
 

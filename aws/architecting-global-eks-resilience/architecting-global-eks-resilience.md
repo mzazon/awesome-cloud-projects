@@ -4,12 +4,12 @@ id: 7bb35940
 category: containers
 difficulty: 400
 subject: aws
-services: eks,transit,gateway,route,53,vpc,lattice
+services: EKS, Transit Gateway, Route 53, VPC Lattice
 estimated-time: 240 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: eks,containers,multi-region,transit-gateway,vpc-lattice,service-mesh,disaster-recovery,kubernetes,cross-region-networking
 recipe-generator-version: 1.3
@@ -241,15 +241,6 @@ echo "✅ IAM roles created successfully"
        "ResourceType=subnet,Tags=[{Key=Name,Value=primary-private-2}]" \
        --region ${PRIMARY_REGION}
    
-   # Attach VPC to Transit Gateway
-   aws ec2 create-transit-gateway-vpc-attachment \
-       --transit-gateway-id ${PRIMARY_TGW_ID} \
-       --vpc-id ${PRIMARY_VPC_ID} \
-       --subnet-ids ${PRIMARY_PRIVATE_SUBNET_1} ${PRIMARY_PRIVATE_SUBNET_2} \
-       --tag-specifications \
-       "ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=primary-tgw-attachment}]" \
-       --region ${PRIMARY_REGION}
-   
    echo "✅ Primary VPC, subnets, and Transit Gateway created"
    ```
 
@@ -316,39 +307,7 @@ echo "✅ IAM roles created successfully"
 
    The primary region now has complete internet connectivity with properly configured public and private subnets. Public subnets are configured for auto-assignment of public IP addresses, enabling load balancers and NAT gateways. Private subnets will host EKS worker nodes, providing secure placement while maintaining outbound internet access through NAT gateways or Transit Gateway routes.
 
-3. **Verify Subnet Configuration and Prepare for EKS**:
-
-   Before creating EKS clusters, we need to verify that our subnet configuration is correct and retrieve the subnet IDs for use in subsequent steps. EKS requires subnets in at least two Availability Zones for high availability, and the subnet selection affects how pods and services are distributed across the infrastructure.
-
-   ```bash
-   # Get public subnet IDs for the primary region
-   PRIMARY_PUBLIC_SUBNET_1=$(aws ec2 describe-subnets \
-       --filters "Name=tag:Name,Values=primary-public-1" \
-       --region ${PRIMARY_REGION} \
-       --query 'Subnets[0].SubnetId' --output text)
-   
-   PRIMARY_PUBLIC_SUBNET_2=$(aws ec2 describe-subnets \
-       --filters "Name=tag:Name,Values=primary-public-2" \
-       --region ${PRIMARY_REGION} \
-       --query 'Subnets[0].SubnetId' --output text)
-   
-   # Get private subnet IDs for the primary region
-   PRIMARY_PRIVATE_SUBNET_1=$(aws ec2 describe-subnets \
-       --filters "Name=tag:Name,Values=primary-private-1" \
-       --region ${PRIMARY_REGION} \
-       --query 'Subnets[0].SubnetId' --output text)
-   
-   PRIMARY_PRIVATE_SUBNET_2=$(aws ec2 describe-subnets \
-       --filters "Name=tag:Name,Values=primary-private-2" \
-       --region ${PRIMARY_REGION} \
-       --query 'Subnets[0].SubnetId' --output text)
-   
-   echo "✅ Primary region subnet IDs retrieved"
-   ```
-
-   The subnet IDs are now stored in environment variables and ready for EKS cluster creation. This step ensures that our infrastructure is properly configured before proceeding with Kubernetes deployment.
-
-4. **Create Secondary Region VPC and Transit Gateway**:
+3. **Create Secondary Region VPC and Transit Gateway**:
 
    The secondary region infrastructure mirrors the primary region design but uses different CIDR blocks to prevent IP address conflicts. AWS Transit Gateway in the secondary region uses ASN 64513 to distinguish it from the primary region. This design pattern enables active-active or active-standby deployment models, depending on your disaster recovery requirements. The secondary region provides geographic distribution for compliance requirements and reduces latency for global users.
 
@@ -435,15 +394,6 @@ echo "✅ IAM roles created successfully"
        --vpc-id ${SECONDARY_VPC_ID} \
        --region ${SECONDARY_REGION}
    
-   # Attach VPC to Transit Gateway
-   aws ec2 create-transit-gateway-vpc-attachment \
-       --transit-gateway-id ${SECONDARY_TGW_ID} \
-       --vpc-id ${SECONDARY_VPC_ID} \
-       --subnet-ids ${SECONDARY_PRIVATE_SUBNET_1} ${SECONDARY_PRIVATE_SUBNET_2} \
-       --tag-specifications \
-       "ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=secondary-tgw-attachment}]" \
-       --region ${SECONDARY_REGION}
-   
    echo "✅ Secondary region VPC and Transit Gateway created"
    ```
 
@@ -451,7 +401,7 @@ echo "✅ IAM roles created successfully"
 
 > **Warning**: Cross-region data transfer charges apply for traffic between regions. Monitor VPC Flow Logs and AWS Cost Explorer to track inter-region communication costs and optimize traffic patterns.
 
-5. **Establish Transit Gateway Cross-Region Peering**:
+4. **Establish Transit Gateway Cross-Region Peering**:
 
    Transit Gateway peering creates a secure, high-bandwidth connection between regions, enabling private communication without traversing the public internet. This connection supports up to 50 Gbps of aggregate bandwidth and uses AWS's private backbone network for optimal performance and security. Cross-region peering is essential for multi-cluster architectures requiring service-to-service communication, data replication, and disaster recovery capabilities.
 
@@ -486,7 +436,7 @@ echo "✅ IAM roles created successfully"
 
    Cross-region connectivity is now established with Transit Gateway peering, enabling secure communication between VPCs in different regions. The peering connection provides private network connectivity over AWS's backbone infrastructure, ensuring low latency and high bandwidth for cross-region application communication.
 
-6. **Configure Transit Gateway Route Tables**:
+5. **Configure Transit Gateway Route Tables**:
 
    Transit Gateway route tables control traffic flow between attached VPCs and peering connections, similar to traditional networking route tables but operating at the cloud scale. Proper route configuration enables selective connectivity between regions while maintaining network isolation where required. This step establishes bidirectional routing between regions, allowing applications in either region to communicate with services in the other region through private network paths.
 
@@ -520,7 +470,7 @@ echo "✅ IAM roles created successfully"
 
    Cross-region routing is now configured, enabling VPCs in each region to communicate through Transit Gateway peering. Traffic between 10.1.0.0/16 (primary) and 10.2.0.0/16 (secondary) will route through the secure peering connection, providing the foundation for multi-cluster Kubernetes communication.
 
-7. **Create Primary EKS Cluster**:
+6. **Create Primary EKS Cluster**:
 
    Amazon EKS provides a fully managed Kubernetes control plane with 99.95% SLA, handling master node provisioning, patching, and scaling automatically. The cluster spans multiple Availability Zones for high availability and integrates with AWS services like IAM, VPC, and CloudWatch. Enabling control plane logging provides comprehensive audit trails for API calls, authentication events, and cluster operations, essential for compliance and troubleshooting in enterprise environments.
 
@@ -528,7 +478,7 @@ echo "✅ IAM roles created successfully"
    # Create EKS cluster in primary region
    aws eks create-cluster \
        --name ${PRIMARY_CLUSTER_NAME} \
-       --version 1.28 \
+       --version 1.29 \
        --role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/eks-cluster-role-${RANDOM_SUFFIX} \
        --resources-vpc-config subnetIds=${PRIMARY_PUBLIC_SUBNET_1},${PRIMARY_PUBLIC_SUBNET_2},${PRIMARY_PRIVATE_SUBNET_1},${PRIMARY_PRIVATE_SUBNET_2} \
        --region ${PRIMARY_REGION} \
@@ -542,9 +492,9 @@ echo "✅ IAM roles created successfully"
    echo "✅ Primary EKS cluster created and active"
    ```
 
-   The primary EKS cluster is now operational with Kubernetes 1.28, providing the foundation for container workloads. The cluster spans multiple AZs and includes comprehensive logging for operational visibility. EKS automatically manages the control plane while providing integration points for worker nodes, networking, and security.
+   The primary EKS cluster is now operational with Kubernetes 1.29, providing the foundation for container workloads. The cluster spans multiple AZs and includes comprehensive logging for operational visibility. EKS automatically manages the control plane while providing integration points for worker nodes, networking, and security.
 
-8. **Create Secondary EKS Cluster**:
+7. **Create Secondary EKS Cluster**:
 
    The secondary EKS cluster provides geographic redundancy and disaster recovery capabilities. By maintaining identical cluster configurations across regions, applications can be deployed consistently with minimal configuration changes. The secondary cluster enables active-active deployments for global applications or serves as a hot standby for disaster recovery scenarios, depending on your business requirements.
 
@@ -584,7 +534,7 @@ echo "✅ IAM roles created successfully"
    # Create EKS cluster in secondary region
    aws eks create-cluster \
        --name ${SECONDARY_CLUSTER_NAME} \
-       --version 1.28 \
+       --version 1.29 \
        --role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/eks-cluster-role-${RANDOM_SUFFIX} \
        --resources-vpc-config subnetIds=${SECONDARY_PUBLIC_SUBNET_1},${SECONDARY_PUBLIC_SUBNET_2},${SECONDARY_PRIVATE_SUBNET_1},${SECONDARY_PRIVATE_SUBNET_2} \
        --region ${SECONDARY_REGION} \
@@ -600,7 +550,7 @@ echo "✅ IAM roles created successfully"
 
    The secondary EKS cluster mirrors the primary cluster configuration, providing consistent Kubernetes environments across regions. Both clusters are now ready for worker node deployment and application workloads, enabling multi-region container orchestration with centralized management capabilities.
 
-9. **Create Node Groups for Both Clusters**:
+8. **Create Node Groups for Both Clusters**:
 
    EKS managed node groups provide automated provisioning, scaling, and lifecycle management for worker nodes. The nodes are deployed in private subnets for security while maintaining internet connectivity through NAT gateways. Using m5.large instances provides a balance of compute, memory, and network performance suitable for most containerized workloads. The scaling configuration enables automatic capacity adjustment based on pod scheduling demands.
 
@@ -643,7 +593,7 @@ echo "✅ IAM roles created successfully"
 
    Both clusters now have operational worker nodes capable of scheduling pods. The managed node groups provide automatic scaling between 2-6 nodes based on workload demands. Nodes are distributed across multiple AZs for high availability and deployed in private subnets for enhanced security.
 
-10. **Configure kubectl for Multi-Cluster Access**:
+9. **Configure kubectl for Multi-Cluster Access**:
 
     Managing multiple Kubernetes clusters requires proper kubectl context configuration to avoid accidental operations on the wrong cluster. EKS integrates with kubectl through AWS IAM authentication, eliminating the need for long-lived tokens or certificates. Using context aliases enables easy switching between clusters while maintaining clear visibility into which cluster you're operating on.
 
@@ -669,18 +619,18 @@ echo "✅ IAM roles created successfully"
 
     Both EKS clusters are now accessible through kubectl with distinct context names. The configuration enables seamless switching between primary and secondary clusters while maintaining secure authentication through AWS IAM. You can now deploy and manage applications across both regions using standard Kubernetes tools.
 
-11. **Install VPC Lattice Gateway API Controller**:
+10. **Install VPC Lattice Gateway API Controller**:
 
     VPC Lattice Gateway API Controller implements the Kubernetes Gateway API specification, providing service mesh capabilities without additional infrastructure overhead. The controller automatically creates VPC Lattice services and routes based on Gateway and HTTPRoute resources, enabling advanced traffic management, security policies, and cross-VPC service communication. This approach simplifies service mesh adoption while leveraging AWS-native networking capabilities.
 
     ```bash
     # Install VPC Lattice Gateway API Controller in primary cluster
     kubectl --context=primary-cluster apply -f \
-        https://raw.githubusercontent.com/aws/aws-application-networking-k8s/main/deploy/deploy-v1.0.0.yaml
+        https://raw.githubusercontent.com/aws/aws-application-networking-k8s/main/files/controller-installation/deploy-v1.1.0.yaml
     
     # Install VPC Lattice Gateway API Controller in secondary cluster
     kubectl --context=secondary-cluster apply -f \
-        https://raw.githubusercontent.com/aws/aws-application-networking-k8s/main/deploy/deploy-v1.0.0.yaml
+        https://raw.githubusercontent.com/aws/aws-application-networking-k8s/main/files/controller-installation/deploy-v1.1.0.yaml
     
     # Wait for controllers to be ready
     kubectl --context=primary-cluster wait --for=condition=Ready pod \
@@ -696,7 +646,7 @@ echo "✅ IAM roles created successfully"
 
     VPC Lattice Gateway API Controllers are now running in both clusters, enabling service mesh federation capabilities. The controllers will automatically create VPC Lattice resources based on Kubernetes Gateway API specifications, providing application-layer networking and security without traditional service mesh complexity.
 
-12. **Deploy Sample Applications with VPC Lattice**:
+11. **Deploy Sample Applications with VPC Lattice**:
 
     This step demonstrates how VPC Lattice integrates with Kubernetes workloads through the Gateway API. The nginx applications serve as representative microservices that would exist in a real multi-cluster deployment. VPC Lattice automatically handles service discovery, load balancing, and traffic routing between services, even across regions. The Gateway and HTTPRoute resources define how traffic flows to services while VPC Lattice handles the underlying network connectivity.
 
@@ -848,7 +798,7 @@ echo "✅ IAM roles created successfully"
 
     Sample applications are now running in both regions with VPC Lattice service mesh capabilities. Each application is accessible through its respective VPC Lattice endpoint, and the Gateway API configuration enables advanced traffic management features like header-based routing, traffic splitting, and automatic retries.
 
-13. **Configure Cross-Cluster Service Discovery with VPC Lattice**:
+12. **Configure Cross-Cluster Service Discovery with VPC Lattice**:
 
     VPC Lattice Service Networks provide centralized service discovery and communication across VPCs and regions. By associating both VPCs with the same service network, applications can discover and communicate with services regardless of their physical location. This enables microservices architectures that span multiple clusters while maintaining service-to-service connectivity and applying consistent security policies across the entire service mesh.
 
@@ -883,7 +833,7 @@ echo "✅ IAM roles created successfully"
 
     Cross-cluster service discovery is now enabled through VPC Lattice Service Network. Applications in either region can discover and communicate with services in the other region using DNS-based service discovery. The service network provides a unified namespace for microservices across the multi-cluster deployment.
 
-14. **Configure Route 53 for Global Load Balancing**:
+13. **Configure Route 53 for Global Load Balancing**:
 
     Route 53 health checks and DNS-based routing provide intelligent traffic distribution across multiple regions based on endpoint health and geographic proximity. Health checks continuously monitor VPC Lattice service endpoints, automatically routing traffic away from unhealthy regions. This DNS-based approach provides global load balancing without requiring additional infrastructure, enabling automatic failover and optimal user experience across geographic locations.
 
@@ -894,9 +844,6 @@ echo "✅ IAM roles created successfully"
     
     SECONDARY_LATTICE_DNS=$(kubectl --context=secondary-cluster get gateway nginx-secondary-gateway \
         -o jsonpath='{.metadata.annotations.application-networking\.k8s\.aws/lattice-assigned-domain-name}')
-    
-    # Create Route 53 hosted zone (if not exists)
-    DOMAIN_NAME="multi-cluster-demo.com"
     
     # Create health checks for both VPC Lattice services
     aws route53 create-health-check \
@@ -1162,7 +1109,7 @@ The architecture addresses critical business requirements including disaster rec
 
 Key architectural decisions include using Transit Gateway for hub-and-spoke networking to support future expansion to multiple regions, implementing VPC Lattice for service mesh capabilities without additional infrastructure overhead, enabling cross-region service discovery through VPC Lattice service networks, and deploying identical application stacks in both regions to ensure consistent behavior during failover scenarios. The solution also supports advanced patterns like traffic splitting, circuit breaking, and automated failover through VPC Lattice policies.
 
-Cost optimization considerations include using spot instances for development environments, implementing cluster autoscaling to match resource consumption with demand, leveraging AWS Savings Plans for predictable workloads, and carefully managing Transit Gateway data processing charges. Organizations should also consider the VPC Lattice pricing model based on active service networks and data processing, implementing efficient service discovery patterns to minimize cross-region traffic costs.
+Cost optimization considerations include using spot instances for development environments, implementing cluster autoscaling to match resource consumption with demand, leveraging AWS Savings Plans for predictable workloads, and carefully managing Transit Gateway data processing charges. Organizations should also consider the VPC Lattice pricing model based on active service networks and data processing, implementing efficient service discovery patterns to minimize cross-region traffic costs. For additional guidance on AWS best practices, see the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) and [EKS Best Practices Guide](https://aws.github.io/aws-eks-best-practices/).
 
 > **Tip**: Implement cluster autoscaling and horizontal pod autoscaling to automatically adjust capacity based on demand, reducing operational overhead and optimizing costs.
 

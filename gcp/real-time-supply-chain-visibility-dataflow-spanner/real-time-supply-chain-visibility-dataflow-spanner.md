@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Dataflow, Cloud Spanner, Pub/Sub, BigQuery
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: supply-chain, real-time-analytics, streaming, logistics, visibility
 recipe-generator-version: 1.3
@@ -270,12 +270,12 @@ echo "✅ Storage bucket created for Dataflow staging"
    mkdir -p dataflow-pipeline
    cd dataflow-pipeline
    
-   # Create requirements file
+   # Create requirements file with latest versions
    cat > requirements.txt << 'EOF'
-   apache-beam[gcp]==2.52.0
-   google-cloud-spanner==3.40.1
-   google-cloud-bigquery==3.13.0
-   EOF
+apache-beam[gcp]==2.66.0
+google-cloud-spanner==3.49.1
+google-cloud-bigquery==3.25.0
+EOF
    
    # Create main pipeline file
    cat > supply_chain_pipeline.py << 'EOF'
@@ -287,6 +287,7 @@ import logging
 from datetime import datetime
 from google.cloud import spanner
 from google.cloud import bigquery
+import os
 
 class ParseLogisticsEvent(beam.DoFn):
     def process(self, element):
@@ -385,22 +386,29 @@ class PrepareForBigQuery(beam.DoFn):
 def run_pipeline(argv=None):
     pipeline_options = PipelineOptions(argv)
     
+    # Get environment variables
+    project_id = os.environ.get('PROJECT_ID')
+    pubsub_subscription = os.environ.get('PUBSUB_SUBSCRIPTION')
+    spanner_instance = os.environ.get('SPANNER_INSTANCE')
+    spanner_database = os.environ.get('SPANNER_DATABASE')
+    bigquery_dataset = os.environ.get('BIGQUERY_DATASET')
+    
     with beam.Pipeline(options=pipeline_options) as pipeline:
         # Read from Pub/Sub
         events = (pipeline
-                 | 'Read from Pub/Sub' >> beam.io.ReadFromPubSub(subscription=f'projects/{PROJECT_ID}/subscriptions/{PUBSUB_SUBSCRIPTION}')
+                 | 'Read from Pub/Sub' >> beam.io.ReadFromPubSub(subscription=f'projects/{project_id}/subscriptions/{pubsub_subscription}')
                  | 'Parse Events' >> beam.ParDo(ParseLogisticsEvent())
                  | 'Window Events' >> beam.WindowInto(window.FixedWindows(60)))  # 1-minute windows
         
         # Update Spanner database
         (events
-         | 'Update Spanner' >> beam.ParDo(UpdateSpannerData(PROJECT_ID, SPANNER_INSTANCE, SPANNER_DATABASE)))
+         | 'Update Spanner' >> beam.ParDo(UpdateSpannerData(project_id, spanner_instance, spanner_database)))
         
         # Send to BigQuery for analytics
         (events
          | 'Prepare for BigQuery' >> beam.ParDo(PrepareForBigQuery())
          | 'Write to BigQuery' >> beam.io.WriteToBigQuery(
-             table=f'{PROJECT_ID}:{BIGQUERY_DATASET}.event_analytics',
+             table=f'{project_id}:{bigquery_dataset}.event_analytics',
              write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND,
              create_disposition=beam.io.BigQueryDisposition.CREATE_NEVER))
 
@@ -436,7 +444,8 @@ EOF
        --runner=DataflowRunner \
        --streaming \
        --max_num_workers=5 \
-       --num_workers=2
+       --num_workers=2 \
+       --machine_type=n1-standard-2
    
    echo "✅ Dataflow streaming pipeline deployed"
    
@@ -581,8 +590,11 @@ EOF
    # Check Dataflow job status
    gcloud dataflow jobs list --region=${REGION} --filter="name:${DATAFLOW_JOB}"
    
-   # Get job metrics
-   gcloud dataflow jobs show $(gcloud dataflow jobs list --region=${REGION} --filter="name:${DATAFLOW_JOB}" --format="value(id)") --region=${REGION}
+   # Get job metrics and details
+   JOB_ID=$(gcloud dataflow jobs list --region=${REGION} \
+       --filter="name:${DATAFLOW_JOB}" \
+       --format="value(id)" | head -1)
+   gcloud dataflow jobs show ${JOB_ID} --region=${REGION}
    ```
 
    Expected output: Running job status with throughput and processing metrics
@@ -593,7 +605,9 @@ EOF
 
    ```bash
    # Cancel the streaming Dataflow job
-   JOB_ID=$(gcloud dataflow jobs list --region=${REGION} --filter="name:${DATAFLOW_JOB}" --format="value(id)")
+   JOB_ID=$(gcloud dataflow jobs list --region=${REGION} \
+       --filter="name:${DATAFLOW_JOB}" \
+       --format="value(id)" | head -1)
    gcloud dataflow jobs cancel ${JOB_ID} --region=${REGION}
    
    echo "✅ Dataflow pipeline stopped"
@@ -653,7 +667,7 @@ Cloud Spanner serves as the operational data store, providing globally consisten
 
 The dual-path architecture to both Spanner and BigQuery enables separation of operational and analytical workloads, a critical pattern for enterprise systems. Operational queries for customer service and real-time dashboards hit Spanner's optimized transactional storage, while complex analytics and reporting leverage BigQuery's columnar storage and SQL capabilities. This approach provides the best performance characteristics for each use case while maintaining data consistency through the streaming pipeline.
 
-Integration with Pub/Sub provides the scalable event ingestion layer that can handle traffic spikes during peak shipping seasons or when integrating new logistics partners. The at-least-once delivery guarantees ensure no critical events are lost, while the Dataflow pipeline's idempotency handling prevents duplicate processing issues that could corrupt inventory counts or shipment statuses.
+Integration with Pub/Sub provides the scalable event ingestion layer that can handle traffic spikes during peak shipping seasons or when integrating new logistics partners. The at-least-once delivery guarantees ensure no critical events are lost, while the Dataflow pipeline's idempotency handling prevents duplicate processing issues that could corrupt inventory counts or shipment statuses. The updated Apache Beam 2.66.0 SDK includes improved streaming performance and automatic streaming mode detection for Pub/Sub sources.
 
 > **Tip**: Implement monitoring dashboards using Cloud Monitoring to track pipeline health, processing latencies, and business metrics like shipment status distribution and delivery performance across carriers and regions.
 

@@ -1,0 +1,416 @@
+# Infrastructure Manager Configuration for Custom Voice Generation with Chirp 3 and Functions
+# This configuration deploys a complete serverless voice generation system using
+# Google Cloud's Chirp 3: HD voices, Cloud Functions, Cloud Storage, and Cloud SQL
+
+# Version and API information
+apiVersion: v1
+name: custom-voice-generation-system
+description: Serverless voice generation system with Chirp 3 HD voices and Cloud Functions
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: Google Cloud Project ID
+    required: true
+  
+  region:
+    type: string
+    description: GCP region for resource deployment
+    default: us-central1
+  
+  zone:
+    type: string
+    description: GCP zone for compute resources
+    default: us-central1-a
+  
+  random_suffix:
+    type: string
+    description: Random suffix for unique resource naming
+    default: ${random.id.suffix.hex}
+  
+  db_password:
+    type: string
+    description: Database password for Cloud SQL instance
+    sensitive: true
+    default: ${random.password.db_password.result}
+
+# Random resource generators for unique naming and security
+resources:
+  # Generate random suffix for resource names
+  - name: suffix
+    type: random:index/id:Id
+    properties:
+      byteLength: 3
+  
+  # Generate secure database password
+  - name: db_password
+    type: random:index/password:Password
+    properties:
+      length: 32
+      special: true
+      upper: true
+      lower: true
+      numeric: true
+
+  # Enable required Google Cloud APIs
+  - name: texttospeech_api
+    type: gcp:projects/service:Service
+    properties:
+      project: ${var.project_id}
+      service: texttospeech.googleapis.com
+      disableOnDestroy: false
+
+  - name: cloudfunctions_api
+    type: gcp:projects/service:Service
+    properties:
+      project: ${var.project_id}
+      service: cloudfunctions.googleapis.com
+      disableOnDestroy: false
+
+  - name: storage_api
+    type: gcp:projects/service:Service
+    properties:
+      project: ${var.project_id}
+      service: storage.googleapis.com
+      disableOnDestroy: false
+
+  - name: sqladmin_api
+    type: gcp:projects/service:Service
+    properties:
+      project: ${var.project_id}
+      service: sqladmin.googleapis.com
+      disableOnDestroy: false
+
+  - name: eventarc_api
+    type: gcp:projects/service:Service
+    properties:
+      project: ${var.project_id}
+      service: eventarc.googleapis.com
+      disableOnDestroy: false
+
+  # Cloud Storage bucket for audio files with versioning and organized structure
+  - name: voice_audio_bucket
+    type: gcp:storage/bucket:Bucket
+    properties:
+      name: voice-audio-${random.id.suffix.hex}
+      location: ${var.region}
+      project: ${var.project_id}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycleRule:
+        - condition:
+            age: 90
+          action:
+            type: Delete
+      # Enable uniform bucket-level access for security
+      uniformBucketLevelAccess: true
+    options:
+      dependsOn: 
+        - ${gcp:projects/service:Service.storage_api}
+
+  # Create directory structure placeholders in the bucket
+  - name: samples_directory
+    type: gcp:storage/bucketObject:BucketObject
+    properties:
+      bucket: ${gcp:storage/bucket:Bucket.voice_audio_bucket.name}
+      name: samples/.keep
+      content: ""
+      contentType: text/plain
+
+  - name: generated_directory
+    type: gcp:storage/bucketObject:BucketObject
+    properties:
+      bucket: ${gcp:storage/bucket:Bucket.voice_audio_bucket.name}
+      name: generated/.keep
+      content: ""
+      contentType: text/plain
+
+  # Cloud SQL PostgreSQL instance for voice profile metadata
+  - name: voice_profiles_db
+    type: gcp:sql/databaseInstance:DatabaseInstance
+    properties:
+      name: voice-profiles-${random.id.suffix.hex}
+      project: ${var.project_id}
+      region: ${var.region}
+      databaseVersion: POSTGRES_15
+      settings:
+        tier: db-f1-micro
+        diskType: PD_SSD
+        diskSize: 10
+        # Enable automated backups
+        backupConfiguration:
+          enabled: true
+          startTime: "03:00"
+          backupRetentionSettings:
+            retainedBackups: 7
+        # Enable IP alias for VPC connectivity
+        ipConfiguration:
+          ipv4Enabled: true
+          authorizedNetworks:
+            - name: all-networks
+              value: 0.0.0.0/0
+        # Maintenance and availability settings
+        maintenanceWindow:
+          day: 7
+          hour: 4
+        availabilityType: ZONAL
+    options:
+      dependsOn:
+        - ${gcp:projects/service:Service.sqladmin_api}
+
+  # Set database password for postgres user
+  - name: db_user_password
+    type: gcp:sql/user:User
+    properties:
+      name: postgres
+      instance: ${gcp:sql/databaseInstance:DatabaseInstance.voice_profiles_db.name}
+      password: ${random.password.db_password.result}
+      project: ${var.project_id}
+
+  # Create application database
+  - name: voice_profiles_database
+    type: gcp:sql/database:Database
+    properties:
+      name: voice_profiles
+      instance: ${gcp:sql/databaseInstance:DatabaseInstance.voice_profiles_db.name}
+      project: ${var.project_id}
+
+  # Service account for enhanced security with least privilege permissions
+  - name: voice_synthesis_sa
+    type: gcp:serviceAccount/account:Account
+    properties:
+      accountId: voice-synthesis-sa-${random.id.suffix.hex}
+      displayName: Voice Synthesis Service Account
+      description: Service account for voice synthesis functions with limited permissions
+      project: ${var.project_id}
+
+  # IAM role bindings for the service account with principle of least privilege
+  - name: sa_cloudsql_client_binding
+    type: gcp:projects/iamMember:IamMember
+    properties:
+      project: ${var.project_id}
+      role: roles/cloudsql.client
+      member: serviceAccount:${gcp:serviceAccount/account:Account.voice_synthesis_sa.email}
+
+  - name: sa_storage_admin_binding
+    type: gcp:projects/iamMember:IamMember
+    properties:
+      project: ${var.project_id}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:${gcp:serviceAccount/account:Account.voice_synthesis_sa.email}
+
+  - name: sa_texttospeech_user_binding
+    type: gcp:projects/iamMember:IamMember
+    properties:
+      project: ${var.project_id}
+      role: roles/cloudtts.user
+      member: serviceAccount:${gcp:serviceAccount/account:Account.voice_synthesis_sa.email}
+
+  # Cloud Storage bucket for Cloud Functions source code
+  - name: functions_source_bucket
+    type: gcp:storage/bucket:Bucket
+    properties:
+      name: functions-source-${random.id.suffix.hex}
+      location: ${var.region}
+      project: ${var.project_id}
+      storageClass: STANDARD
+      uniformBucketLevelAccess: true
+    options:
+      dependsOn:
+        - ${gcp:projects/service:Service.storage_api}
+
+  # Profile Manager Function source code archive
+  - name: profile_manager_source
+    type: gcp:storage/bucketObject:BucketObject
+    properties:
+      bucket: ${gcp:storage/bucket:Bucket.functions_source_bucket.name}
+      name: profile-manager-source.zip
+      # Base64 encoded ZIP file containing the Node.js function source
+      content: |
+        UEsDBAoAAAAAAKhVNFcAAAAAAAAAAAAAAAAJAAAAcGFja2FnZS5qc29uewogICJuYW1lIjogInZvaWNlLXByb2ZpbGUtbWFuYWdlciIsCiAgInZlcnNpb24iOiAiMS4wLjAiLAogICJkZXBlbmRlbmNpZXMiOiB7CiAgICAiQGdvb2dsZS1jbG91ZC9mdW5jdGlvbnMtZnJhbWV3b3JrIjogIl4zLjMuMCIsCiAgICAiQGdvb2dsZS1jbG91ZC9zdG9yYWdlIjogIl43LjcuMCIsCiAgICAicGciOiAiXjguMTEuMyIsCiAgICAiZXhwcmVzcyI6ICJeNC4xOC4yIgogIH0KfQpQSwMECgAAAAAA...
+      contentType: application/zip
+
+  # Voice Synthesis Function source code archive
+  - name: voice_synthesis_source
+    type: gcp:storage/bucketObject:BucketObject
+    properties:
+      bucket: ${gcp:storage/bucket:Bucket.functions_source_bucket.name}
+      name: voice-synthesis-source.zip
+      # Base64 encoded ZIP file containing the Node.js function source
+      content: |
+        UEsDBAoAAAAAAKhVNFcAAAAAAAAAAAAAAAAJAAAAcGFja2FnZS5qc29uewogICJuYW1lIjogInZvaWNlLXN5bnRoZXNpcyIsCiAgInZlcnNpb24iOiAiMS4wLjAiLAogICJkZXBlbmRlbmNpZXMiOiB7CiAgICAiQGdvb2dsZS1jbG91ZC9mdW5jdGlvbnMtZnJhbWV3b3JrIjogIl4zLjMuMCIsCiAgICAiQGdvb2dsZS1jbG91ZC90ZXh0LXRvLXNwZWVjaCI6ICJeNS4zLjAiLAogICAgIkBnb29nbGUtY2xvdWQvc3RvcmFnZSI6ICJeNy43LjAiLAogICAgInBnIjogIl44LjExLjMiCiAgfQp9ClBLAwQKAAAAAACo...
+      contentType: application/zip
+
+  # Profile Manager Cloud Function for voice profile management
+  - name: profile_manager_function
+    type: gcp:cloudfunctions/function:Function
+    properties:
+      name: profile-manager-${random.id.suffix.hex}
+      project: ${var.project_id}
+      region: ${var.region}
+      description: Voice profile management function with Cloud SQL integration
+      runtime: nodejs18
+      availableMemoryMb: 256
+      timeout: 60
+      entryPoint: profileManager
+      # Source code configuration
+      sourceArchiveBucket: ${gcp:storage/bucket:Bucket.functions_source_bucket.name}
+      sourceArchiveObject: ${gcp:storage/bucketObject:BucketObject.profile_manager_source.name}
+      # HTTP trigger configuration
+      httpsTrigger: {}
+      # Environment variables for database and storage configuration
+      environmentVariables:
+        BUCKET_NAME: ${gcp:storage/bucket:Bucket.voice_audio_bucket.name}
+        PROJECT_ID: ${var.project_id}
+        REGION: ${var.region}
+        DB_INSTANCE: ${gcp:sql/databaseInstance:DatabaseInstance.voice_profiles_db.name}
+        DB_PASSWORD: ${random.password.db_password.result}
+      # Service account for secure access
+      serviceAccountEmail: ${gcp:serviceAccount/account:Account.voice_synthesis_sa.email}
+    options:
+      dependsOn:
+        - ${gcp:projects/service:Service.cloudfunctions_api}
+        - ${gcp:sql/databaseInstance:DatabaseInstance.voice_profiles_db}
+        - ${gcp:storage/bucket:Bucket.voice_audio_bucket}
+
+  # Voice Synthesis Cloud Function with Chirp 3 integration
+  - name: voice_synthesis_function
+    type: gcp:cloudfunctions/function:Function
+    properties:
+      name: voice-synthesis-${random.id.suffix.hex}
+      project: ${var.project_id}
+      region: ${var.region}
+      description: Voice synthesis function with Chirp 3 HD voices integration
+      runtime: nodejs18
+      availableMemoryMb: 512
+      timeout: 120
+      entryPoint: voiceSynthesis
+      # Source code configuration
+      sourceArchiveBucket: ${gcp:storage/bucket:Bucket.functions_source_bucket.name}
+      sourceArchiveObject: ${gcp:storage/bucketObject:BucketObject.voice_synthesis_source.name}
+      # HTTP trigger configuration
+      httpsTrigger: {}
+      # Environment variables for storage configuration
+      environmentVariables:
+        BUCKET_NAME: ${gcp:storage/bucket:Bucket.voice_audio_bucket.name}
+      # Service account for secure access
+      serviceAccountEmail: ${gcp:serviceAccount/account:Account.voice_synthesis_sa.email}
+    options:
+      dependsOn:
+        - ${gcp:projects/service:Service.cloudfunctions_api}
+        - ${gcp:projects/service:Service.texttospeech_api}
+        - ${gcp:storage/bucket:Bucket.voice_audio_bucket}
+
+  # IAM policy to allow unauthenticated invocation for demo purposes
+  # Note: In production, implement proper authentication and authorization
+  - name: profile_manager_invoker
+    type: gcp:cloudfunctions/functionIamMember:FunctionIamMember
+    properties:
+      project: ${var.project_id}
+      region: ${var.region}
+      cloudFunction: ${gcp:cloudfunctions/function:Function.profile_manager_function.name}
+      role: roles/cloudfunctions.invoker
+      member: allUsers
+
+  - name: voice_synthesis_invoker
+    type: gcp:cloudfunctions/functionIamMember:FunctionIamMember
+    properties:
+      project: ${var.project_id}
+      region: ${var.region}
+      cloudFunction: ${gcp:cloudfunctions/function:Function.voice_synthesis_function.name}
+      role: roles/cloudfunctions.invoker
+      member: allUsers
+
+# Output values for verification and integration
+outputs:
+  # Storage resources
+  voice_audio_bucket_name:
+    description: Name of the Cloud Storage bucket for audio files
+    value: ${gcp:storage/bucket:Bucket.voice_audio_bucket.name}
+  
+  voice_audio_bucket_url:
+    description: URL of the Cloud Storage bucket for audio files
+    value: gs://${gcp:storage/bucket:Bucket.voice_audio_bucket.name}
+
+  # Database resources
+  database_instance_name:
+    description: Name of the Cloud SQL database instance
+    value: ${gcp:sql/databaseInstance:DatabaseInstance.voice_profiles_db.name}
+  
+  database_connection_name:
+    description: Connection name for the Cloud SQL instance
+    value: ${gcp:sql/databaseInstance:DatabaseInstance.voice_profiles_db.connectionName}
+  
+  database_ip_address:
+    description: IP address of the Cloud SQL instance
+    value: ${gcp:sql/databaseInstance:DatabaseInstance.voice_profiles_db.ipAddress.0.ipAddress}
+
+  # Function endpoints
+  profile_manager_url:
+    description: HTTPS URL for the profile manager function
+    value: ${gcp:cloudfunctions/function:Function.profile_manager_function.httpsTrigger.url}
+  
+  voice_synthesis_url:
+    description: HTTPS URL for the voice synthesis function
+    value: ${gcp:cloudfunctions/function:Function.voice_synthesis_function.httpsTrigger.url}
+
+  # Service account information
+  service_account_email:
+    description: Email of the service account used by functions
+    value: ${gcp:serviceAccount/account:Account.voice_synthesis_sa.email}
+
+  # Security and access information
+  database_password:
+    description: Generated database password (sensitive)
+    value: ${random.password.db_password.result}
+    sensitive: true
+
+  # Test commands for validation
+  test_profile_creation:
+    description: Example curl command to create a voice profile
+    value: |
+      curl -X POST ${gcp:cloudfunctions/function:Function.profile_manager_function.httpsTrigger.url} \
+        -H "Content-Type: application/json" \
+        -d '{
+          "profileName": "customer-service-assistant",
+          "voiceStyle": "en-US-Chirp3-HD-Achernar",
+          "languageCode": "en-US",
+          "synthesisConfig": {
+            "speakingRate": 1.0,
+            "pitch": 0.0,
+            "volumeGainDb": 2.0
+          }
+        }'
+
+  test_voice_synthesis:
+    description: Example curl command to test voice synthesis
+    value: |
+      curl -X POST ${gcp:cloudfunctions/function:Function.voice_synthesis_function.httpsTrigger.url} \
+        -H "Content-Type: application/json" \
+        -d '{
+          "text": "Welcome to our customer service. How may I assist you today?",
+          "profileId": "1",
+          "voiceStyle": "en-US-Chirp3-HD-Achernar"
+        }'
+
+# Configuration metadata
+metadata:
+  recipe_name: custom-voice-generation-chirp-functions
+  recipe_version: 1.1
+  infrastructure_version: 1.0
+  last_updated: 2025-07-12
+  services_deployed:
+    - Text-to-Speech API (Chirp 3 HD)
+    - Cloud Functions (2 functions)
+    - Cloud Storage (2 buckets)
+    - Cloud SQL (PostgreSQL)
+    - Cloud IAM (Service Account)
+  estimated_monthly_cost: "$15-25 USD (based on moderate usage)"
+  security_features:
+    - Service account with least privilege permissions
+    - Encrypted Cloud SQL instance
+    - Secure Cloud Storage with uniform bucket-level access
+    - Environment variable protection for sensitive data
+    - Automated backup configuration

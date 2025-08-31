@@ -6,16 +6,18 @@ difficulty: 300
 subject: aws
 services: pinpoint, iam, s3, cloudwatch
 estimated-time: 150 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: pinpoint, ab-testing, mobile, analytics, engagement, conversion-optimization
 recipe-generator-version: 1.3
 ---
 
 # Mobile App A/B Testing with Pinpoint Analytics
+
+> **Important Notice**: Amazon Pinpoint will end support on October 30, 2026. After this date, you will no longer be able to access Pinpoint engagement features (endpoints, segments, campaigns, journeys, and analytics). For migration options, see the [Amazon Pinpoint migration guide](https://docs.aws.amazon.com/pinpoint/latest/userguide/migrate.html). Push notification APIs will continue under AWS End User Messaging services.
 
 ## Problem
 
@@ -86,6 +88,8 @@ graph TB
 5. Basic JSON and data analysis skills
 6. Estimated cost: $50-100/month for testing (depends on message volume and analytics export)
 
+> **Note**: Consider migration timeline when planning long-term A/B testing strategies due to Pinpoint's end of support in October 2026.
+
 ## Preparation
 
 ```bash
@@ -106,6 +110,9 @@ export IAM_ROLE_NAME="PinpointAnalyticsRole-${RANDOM_SUFFIX}"
 
 # Create S3 bucket for analytics exports
 aws s3 mb s3://${S3_BUCKET_NAME} --region ${AWS_REGION}
+
+# Wait for bucket to be available
+aws s3 wait bucket-exists --bucket ${S3_BUCKET_NAME}
 
 echo "✅ Environment variables set and S3 bucket created"
 echo "Project Name: ${PINPOINT_PROJECT_NAME}"
@@ -151,10 +158,31 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
            ]
        }'
    
-   # Attach policy for S3 access
+   # Create custom policy for S3 access with least privilege
+   aws iam create-policy \
+       --policy-name PinpointS3ExportPolicy-${RANDOM_SUFFIX} \
+       --policy-document '{
+           "Version": "2012-10-17",
+           "Statement": [
+               {
+                   "Effect": "Allow",
+                   "Action": [
+                       "s3:PutObject",
+                       "s3:PutObjectAcl",
+                       "s3:GetBucketLocation"
+                   ],
+                   "Resource": [
+                       "arn:aws:s3:::'${S3_BUCKET_NAME}'",
+                       "arn:aws:s3:::'${S3_BUCKET_NAME}'/*"
+                   ]
+               }
+           ]
+       }'
+   
+   # Attach custom policy to role
    aws iam attach-role-policy \
        --role-name ${IAM_ROLE_NAME} \
-       --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/PinpointS3ExportPolicy-${RANDOM_SUFFIX}
    
    # Get role ARN
    ROLE_ARN=$(aws iam get-role \
@@ -164,7 +192,7 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
    echo "✅ IAM role created: ${ROLE_ARN}"
    ```
 
-   The IAM role configuration uses a trust policy that specifically allows the Pinpoint service to assume the role and write analytics data to S3. This setup enables automated export of detailed campaign metrics, including delivery rates, open rates, click-through rates, and custom conversion events that are crucial for A/B test analysis. The trust relationship ensures that only Amazon Pinpoint can assume this role, following AWS security best practices for service-to-service authentication.
+   The IAM role configuration uses a trust policy that specifically allows the Pinpoint service to assume the role and write analytics data to S3. This setup enables automated export of detailed campaign metrics, including delivery rates, open rates, click-through rates, and custom conversion events that are crucial for A/B test analysis. The custom policy follows the principle of least privilege by granting only the minimum S3 permissions required for Pinpoint analytics export.
 
 3. **Enable Push Notification Channels**:
 
@@ -173,23 +201,29 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
    ```bash
    # Configure GCM/FCM channel (Android)
    # Note: Replace with your actual Firebase server key
-   aws pinpoint update-gcm-channel \
-       --application-id ${PINPOINT_APP_ID} \
-       --gcm-channel-request \
-       ApiKey="YOUR_FIREBASE_SERVER_KEY" \
-       Enabled=true
+   echo "Configuring push notification channels..."
+   echo "For FCM (Android), use your Firebase Server Key:"
+   echo "aws pinpoint update-gcm-channel \\"
+   echo "    --application-id ${PINPOINT_APP_ID} \\"
+   echo "    --gcm-channel-request \\"
+   echo "    ApiKey=\"YOUR_FIREBASE_SERVER_KEY\" \\"
+   echo "    Enabled=true"
+   echo ""
+   echo "For APNS (iOS), upload your certificate or use token-based auth:"
+   echo "aws pinpoint update-apns-channel \\"
+   echo "    --application-id ${PINPOINT_APP_ID} \\"
+   echo "    --apns-channel-request \\"
+   echo "    Certificate=\"$(base64 -i your-certificate.p12)\" \\"
+   echo "    PrivateKey=\"YOUR_PRIVATE_KEY\" \\"
+   echo "    Enabled=true"
    
-   # Configure APNS channel (iOS)
-   # Note: This requires your Apple Push certificate
-   # For sandbox testing, use update-apns-sandbox-channel
-   
-   echo "✅ Push notification channels configured"
+   echo "✅ Push notification channel configuration instructions provided"
    echo "Note: Replace placeholders with actual credentials"
    ```
 
    The channel configuration establishes authenticated connections between Pinpoint and platform-specific notification services (Firebase Cloud Messaging for Android and Apple Push Notification Service for iOS). This setup enables Pinpoint to deliver your A/B test message variants directly to user devices while maintaining platform security requirements.
 
-   > **Warning**: Store your Firebase server keys and Apple certificates securely using AWS Secrets Manager. Never commit these credentials to version control.
+   > **Warning**: Store your Firebase server keys and Apple certificates securely using AWS Secrets Manager. Never commit these credentials to version control. See [AWS Secrets Manager documentation](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html) for secure credential storage.
 
 4. **Create User Segments for A/B Testing**:
 
@@ -319,6 +353,15 @@ EOF
    Event tracking is essential for measuring A/B test effectiveness beyond basic delivery metrics. This configuration enables real-time streaming of user interaction data and custom conversion events, allowing you to track meaningful business outcomes like app opens, purchases, or feature usage that result from your campaign messages.
 
    ```bash
+   # First create the Kinesis stream for event processing
+   aws kinesis create-stream \
+       --stream-name pinpoint-events \
+       --shard-count 1
+   
+   # Wait for stream to be active
+   aws kinesis wait stream-exists \
+       --stream-name pinpoint-events
+   
    # Create event stream for real-time analytics
    aws pinpoint put-event-stream \
        --application-id ${PINPOINT_APP_ID} \
@@ -368,16 +411,12 @@ EOF
    aws pinpoint update-application-settings \
        --application-id ${PINPOINT_APP_ID} \
        --write-application-settings-request '{
-           "CampaignHook": {
-               "Mode": "DELIVERY",
-               "WebUrl": "https://your-webhook-url.com/campaign-hook"
-           },
            "CloudWatchMetricsEnabled": true,
            "EventTaggingEnabled": true,
            "Limits": {
                "Daily": 1000,
                "MaximumDuration": 86400,
-               "MessagesPerSecond": 100,
+               "MessagesPerSecond": 10,
                "Total": 10000
            }
        }'
@@ -474,40 +513,48 @@ def lambda_handler(event, context):
     application_id = event['application_id']
     campaign_id = event['campaign_id']
     
-    # Get campaign analytics
-    response = pinpoint.get_campaign_activities(
-        ApplicationId=application_id,
-        CampaignId=campaign_id
-    )
-    
-    # Analyze conversion rates for each treatment
-    # This is a simplified example - implement statistical significance testing
-    treatments = response['ActivitiesResponse']['Item']
-    
-    best_treatment = None
-    best_conversion_rate = 0
-    
-    for treatment in treatments:
-        delivered = treatment.get('DeliveredCount', 0)
-        conversions = treatment.get('ConversionsCount', 0)
+    try:
+        # Get campaign analytics
+        response = pinpoint.get_campaign_activities(
+            ApplicationId=application_id,
+            CampaignId=campaign_id
+        )
         
-        if delivered > 0:
-            conversion_rate = conversions / delivered
-            if conversion_rate > best_conversion_rate:
-                best_conversion_rate = conversion_rate
-                best_treatment = treatment
+        # Analyze conversion rates for each treatment
+        # This is a simplified example - implement statistical significance testing
+        activities = response['ActivitiesResponse']['Item']
+        
+        best_treatment = None
+        best_conversion_rate = 0
+        
+        for activity in activities:
+            delivered = activity.get('DeliveredCount', 0)
+            conversions = activity.get('ConversionsCount', 0)
+            
+            if delivered > 0:
+                conversion_rate = conversions / delivered
+                if conversion_rate > best_conversion_rate:
+                    best_conversion_rate = conversion_rate
+                    best_treatment = activity
+        
+        # Log results
+        print(f"Best treatment: {best_treatment}")
+        print(f"Conversion rate: {best_conversion_rate:.2%}")
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'best_treatment': best_treatment,
+                'conversion_rate': best_conversion_rate
+            })
+        }
     
-    # Log results
-    print(f"Best treatment: {best_treatment}")
-    print(f"Conversion rate: {best_conversion_rate:.2%}")
-    
-    return {
-        'statusCode': 200,
-        'body': json.dumps({
-            'best_treatment': best_treatment,
-            'conversion_rate': best_conversion_rate
-        })
-    }
+    except Exception as e:
+        print(f"Error analyzing campaign: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
 EOF
     
     echo "✅ Winner selection logic created (Lambda function template)"
@@ -516,34 +563,7 @@ EOF
 
     This automated approach reduces the time between test completion and optimization implementation, enabling rapid iteration and continuous improvement of your messaging strategy. The function can be enhanced with sophisticated statistical testing to ensure reliable winner selection. Consider implementing confidence intervals and p-value calculations to validate that observed differences between treatments are statistically significant rather than due to random variation.
 
-11. **Set Up Real-time Event Processing**:
-
-    Real-time event processing enables immediate analysis of user interactions as they occur during your A/B test. By streaming events to Kinesis, you can build real-time analytics pipelines that detect performance trends early and trigger automated optimizations based on emerging data patterns.
-
-    ```bash
-    # Create Kinesis stream for real-time event processing
-    aws kinesis create-stream \
-        --stream-name pinpoint-events \
-        --shard-count 1
-    
-    # Wait for stream to be active
-    aws kinesis wait stream-exists \
-        --stream-name pinpoint-events
-    
-    # Configure event stream in Pinpoint
-    aws pinpoint put-event-stream \
-        --application-id ${PINPOINT_APP_ID} \
-        --write-event-stream '{
-            "DestinationStreamArn": "arn:aws:kinesis:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':stream/pinpoint-events",
-            "RoleArn": "'${ROLE_ARN}'"
-        }'
-    
-    echo "✅ Real-time event processing configured"
-    ```
-
-    The Kinesis stream configuration creates a real-time data pipeline that captures user engagement events as they happen. This enables immediate campaign performance monitoring and supports dynamic optimization strategies that can adjust campaign parameters based on real-time performance data.
-
-12. **Create Advanced Segment Targeting**:
+11. **Create Advanced Segment Targeting**:
 
     Advanced segmentation enables precision targeting based on user behavior patterns and engagement metrics. This behavioral segment identifies high-value users who have demonstrated consistent app usage, allowing you to tailor A/B tests specifically for your most engaged user base and potentially discover optimization strategies for user retention.
 
@@ -743,18 +763,22 @@ EOF
    echo "✅ S3 bucket cleaned up"
    ```
 
-6. **Remove IAM Role**:
+6. **Remove IAM Role and Policy**:
 
    ```bash
-   # Detach policies from role
+   # Detach custom policy from role
    aws iam detach-role-policy \
        --role-name ${IAM_ROLE_NAME} \
-       --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/PinpointS3ExportPolicy-${RANDOM_SUFFIX}
+   
+   # Delete custom policy
+   aws iam delete-policy \
+       --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/PinpointS3ExportPolicy-${RANDOM_SUFFIX}
    
    # Delete IAM role
    aws iam delete-role --role-name ${IAM_ROLE_NAME}
    
-   echo "✅ IAM role removed"
+   echo "✅ IAM role and policy removed"
    ```
 
 7. **Delete Pinpoint Application**:
@@ -774,9 +798,9 @@ The architecture demonstrated here showcases Pinpoint's multi-channel capabiliti
 
 Statistical significance testing is crucial for reliable A/B testing results. Pinpoint provides built-in analytics that help evaluate whether observed differences between treatments are statistically meaningful or due to random variation. The platform's event tracking capabilities enable measurement of custom conversion metrics beyond standard engagement rates, such as in-app purchases, feature adoption, or user retention rates. This granular tracking allows for comprehensive analysis of user behavior patterns and long-term impact assessment of different messaging strategies. Advanced segmentation features allow for sophisticated targeting based on user attributes, behavior patterns, and engagement history, as documented in the [Amazon Pinpoint segmentation guide](https://docs.aws.amazon.com/pinpoint/latest/developerguide/segments-dynamic.html).
 
-The cost-effectiveness of Pinpoint's A/B testing comes from its pay-per-use model and automated optimization features. Unlike maintaining separate testing infrastructure, Pinpoint eliminates the need for custom analytics pipelines, statistical analysis tools, and campaign management systems. The integration with AWS services like Kinesis for real-time event processing and S3 for long-term storage provides a scalable foundation that grows with application requirements while maintaining cost efficiency through intelligent resource allocation. This serverless approach to A/B testing reduces operational overhead and enables teams to focus on optimization strategy rather than infrastructure management.
+Given Pinpoint's planned end of support, organizations should consider migration strategies early in their planning process. Push notification capabilities will continue under [AWS End User Messaging](https://aws.amazon.com/end-user-messaging/), while engagement features like campaigns and analytics will need migration to alternatives such as Amazon Connect or third-party solutions. The cost-effectiveness of Pinpoint's A/B testing comes from its pay-per-use model and automated optimization features, eliminating the need for custom analytics pipelines and campaign management systems during its supported lifetime.
 
-> **Tip**: Always run A/B tests for a sufficient duration to capture weekly usage patterns and achieve statistical significance. Consider seasonal variations and user behavior patterns when interpreting results. See [Amazon Pinpoint analytics](https://docs.aws.amazon.com/pinpoint/latest/developerguide/welcome.html) for guidance on measuring campaign effectiveness.
+> **Tip**: Always run A/B tests for a sufficient duration to capture weekly usage patterns and achieve statistical significance. Consider seasonal variations and user behavior patterns when interpreting results. See [Amazon Pinpoint analytics documentation](https://docs.aws.amazon.com/pinpoint/latest/developerguide/analytics.html) for guidance on measuring campaign effectiveness.
 
 ## Challenge
 
@@ -784,13 +808,13 @@ Extend this A/B testing solution by implementing these advanced enhancements:
 
 1. **Multi-variate Testing**: Implement multi-dimensional testing by combining different message content, timing, and frequency variations to identify optimal combinations across multiple variables simultaneously.
 
-2. **Predictive Audience Segmentation**: Use Amazon Personalize to create dynamic user segments based on predicted behavior patterns, enabling more sophisticated targeting strategies for A/B tests.
+2. **Migration Strategy Implementation**: Develop a migration plan to AWS End User Messaging for push notifications and Amazon Connect for engagement features, ensuring business continuity before Pinpoint's end of support.
 
-3. **Cross-channel Journey Optimization**: Implement A/B testing across multiple touchpoints by integrating Amazon Pinpoint with Amazon Connect for voice interactions and Amazon Chime SDK for in-app communication features.
+3. **Cross-channel Journey Optimization**: Implement A/B testing across multiple touchpoints by integrating with AWS End User Messaging services and third-party engagement platforms for comprehensive user journey optimization.
 
 4. **Advanced Statistical Analysis**: Deploy Amazon SageMaker to perform Bayesian A/B testing and multi-armed bandit algorithms that automatically allocate more traffic to winning variants during the test period.
 
-5. **Real-time Personalization**: Build a recommendation engine that uses A/B test results to personalize message content, timing, and channel selection for individual users based on their historical response patterns and demographic characteristics.
+5. **Real-time Personalization Engine**: Build a recommendation system using Amazon Personalize that uses A/B test results to personalize message content, timing, and channel selection for individual users based on their historical response patterns and demographic characteristics.
 
 ## Infrastructure Code
 

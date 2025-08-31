@@ -1,0 +1,387 @@
+# Google Cloud Infrastructure Manager Configuration
+# Weather Forecast API with Cloud Functions
+# 
+# This configuration deploys a complete serverless weather API solution using
+# Cloud Run (2nd generation Cloud Functions) with proper IAM, logging, and monitoring.
+#
+# Resources Created:
+# - Cloud Run service (for the weather function)
+# - IAM service account with minimal permissions
+# - Cloud Storage bucket for source code deployment
+# - Required API enablement
+# - Monitoring and logging configuration
+
+# Configuration metadata
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    archive:
+      source: "hashicorp/archive"
+      version: "~> 2.4"
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "The GCP project ID where resources will be created"
+    type: string
+  
+  region:
+    description: "The GCP region for deploying resources"
+    type: string
+    default: "us-central1"
+  
+  function_name:
+    description: "Name of the Cloud Run service (weather function)"
+    type: string
+    default: "weather-forecast"
+  
+  openweather_api_key:
+    description: "OpenWeatherMap API key (use 'demo_key' for testing)"
+    type: string
+    default: "demo_key"
+    sensitive: true
+  
+  memory_limit:
+    description: "Memory allocation for the Cloud Run service"
+    type: string
+    default: "512Mi"
+  
+  timeout_seconds:
+    description: "Maximum execution time for function requests"
+    type: number
+    default: 60
+  
+  max_instances:
+    description: "Maximum number of instances for auto-scaling"
+    type: number
+    default: 100
+  
+  labels:
+    description: "Resource labels for organization and billing"
+    type: map(string)
+    default: {
+      environment = "development"
+      application = "weather-api"
+      managed-by  = "infrastructure-manager"
+    }
+
+# Provider configuration
+provider:
+  google:
+    project: ${var.project_id}
+    region: ${var.region}
+  
+  google-beta:
+    project: ${var.project_id}
+    region: ${var.region}
+
+# Enable required Google Cloud APIs
+resources:
+  # Enable Cloud Run API (required for 2nd gen functions)
+  cloudrun_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: "run.googleapis.com"
+      disable_on_destroy: false
+
+  # Enable Cloud Build API (required for function deployment)
+  cloudbuild_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: "cloudbuild.googleapis.com"
+      disable_on_destroy: false
+
+  # Enable Artifact Registry API (required for container storage)
+  artifactregistry_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: "artifactregistry.googleapis.com"
+      disable_on_destroy: false
+
+  # Enable Cloud Logging API
+  logging_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: "logging.googleapis.com"
+      disable_on_destroy: false
+
+  # Enable Cloud Monitoring API
+  monitoring_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: "monitoring.googleapis.com"
+      disable_on_destroy: false
+
+  # Create service account for the Cloud Run service
+  # Following principle of least privilege
+  function_service_account:
+    type: google_service_account
+    properties:
+      account_id: "${var.function_name}-sa"
+      display_name: "Weather Forecast Function Service Account"
+      description: "Service account for weather forecast Cloud Run service"
+      project: ${var.project_id}
+    depends_on:
+      - cloudrun_api
+
+  # IAM binding for the service account to act as Cloud Run runtime
+  service_account_user_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/run.serviceAgent"
+      member: "serviceAccount:${google_service_account.function_service_account.email}"
+    depends_on:
+      - function_service_account
+
+  # Create Cloud Storage bucket for function source code
+  # Using uniform bucket-level access for security
+  source_bucket:
+    type: google_storage_bucket
+    properties:
+      name: "${var.project_id}-${var.function_name}-source"
+      location: ${var.region}
+      project: ${var.project_id}
+      
+      # Enable uniform bucket-level access for security
+      uniform_bucket_level_access: true
+      
+      # Configure lifecycle to manage old versions
+      lifecycle_rule:
+        - condition:
+            age: 30
+          action:
+            type: "Delete"
+      
+      labels: ${var.labels}
+    depends_on:
+      - cloudrun_api
+
+  # Create ZIP archive of function source code
+  function_source_archive:
+    type: archive_file
+    properties:
+      type: "zip"
+      output_path: "./weather-function-source.zip"
+      source_dir: "./function-source"
+
+  # Upload function source code to Cloud Storage
+  function_source_object:
+    type: google_storage_bucket_object
+    properties:
+      name: "weather-function-${filemd5("./weather-function-source.zip")}.zip"
+      bucket: ${google_storage_bucket.source_bucket.name}
+      source: ${data.archive_file.function_source_archive.output_path}
+      
+      # Cache control for versioning
+      cache_control: "no-cache"
+    depends_on:
+      - source_bucket
+      - function_source_archive
+
+  # Deploy Cloud Run service (2nd generation Cloud Functions)
+  weather_function:
+    type: google_cloud_run_v2_service
+    properties:
+      name: ${var.function_name}
+      location: ${var.region}
+      project: ${var.project_id}
+      
+      # Deletion protection for production use
+      deletion_protection: false
+      
+      template:
+        # Service account configuration
+        service_account: ${google_service_account.function_service_account.email}
+        
+        # Scaling configuration
+        scaling:
+          max_instance_count: ${var.max_instances}
+          min_instance_count: 0
+        
+        # Container configuration
+        containers:
+          - image: "us-docker.pkg.dev/cloudrun/container/hello"  # Placeholder, will be replaced by source
+            
+            # Resource allocation
+            resources:
+              limits:
+                memory: ${var.memory_limit}
+                cpu: "1000m"
+            
+            # Environment variables
+            env:
+              - name: "OPENWEATHER_API_KEY"
+                value: ${var.openweather_api_key}
+              - name: "FUNCTION_TARGET"
+                value: "weather_forecast"
+            
+            # Port configuration for HTTP
+            ports:
+              - container_port: 8080
+                name: "http1"
+        
+        # Execution environment configuration
+        execution_environment: "EXECUTION_ENVIRONMENT_GEN2"
+        timeout: "${var.timeout_seconds}s"
+        
+        # VPC connector configuration (if needed)
+        # vpc_access:
+        #   connector: "projects/${var.project_id}/locations/${var.region}/connectors/default"
+        
+        # Session affinity (not needed for stateless function)
+        session_affinity: false
+      
+      # Traffic configuration (100% to latest revision)
+      traffic:
+        - percent: 100
+          type: "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+      
+      labels: ${var.labels}
+      
+      # Annotations for additional configuration
+      annotations:
+        "run.googleapis.com/ingress": "all"
+        "run.googleapis.com/ingress-status": "all"
+    
+    depends_on:
+      - cloudrun_api
+      - cloudbuild_api
+      - artifactregistry_api
+      - function_service_account
+      - function_source_object
+
+  # IAM policy to allow unauthenticated access (public API)
+  function_invoker_policy:
+    type: google_cloud_run_v2_service_iam_member
+    properties:
+      project: ${var.project_id}
+      location: ${var.region}
+      name: ${google_cloud_run_v2_service.weather_function.name}
+      role: "roles/run.invoker"
+      member: "allUsers"
+    depends_on:
+      - weather_function
+
+  # Create log sink for function monitoring (optional)
+  function_log_sink:
+    type: google_logging_project_sink
+    properties:
+      name: "${var.function_name}-error-sink"
+      project: ${var.project_id}
+      destination: "logging.googleapis.com/projects/${var.project_id}/logs/${var.function_name}-errors"
+      
+      # Filter for error-level logs only
+      filter: "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${var.function_name}\" AND severity>=ERROR"
+      
+      # Unique writer identity
+      unique_writer_identity: true
+    depends_on:
+      - logging_api
+      - weather_function
+
+  # Create monitoring alert policy for function errors (optional)
+  function_error_alert:
+    type: google_monitoring_alert_policy
+    properties:
+      display_name: "Weather Function Error Rate"
+      project: ${var.project_id}
+      
+      # Alert when error rate exceeds threshold
+      conditions:
+        - display_name: "Cloud Run Error Rate"
+          condition_threshold:
+            filter: "resource.type=cloud_run_revision AND resource.label.service_name=${var.function_name}"
+            comparison: "COMPARISON_GREATER_THAN"
+            threshold_value: 0.1  # 10% error rate
+            duration: "300s"  # 5 minutes
+            aggregations:
+              - alignment_period: "60s"
+                per_series_aligner: "ALIGN_RATE"
+                cross_series_reducer: "REDUCE_MEAN"
+                group_by_fields:
+                  - "resource.label.service_name"
+      
+      # Notification channels (configure as needed)
+      # notification_channels: ["projects/${var.project_id}/notificationChannels/NOTIFICATION_CHANNEL_ID"]
+      
+      # Documentation for responders
+      documentation:
+        content: "Weather Function error rate has exceeded 10% over the last 5 minutes. Check Cloud Run logs for details."
+        mime_type: "text/markdown"
+      
+      # Alert policy enabled by default
+      enabled: true
+      
+      # Combine alerts to reduce noise
+      combiner: "OR"
+    depends_on:
+      - monitoring_api
+      - weather_function
+
+# Output values for reference and integration
+outputs:
+  function_url:
+    description: "The URL of the deployed weather forecast function"
+    value: ${google_cloud_run_v2_service.weather_function.uri}
+  
+  function_name:
+    description: "The name of the deployed Cloud Run service"
+    value: ${google_cloud_run_v2_service.weather_function.name}
+  
+  service_account_email:
+    description: "Email of the service account used by the function"
+    value: ${google_service_account.function_service_account.email}
+  
+  source_bucket_name:
+    description: "Name of the Cloud Storage bucket containing function source"
+    value: ${google_storage_bucket.source_bucket.name}
+  
+  project_id:
+    description: "The GCP project ID where resources were created"
+    value: ${var.project_id}
+  
+  region:
+    description: "The GCP region where resources were deployed"
+    value: ${var.region}
+  
+  # Additional outputs for monitoring and debugging
+  function_location:
+    description: "The location of the Cloud Run service"
+    value: ${google_cloud_run_v2_service.weather_function.location}
+  
+  log_sink_name:
+    description: "Name of the log sink for error monitoring"
+    value: ${google_logging_project_sink.function_log_sink.name}
+
+# Data sources for dynamic values
+data:
+  # Archive file for function source code
+  function_source_archive:
+    type: archive_file
+    properties:
+      type: "zip"
+      output_path: "./weather-function-source.zip"
+      source_dir: "./function-source"
+
+# Local values for computed configurations
+locals:
+  # Common labels applied to all resources
+  common_labels:
+    terraform: "true"
+    environment: "development"
+    application: "weather-forecast-api"
+    
+  # Function source hash for versioning
+  source_hash: ${filemd5("./weather-function-source.zip")}

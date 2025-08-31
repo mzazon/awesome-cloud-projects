@@ -4,12 +4,12 @@ id: a3b0acb7
 category: databases
 difficulty: 400
 subject: aws
-services: Amazon RDS, CloudWatch, SNS, IAM
+services: RDS, CloudWatch, SNS, Lambda
 estimated-time: 240 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: disaster-recovery, rds, cross-region, read-replicas, automation, high-availability
 recipe-generator-version: 1.3
@@ -94,18 +94,19 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for RDS, Lambda, CloudWatch, SNS, and Route 53
+1. AWS account with appropriate permissions for RDS, Lambda, CloudWatch, SNS, Route 53, and EventBridge
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Two AWS regions configured for primary and disaster recovery operations
 4. VPC with private subnets in both regions for RDS deployment
-5. Understanding of RDS backup and recovery concepts
-6. Estimated cost: $200-400/month for RDS instances, storage, and cross-region data transfer
+5. IAM execution role for Lambda functions with appropriate permissions
+6. Understanding of RDS backup and recovery concepts
+7. Estimated cost: $200-400/month for RDS instances, storage, and cross-region data transfer
 
 > **Note**: Cross-region data transfer charges apply for read replica synchronization and can be significant for high-volume databases.
 
-> **Tip**: Regularly test your disaster recovery procedures with planned failover exercises to ensure RTO and RPO targets are met. Automate these tests to validate your disaster recovery automation.
-
 > **Warning**: Read replicas have asynchronous replication which can result in data loss during primary database failures. Consider Amazon Aurora Global Database for synchronous cross-region replication if zero data loss is required.
+
+> **Tip**: Regularly test your disaster recovery procedures with planned failover exercises to ensure RTO and RPO targets are met. Automate these tests to validate your disaster recovery automation.
 
 ## Preparation
 
@@ -140,7 +141,56 @@ aws s3api put-bucket-versioning \
     --bucket dr-config-bucket-${RANDOM_SUFFIX} \
     --versioning-configuration Status=Enabled
 
-echo "✅ Environment variables and S3 bucket configured"
+# Create IAM role for Lambda execution (if not exists)
+aws iam create-role \
+    --role-name lambda-execution-role \
+    --assume-role-policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "lambda.amazonaws.com"},
+                "Action": "sts:AssumeRole"
+            }
+        ]
+    }' 2>/dev/null || echo "Role already exists"
+
+# Attach necessary policies to Lambda execution role
+aws iam attach-role-policy \
+    --role-name lambda-execution-role \
+    --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+aws iam attach-role-policy \
+    --role-name lambda-execution-role \
+    --policy-arn arn:aws:iam::aws:policy/AmazonRDSFullAccess
+
+aws iam attach-role-policy \
+    --role-name lambda-execution-role \
+    --policy-arn arn:aws:iam::aws:policy/AmazonSNSFullAccess
+
+aws iam attach-role-policy \
+    --role-name lambda-execution-role \
+    --policy-arn arn:aws:iam::aws:policy/AmazonSSMFullAccess
+
+# Create RDS monitoring role (if not exists)
+aws iam create-role \
+    --role-name rds-monitoring-role \
+    --assume-role-policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "monitoring.rds.amazonaws.com"},
+                "Action": "sts:AssumeRole"
+            }
+        ]
+    }' 2>/dev/null || echo "Role already exists"
+
+aws iam attach-role-policy \
+    --role-name rds-monitoring-role \
+    --policy-arn arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+echo "✅ Environment variables, S3 bucket, and IAM roles configured"
 ```
 
 ## Steps
@@ -152,6 +202,13 @@ echo "✅ Environment variables and S3 bucket configured"
    The primary database serves as the authoritative source of truth for your application data. By enabling features like Performance Insights, encryption at rest, and enhanced monitoring, we establish comprehensive observability and security controls that are essential for production workloads. These configurations ensure your database meets compliance requirements while providing the performance metrics needed for disaster recovery decision-making.
 
    ```bash
+   # Generate a secure password for the database
+   DB_PASSWORD=$(aws secretsmanager get-random-password \
+       --exclude-characters '"@/\' \
+       --password-length 16 \
+       --require-each-included-type \
+       --output text --query RandomPassword)
+
    # Create primary RDS instance in primary region
    aws rds create-db-instance \
        --region ${PRIMARY_REGION} \
@@ -159,11 +216,7 @@ echo "✅ Environment variables and S3 bucket configured"
        --db-instance-class db.t3.micro \
        --engine mysql \
        --master-username admin \
-       --master-user-password $(aws secretsmanager get-random-password \
-           --exclude-characters '"@/\' \
-           --password-length 16 \
-           --require-each-included-type \
-           --output text --query RandomPassword) \
+       --master-user-password "${DB_PASSWORD}" \
        --allocated-storage 20 \
        --backup-retention-period 7 \
        --storage-encrypted \
@@ -404,7 +457,7 @@ EOF
    aws lambda create-function \
        --region ${PRIMARY_REGION} \
        --function-name ${LAMBDA_FUNCTION_PRIMARY} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role \
        --handler dr-coordinator.lambda_handler \
        --zip-file fileb://dr-coordinator.zip \
@@ -452,7 +505,7 @@ def lambda_handler(event, context):
         if 'source' in event and event['source'] == 'aws.rds':
             detail = event['detail']
             
-            if detail['eventName'] == 'promote-read-replica' and detail['responseElements']:
+            if detail.get('eventName') == 'PromoteReadReplica' and 'responseElements' in detail:
                 db_instance_id = detail['responseElements']['dBInstanceIdentifier']
                 
                 print(f"Processing promotion completion for {db_instance_id}")
@@ -528,7 +581,7 @@ EOF
    aws lambda create-function \
        --region ${DR_REGION} \
        --function-name ${LAMBDA_FUNCTION_DR} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role \
        --handler replica-promoter.lambda_handler \
        --zip-file fileb://replica-promoter.zip \
@@ -557,9 +610,10 @@ EOF
        --name "rds-promotion-events" \
        --event-pattern '{
            "source": ["aws.rds"],
-           "detail-type": ["RDS DB Instance Event"],
+           "detail-type": ["AWS API Call via CloudTrail"],
            "detail": {
-               "eventName": ["promote-read-replica"]
+               "eventSource": ["rds.amazonaws.com"],
+               "eventName": ["PromoteReadReplica"]
            }
        }' \
        --state ENABLED \

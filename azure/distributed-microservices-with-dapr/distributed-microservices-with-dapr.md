@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Container Apps, Dapr, Azure Service Bus, Azure Cosmos DB
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: microservices, distributed-systems, dapr, containers, event-driven
 recipe-generator-version: 1.3
@@ -88,21 +88,22 @@ graph TB
 
 1. Azure subscription with Owner or Contributor access
 2. Azure CLI (version 2.53.0 or later) installed and configured
-3. Basic understanding of microservices architecture and containerization
-4. Familiarity with REST APIs and event-driven patterns
-5. Docker installed locally for container image building (optional)
-6. Estimated cost: ~$50-100/month (depending on usage and scale)
+3. Container Apps CLI extension installed (az extension add --name containerapp --upgrade)
+4. Basic understanding of microservices architecture and containerization
+5. Familiarity with REST APIs and event-driven patterns
+6. Docker installed locally for container image building (optional)
+7. Estimated cost: ~$50-100/month (depending on usage and scale)
 
 > **Note**: This recipe uses consumption-based pricing for Container Apps. Costs scale with actual usage, making it ideal for development and production workloads.
 
 ## Preparation
 
 ```bash
-# Set environment variables
-export RESOURCE_GROUP="rg-dapr-microservices"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-dapr-microservices-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
-export ENVIRONMENT_NAME="aca-env-dapr"
-export LOG_ANALYTICS_WORKSPACE="law-dapr-microservices"
+export ENVIRONMENT_NAME="aca-env-dapr-${RANDOM_SUFFIX}"
+export LOG_ANALYTICS_WORKSPACE="law-dapr-microservices-${RANDOM_SUFFIX}"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for globally unique names
@@ -142,7 +143,7 @@ echo "✅ Log Analytics workspace created"
 
 1. **Create Container Apps Environment with Dapr**:
 
-   Azure Container Apps provides a fully managed serverless platform for running containerized applications. The Container Apps environment serves as a secure boundary that groups multiple container apps together, enabling them to share the same virtual network and Log Analytics workspace. Enabling Dapr at the environment level ensures all deployed container apps can leverage Dapr's distributed application runtime capabilities without additional configuration.
+   Azure Container Apps provides a fully managed serverless platform for running containerized applications. The Container Apps environment serves as a secure boundary that groups multiple container apps together, enabling them to share the same virtual network and Log Analytics workspace. This managed environment automatically handles infrastructure concerns like networking, load balancing, and scaling, allowing developers to focus on application logic rather than operational complexity.
 
    ```bash
    # Create Container Apps environment
@@ -156,7 +157,7 @@ echo "✅ Log Analytics workspace created"
    echo "✅ Container Apps environment created: ${ENVIRONMENT_NAME}"
    ```
 
-   The Container Apps environment is now ready to host Dapr-enabled microservices. This managed environment handles infrastructure concerns like networking, load balancing, and scaling, allowing developers to focus on application logic rather than operational complexity.
+   The Container Apps environment is now ready to host Dapr-enabled microservices. This environment provides automatic Dapr sidecar injection and shared networking capabilities across all deployed applications.
 
 2. **Configure Azure Service Bus for Pub/Sub Messaging**:
 
@@ -176,6 +177,13 @@ echo "✅ Log Analytics workspace created"
        --namespace-name ${SERVICE_BUS_NAMESPACE} \
        --resource-group ${RESOURCE_GROUP}
    
+   # Create subscription for inventory service
+   az servicebus topic subscription create \
+       --name inventory-subscription \
+       --topic-name orders \
+       --namespace-name ${SERVICE_BUS_NAMESPACE} \
+       --resource-group ${RESOURCE_GROUP}
+   
    # Get Service Bus connection string
    SERVICE_BUS_CONNECTION=$(az servicebus namespace authorization-rule keys list \
        --name RootManageSharedAccessKey \
@@ -183,8 +191,10 @@ echo "✅ Log Analytics workspace created"
        --resource-group ${RESOURCE_GROUP} \
        --query primaryConnectionString --output tsv)
    
-   echo "✅ Service Bus namespace and topic created"
+   echo "✅ Service Bus namespace, topic, and subscription created"
    ```
+
+   The Service Bus infrastructure is now configured to handle message routing between microservices. The topic-subscription pattern enables multiple services to receive copies of the same events for parallel processing.
 
 3. **Create Azure Cosmos DB for State Management**:
 
@@ -226,6 +236,8 @@ echo "✅ Log Analytics workspace created"
    echo "✅ Cosmos DB account and state container created"
    ```
 
+   The Cosmos DB state store is configured with serverless billing and session consistency, providing optimal performance for distributed microservices while maintaining cost efficiency.
+
 4. **Create Azure Key Vault for Secrets Management**:
 
    Azure Key Vault provides centralized secrets management with hardware security module (HSM) protection, access policies, and audit logging. Integration with Dapr's secrets building block enables applications to retrieve secrets at runtime without hardcoding sensitive information. This approach enhances security by separating configuration from code and enabling secret rotation without application changes.
@@ -254,8 +266,10 @@ echo "✅ Log Analytics workspace created"
        --name "cosmosdb-key" \
        --value "${COSMOS_KEY}"
    
-   echo "✅ Key Vault created and secrets stored"
+   echo "✅ Key Vault created and secrets stored securely"
    ```
+
+   All sensitive connection strings and credentials are now centrally managed in Key Vault, following Azure security best practices for secrets management.
 
 5. **Configure Dapr Components**:
 
@@ -319,7 +333,7 @@ echo "✅ Log Analytics workspace created"
    echo "✅ Dapr components configured"
    ```
 
-   The Dapr components are now configured and ready to be used by container apps. These components abstract the underlying Azure services, providing a consistent API for pub/sub messaging and state management across all microservices.
+   The Dapr components are now configured and scoped to specific services, providing secure access to Azure Service Bus and Cosmos DB through standardized APIs.
 
 6. **Deploy Order Service Microservice**:
 
@@ -358,6 +372,8 @@ echo "✅ Log Analytics workspace created"
    echo "✅ Order service deployed: https://${ORDER_SERVICE_URL}"
    ```
 
+   The order service is now running with external ingress enabled, allowing client applications to submit orders via HTTPS endpoints.
+
 7. **Deploy Inventory Service Microservice**:
 
    The inventory service showcases Dapr's event-driven architecture by subscribing to order events and maintaining inventory state. It automatically receives messages from Service Bus through Dapr's pub/sub subscription mechanism, processes them asynchronously, and updates inventory levels in Cosmos DB. This loosely coupled design enables independent scaling and evolution of services.
@@ -388,18 +404,18 @@ echo "✅ Log Analytics workspace created"
    echo "✅ Inventory service deployed"
    ```
 
+   The inventory service operates with internal ingress, ensuring it only receives traffic from other services within the Container Apps environment while maintaining secure communication through Dapr sidecars.
+
 8. **Configure Service-to-Service Communication**:
 
    Dapr's service invocation building block provides automatic service discovery, load balancing, and mutual TLS encryption between services. This eliminates the need for custom service registries or API gateways while ensuring secure communication. The sidecar pattern enables zero-trust networking by default, with each service authenticated and authorized for specific operations.
 
    ```bash
-   # Test service invocation from order to inventory service
-   # This would typically be done from within the order service code
-   # Example shown for demonstration purposes
-   
+   # Create test script for service invocation
    cat > test-service-invocation.sh <<EOF
    #!/bin/bash
    # Example of service invocation using Dapr
+   # This demonstrates how services communicate through Dapr sidecars
    curl -X POST http://localhost:3500/v1.0/invoke/inventory-service/method/check-inventory \
         -H "Content-Type: application/json" \
         -d '{"productId": "PROD-001", "quantity": 5}'
@@ -417,31 +433,34 @@ echo "✅ Log Analytics workspace created"
    Observability is crucial for understanding distributed system behavior. Azure Container Apps automatically integrates with Azure Monitor and Application Insights, providing end-to-end tracing across Dapr-enabled services. This comprehensive monitoring solution captures metrics, logs, and distributed traces, enabling rapid troubleshooting and performance optimization.
 
    ```bash
-   # Enable Application Insights (if not already enabled)
+   # Create Application Insights component
    az monitor app-insights component create \
        --app insights-dapr-demo \
        --location ${LOCATION} \
        --resource-group ${RESOURCE_GROUP} \
        --workspace ${LOG_ANALYTICS_ID}
    
-   INSTRUMENTATION_KEY=$(az monitor app-insights component show \
+   # Get connection string for Application Insights
+   INSIGHTS_CONNECTION_STRING=$(az monitor app-insights component show \
        --app insights-dapr-demo \
        --resource-group ${RESOURCE_GROUP} \
-       --query instrumentationKey --output tsv)
+       --query connectionString --output tsv)
    
    # Update container apps with Application Insights
    az containerapp update \
        --name order-service \
        --resource-group ${RESOURCE_GROUP} \
-       --set-env-vars APPLICATIONINSIGHTS_CONNECTION_STRING=InstrumentationKey=${INSTRUMENTATION_KEY}
+       --set-env-vars APPLICATIONINSIGHTS_CONNECTION_STRING="${INSIGHTS_CONNECTION_STRING}"
    
    az containerapp update \
        --name inventory-service \
        --resource-group ${RESOURCE_GROUP} \
-       --set-env-vars APPLICATIONINSIGHTS_CONNECTION_STRING=InstrumentationKey=${INSTRUMENTATION_KEY}
+       --set-env-vars APPLICATIONINSIGHTS_CONNECTION_STRING="${INSIGHTS_CONNECTION_STRING}"
    
    echo "✅ Distributed tracing enabled"
    ```
+
+   Application Insights is now capturing telemetry data from both microservices, providing end-to-end visibility into request flows and performance metrics.
 
 ## Validation & Testing
 
@@ -495,9 +514,9 @@ echo "✅ Log Analytics workspace created"
         -H "Content-Type: application/json" \
         -d '{"orderId": "ORD-001", "customerId": "CUST-123", "items": [{"productId": "PROD-001", "quantity": 2}]}'
    
-   # Check Service Bus topic for messages
+   # Check Service Bus subscription for messages
    az servicebus topic subscription show \
-       --name orders \
+       --name inventory-subscription \
        --topic-name orders \
        --namespace-name ${SERVICE_BUS_NAMESPACE} \
        --resource-group ${RESOURCE_GROUP} \

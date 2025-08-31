@@ -1,0 +1,504 @@
+# Infrastructure Manager Configuration for Base64 Encoder/Decoder Cloud Functions
+# This configuration deploys serverless HTTP Cloud Functions for Base64 encoding/decoding
+# with Cloud Storage integration for file operations
+
+# Terraform configuration block
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.4"
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+    
+  bucket_prefix:
+    description: "Prefix for Cloud Storage bucket name"
+    type: string
+    default: "base64-files"
+    
+  encoder_function_name:
+    description: "Name for the Base64 encoder Cloud Function"
+    type: string
+    default: "base64-encoder"
+    
+  decoder_function_name:
+    description: "Name for the Base64 decoder Cloud Function"
+    type: string
+    default: "base64-decoder"
+    
+  function_memory:
+    description: "Memory allocation for Cloud Functions (MB)"
+    type: number
+    default: 256
+    validation:
+      condition: var.function_memory >= 128 && var.function_memory <= 8192
+      error_message: "Function memory must be between 128 and 8192 MB"
+      
+  function_timeout:
+    description: "Timeout for Cloud Functions (seconds)"
+    type: number
+    default: 60
+    validation:
+      condition: var.function_timeout >= 1 && var.function_timeout <= 540
+      error_message: "Function timeout must be between 1 and 540 seconds"
+      
+  max_instances:
+    description: "Maximum number of function instances"
+    type: number
+    default: 10
+    validation:
+      condition: var.max_instances >= 1 && var.max_instances <= 1000
+      error_message: "Max instances must be between 1 and 1000"
+
+# Provider configuration
+providers:
+  google:
+    project: ${var.project_id}
+    region: ${var.region}
+
+# Generate random suffix for unique resource names
+resources:
+  random_id:
+    type: random_id
+    properties:
+      byte_length: 3
+      
+  # Enable required Google Cloud APIs
+  project_services:
+    type: google_project_service
+    for_each: 
+      - cloudfunctions.googleapis.com
+      - cloudbuild.googleapis.com
+      - storage.googleapis.com
+      - artifactregistry.googleapis.com
+    properties:
+      project: ${var.project_id}
+      service: ${each.value}
+      disable_dependent_services: true
+      disable_on_destroy: false
+
+  # Create Cloud Storage bucket for file operations
+  storage_bucket:
+    type: google_storage_bucket
+    properties:
+      name: "${var.bucket_prefix}-${random_id.hex}"
+      project: ${var.project_id}
+      location: ${var.region}
+      
+      # Storage class optimization for cost efficiency
+      storage_class: "STANDARD"
+      
+      # Enable uniform bucket-level access for simplified IAM
+      uniform_bucket_level_access: true
+      
+      # Lifecycle management to optimize costs
+      lifecycle_rule:
+        - condition:
+            age: 30
+          action:
+            type: "Delete"
+            
+      # Enable versioning for file safety
+      versioning:
+        enabled: true
+        
+      # CORS configuration for web application integration
+      cors:
+        - origin: ["*"]
+          method: ["GET", "POST", "PUT", "DELETE"]
+          response_header: ["*"]
+          max_age_seconds: 3600
+          
+    depends_on:
+      - project_services
+
+  # IAM binding for Cloud Functions to access Storage bucket
+  storage_bucket_iam:
+    type: google_storage_bucket_iam_binding
+    properties:
+      bucket: ${storage_bucket.name}
+      role: "roles/storage.objectAdmin"
+      members:
+        - "serviceAccount:${var.project_id}@appspot.gserviceaccount.com"
+    depends_on:
+      - storage_bucket
+
+  # Create ZIP archive for encoder function source code
+  encoder_function_source:
+    type: data.archive_file
+    properties:
+      type: "zip"
+      output_path: "/tmp/encoder-function.zip"
+      source:
+        - filename: "main.py"
+          content: |
+            import base64
+            import json
+            import logging
+            from google.cloud import storage
+            import functions_framework
+
+            # Configure logging
+            logging.basicConfig(level=logging.INFO)
+            logger = logging.getLogger(__name__)
+
+            @functions_framework.http
+            def encode_base64(request):
+                """HTTP Cloud Function to encode text or files to Base64."""
+                
+                # Set CORS headers for browser compatibility
+                headers = {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type',
+                    'Content-Type': 'application/json'
+                }
+                
+                # Handle preflight requests
+                if request.method == 'OPTIONS':
+                    return ('', 204, headers)
+                
+                try:
+                    if request.method == 'POST':
+                        # Handle JSON input for text encoding
+                        if request.is_json:
+                            data = request.get_json()
+                            text_input = data.get('text', '')
+                            
+                            if not text_input:
+                                return (json.dumps({'error': 'Text input required'}), 400, headers)
+                            
+                            # Encode text to Base64
+                            encoded = base64.b64encode(text_input.encode('utf-8')).decode('utf-8')
+                            
+                            response = {
+                                'encoded': encoded,
+                                'original_length': len(text_input),
+                                'encoded_length': len(encoded)
+                            }
+                            
+                            logger.info(f"Successfully encoded {len(text_input)} characters")
+                            return (json.dumps(response), 200, headers)
+                        
+                        # Handle form data for file uploads
+                        elif 'file' in request.files:
+                            file = request.files['file']
+                            file_content = file.read()
+                            
+                            # Encode file content to Base64
+                            encoded = base64.b64encode(file_content).decode('utf-8')
+                            
+                            response = {
+                                'encoded': encoded,
+                                'filename': file.filename,
+                                'original_size': len(file_content),
+                                'encoded_size': len(encoded)
+                            }
+                            
+                            logger.info(f"Successfully encoded file: {file.filename}")
+                            return (json.dumps(response), 200, headers)
+                        
+                    # Handle GET requests with query parameters
+                    elif request.method == 'GET':
+                        query_text = request.args.get('text', '')
+                        
+                        if not query_text:
+                            return (json.dumps({'error': 'Text parameter required'}), 400, headers)
+                        
+                        encoded = base64.b64encode(query_text.encode('utf-8')).decode('utf-8')
+                        
+                        response = {
+                            'encoded': encoded,
+                            'original_length': len(query_text),
+                            'encoded_length': len(encoded)
+                        }
+                        
+                        return (json.dumps(response), 200, headers)
+                    
+                    return (json.dumps({'error': 'Invalid request method'}), 405, headers)
+                    
+                except Exception as e:
+                    logger.error(f"Encoding error: {str(e)}")
+                    return (json.dumps({'error': 'Internal server error'}), 500, headers)
+        - filename: "requirements.txt"
+          content: |
+            functions-framework==3.*
+            google-cloud-storage==2.*
+
+  # Upload encoder function source to Cloud Storage
+  encoder_function_bucket_object:
+    type: google_storage_bucket_object
+    properties:
+      name: "encoder-function-${random_id.hex}.zip"
+      bucket: ${storage_bucket.name}
+      source: ${encoder_function_source.output_path}
+    depends_on:
+      - storage_bucket
+      - encoder_function_source
+
+  # Deploy Base64 encoder Cloud Function
+  encoder_function:
+    type: google_cloudfunctions2_function
+    properties:
+      name: ${var.encoder_function_name}
+      project: ${var.project_id}
+      location: ${var.region}
+      description: "HTTP Cloud Function for Base64 encoding operations"
+      
+      # Build configuration
+      build_config:
+        runtime: "python312"
+        entry_point: "encode_base64"
+        source:
+          storage_source:
+            bucket: ${storage_bucket.name}
+            object: ${encoder_function_bucket_object.name}
+            
+      # Service configuration
+      service_config:
+        max_instance_count: ${var.max_instances}
+        min_instance_count: 0
+        available_memory: "${var.function_memory}Mi"
+        timeout_seconds: ${var.function_timeout}
+        max_instance_request_concurrency: 80
+        available_cpu: "1"
+        
+        # Environment variables
+        environment_variables:
+          STORAGE_BUCKET: ${storage_bucket.name}
+          
+        # Service account configuration
+        service_account_email: "${var.project_id}@appspot.gserviceaccount.com"
+        
+        # Ingress settings
+        ingress_settings: "ALLOW_ALL"
+        all_traffic_on_latest_revision: true
+        
+    depends_on:
+      - project_services
+      - encoder_function_bucket_object
+
+  # Create ZIP archive for decoder function source code
+  decoder_function_source:
+    type: data.archive_file
+    properties:
+      type: "zip"
+      output_path: "/tmp/decoder-function.zip"
+      source:
+        - filename: "main.py"
+          content: |
+            import base64
+            import json
+            import logging
+            from google.cloud import storage
+            import functions_framework
+
+            # Configure logging
+            logging.basicConfig(level=logging.INFO)
+            logger = logging.getLogger(__name__)
+
+            @functions_framework.http
+            def decode_base64(request):
+                """HTTP Cloud Function to decode Base64 text back to original format."""
+                
+                # Set CORS headers for browser compatibility
+                headers = {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type',
+                    'Content-Type': 'application/json'
+                }
+                
+                # Handle preflight requests
+                if request.method == 'OPTIONS':
+                    return ('', 204, headers)
+                
+                try:
+                    base64_input = ''
+                    
+                    if request.method == 'POST' and request.is_json:
+                        data = request.get_json()
+                        base64_input = data.get('encoded', '')
+                    elif request.method == 'GET':
+                        base64_input = request.args.get('encoded', '')
+                    
+                    if not base64_input:
+                        return (json.dumps({'error': 'Base64 encoded input required'}), 400, headers)
+                    
+                    # Validate and decode Base64 input
+                    try:
+                        # Remove any whitespace and validate Base64 format
+                        base64_input = base64_input.strip()
+                        decoded_bytes = base64.b64decode(base64_input, validate=True)
+                        
+                        # Attempt to decode as UTF-8 text
+                        try:
+                            decoded_text = decoded_bytes.decode('utf-8')
+                            is_text = True
+                        except UnicodeDecodeError:
+                            decoded_text = None
+                            is_text = False
+                        
+                        response = {
+                            'decoded': decoded_text if is_text else None,
+                            'is_text': is_text,
+                            'decoded_length': len(decoded_bytes),
+                            'original_length': len(base64_input)
+                        }
+                        
+                        if not is_text:
+                            response['message'] = 'Content appears to be binary data'
+                            response['size_bytes'] = len(decoded_bytes)
+                        
+                        logger.info(f"Successfully decoded {len(base64_input)} characters")
+                        return (json.dumps(response), 200, headers)
+                        
+                    except Exception as decode_error:
+                        logger.warning(f"Base64 decode error: {str(decode_error)}")
+                        return (json.dumps({
+                            'error': 'Invalid Base64 input',
+                            'details': 'Input must be valid Base64 encoded data'
+                        }), 400, headers)
+                    
+                except Exception as e:
+                    logger.error(f"Decoder error: {str(e)}")
+                    return (json.dumps({'error': 'Internal server error'}), 500, headers)
+        - filename: "requirements.txt"
+          content: |
+            functions-framework==3.*
+            google-cloud-storage==2.*
+
+  # Upload decoder function source to Cloud Storage
+  decoder_function_bucket_object:
+    type: google_storage_bucket_object
+    properties:
+      name: "decoder-function-${random_id.hex}.zip"
+      bucket: ${storage_bucket.name}
+      source: ${decoder_function_source.output_path}
+    depends_on:
+      - storage_bucket
+      - decoder_function_source
+
+  # Deploy Base64 decoder Cloud Function
+  decoder_function:
+    type: google_cloudfunctions2_function
+    properties:
+      name: ${var.decoder_function_name}
+      project: ${var.project_id}
+      location: ${var.region}
+      description: "HTTP Cloud Function for Base64 decoding operations"
+      
+      # Build configuration
+      build_config:
+        runtime: "python312"
+        entry_point: "decode_base64"
+        source:
+          storage_source:
+            bucket: ${storage_bucket.name}
+            object: ${decoder_function_bucket_object.name}
+            
+      # Service configuration
+      service_config:
+        max_instance_count: ${var.max_instances}
+        min_instance_count: 0
+        available_memory: "${var.function_memory}Mi"
+        timeout_seconds: ${var.function_timeout}
+        max_instance_request_concurrency: 80
+        available_cpu: "1"
+        
+        # Environment variables
+        environment_variables:
+          STORAGE_BUCKET: ${storage_bucket.name}
+          
+        # Service account configuration
+        service_account_email: "${var.project_id}@appspot.gserviceaccount.com"
+        
+        # Ingress settings
+        ingress_settings: "ALLOW_ALL"
+        all_traffic_on_latest_revision: true
+        
+    depends_on:
+      - project_services
+      - decoder_function_bucket_object
+
+  # IAM policy for public access to encoder function
+  encoder_function_iam:
+    type: google_cloudfunctions2_function_iam_binding
+    properties:
+      project: ${var.project_id}
+      location: ${var.region}
+      cloud_function: ${encoder_function.name}
+      role: "roles/cloudfunctions.invoker"
+      members:
+        - "allUsers"
+    depends_on:
+      - encoder_function
+
+  # IAM policy for public access to decoder function
+  decoder_function_iam:
+    type: google_cloudfunctions2_function_iam_binding
+    properties:
+      project: ${var.project_id}
+      location: ${var.region}
+      cloud_function: ${decoder_function.name}
+      role: "roles/cloudfunctions.invoker"
+      members:
+        - "allUsers"
+    depends_on:
+      - decoder_function
+
+# Output values for validation and integration
+outputs:
+  storage_bucket_name:
+    description: "Name of the created Cloud Storage bucket"
+    value: ${storage_bucket.name}
+    
+  storage_bucket_url:
+    description: "URL of the Cloud Storage bucket"
+    value: "gs://${storage_bucket.name}"
+    
+  encoder_function_name:
+    description: "Name of the encoder Cloud Function"
+    value: ${encoder_function.name}
+    
+  encoder_function_url:
+    description: "HTTP trigger URL for the encoder function"
+    value: ${encoder_function.service_config[0].uri}
+    
+  decoder_function_name:
+    description: "Name of the decoder Cloud Function"
+    value: ${decoder_function.name}
+    
+  decoder_function_url:
+    description: "HTTP trigger URL for the decoder function"
+    value: ${decoder_function.service_config[0].uri}
+    
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+    
+  region:
+    description: "Deployment region"
+    value: ${var.region}
+    
+  # Test commands for validation
+  test_encoder_command:
+    description: "cURL command to test encoder function"
+    value: "curl -X POST '${encoder_function.service_config[0].uri}' -H 'Content-Type: application/json' -d '{\"text\":\"Hello World\"}'"
+    
+  test_decoder_command:
+    description: "cURL command to test decoder function"
+    value: "curl -X POST '${decoder_function.service_config[0].uri}' -H 'Content-Type: application/json' -d '{\"encoded\":\"SGVsbG8gV29ybGQ=\"}'"

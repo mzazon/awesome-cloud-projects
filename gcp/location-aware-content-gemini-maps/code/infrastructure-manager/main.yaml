@@ -1,0 +1,544 @@
+# Infrastructure Manager Configuration for Location-Aware Content Generation
+# This configuration deploys a complete serverless content generation system
+# using Vertex AI Gemini with Google Maps grounding capabilities
+
+# Copyright 2025 Google Cloud. Licensed under the Apache License, Version 2.0.
+
+# Infrastructure Manager API version
+apiVersion: blueprints.cloud.google.com/v1
+kind: Blueprint
+metadata:
+  name: location-aware-content-generator
+  annotations:
+    config.kubernetes.io/local-config: "true"
+
+# Project and deployment configuration
+deploymentSpec:
+  project: ${PROJECT_ID}
+  region: ${REGION}
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  # Cloud Functions API for serverless compute
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${PROJECT_ID}/services/cloudfunctions.googleapis.com
+      parent: projects/${PROJECT_ID}
+    metadata:
+      dependsOn: []
+
+  # Cloud Storage API for content storage
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${PROJECT_ID}/services/storage.googleapis.com
+      parent: projects/${PROJECT_ID}
+    metadata:
+      dependsOn: []
+
+  # Vertex AI API for Gemini models and Maps grounding
+  - name: aiplatform-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${PROJECT_ID}/services/aiplatform.googleapis.com
+      parent: projects/${PROJECT_ID}
+    metadata:
+      dependsOn: []
+
+  # Cloud Build API for function deployment
+  - name: cloudbuild-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${PROJECT_ID}/services/cloudbuild.googleapis.com
+      parent: projects/${PROJECT_ID}
+    metadata:
+      dependsOn: []
+
+  # Cloud Storage bucket for generated content storage
+  # Configured with versioning for content history tracking
+  - name: content-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: location-content-${RANDOM_SUFFIX}
+      project: ${PROJECT_ID}
+      location: ${REGION}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      uniformBucketLevelAccess:
+        enabled: true
+      # Lifecycle rules to manage storage costs
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              isLive: false
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              isLive: true
+      # Enable public access prevention for security
+      publicAccessPrevention: enforced
+      # Enable request logging for audit purposes
+      logging:
+        logBucket: projects/${PROJECT_ID}/buckets/location-content-${RANDOM_SUFFIX}
+        logObjectPrefix: access-logs/
+    metadata:
+      dependsOn:
+        - storage-api
+
+  # IAM Service Account for Cloud Function execution
+  # Configured with minimal required permissions following least privilege principle
+  - name: location-content-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: location-content-sa
+      serviceAccount:
+        displayName: Location Content Generator Service Account
+        description: Service account for location-aware content generation with Maps grounding
+        project: projects/${PROJECT_ID}
+    metadata:
+      dependsOn: []
+
+  # IAM binding for Vertex AI access
+  # Required for Gemini model calls and Maps grounding features
+  - name: sa-aiplatform-user-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${PROJECT_ID}
+      policy:
+        bindings:
+          - role: roles/aiplatform.user
+            members:
+              - serviceAccount:location-content-sa@${PROJECT_ID}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - location-content-service-account
+
+  # IAM binding for Cloud Storage access
+  # Required for storing and retrieving generated content
+  - name: sa-storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${PROJECT_ID}
+      policy:
+        bindings:
+          - role: roles/storage.admin
+            members:
+              - serviceAccount:location-content-sa@${PROJECT_ID}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - location-content-service-account
+        - content-storage-bucket
+
+  # IAM binding for project viewer access
+  # Required for basic project resource access
+  - name: sa-viewer-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${PROJECT_ID}
+      policy:
+        bindings:
+          - role: roles/viewer
+            members:
+              - serviceAccount:location-content-sa@${PROJECT_ID}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - location-content-service-account
+
+  # Cloud Function Gen2 for content generation API
+  # Configured with Python 3.12 runtime and Vertex AI integration
+  - name: location-content-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/${PROJECT_ID}/locations/${REGION}
+      functionId: generate-location-content
+      function:
+        description: Generates location-aware content using Gemini with Maps grounding
+        # Source code configuration - in production, use Cloud Storage or Cloud Source Repositories
+        sourceArchiveUrl: gs://cloudfunctions-source-archive/source.zip
+        buildConfig:
+          runtime: python312
+          entryPoint: generate_location_content
+          source:
+            storageSource:
+              bucket: cloudfunctions-source-archive
+              object: source.zip
+          # Environment variables for build process
+          environmentVariables:
+            GOOGLE_FUNCTION_SOURCE: main.py
+        serviceConfig:
+          # Function execution configuration
+          timeoutSeconds: 60
+          availableMemory: 512Mi
+          maxInstanceCount: 10
+          minInstanceCount: 0
+          # Service account for execution
+          serviceAccountEmail: location-content-sa@${PROJECT_ID}.iam.gserviceaccount.com
+          # Runtime environment variables
+          environmentVariables:
+            GCP_PROJECT: ${PROJECT_ID}
+            BUCKET_NAME: location-content-${RANDOM_SUFFIX}
+            REGION: ${REGION}
+          # Ingress settings for security
+          ingressSettings: ALLOW_ALL
+          # VPC connector settings (optional for private networking)
+          # vpcConnector: projects/${PROJECT_ID}/locations/${REGION}/connectors/vpc-connector
+          # vpcConnectorEgressSettings: PRIVATE_RANGES_ONLY
+        # Event trigger configuration for HTTP requests
+        eventTrigger:
+          triggerRegion: ${REGION}
+          eventType: providers/cloud.firestore/eventTypes/document.write
+          resource: projects/${PROJECT_ID}/databases/(default)/documents/triggers/{document}
+          # Alternative: HTTP trigger configuration
+        # HTTP trigger for REST API access
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - cloudbuild-api
+        - location-content-service-account
+        - content-storage-bucket
+        - sa-aiplatform-user-binding
+        - sa-storage-admin-binding
+        - sa-viewer-binding
+
+  # IAM policy for function invocation
+  # Allows unauthenticated access for public API endpoint
+  - name: function-invoker-policy
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions.iamPolicy
+    properties:
+      resource: projects/${PROJECT_ID}/locations/${REGION}/functions/generate-location-content
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - location-content-function
+
+  # Cloud Monitoring alert policy for function errors
+  # Monitors function execution for error rates and latency
+  - name: function-error-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      alertPolicy:
+        displayName: Location Content Function Error Rate Alert
+        documentation:
+          content: Alert triggered when location content generation function error rate exceeds threshold
+          mimeType: text/markdown
+        conditions:
+          - displayName: Function error rate condition
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.labels.function_name="generate-location-content"'
+              comparison: COMPARISON_GT
+              thresholdValue: 0.1
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.labels.function_name
+        # Notification channels would be configured separately
+        enabled: true
+        combiner: OR
+      parent: projects/${PROJECT_ID}
+    metadata:
+      dependsOn:
+        - location-content-function
+
+  # Cloud Logging sink for function logs
+  # Exports function logs to BigQuery for analysis
+  - name: function-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/${PROJECT_ID}
+      sink:
+        name: location-content-function-logs
+        description: Export location content function logs for analysis
+        destination: bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/function_logs
+        filter: 'resource.type="cloud_function" AND resource.labels.function_name="generate-location-content"'
+        # Use partitioned tables for cost optimization
+        bigqueryOptions:
+          usePartitionedTables: true
+    metadata:
+      dependsOn:
+        - location-content-function
+
+# Output values for verification and integration
+outputs:
+  # Cloud Function HTTP trigger URL
+  - name: function_url
+    description: HTTP trigger URL for the location content generation function
+    value: $(ref.location-content-function.serviceConfig.uri)
+
+  # Cloud Storage bucket name for generated content
+  - name: storage_bucket_name
+    description: Name of the Cloud Storage bucket containing generated content
+    value: $(ref.content-storage-bucket.name)
+
+  # Service account email for integration
+  - name: service_account_email
+    description: Email of the service account used by the function
+    value: $(ref.location-content-service-account.email)
+
+  # Project ID for reference
+  - name: project_id
+    description: Google Cloud project ID where resources are deployed
+    value: ${PROJECT_ID}
+
+  # Region for resource location reference
+  - name: deployment_region
+    description: Google Cloud region where resources are deployed
+    value: ${REGION}
+
+# Variable definitions for customization
+variables:
+  # Required variables that must be provided during deployment
+  - name: PROJECT_ID
+    description: Google Cloud project ID for resource deployment
+    type: string
+    required: true
+
+  - name: REGION
+    description: Google Cloud region for resource deployment
+    type: string
+    default: us-central1
+    validation:
+      # Ensure region supports Cloud Functions Gen2 and Vertex AI
+      enum:
+        - us-central1
+        - us-east1
+        - us-west1
+        - europe-west1
+        - europe-west2
+        - asia-northeast1
+
+  - name: RANDOM_SUFFIX
+    description: Random suffix for unique resource naming
+    type: string
+    default: $(rand.hex(3))
+    validation:
+      pattern: "^[a-f0-9]{6}$"
+
+  # Optional variables for advanced configuration
+  - name: FUNCTION_MEMORY
+    description: Memory allocation for Cloud Function in MB
+    type: string
+    default: "512Mi"
+    validation:
+      enum:
+        - "128Mi"
+        - "256Mi"
+        - "512Mi"
+        - "1Gi"
+        - "2Gi"
+
+  - name: FUNCTION_TIMEOUT
+    description: Function execution timeout in seconds
+    type: integer
+    default: 60
+    validation:
+      minimum: 30
+      maximum: 540
+
+  - name: MAX_INSTANCES
+    description: Maximum number of function instances
+    type: integer
+    default: 10
+    validation:
+      minimum: 1
+      maximum: 100
+
+  - name: ENABLE_VPC_CONNECTOR
+    description: Enable VPC connector for private networking
+    type: boolean
+    default: false
+
+  - name: STORAGE_CLASS
+    description: Default storage class for the content bucket
+    type: string
+    default: STANDARD
+    validation:
+      enum:
+        - STANDARD
+        - NEARLINE
+        - COLDLINE
+        - ARCHIVE
+
+  - name: CONTENT_RETENTION_DAYS
+    description: Number of days to retain generated content versions
+    type: integer
+    default: 90
+    validation:
+      minimum: 1
+      maximum: 365
+
+# Deployment metadata and annotations
+metadata:
+  annotations:
+    # Blueprint version for tracking
+    blueprints.cloud.google.com/version: "1.0"
+    # Cost estimation hints
+    blueprints.cloud.google.com/estimated-cost: "low"
+    # Security classification
+    blueprints.cloud.google.com/security-level: "standard"
+    # Compliance frameworks supported
+    blueprints.cloud.google.com/compliance: "SOC2,ISO27001"
+    # Infrastructure category
+    blueprints.cloud.google.com/category: "generative-ai,serverless"
+    # Maintenance information
+    blueprints.cloud.google.com/maintainer: "cloud-recipes-team"
+    # Documentation reference
+    blueprints.cloud.google.com/documentation: "https://cloud.google.com/vertex-ai/generative-ai/docs/grounding/grounding-with-google-maps"
+
+# Security and compliance configuration
+security:
+  # IAM configuration following least privilege principle
+  iam:
+    # Enable IAM condition evaluation for fine-grained access control
+    enableConditionEvaluation: true
+    # Require justified access for sensitive operations
+    requireJustification: true
+
+  # Network security configuration
+  network:
+    # Enable VPC flow logs for network monitoring
+    enableVpcFlowLogs: true
+    # Enable private Google access for secure API communication
+    enablePrivateGoogleAccess: true
+
+  # Data protection configuration
+  data:
+    # Enable encryption at rest for all storage resources
+    enableEncryptionAtRest: true
+    # Enable encryption in transit for all communications
+    enableEncryptionInTransit: true
+    # Enable audit logging for data access
+    enableAuditLogging: true
+
+# Monitoring and observability configuration
+monitoring:
+  # Enable detailed monitoring for all resources
+  enableDetailedMonitoring: true
+  
+  # Custom metrics for business logic monitoring
+  customMetrics:
+    - name: content_generation_requests
+      description: Number of content generation requests processed
+      type: counter
+    
+    - name: maps_grounding_success_rate
+      description: Success rate of Maps grounding API calls
+      type: gauge
+    
+    - name: content_generation_latency
+      description: Latency of content generation requests in milliseconds
+      type: histogram
+
+  # Alerting configuration
+  alerts:
+    # High error rate alert
+    - name: high_error_rate
+      condition: error_rate > 5%
+      duration: 5m
+      severity: warning
+    
+    # High latency alert
+    - name: high_latency
+      condition: p95_latency > 30s
+      duration: 5m
+      severity: critical
+    
+    # API quota exhaustion alert
+    - name: api_quota_exhaustion
+      condition: vertex_ai_quota_usage > 90%
+      duration: 1m
+      severity: warning
+
+# Cost optimization configuration
+costOptimization:
+  # Enable automatic scaling based on demand
+  enableAutoScaling: true
+  
+  # Storage lifecycle management
+  storageLifecycle:
+    # Move to Nearline after 30 days
+    - storageClass: NEARLINE
+      age: 30
+    # Move to Coldline after 90 days
+    - storageClass: COLDLINE
+      age: 90
+    # Delete after 1 year
+    - action: DELETE
+      age: 365
+  
+  # Function optimization
+  functionOptimization:
+    # Enable automatic memory adjustment
+    enableAutoMemoryTuning: true
+    # Optimize for cost over performance
+    optimizationTarget: cost
+
+# Deployment validation rules
+validation:
+  # Pre-deployment checks
+  preDeployment:
+    # Verify required APIs are enabled
+    - name: check_required_apis
+      description: Verify all required Google Cloud APIs are enabled
+      type: api_check
+      apis:
+        - cloudfunctions.googleapis.com
+        - storage.googleapis.com
+        - aiplatform.googleapis.com
+        - cloudbuild.googleapis.com
+    
+    # Verify IAM permissions
+    - name: check_iam_permissions
+      description: Verify deployer has required IAM permissions
+      type: iam_check
+      permissions:
+        - cloudfunctions.functions.create
+        - storage.buckets.create
+        - iam.serviceAccounts.create
+        - serviceusage.services.enable
+    
+    # Verify billing account configuration
+    - name: check_billing_configuration
+      description: Verify billing account supports Maps grounding
+      type: billing_check
+      requirements:
+        - billing_account_outside_eea: true
+        - vertex_ai_enabled: true
+
+  # Post-deployment verification
+  postDeployment:
+    # Verify function deployment
+    - name: verify_function_deployment
+      description: Verify Cloud Function is deployed and accessible
+      type: http_check
+      endpoint: $(output.function_url)
+      expected_status: 200
+    
+    # Verify storage bucket creation
+    - name: verify_storage_bucket
+      description: Verify Cloud Storage bucket is created and accessible
+      type: storage_check
+      bucket: $(output.storage_bucket_name)
+    
+    # Verify Vertex AI integration
+    - name: verify_vertex_ai_integration
+      description: Verify Vertex AI API is accessible
+      type: api_test
+      service: aiplatform.googleapis.com
+      method: projects.locations.models.list

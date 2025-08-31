@@ -4,12 +4,12 @@ id: f8c2a1d6
 category: analytics
 difficulty: 200
 subject: azure
-services: Azure AI Foundry Agent Service, Azure Sustainability Manager, Azure Service Bus, Azure Functions
+services: Azure AI Services, Microsoft Sustainability Manager, Azure Service Bus, Azure Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: sustainability, ai-agents, carbon-tracking, supply-chain, analytics, automation
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Modern enterprises struggle with accurately tracking and optimizing carbon emiss
 
 ## Solution
 
-This solution creates an intelligent carbon tracking system that uses Azure AI Foundry Agent Service to deploy specialized AI agents for automated data collection, analysis, and optimization recommendations. The system integrates with Azure Sustainability Manager to centralize emissions data and provides real-time insights through automated workflows powered by Azure Service Bus and Azure Functions. This approach enables continuous monitoring of supply chain carbon footprints with intelligent recommendations for emission reduction strategies.
+This solution creates an intelligent carbon tracking system that uses Azure AI Services to deploy specialized AI agents for automated data collection, analysis, and optimization recommendations. The system integrates with Microsoft Sustainability Manager to centralize emissions data and provides real-time insights through automated workflows powered by Azure Service Bus and Azure Functions. This approach enables continuous monitoring of supply chain carbon footprints with intelligent recommendations for emission reduction strategies.
 
 ## Architecture Diagram
 
@@ -41,8 +41,8 @@ graph TB
         AGENT3[Optimization Agent]
     end
     
-    subgraph "Azure AI Foundry"
-        AIF[AI Foundry Agent Service]
+    subgraph "Azure AI Services"
+        AIS[Azure AI Services Resource]
         MODEL[GPT-4 Model]
     end
     
@@ -52,7 +52,7 @@ graph TB
     end
     
     subgraph "Sustainability Platform"
-        ASM[Azure Sustainability Manager]
+        ASM[Microsoft Sustainability Manager]
         REPORTS[Carbon Reports]
         INSIGHTS[Emissions Insights]
     end
@@ -66,12 +66,12 @@ graph TB
     IOT --> AGENT1
     ERP --> AGENT1
     
-    AGENT1 --> AIF
-    AGENT2 --> AIF
-    AGENT3 --> AIF
+    AGENT1 --> AIS
+    AGENT2 --> AIS
+    AGENT3 --> AIS
     
-    AIF --> MODEL
-    AIF --> SB
+    AIS --> MODEL
+    AIS --> SB
     
     SB --> FUNC
     FUNC --> ASM
@@ -81,7 +81,7 @@ graph TB
     ASM --> WORKFLOWS
     WORKFLOWS --> ALERTS
     
-    style AIF fill:#0078D4
+    style AIS fill:#0078D4
     style ASM fill:#107C10
     style SB fill:#FF6900
     style FUNC fill:#FFCD00
@@ -89,13 +89,13 @@ graph TB
 
 ## Prerequisites
 
-1. Azure subscription with the following permissions: Contributor access to create AI Foundry projects, Sustainability Manager instances, and Service Bus namespaces
+1. Azure subscription with the following permissions: Contributor access to create AI Services resources, Sustainability Manager instances, and Service Bus namespaces
 2. Azure CLI v2.60.0 or later installed and configured (or use Azure Cloud Shell)
 3. Understanding of AI agent concepts, carbon accounting principles, and supply chain management
 4. Access to sample supply chain data sources (APIs or files) for testing
 5. Estimated cost: $150-300 for a complete implementation and testing cycle
 
-> **Note**: Azure AI Foundry Agent Service requires specific regional availability. Verify service availability in your preferred Azure region before proceeding with deployment.
+> **Note**: Azure AI Services with agent capabilities requires specific regional availability. Verify service availability in your preferred Azure region before proceeding with deployment.
 
 ## Preparation
 
@@ -109,7 +109,7 @@ export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 RANDOM_SUFFIX=$(openssl rand -hex 3)
 
 # Set resource names
-export AI_FOUNDRY_PROJECT="aif-carbon-${RANDOM_SUFFIX}"
+export AI_SERVICES_NAME="ais-carbon-${RANDOM_SUFFIX}"
 export SUSTAINABILITY_MANAGER="asm-carbon-${RANDOM_SUFFIX}"
 export SERVICE_BUS_NAMESPACE="sb-carbon-${RANDOM_SUFFIX}"
 export FUNCTION_APP_NAME="func-carbon-${RANDOM_SUFFIX}"
@@ -124,57 +124,68 @@ az group create \
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
 # Register required resource providers
-az provider register --namespace Microsoft.MachineLearningServices
 az provider register --namespace Microsoft.CognitiveServices
 az provider register --namespace Microsoft.ServiceBus
+az provider register --namespace Microsoft.Web
 
 echo "✅ Resource providers registered successfully"
 ```
 
 ## Steps
 
-1. **Create Azure AI Foundry Project with Agent Service**:
+1. **Create Azure AI Services Resource for Agent Capabilities**:
 
-   Azure AI Foundry Agent Service provides the foundation for building intelligent, autonomous agents that can orchestrate complex supply chain data collection and analysis workflows. This managed service handles agent lifecycle management, tool orchestration, and enterprise security, enabling rapid deployment of AI-powered sustainability solutions without infrastructure complexity.
+   Azure AI Services provides the foundation for building intelligent, autonomous agents that can orchestrate complex supply chain data collection and analysis workflows. This multi-service resource handles AI model access, tool orchestration, and enterprise security, enabling rapid deployment of AI-powered sustainability solutions without infrastructure complexity.
 
    ```bash
-   # Create AI Foundry project
-   az ml workspace create \
-       --name ${AI_FOUNDRY_PROJECT} \
+   # Create Azure AI Services resource with agent capabilities
+   az cognitiveservices account create \
+       --name ${AI_SERVICES_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --description "AI Foundry project for carbon tracking agents" \
+       --kind AIServices \
+       --sku S0 \
+       --yes \
        --tags project=carbon-tracking environment=demo
    
-   # Get the workspace ID for later use
-   WORKSPACE_ID=$(az ml workspace show \
-       --name ${AI_FOUNDRY_PROJECT} \
+   # Get the resource endpoint and key for later use
+   AI_SERVICES_ENDPOINT=$(az cognitiveservices account show \
+       --name ${AI_SERVICES_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query id --output tsv)
+       --query properties.endpoint --output tsv)
    
-   echo "✅ AI Foundry project created: ${AI_FOUNDRY_PROJECT}"
+   AI_SERVICES_KEY=$(az cognitiveservices account keys list \
+       --name ${AI_SERVICES_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query key1 --output tsv)
+   
+   echo "✅ Azure AI Services resource created: ${AI_SERVICES_NAME}"
    ```
 
-   The AI Foundry project now provides a secure, scalable environment for deploying intelligent agents. This foundation enables enterprise-grade AI orchestration with built-in monitoring, security controls, and integration capabilities essential for production sustainability workloads.
+   The Azure AI Services resource now provides a secure, scalable environment for deploying intelligent agents. This foundation enables enterprise-grade AI orchestration with built-in monitoring, security controls, and integration capabilities essential for production sustainability workloads.
 
-2. **Deploy Azure Sustainability Manager Instance**:
+2. **Deploy Microsoft Sustainability Manager Environment**:
 
-   Azure Sustainability Manager serves as the centralized platform for emissions data management, providing automated carbon calculations, regulatory reporting capabilities, and sustainability insights. This solution unifies data from multiple sources and applies standardized carbon accounting methodologies to ensure accurate, auditable emissions tracking across the entire supply chain.
+   Microsoft Sustainability Manager serves as the centralized platform for emissions data management, providing automated carbon calculations, regulatory reporting capabilities, and sustainability insights. This solution unifies data from multiple sources and applies standardized carbon accounting methodologies to ensure accurate, auditable emissions tracking across the entire supply chain.
 
    ```bash
-   # Create Sustainability Manager environment (requires Power Platform)
-   az powerplatform environment create \
+   # Install Power Platform CLI if not already installed
+   if ! command -v pac &> /dev/null; then
+       echo "Installing Power Platform CLI..."
+       dotnet tool install --global Microsoft.PowerApps.CLI.Tool
+   fi
+   
+   # Authenticate with Power Platform
+   pac auth create --environment-id ${SUSTAINABILITY_MANAGER}
+   
+   # Create Power Platform environment for Sustainability Manager
+   pac admin create \
        --name ${SUSTAINABILITY_MANAGER} \
-       --location ${LOCATION} \
        --type Sandbox \
-       --description "Carbon tracking environment"
+       --region unitedstates \
+       --templates "D365_SustainabilityManager"
    
-   # Get environment details
-   SUSTAINABILITY_ENV=$(az powerplatform environment show \
-       --name ${SUSTAINABILITY_MANAGER} \
-       --query name --output tsv)
-   
-   echo "✅ Sustainability Manager environment created: ${SUSTAINABILITY_ENV}"
+   echo "✅ Sustainability Manager environment created: ${SUSTAINABILITY_MANAGER}"
    ```
 
    The Sustainability Manager environment is now ready to receive and process carbon emissions data. This platform provides the compliance framework and calculation engines needed for accurate carbon accounting while supporting integration with external data sources and automated reporting workflows.
@@ -237,7 +248,7 @@ echo "✅ Resource providers registered successfully"
        --storage-account ${STORAGE_ACCOUNT} \
        --consumption-plan-location ${LOCATION} \
        --runtime python \
-       --runtime-version 3.11 \
+       --runtime-version 3.12 \
        --functions-version 4 \
        --tags purpose=carbon-processing
    
@@ -245,7 +256,9 @@ echo "✅ Resource providers registered successfully"
    az functionapp config appsettings set \
        --name ${FUNCTION_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --settings "ServiceBusConnection=${SB_CONNECTION_STRING}"
+       --settings "ServiceBusConnection=${SB_CONNECTION_STRING}" \
+                   "AI_SERVICES_ENDPOINT=${AI_SERVICES_ENDPOINT}" \
+                   "AI_SERVICES_KEY=${AI_SERVICES_KEY}"
    
    echo "✅ Function App created and configured for carbon data processing"
    ```
@@ -269,23 +282,38 @@ echo "✅ Resource providers registered successfully"
          "type": "function",
          "function": {
            "name": "validate_carbon_data",
-           "description": "Validate carbon emissions data quality and completeness"
+           "description": "Validate carbon emissions data quality and completeness",
+           "parameters": {
+             "type": "object",
+             "properties": {
+               "data": {"type": "object", "description": "Carbon data to validate"},
+               "source": {"type": "string", "description": "Data source identifier"}
+             },
+             "required": ["data", "source"]
+           }
          }
        },
        {
          "type": "function", 
          "function": {
            "name": "extract_emissions_metrics",
-           "description": "Extract carbon emissions metrics from unstructured data"
+           "description": "Extract carbon emissions metrics from unstructured data",
+           "parameters": {
+             "type": "object",
+             "properties": {
+               "raw_data": {"type": "string", "description": "Raw data to process"},
+               "data_format": {"type": "string", "description": "Format of input data"}
+             },
+             "required": ["raw_data", "data_format"]
+           }
          }
        }
      ]
    }
    EOF
    
-   # Deploy the data collection agent (conceptual - actual deployment via AI Foundry portal)
    echo "✅ Data collection agent configuration created"
-   echo "Deploy this agent configuration through Azure AI Foundry portal"
+   echo "Deploy this agent configuration through Azure AI Services API"
    ```
 
    The AI agent configuration enables intelligent data collection from multiple supply chain sources. These agents will automatically process incoming data, validate emissions calculations, and route processed information to the appropriate sustainability management systems with minimal human intervention.
@@ -307,21 +335,47 @@ echo "✅ Resource providers registered successfully"
          "type": "function",
          "function": {
            "name": "analyze_emission_trends",
-           "description": "Analyze carbon emissions trends and patterns"
+           "description": "Analyze carbon emissions trends and patterns",
+           "parameters": {
+             "type": "object",
+             "properties": {
+               "time_series_data": {"type": "array", "description": "Historical emissions data"},
+               "analysis_period": {"type": "string", "description": "Time period for analysis"}
+             },
+             "required": ["time_series_data", "analysis_period"]
+           }
          }
        },
        {
          "type": "function",
          "function": {
            "name": "generate_optimization_recommendations",
-           "description": "Generate actionable recommendations for carbon reduction"
+           "description": "Generate actionable recommendations for carbon reduction",
+           "parameters": {
+             "type": "object",
+             "properties": {
+               "current_emissions": {"type": "number", "description": "Current emission levels"},
+               "target_reduction": {"type": "number", "description": "Target reduction percentage"},
+               "constraints": {"type": "object", "description": "Business constraints"}
+             },
+             "required": ["current_emissions", "target_reduction"]
+           }
          }
        },
        {
          "type": "function",
          "function": {
            "name": "calculate_reduction_impact",
-           "description": "Calculate potential carbon reduction impact of proposed changes"
+           "description": "Calculate potential carbon reduction impact of proposed changes",
+           "parameters": {
+             "type": "object",
+             "properties": {
+               "baseline_emissions": {"type": "number", "description": "Current baseline emissions"},
+               "proposed_changes": {"type": "array", "description": "List of proposed changes"},
+               "implementation_timeline": {"type": "string", "description": "Timeline for implementation"}
+             },
+             "required": ["baseline_emissions", "proposed_changes"]
+           }
          }
        }
      ]
@@ -335,7 +389,7 @@ echo "✅ Resource providers registered successfully"
 
 7. **Integrate Agents with Sustainability Manager Data Pipeline**:
 
-   Seamless integration between AI agents and Azure Sustainability Manager ensures that collected and analyzed carbon data flows directly into centralized sustainability reporting systems. This integration maintains data lineage, supports audit requirements, and enables real-time dashboard updates for stakeholders. The automated pipeline reduces manual intervention while ensuring data accuracy and compliance.
+   Seamless integration between AI agents and Microsoft Sustainability Manager ensures that collected and analyzed carbon data flows directly into centralized sustainability reporting systems. This integration maintains data lineage, supports audit requirements, and enables real-time dashboard updates for stakeholders. The automated pipeline reduces manual intervention while ensuring data accuracy and compliance.
 
    ```bash
    # Create integration function for Sustainability Manager
@@ -440,29 +494,29 @@ echo "✅ Resource providers registered successfully"
 
 ## Validation & Testing
 
-1. **Verify AI Foundry Agent Service Deployment**:
+1. **Verify Azure AI Services Deployment**:
 
    ```bash
-   # Check AI Foundry project status
-   az ml workspace show \
-       --name ${AI_FOUNDRY_PROJECT} \
+   # Check AI Services resource status
+   az cognitiveservices account show \
+       --name ${AI_SERVICES_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --output table
    
    # Verify agent configurations
    ls -la *.json
    
-   echo "Expected: AI Foundry project in 'Succeeded' provisioning state"
+   echo "Expected: AI Services resource in 'Succeeded' provisioning state"
    ```
 
-   Expected output: AI Foundry project showing "Succeeded" status with agent configuration files present.
+   Expected output: AI Services resource showing "Succeeded" status with agent configuration files present.
 
 2. **Test Service Bus Message Processing**:
 
    ```bash
    # Send test carbon data message
-   az servicebus queue send \
-       --name carbon-data-queue \
+   az servicebus message send \
+       --queue-name carbon-data-queue \
        --namespace-name ${SERVICE_BUS_NAMESPACE} \
        --resource-group ${RESOURCE_GROUP} \
        --body '{"facility_id":"FAC001","source":"transportation","co2_eq_tonnes":25.5,"date":"2025-07-12","scope":"scope3"}'
@@ -472,7 +526,7 @@ echo "✅ Resource providers registered successfully"
        --name carbon-data-queue \
        --namespace-name ${SERVICE_BUS_NAMESPACE} \
        --resource-group ${RESOURCE_GROUP} \
-       --query messageCount
+       --query countDetails.activeMessageCount
    ```
 
    Expected output: Message count should decrease as Function Apps process the carbon data.
@@ -552,24 +606,23 @@ echo "✅ Resource providers registered successfully"
    echo "✅ Service Bus namespace deleted"
    ```
 
-3. **Remove AI Foundry Project**:
+3. **Remove Azure AI Services Resource**:
 
    ```bash
-   # Delete AI Foundry workspace
-   az ml workspace delete \
-       --name ${AI_FOUNDRY_PROJECT} \
-       --resource-group ${RESOURCE_GROUP} \
-       --yes
+   # Delete AI Services resource
+   az cognitiveservices account delete \
+       --name ${AI_SERVICES_NAME} \
+       --resource-group ${RESOURCE_GROUP}
    
-   echo "✅ AI Foundry project deleted"
+   echo "✅ Azure AI Services resource deleted"
    ```
 
 4. **Remove Sustainability Manager Environment**:
 
    ```bash
    # Delete Power Platform environment
-   az powerplatform environment delete \
-       --name ${SUSTAINABILITY_MANAGER} \
+   pac admin delete \
+       --environment ${SUSTAINABILITY_MANAGER} \
        --yes
    
    echo "✅ Sustainability Manager environment deleted"
@@ -593,7 +646,7 @@ echo "✅ Resource providers registered successfully"
 
 ## Discussion
 
-Azure AI Foundry Agent Service revolutionizes supply chain carbon tracking by providing intelligent, autonomous agents that can understand complex sustainability data patterns and orchestrate sophisticated emission reduction workflows. This agent-based approach significantly reduces the manual effort required for carbon data collection while improving accuracy and consistency across global supply chains. The combination with Azure Sustainability Manager creates a comprehensive platform that not only tracks emissions but also provides actionable insights for achieving net-zero goals. For detailed information on agent development, see the [Azure AI Foundry Agent Service documentation](https://learn.microsoft.com/en-us/azure/ai-foundry/agents/overview).
+Azure AI Services revolutionizes supply chain carbon tracking by providing intelligent, autonomous agents that can understand complex sustainability data patterns and orchestrate sophisticated emission reduction workflows. This agent-based approach significantly reduces the manual effort required for carbon data collection while improving accuracy and consistency across global supply chains. The combination with Microsoft Sustainability Manager creates a comprehensive platform that not only tracks emissions but also provides actionable insights for achieving net-zero goals. For detailed information on agent development, see the [Azure AI Services Agent documentation](https://learn.microsoft.com/en-us/azure/ai-services/agents/).
 
 The integration of multiple Azure services creates a robust event-driven architecture that scales automatically with supply chain complexity. Azure Service Bus ensures reliable message processing even during peak data collection periods, while Azure Functions provide cost-effective serverless processing that adapts to variable workloads. This serverless approach eliminates infrastructure management overhead while maintaining the performance and reliability required for enterprise sustainability reporting. The [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) principles of reliability and cost optimization are naturally incorporated into this design.
 

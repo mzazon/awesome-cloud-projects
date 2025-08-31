@@ -4,12 +4,12 @@ id: d9f3b7e5
 category: devops
 difficulty: 200
 subject: aws
-services: cloudwatch,evidently,lambda
+services: cloudwatch-evidently,lambda,iam
 estimated-time: 60 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: devops,feature-flags,evidently,testing,deployment
 recipe-generator-version: 1.3
@@ -24,6 +24,8 @@ Software development teams struggle with safely deploying new features to produc
 ## Solution
 
 Amazon CloudWatch Evidently provides a managed feature flag service that enables safe feature deployments through controlled exposure, A/B testing, and real-time monitoring. By implementing feature flags with Evidently, teams can gradually roll out features to specific user segments, monitor performance metrics, and instantly toggle features on or off without code changes or redeployments.
+
+> **Important**: AWS is discontinuing CloudWatch Evidently on October 16, 2025. After this date, the service will no longer be available. AWS recommends migrating to [AWS AppConfig feature flags](https://docs.aws.amazon.com/appconfig/latest/userguide/what-is-appconfig.html) as the preferred alternative for feature flag management and experimentation.
 
 ## Architecture Diagram
 
@@ -74,6 +76,8 @@ graph TB
 3. Basic understanding of feature flags and deployment strategies
 4. Familiarity with Lambda functions and API development
 5. Estimated cost: $5-15/month for development usage (varies by evaluation volume)
+
+> **Warning**: CloudWatch Evidently will be discontinued on October 16, 2025. This recipe is provided for educational purposes and existing implementations. For new projects, consider using [AWS AppConfig feature flags](https://docs.aws.amazon.com/appconfig/latest/userguide/creating-feature-flags-and-configuration-data.html) instead.
 
 > **Note**: CloudWatch Evidently charges based on feature evaluations. During development, costs typically remain under $10/month. See [Evidently pricing](https://aws.amazon.com/cloudwatch/pricing/) for detailed information.
 
@@ -132,6 +136,9 @@ echo "IAM role: ${IAM_ROLE_NAME}"
    aws iam attach-role-policy \
        --role-name ${IAM_ROLE_NAME} \
        --policy-arn arn:aws:iam::aws:policy/CloudWatchEvidentlyFullAccess
+
+   # Wait for IAM role to be available
+   sleep 10
 
    echo "✅ IAM role created with Evidently permissions"
    ```
@@ -291,7 +298,7 @@ EOF
 
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda-package.zip \
@@ -331,8 +338,8 @@ EOF
        --payload '{"userId": "test-user-123"}' \
        response.json
 
-   # Display evaluation result
-   cat response.json | jq '.'
+   # Display evaluation result (requires jq for formatting)
+   cat response.json | jq '.' || cat response.json
    ```
 
    Expected output: JSON response showing feature evaluation result with user ID, enabled status, and variation.
@@ -442,6 +449,10 @@ Evidently's evaluation API is designed for high-throughput applications with sub
 
 The combination of Evidently with Lambda demonstrates a serverless approach to feature management that scales automatically with application load. This architecture pattern works equally well with container-based applications, traditional server deployments, and modern serverless architectures, providing consistency across diverse technology stacks.
 
+**Migration Path**: As CloudWatch Evidently reaches end-of-life on October 16, 2025, teams should plan migration to [AWS AppConfig feature flags](https://docs.aws.amazon.com/appconfig/latest/userguide/what-is-appconfig.html), which provides similar capabilities with better integration into the broader AWS ecosystem. The [AWS AppConfig migration guide](https://docs.aws.amazon.com/appconfig/latest/userguide/retrieving-feature-flags.html) provides detailed steps for transitioning feature flag implementations.
+
+> **Tip**: Use AWS X-Ray for distributed tracing to monitor feature flag performance and identify bottlenecks across your serverless architecture. The [X-Ray documentation](https://docs.aws.amazon.com/xray/latest/devguide/) provides comprehensive guidance for implementing observability in Lambda functions.
+
 ## Challenge
 
 Extend this solution by implementing these enhancements:
@@ -455,6 +466,8 @@ Extend this solution by implementing these enhancements:
 4. **Real-Time Alert Integration**: Set up CloudWatch alarms that automatically stop launches when error rates exceed thresholds or business metrics decline significantly.
 
 5. **Enterprise Integration**: Integrate with existing CI/CD pipelines to automatically create and manage feature flags as part of the deployment process, including automated rollback triggers.
+
+6. **Migration to AppConfig**: Plan and implement migration from Evidently to AWS AppConfig feature flags, taking advantage of AppConfig's enhanced validation, deployment strategies, and integration with other AWS services.
 
 ## Infrastructure Code
 

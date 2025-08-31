@@ -1,0 +1,387 @@
+# Infrastructure Manager Configuration for Form Data Validation with Cloud Functions and Firestore
+# This configuration deploys a complete serverless form validation solution
+# including Cloud Functions, Firestore database, and necessary IAM permissions
+
+# Variables for customization
+variables:
+  project_id:
+    description: "Google Cloud project ID for deployment"
+    type: string
+    
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+    
+  function_name:
+    description: "Name for the Cloud Function"
+    type: string
+    default: "validate-form-data"
+    
+  function_memory:
+    description: "Memory allocation for Cloud Function"
+    type: string
+    default: "256M"
+    
+  function_timeout:
+    description: "Timeout in seconds for function execution"
+    type: number
+    default: 60
+
+# Resource definitions
+resources:
+  # Enable required APIs for the solution
+  enable_apis:
+    type: gcp-types/serviceusage-v1:services
+    name: enable-required-apis
+    properties:
+      name: projects/${var.project_id}/services/cloudfunctions.googleapis.com
+    metadata:
+      runtimePolicy:
+        - UPDATE_ON_CHANGE
+    
+  enable_firestore_api:
+    type: gcp-types/serviceusage-v1:services
+    name: enable-firestore-api
+    properties:
+      name: projects/${var.project_id}/services/firestore.googleapis.com
+    metadata:
+      runtimePolicy:
+        - UPDATE_ON_CHANGE
+
+  enable_logging_api:
+    type: gcp-types/serviceusage-v1:services
+    name: enable-logging-api
+    properties:
+      name: projects/${var.project_id}/services/logging.googleapis.com
+    metadata:
+      runtimePolicy:
+        - UPDATE_ON_CHANGE
+
+  # Firestore Database Configuration
+  # Creates a Firestore database in native mode for document storage
+  firestore_database:
+    type: gcp-types/firestore-v1:projects.databases
+    name: firestore-database
+    properties:
+      parent: projects/${var.project_id}
+      databaseId: "(default)"
+      database:
+        # Native mode provides strong consistency and ACID transactions
+        type: FIRESTORE_NATIVE
+        # Set location for data residency and latency optimization
+        locationId: ${var.region}
+        # Enable point-in-time recovery for data protection
+        pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_ENABLED
+        # Enable delete protection to prevent accidental deletion
+        deleteProtectionState: DELETE_PROTECTION_ENABLED
+        # Configure app engine integration mode
+        appEngineIntegrationMode: DISABLED
+    metadata:
+      description: "Firestore database for storing validated form submissions"
+    dependsOn:
+      - enable_firestore_api
+
+  # Service Account for Cloud Function Execution
+  # Follows principle of least privilege with minimal required permissions
+  function_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    name: function-service-account
+    properties:
+      accountId: form-validation-function-sa
+      serviceAccount:
+        displayName: "Form Validation Function Service Account"
+        description: "Service account for form validation Cloud Function with Firestore access"
+    metadata:
+      description: "Service account with minimal permissions for function execution"
+
+  # IAM Binding for Firestore Access
+  # Grants the service account permission to read/write Firestore documents
+  firestore_access_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: firestore-access-binding
+    properties:
+      resource: ${var.project_id}
+      role: roles/datastore.user
+      member: serviceAccount:${function_service_account.email}
+    metadata:
+      description: "IAM binding for Firestore document access"
+    dependsOn:
+      - function_service_account
+      - firestore_database
+
+  # IAM Binding for Cloud Logging Access
+  # Enables the function to write structured logs for monitoring and debugging
+  logging_access_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: logging-access-binding
+    properties:
+      resource: ${var.project_id}
+      role: roles/logging.logWriter
+      member: serviceAccount:${function_service_account.email}
+    metadata:
+      description: "IAM binding for Cloud Logging access"
+    dependsOn:
+      - function_service_account
+      - enable_logging_api
+
+  # Storage Bucket for Cloud Function Source Code
+  # Required for deploying Cloud Functions (2nd generation)
+  function_source_bucket:
+    type: gcp-types/storage-v1:buckets
+    name: function-source-bucket
+    properties:
+      # Generate unique bucket name using project ID
+      name: ${var.project_id}-function-source-${substr(timestamp(), 0, 8)}
+      # Set lifecycle policy to automatically delete old function versions
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 7
+              matchesStorageClass:
+                - STANDARD
+      # Enable versioning for function source code management
+      versioning:
+        enabled: true
+      # Set uniform bucket-level access for security
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Set location for regulatory compliance and performance
+      location: ${var.region}
+      # Configure public access prevention
+      publicAccessPrevention: enforced
+    metadata:
+      description: "Storage bucket for Cloud Function source code"
+
+  # Upload Function Source Code to Storage
+  # Creates the function source code as an archive in the bucket
+  function_source_archive:
+    type: gcp-types/storage-v1:objects
+    name: function-source-archive
+    properties:
+      bucket: ${function_source_bucket.name}
+      name: function-source.zip
+      # Inline function source code - requirements.txt
+      metadata:
+        source-type: "function-code"
+    # Note: In practice, source code would be uploaded separately or via CI/CD
+    dependsOn:
+      - function_source_bucket
+
+  # Cloud Function (2nd Generation) for Form Validation
+  # Serverless HTTP function that validates form data and stores in Firestore  
+  form_validation_function:
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    name: form-validation-function
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      functionId: ${var.function_name}
+      function:
+        description: "HTTP function for validating and storing form submissions"
+        # Build configuration for the function
+        buildConfig:
+          # Runtime configuration for Python 3.12
+          runtime: python312
+          entryPoint: validate_form_data
+          source:
+            # Reference to uploaded source code
+            storageSource:
+              bucket: ${function_source_bucket.name}
+              object: ${function_source_archive.name}
+          # Environment variables for build process
+          environmentVariables:
+            GOOGLE_CLOUD_PROJECT: ${var.project_id}
+        # Service configuration for function execution
+        serviceConfig:
+          # Configure function execution environment
+          maxInstanceCount: 100
+          minInstanceCount: 0
+          availableMemory: ${var.function_memory}
+          timeoutSeconds: ${var.function_timeout}
+          # Configure service account for secure execution
+          serviceAccountEmail: ${function_service_account.email}
+          # Runtime environment variables
+          environmentVariables:
+            FUNCTION_TARGET: validate_form_data
+            GOOGLE_CLOUD_PROJECT: ${var.project_id}
+          # Configure ingress settings for security
+          ingressSettings: ALLOW_ALL
+          # Configure VPC connector if needed (optional)
+          # vpcConnector: projects/${var.project_id}/locations/${var.region}/connectors/vpc-connector
+        # Configure function labels for organization and billing
+        labels:
+          purpose: form-validation
+          environment: production
+          component: serverless-api
+          managed-by: infrastructure-manager
+    metadata:
+      description: "Cloud Function for form data validation and Firestore storage"
+    dependsOn:
+      - function_source_archive
+      - function_service_account
+      - firestore_access_binding
+      - logging_access_binding
+      - enable_apis
+
+  # IAM Policy for Public Function Access
+  # Allows unauthenticated users to invoke the function via HTTP
+  function_public_access:
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions.setIamPolicy
+    name: function-public-access
+    properties:
+      resource: ${form_validation_function.name}
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      description: "Public access policy for form submission endpoint"
+    dependsOn:
+      - form_validation_function
+
+  # Firestore Index for query optimization
+  # Creates composite indexes for efficient querying of form submissions  
+  firestore_composite_index:
+    type: gcp-types/firestore-v1:projects.databases.collectionGroups.indexes
+    name: firestore-composite-index
+    properties:
+      parent: projects/${var.project_id}/databases/(default)/collectionGroups/form_submissions
+      index:
+        # Configure query fields for optimized performance
+        fields:
+          - fieldPath: submitted_at
+            order: DESCENDING
+          - fieldPath: source
+            order: ASCENDING
+        # Set query scope for collection group queries
+        queryScope: COLLECTION
+        # Set index state
+        state: READY
+    metadata:
+      description: "Composite index for efficient form submission queries"
+    dependsOn:
+      - firestore_database
+
+  # Log-based Metric for Monitoring
+  # Creates custom metrics for monitoring form submission patterns
+  form_submission_metric:
+    type: gcp-types/logging-v2:projects.metrics
+    name: form-submission-metric  
+    properties:
+      parent: projects/${var.project_id}
+      metricId: form_submissions_total
+      metric:
+        description: "Total number of form submissions processed"
+        # Filter for successful form submissions
+        filter: |
+          resource.type="cloud_function"
+          resource.labels.function_name="${var.function_name}"
+          textPayload:"Form submitted successfully"
+        # Configure metric labels for detailed analysis
+        labelExtractors:
+          validation_status: EXTRACT(jsonPayload.success)
+          submission_source: EXTRACT(jsonPayload.source)
+        # Configure metric descriptor
+        metricDescriptor:
+          metricKind: COUNTER
+          valueType: INT64
+          displayName: "Form Submissions"
+          unit: "1"
+    metadata:
+      description: "Log-based metric for monitoring form submission volume"
+    dependsOn:
+      - form_validation_function
+      - enable_logging_api
+
+  # Cloud Monitoring Alert Policy
+  # Creates alerts for function errors or high validation failure rates
+  validation_error_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    name: validation-error-alert
+    properties:
+      parent: projects/${var.project_id}
+      alertPolicy:
+        displayName: "Form Validation Errors"
+        documentation:
+          content: |
+            This alert triggers when the form validation function experiences
+            a high error rate, indicating potential issues with the validation
+            logic or infrastructure problems.
+          mimeType: text/markdown
+        # Configure alert conditions for error monitoring
+        conditions:
+          - displayName: "High validation error rate"
+            conditionThreshold:
+              filter: |
+                resource.type="cloud_function"
+                resource.labels.function_name="${var.function_name}"
+                severity>=ERROR
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        # Configure notification settings
+        enabled: true
+        combiner: OR
+        # Set alert severity
+        severity: WARNING
+    metadata:
+      description: "Alert policy for monitoring validation errors and function health"
+    dependsOn:
+      - form_validation_function
+
+# Output values for verification and integration
+outputs:
+  function_url:
+    description: "HTTPS URL for the form validation function"
+    value: ${form_validation_function.serviceConfig.uri}
+    
+  firestore_database_name:
+    description: "Firestore database resource name"
+    value: ${firestore_database.name}
+    
+  service_account_email:
+    description: "Service account email for function execution"
+    value: ${function_service_account.email}
+    
+  source_bucket_name:
+    description: "Storage bucket containing function source code"
+    value: ${function_source_bucket.name}
+    
+  monitoring_metric_name:
+    description: "Log-based metric for form submission monitoring"
+    value: ${form_submission_metric.name}
+    
+  project_id:
+    description: "Google Cloud project ID used for deployment"
+    value: ${var.project_id}
+    
+  region:
+    description: "Google Cloud region used for deployment"
+    value: ${var.region}
+
+# Metadata for deployment tracking and documentation
+metadata:
+  name: "form-validation-infrastructure"
+  description: "Complete serverless form validation solution with Cloud Functions and Firestore"
+  version: "1.0.0"
+  author: "Infrastructure Manager Generator"
+  created: "2025-01-12"
+  tags:
+    - "serverless"
+    - "form-validation" 
+    - "firestore"
+    - "cloud-functions"
+    - "python"
+    - "http-api"
+  documentation:
+    readme: "This Infrastructure Manager configuration deploys a complete form validation solution using Google Cloud serverless technologies."
+    architecture: "The solution uses Cloud Functions for HTTP request processing, Firestore for data persistence, and Cloud Logging for observability."
+    security: "Follows Google Cloud security best practices with least-privilege IAM, uniform bucket-level access, and delete protection."

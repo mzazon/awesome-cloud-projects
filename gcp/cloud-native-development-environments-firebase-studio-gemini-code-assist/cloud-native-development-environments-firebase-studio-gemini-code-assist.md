@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Firebase Studio, Gemini Code Assist, Cloud Source Repositories, Artifact Registry
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: firebase, ai-development, cloud-ide, devops, collaboration
 recipe-generator-version: 1.3
@@ -86,7 +86,7 @@ graph TB
 # Set environment variables for GCP resources
 export PROJECT_ID="firebase-studio-dev-$(date +%s)"
 export REGION="us-central1"
-export FIREBASE_PROJECT_NAME="my-ai-app"
+export ZONE="us-central1-a"
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
@@ -100,6 +100,7 @@ gcloud projects create ${PROJECT_ID} \
 # Set default project and region
 gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
+gcloud config set compute/zone ${ZONE}
 
 # Enable required APIs
 gcloud services enable firebase.googleapis.com
@@ -116,7 +117,7 @@ echo "✅ Required APIs enabled"
 
 1. **Initialize Firebase Project and Enable Firebase Studio**:
 
-   Firebase Studio represents a paradigm shift in cloud-native development, providing an integrated development environment that combines the power of Firebase services with AI-powered code assistance. This cloud-based IDE eliminates the complexity of local development setup while providing enterprise-grade collaboration features and seamless integration with Google Cloud services.
+   Firebase Studio represents a paradigm shift in cloud-native development, providing an integrated development environment that combines the power of Firebase services with AI-powered code assistance. This cloud-based IDE eliminates the complexity of local development setup while providing enterprise-grade collaboration features and seamless integration with Google Cloud services. Firebase Studio is now the evolution of Project IDX, offering enhanced AI capabilities through Gemini integration.
 
    ```bash
    # Install Firebase CLI if not already installed
@@ -218,13 +219,15 @@ echo "✅ Required APIs enabled"
    
    # Create service account for Gemini Code Assist
    gcloud iam service-accounts create gemini-code-assist \
-       --display-name="Gemini Code Assist Service Account" \
-       --description="Service account for AI-powered development assistance"
+       --display-name="Gemini Code Assist Service Account"
    
-   # Grant necessary permissions
+   # Grant necessary permissions for AI Platform access
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:gemini-code-assist@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/aiplatform.user"
+   
+   # Wait for IAM changes to propagate
+   sleep 30
    
    echo "✅ Gemini Code Assist integration configured"
    echo "Note: Additional configuration will be done within Firebase Studio"
@@ -292,19 +295,23 @@ echo "✅ Required APIs enabled"
    
    # Build Docker image
    - name: 'gcr.io/cloud-builders/docker'
-     args: ['build', '-t', '${REGISTRY_URL}/ai-app:latest', '.']
+     args: ['build', '-t', '\${_REGISTRY_URL}/ai-app:latest', '.']
    
    # Push image to Artifact Registry
    - name: 'gcr.io/cloud-builders/docker'
-     args: ['push', '${REGISTRY_URL}/ai-app:latest']
+     args: ['push', '\${_REGISTRY_URL}/ai-app:latest']
    
    # Deploy to Cloud Run
    - name: 'gcr.io/cloud-builders/gcloud'
      args: ['run', 'deploy', 'ai-app', 
-            '--image', '${REGISTRY_URL}/ai-app:latest',
-            '--region', '${REGION}',
+            '--image', '\${_REGISTRY_URL}/ai-app:latest',
+            '--region', '\${_REGION}',
             '--platform', 'managed',
             '--allow-unauthenticated']
+   
+   substitutions:
+     _REGISTRY_URL: '${REGISTRY_URL}'
+     _REGION: '${REGION}'
    
    options:
      logging: CLOUD_LOGGING_ONLY
@@ -313,7 +320,7 @@ echo "✅ Required APIs enabled"
    # Create build trigger
    gcloud builds triggers create cloud-source-repositories \
        --repo=${REPO_NAME} \
-       --branch-pattern="main" \
+       --branch-pattern="^main$" \
        --build-config=cloudbuild.yaml \
        --description="Automated build and deployment trigger"
    
@@ -334,8 +341,9 @@ echo "✅ Required APIs enabled"
    # Create initial project files
    echo "# AI Development Environment" > README.md
    echo "node_modules/" > .gitignore
-   echo "*.env" >> .gitignore
+   echo "*.env.local" >> .gitignore
    echo ".DS_Store" >> .gitignore
+   echo "dist/" >> .gitignore
    
    # Add Cloud Build configuration
    cp ../cloudbuild.yaml .
@@ -462,13 +470,13 @@ echo "✅ Required APIs enabled"
 
 ## Discussion
 
-Firebase Studio represents a fundamental shift in how development teams approach cloud-native application development, particularly for AI-powered applications. By providing a browser-based development environment with integrated AI assistance through Gemini Code Assist, it eliminates the complexity and inconsistency of local development setups while enabling unprecedented collaboration capabilities. The platform's integration with Google Cloud services creates a seamless workflow from ideation through deployment, significantly reducing the time required to build and iterate on AI applications.
+Firebase Studio represents a fundamental shift in how development teams approach cloud-native application development, particularly for AI-powered applications. By providing a browser-based development environment with integrated AI assistance through Gemini Code Assist, it eliminates the complexity and inconsistency of local development setups while enabling unprecedented collaboration capabilities. The platform's integration with Google Cloud services creates a seamless workflow from ideation through deployment, significantly reducing the time required to build and iterate on AI applications. Following the evolution from Project IDX, Firebase Studio now offers enhanced AI capabilities and deeper integration with Firebase services.
 
-The integration of Cloud Source Repositories and Artifact Registry creates a comprehensive DevOps pipeline that maintains enterprise-grade security and compliance requirements. Cloud Source Repositories provides secure, scalable version control with deep integration into Google Cloud's identity and access management systems, while Artifact Registry ensures consistent artifact management with built-in vulnerability scanning and access controls. This combination enables teams to maintain development velocity while adhering to security best practices and regulatory requirements.
+The integration of Cloud Source Repositories and Artifact Registry creates a comprehensive DevOps pipeline that maintains enterprise-grade security and compliance requirements. Cloud Source Repositories provides secure, scalable version control with deep integration into Google Cloud's identity and access management systems, while Artifact Registry ensures consistent artifact management with built-in vulnerability scanning and access controls. This combination enables teams to maintain development velocity while adhering to security best practices and regulatory requirements outlined in the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework).
 
 The App Prototyping Agent within Firebase Studio demonstrates the transformative potential of AI-assisted development. By enabling natural language application design and automatic code generation, it democratizes application development and allows teams to rapidly validate concepts before investing significant development resources. This capability is particularly valuable for organizations exploring AI integration opportunities, as it reduces the technical barriers to experimentation and proof-of-concept development.
 
-For more detailed information about Firebase Studio capabilities, see the [Firebase Studio documentation](https://firebase.google.com/docs/studio). The [Gemini Code Assist overview](https://developers.google.com/gemini-code-assist/docs/overview) provides comprehensive guidance on leveraging AI assistance in development workflows. Additional best practices for cloud-native development can be found in the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework). For CI/CD implementation patterns, reference the [Cloud Build documentation](https://cloud.google.com/build/docs), and for container management strategies, see the [Artifact Registry best practices guide](https://cloud.google.com/artifact-registry/docs/best-practices).
+For more detailed information about Firebase Studio capabilities, see the [Firebase Studio documentation](https://firebase.google.com/docs/studio). The [Gemini Code Assist overview](https://cloud.google.com/docs/duet-ai/code-assist) provides comprehensive guidance on leveraging AI assistance in development workflows. Additional best practices for cloud-native development can be found in the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework). For CI/CD implementation patterns, reference the [Cloud Build documentation](https://cloud.google.com/build/docs), and for container management strategies, see the [Artifact Registry best practices guide](https://cloud.google.com/artifact-registry/docs/best-practices).
 
 > **Tip**: Take advantage of Firebase Studio's pre-built templates and Gemini Code Assist agents to accelerate development workflows. The Migration agent can help modernize existing codebases, while the AI Testing agent provides automated testing capabilities for AI-powered features, significantly improving development efficiency and code quality.
 

@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: NetApp Volumes, AlloyDB, Cloud Monitoring, Cloud Build
 estimated-time: 150 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: 2025-07-17
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: enterprise-database, high-performance, storage, postgresql, monitoring, automation
 recipe-generator-version: 1.3
@@ -231,7 +231,7 @@ echo "✅ NetApp Storage Pool: ${NETAPP_STORAGE_POOL}"
    # Get volume mount information for database configuration
    VOLUME_MOUNT_PATH=$(gcloud netapp volumes describe ${NETAPP_VOLUME} \
        --location=${REGION} \
-       --format="value(mountOptions.mountPath)")
+       --format="value(mountOptions[0].export)")
    
    echo "✅ NetApp volume created: ${VOLUME_MOUNT_PATH}"
    ```
@@ -240,7 +240,7 @@ echo "✅ NetApp Storage Pool: ${NETAPP_STORAGE_POOL}"
 
 5. **Deploy AlloyDB Cluster with High Availability**:
 
-   AlloyDB for PostgreSQL delivers enterprise-grade database performance with intelligent query optimization, columnar storage, and built-in analytics capabilities. The cluster configuration includes primary and read replica instances to support both transactional and analytical workloads, providing horizontal scalability and high availability for mission-critical applications.
+   AlloyDB for PostgreSQL delivers enterprise-grade database performance with intelligent query optimization, columnar storage, and built-in analytics capabilities. The cluster configuration includes continuous backups and automated maintenance windows to support both transactional and analytical workloads, providing horizontal scalability and high availability for mission-critical applications.
 
    ```bash
    # Create AlloyDB cluster for enterprise workloads
@@ -248,7 +248,7 @@ echo "✅ NetApp Storage Pool: ${NETAPP_STORAGE_POOL}"
        --region=${REGION} \
        --network=${VPC_NAME} \
        --database-version=POSTGRES_15 \
-       --continuous-backup-enabled \
+       --enable-continuous-backup \
        --automated-backup-start-time="02:00" \
        --automated-backup-days-of-week=MONDAY,TUESDAY,WEDNESDAY,THURSDAY,FRIDAY,SATURDAY,SUNDAY \
        --automated-backup-retention-period=30d \
@@ -278,7 +278,6 @@ echo "✅ NetApp Storage Pool: ${NETAPP_STORAGE_POOL}"
        --region=${REGION} \
        --instance-type=PRIMARY \
        --cpu-count=16 \
-       --memory-size=64GiB \
        --database-flags=shared_preload_libraries=pg_stat_statements,pg_hint_plan
    
    # Wait for primary instance creation
@@ -306,7 +305,6 @@ echo "✅ NetApp Storage Pool: ${NETAPP_STORAGE_POOL}"
        --region=${REGION} \
        --instance-type=READ_POOL \
        --cpu-count=8 \
-       --memory-size=32GiB \
        --read-pool-node-count=3
    
    # Wait for replica creation
@@ -572,7 +570,7 @@ EOF
        --format="table(name,state,capacityGib,protocols)"
    ```
 
-   Expected output: Storage pool should show "READY" state, volume should show "READY" state with NFS protocol.
+   Expected output: Storage pool should show "READY" state, volume should show "READY" state with NFSV4 protocol.
 
 3. Test database performance with synthetic workload:
 

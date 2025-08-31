@@ -1,0 +1,619 @@
+# Infrastructure Manager Configuration for AI-Powered App Development with Firebase Studio and Gemini
+# This configuration deploys the complete infrastructure for building AI-powered applications
+# using Firebase Studio, Gemini AI, App Hosting, and Firestore.
+
+# Configuration metadata
+metadata:
+  name: firebase-studio-ai-app
+  description: |
+    Complete infrastructure for AI-powered app development using Firebase Studio,
+    Gemini AI assistant, Firestore database, and App Hosting deployment platform.
+    This setup enables rapid prototyping and production deployment of AI-enhanced applications.
+  version: "1.0"
+  labels:
+    environment: development
+    category: ai-development
+    framework: firebase
+    deployment-type: serverless
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for the Firebase application"
+    default: ""
+    validation:
+      regex: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+
+  region:
+    type: string
+    description: "Primary region for Firebase and Google Cloud resources"
+    default: "us-central1"
+    allowed_values:
+      - "us-central1"
+      - "us-east1"
+      - "us-west1"
+      - "europe-west1"
+      - "asia-northeast1"
+
+  app_name:
+    type: string
+    description: "Application name for Firebase Studio project"
+    default: "ai-task-manager"
+    validation:
+      regex: "^[a-z][a-z0-9-]{2,30}[a-z0-9]$"
+
+  firebase_display_name:
+    type: string
+    description: "Display name for the Firebase project"
+    default: "AI-Powered Task Manager"
+
+  enable_github_integration:
+    type: boolean
+    description: "Enable GitHub integration for App Hosting continuous deployment"
+    default: true
+
+  github_repository_url:
+    type: string
+    description: "GitHub repository URL for App Hosting deployment"
+    default: ""
+
+  gemini_api_key:
+    type: string
+    description: "Gemini API key for AI features (will be stored in Secret Manager)"
+    default: "your-gemini-api-key"
+    sensitive: true
+
+# Required Google Cloud APIs and services
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-firebase-api
+    type: gcp-types/serviceusage-v1:serviceusage.services.batchEnable
+    properties:
+      parent: projects/${var.project_id}
+      serviceIds:
+        - firebase.googleapis.com
+        - firestore.googleapis.com
+        - cloudbuild.googleapis.com
+        - run.googleapis.com
+        - secretmanager.googleapis.com
+        - artifactregistry.googleapis.com
+        - developerconnect.googleapis.com
+        - cloudfunctions.googleapis.com
+        - storage.googleapis.com
+        - logging.googleapis.com
+        - monitoring.googleapis.com
+    metadata:
+      dependsOn: []
+
+  # Firebase project initialization
+  - name: firebase-project
+    type: gcp-types/firebase-v1beta1:projects
+    properties:
+      projectId: ${var.project_id}
+      displayName: ${var.firebase_display_name}
+      resources:
+        hostingSite: ${var.app_name}
+    metadata:
+      dependsOn:
+        - enable-firebase-api
+
+  # Firestore database configuration
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/${var.project_id}
+      databaseId: "(default)"
+      type: FIRESTORE_NATIVE
+      locationId: ${var.region}
+      pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_ENABLED
+      deleteProtectionState: DELETE_PROTECTION_DISABLED
+      concurrencyMode: OPTIMISTIC
+      appEngineIntegrationMode: DISABLED
+    metadata:
+      dependsOn:
+        - firebase-project
+
+  # Firestore composite indexes for AI-enhanced queries
+  - name: firestore-index-user-priority
+    type: gcp-types/firestore-v1:projects.databases.collectionGroups.indexes
+    properties:
+      parent: projects/${var.project_id}/databases/(default)/collectionGroups/tasks
+      fields:
+        - fieldPath: userId
+          order: ASCENDING
+        - fieldPath: priority
+          order: DESCENDING
+        - fieldPath: createdAt
+          order: ASCENDING
+      queryScope: COLLECTION
+    metadata:
+      dependsOn:
+        - firestore-database
+
+  - name: firestore-index-ai-suggestions
+    type: gcp-types/firestore-v1:projects.databases.collectionGroups.indexes
+    properties:
+      parent: projects/${var.project_id}/databases/(default)/collectionGroups/tasks
+      fields:
+        - fieldPath: userId
+          order: ASCENDING
+        - fieldPath: aiGenerated
+          order: ASCENDING
+        - fieldPath: suggestionScore
+          order: DESCENDING
+      queryScope: COLLECTION
+    metadata:
+      dependsOn:
+        - firestore-database
+
+  - name: firestore-index-status-duedate
+    type: gcp-types/firestore-v1:projects.databases.collectionGroups.indexes
+    properties:
+      parent: projects/${var.project_id}/databases/(default)/collectionGroups/tasks
+      fields:
+        - fieldPath: userId
+          order: ASCENDING
+        - fieldPath: status
+          order: ASCENDING
+        - fieldPath: dueDate
+          order: ASCENDING
+      queryScope: COLLECTION
+    metadata:
+      dependsOn:
+        - firestore-database
+
+  # Firebase Authentication configuration
+  - name: firebase-auth-config
+    type: gcp-types/identitytoolkit-v1:projects
+    properties:
+      projectId: ${var.project_id}
+      signIn:
+        allowDuplicateEmails: false
+        anonymous:
+          enabled: true
+        email:
+          enabled: true
+          passwordRequired: true
+        googleSignIn:
+          enabled: true
+        hashConfig:
+          algorithm: SCRYPT
+          memoryCost: 14
+      notification:
+        sendEmail:
+          method: DEFAULT
+        sendSms:
+          useDeviceLocale: true
+      quota:
+        signUpQuotaConfig:
+          quota: 100
+          quotaDuration: "3600s"
+    metadata:
+      dependsOn:
+        - firebase-project
+
+  # Cloud Storage bucket for file assets
+  - name: storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.project_id}-firebase-assets
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      cors:
+        - origin: 
+            - "*"
+          method:
+            - GET
+            - POST
+            - PUT
+            - DELETE
+          responseHeader:
+            - "*"
+          maxAgeSeconds: 3600
+      lifecycle:
+        rule:
+          - condition:
+              age: 365
+            action:
+              type: Delete
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+    metadata:
+      dependsOn:
+        - enable-firebase-api
+
+  # Secret Manager for Gemini API key
+  - name: gemini-api-secret
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      parent: projects/${var.project_id}
+      secretId: gemini-api-key
+      replication:
+        automatic: {}
+      labels:
+        environment: development
+        service: firebase-studio
+        purpose: ai-integration
+    metadata:
+      dependsOn:
+        - enable-firebase-api
+
+  # Secret version for Gemini API key
+  - name: gemini-api-secret-version
+    type: gcp-types/secretmanager-v1:projects.secrets.versions
+    properties:
+      parent: projects/${var.project_id}/secrets/gemini-api-key
+      payload:
+        data: ${base64encode(var.gemini_api_key)}
+    metadata:
+      dependsOn:
+        - gemini-api-secret
+
+  # Artifact Registry repository for App Hosting
+  - name: artifact-registry-repo
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      repositoryId: ${var.app_name}-repo
+      format: DOCKER
+      description: "Container registry for Firebase App Hosting deployments"
+      labels:
+        environment: development
+        service: app-hosting
+        framework: firebase
+    metadata:
+      dependsOn:
+        - enable-firebase-api
+
+  # Cloud Build trigger for CI/CD (conditional on GitHub integration)
+  - name: cloudbuild-trigger
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      projectId: ${var.project_id}
+      name: ${var.app_name}-build-trigger
+      description: "Automated build trigger for Firebase App Hosting"
+      disabled: false
+      github:
+        owner: "$(echo ${var.github_repository_url} | cut -d'/' -f4)"
+        name: "$(echo ${var.github_repository_url} | cut -d'/' -f5)"
+        push:
+          branch: "^main$"
+      build:
+        steps:
+          - name: gcr.io/cloud-builders/npm
+            args:
+              - install
+          - name: gcr.io/cloud-builders/npm
+            args:
+              - run
+              - build
+          - name: gcr.io/cloud-builders/docker
+            args:
+              - build
+              - -t
+              - ${var.region}-docker.pkg.dev/${var.project_id}/${var.app_name}-repo/${var.app_name}:$COMMIT_SHA
+              - .
+          - name: gcr.io/cloud-builders/docker
+            args:
+              - push
+              - ${var.region}-docker.pkg.dev/${var.project_id}/${var.app_name}-repo/${var.app_name}:$COMMIT_SHA
+        images:
+          - ${var.region}-docker.pkg.dev/${var.project_id}/${var.app_name}-repo/${var.app_name}:$COMMIT_SHA
+        options:
+          logging: CLOUD_LOGGING_ONLY
+          machineType: E2_STANDARD_4
+        timeout: 1200s
+    metadata:
+      dependsOn:
+        - artifact-registry-repo
+      condition: ${var.enable_github_integration}
+
+  # IAM service account for App Hosting
+  - name: app-hosting-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: ${var.app_name}-app-hosting
+      displayName: "Firebase App Hosting Service Account"
+      description: "Service account for Firebase App Hosting with minimal required permissions"
+      project: ${var.project_id}
+    metadata:
+      dependsOn:
+        - enable-firebase-api
+
+  # IAM bindings for App Hosting service account
+  - name: app-hosting-sa-firestore-user
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/datastore.user
+      member: serviceAccount:${var.app_name}-app-hosting@${var.project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - app-hosting-service-account
+
+  - name: app-hosting-sa-storage-user
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/storage.objectUser
+      member: serviceAccount:${var.app_name}-app-hosting@${var.project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - app-hosting-service-account
+
+  - name: app-hosting-sa-secret-accessor
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/secretmanager.secretAccessor
+      member: serviceAccount:${var.app_name}-app-hosting@${var.project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - app-hosting-service-account
+
+  # Cloud Run service for App Hosting backend
+  - name: app-hosting-cloud-run
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/${var.project_id}
+      location: ${var.region}
+      body:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: ${var.app_name}-backend
+          namespace: ${var.project_id}
+          labels:
+            cloud.googleapis.com/location: ${var.region}
+            environment: development
+            service: app-hosting
+          annotations:
+            run.googleapis.com/ingress: all
+            run.googleapis.com/ingress-status: all
+        spec:
+          template:
+            metadata:
+              annotations:
+                autoscaling.knative.dev/maxScale: "100"
+                autoscaling.knative.dev/minScale: "0"
+                run.googleapis.com/execution-environment: gen2
+                run.googleapis.com/cpu-throttling: "false"
+            spec:
+              containerConcurrency: 80
+              timeoutSeconds: 300
+              serviceAccountName: ${var.app_name}-app-hosting@${var.project_id}.iam.gserviceaccount.com
+              containers:
+                - name: ${var.app_name}-container
+                  image: gcr.io/cloudrun/placeholder
+                  ports:
+                    - name: http1
+                      containerPort: 8080
+                      protocol: TCP
+                  env:
+                    - name: FIREBASE_PROJECT_ID
+                      value: ${var.project_id}
+                    - name: FIRESTORE_DATABASE_ID
+                      value: "(default)"
+                    - name: GEMINI_API_KEY
+                      valueFrom:
+                        secretKeyRef:
+                          name: gemini-api-key
+                          key: latest
+                  resources:
+                    limits:
+                      cpu: "2"
+                      memory: "2Gi"
+                    requests:
+                      cpu: "1"
+                      memory: "512Mi"
+                  startupProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 0
+                    timeoutSeconds: 1
+                    periodSeconds: 3
+                    successThreshold: 1
+                    failureThreshold: 5
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    timeoutSeconds: 1
+                    periodSeconds: 10
+                    successThreshold: 1
+                    failureThreshold: 3
+          traffic:
+            - percent: 100
+              latestRevision: true
+    metadata:
+      dependsOn:
+        - app-hosting-service-account
+        - app-hosting-sa-firestore-user
+        - app-hosting-sa-storage-user
+        - app-hosting-sa-secret-accessor
+
+  # Firebase Hosting configuration
+  - name: firebase-hosting-site
+    type: gcp-types/firebasehosting-v1beta1:projects.sites
+    properties:
+      parent: projects/${var.project_id}
+      siteId: ${var.app_name}
+      labels:
+        environment: development
+        service: firebase-hosting
+    metadata:
+      dependsOn:
+        - firebase-project
+
+  # Cloud CDN for global content distribution
+  - name: cloud-cdn-backend-service
+    type: gcp-types/compute-v1:backendServices
+    properties:
+      name: ${var.app_name}-cdn-backend
+      project: ${var.project_id}
+      description: "Backend service for Firebase App Hosting with Cloud CDN"
+      protocol: HTTPS
+      loadBalancingScheme: EXTERNAL
+      timeoutSec: 30
+      enableCDN: true
+      cdnPolicy:
+        cacheMode: CACHE_ALL_STATIC
+        defaultTtl: 3600
+        maxTtl: 86400
+        negativeCaching: true
+        negativeCachingPolicy:
+          - code: 404
+            ttl: 300
+          - code: 410
+            ttl: 300
+        serveWhileStale: 86400
+      customRequestHeaders:
+        - "X-Firebase-Studio: true"
+        - "X-AI-Powered: gemini"
+    metadata:
+      dependsOn:
+        - app-hosting-cloud-run
+
+  # Cloud Monitoring workspace for observability
+  - name: monitoring-workspace
+    type: gcp-types/monitoring-v1:projects
+    properties:
+      name: projects/${var.project_id}
+      displayName: "Firebase Studio AI App Monitoring"
+    metadata:
+      dependsOn:
+        - enable-firebase-api
+
+  # Cloud Logging sink for centralized logging
+  - name: logging-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/${var.project_id}
+      name: ${var.app_name}-app-logs
+      description: "Centralized logging for Firebase Studio AI application"
+      destination: storage.googleapis.com/${var.project_id}-firebase-assets/logs
+      filter: |
+        resource.type="cloud_run_revision" OR
+        resource.type="firebase_domain" OR
+        resource.type="gce_firestore_database" OR
+        logName="projects/${var.project_id}/logs/firebase"
+      includeChildren: true
+    metadata:
+      dependsOn:
+        - storage-bucket
+
+# Output values for integration and verification
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+
+  firebase_project_url:
+    description: "Firebase Console URL for project management"
+    value: "https://console.firebase.google.com/project/${var.project_id}"
+
+  firebase_studio_url:
+    description: "Firebase Studio URL for AI-powered development"
+    value: "https://studio.firebase.google.com"
+
+  firestore_database_id:
+    description: "Firestore database identifier"
+    value: "(default)"
+
+  app_hosting_url:
+    description: "Firebase App Hosting deployment URL"
+    value: "https://${var.app_name}.web.app"
+
+  cloud_run_service_url:
+    description: "Cloud Run service URL for backend API"
+    value: $(ref.app-hosting-cloud-run.status.url)
+
+  artifact_registry_url:
+    description: "Artifact Registry repository URL"
+    value: "${var.region}-docker.pkg.dev/${var.project_id}/${var.app_name}-repo"
+
+  storage_bucket_name:
+    description: "Cloud Storage bucket name for file assets"
+    value: "${var.project_id}-firebase-assets"
+
+  secret_manager_secret:
+    description: "Secret Manager secret name for Gemini API key"
+    value: "projects/${var.project_id}/secrets/gemini-api-key"
+
+  monitoring_workspace:
+    description: "Cloud Monitoring workspace name"
+    value: "projects/${var.project_id}"
+
+  service_account_email:
+    description: "App Hosting service account email"
+    value: "${var.app_name}-app-hosting@${var.project_id}.iam.gserviceaccount.com"
+
+  firestore_indexes:
+    description: "Created Firestore composite indexes"
+    value:
+      - "tasks: userId (ASC), priority (DESC), createdAt (ASC)"
+      - "tasks: userId (ASC), aiGenerated (ASC), suggestionScore (DESC)"
+      - "tasks: userId (ASC), status (ASC), dueDate (ASC)"
+
+  enabled_apis:
+    description: "List of enabled Google Cloud APIs"
+    value:
+      - firebase.googleapis.com
+      - firestore.googleapis.com
+      - cloudbuild.googleapis.com
+      - run.googleapis.com
+      - secretmanager.googleapis.com
+      - artifactregistry.googleapis.com
+      - developerconnect.googleapis.com
+      - cloudfunctions.googleapis.com
+      - storage.googleapis.com
+      - logging.googleapis.com
+      - monitoring.googleapis.com
+
+  deployment_commands:
+    description: "Commands to deploy using Infrastructure Manager"
+    value: |
+      # Deploy the infrastructure:
+      gcloud infra-manager deployments apply projects/${var.project_id}/locations/${var.region}/deployments/firebase-studio-ai-app \
+        --service-account=projects/${var.project_id}/serviceAccounts/infra-manager@${var.project_id}.iam.gserviceaccount.com \
+        --git-source-repo=https://github.com/your-org/your-repo.git \
+        --git-source-directory=gcp/ai-powered-app-development-firebase-studio-gemini/code/infrastructure-manager \
+        --git-source-ref=main \
+        --input-values=project_id=${var.project_id},region=${var.region},app_name=${var.app_name}
+
+      # Verify deployment:
+      gcloud infra-manager deployments describe projects/${var.project_id}/locations/${var.region}/deployments/firebase-studio-ai-app
+
+  firebase_studio_setup:
+    description: "Firebase Studio setup instructions"
+    value: |
+      1. Navigate to: https://studio.firebase.google.com
+      2. Select project: ${var.project_id}
+      3. Connect GitHub repository for App Hosting
+      4. Configure build settings in Firebase Console
+      5. Start AI-assisted development with Gemini integration
+
+  post_deployment_verification:
+    description: "Commands to verify successful deployment"
+    value: |
+      # Verify Firebase project
+      gcloud firebase projects list --filter="projectId:${var.project_id}"
+      
+      # Check Firestore database
+      gcloud firestore databases list --project=${var.project_id}
+      
+      # Verify Cloud Run service
+      gcloud run services list --project=${var.project_id} --region=${var.region}
+      
+      # Check Secret Manager
+      gcloud secrets list --project=${var.project_id}
+      
+      # Test Firebase Studio access
+      echo "Access Firebase Studio at: https://studio.firebase.google.com"

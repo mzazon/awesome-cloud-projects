@@ -6,10 +6,10 @@ difficulty: 400
 subject: azure
 services: Azure Managed Lustre, Azure CycleCloud, Azure Batch, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: hpc, lustre, cyclecloud, parallel-computing, scientific-computing
 recipe-generator-version: 1.3
@@ -85,19 +85,19 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with Contributor permissions for creating HPC resources
-2. Azure CLI version 2.40.0 or later with CycleCloud extension
+2. Azure CLI version 2.40.0 or later with amlfs extension
 3. Understanding of HPC concepts, job schedulers (Slurm), and parallel file systems
 4. SSH key pair for secure cluster access
 5. Estimated cost: $200-500 per day for moderate HPC workloads (depending on compute scale and storage throughput)
 
-> **Note**: Azure Managed Lustre requires specialized VM SKUs with InfiniBand networking for optimal performance. Ensure your subscription has quota for HBv3, HCv1, or NCv3 series virtual machines.
+> **Note**: Azure Managed Lustre requires specialized VM SKUs with InfiniBand networking for optimal performance. Ensure your subscription has quota for HBv3, HBv4, or HCv1 series virtual machines.
 
 ## Preparation
 
 ```bash
 # Set environment variables for Azure resources
 export RESOURCE_GROUP="rg-hpc-lustre-${RANDOM_SUFFIX}"
-export LOCATION="East US"
+export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
@@ -113,7 +113,7 @@ export SSH_KEY_NAME="hpc-ssh-key"
 # Create resource group for HPC environment
 az group create \
     --name ${RESOURCE_GROUP} \
-    --location "${LOCATION}" \
+    --location ${LOCATION} \
     --tags purpose=hpc-demo environment=production
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
@@ -128,7 +128,7 @@ echo "✅ SSH key pair generated for cluster authentication"
 az storage account create \
     --name ${STORAGE_ACCOUNT} \
     --resource-group ${RESOURCE_GROUP} \
-    --location "${LOCATION}" \
+    --location ${LOCATION} \
     --sku Standard_LRS \
     --kind StorageV2 \
     --hierarchical-namespace true
@@ -147,7 +147,7 @@ echo "✅ Storage account created with Data Lake capabilities"
    az network vnet create \
        --name ${VNET_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --location "${LOCATION}" \
+       --location ${LOCATION} \
        --address-prefixes 10.0.0.0/16 \
        --subnet-name compute-subnet \
        --subnet-prefixes 10.0.1.0/24
@@ -181,25 +181,23 @@ echo "✅ Storage account created with Data Lake capabilities"
    
    # Create Azure Managed Lustre file system with high-performance configuration
    az amlfs create \
-       --name ${LUSTRE_NAME} \
+       --aml-filesystem-name ${LUSTRE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --location "${LOCATION}" \
-       --file-system-type "Durable" \
-       --storage-type "SSD" \
-       --throughput-per-unit-mb 1000 \
-       --storage-capacity-tib 4 \
-       --subnet-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/${VNET_NAME}/subnets/storage-subnet"
+       --location ${LOCATION} \
+       --sku AMLFS-Durable-Premium-250 \
+       --storage-capacity 4 \
+       --filesystem-subnet "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/${VNET_NAME}/subnets/storage-subnet"
    
    # Wait for Lustre file system provisioning to complete
    az amlfs wait \
-       --name ${LUSTRE_NAME} \
+       --aml-filesystem-name ${LUSTRE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --created
    
    echo "✅ Azure Managed Lustre file system provisioned with 4 TiB capacity"
    ```
 
-   The Lustre file system now provides 4 TiB of high-performance storage with 1000 MB/s throughput per unit, enabling concurrent access from hundreds of compute nodes with consistent performance characteristics.
+   The Lustre file system now provides 4 TiB of high-performance storage with premium throughput capabilities, enabling concurrent access from hundreds of compute nodes with consistent performance characteristics.
 
 3. **Install and Configure Azure CycleCloud**:
 
@@ -210,7 +208,7 @@ echo "✅ Storage account created with Data Lake capabilities"
    az vm create \
        --name ${CYCLECLOUD_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --image "microsoft-ads:azure-cyclecloud:cyclecloud81:8.1.0" \
+       --image "microsoft-ads:azure-cyclecloud:cyclecloud82:8.2.0" \
        --size Standard_D4s_v3 \
        --subnet "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/${VNET_NAME}/subnets/management-subnet" \
        --admin-username azureuser \
@@ -239,32 +237,32 @@ echo "✅ Storage account created with Data Lake capabilities"
    ```bash
    # Get Lustre file system mount information
    LUSTRE_MOUNT_IP=$(az amlfs show \
-       --name ${LUSTRE_NAME} \
+       --aml-filesystem-name ${LUSTRE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query "mountCommand" \
-       --output tsv | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+')
+       --query "mgsAddress" \
+       --output tsv)
    
    LUSTRE_MOUNT_PATH="/mnt/lustre"
    LUSTRE_MOUNT_COMMAND="sudo mount -t lustre ${LUSTRE_MOUNT_IP}@tcp:/lustrefs ${LUSTRE_MOUNT_PATH}"
    
    # Create CycleCloud cluster initialization script for Lustre mounting
    cat > lustre-mount-script.sh << 'EOF'
-   #!/bin/bash
-   # Install Lustre client packages
-   yum install -y lustre-client
-   
-   # Create mount point
-   mkdir -p /mnt/lustre
-   
-   # Mount Lustre file system
-   mount -t lustre LUSTRE_MOUNT_IP@tcp:/lustrefs /mnt/lustre
-   
-   # Add to fstab for persistent mounting
-   echo "LUSTRE_MOUNT_IP@tcp:/lustrefs /mnt/lustre lustre defaults,_netdev 0 0" >> /etc/fstab
-   
-   # Set appropriate permissions for HPC workloads
-   chmod 755 /mnt/lustre
-   EOF
+#!/bin/bash
+# Install Lustre client packages
+yum install -y lustre-client
+
+# Create mount point
+mkdir -p /mnt/lustre
+
+# Mount Lustre file system
+mount -t lustre LUSTRE_MOUNT_IP@tcp:/lustrefs /mnt/lustre
+
+# Add to fstab for persistent mounting
+echo "LUSTRE_MOUNT_IP@tcp:/lustrefs /mnt/lustre lustre defaults,_netdev 0 0" >> /etc/fstab
+
+# Set appropriate permissions for HPC workloads
+chmod 755 /mnt/lustre
+EOF
    
    # Replace placeholder with actual Lustre IP
    sed -i "s/LUSTRE_MOUNT_IP/${LUSTRE_MOUNT_IP}/g" lustre-mount-script.sh
@@ -300,7 +298,7 @@ echo "✅ Storage account created with Data Lake capabilities"
        --parameter ProjectorientedQueues=true
    
    exit
-   REMOTE_COMMANDS
+REMOTE_COMMANDS
    
    echo "✅ Slurm cluster template configured with HPC-optimized settings"
    ```
@@ -330,7 +328,7 @@ echo "✅ Storage account created with Data Lake capabilities"
    cyclecloud show_nodes hpc-slurm-cluster --output json | jq '.[] | select(.role=="master")'
    
    exit
-   REMOTE_COMMANDS
+REMOTE_COMMANDS
    
    echo "✅ HPC cluster is operational and ready for job submission"
    ```
@@ -346,7 +344,7 @@ echo "✅ Storage account created with Data Lake capabilities"
    az monitor log-analytics workspace create \
        --workspace-name "law-hpc-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
-       --location "${LOCATION}" \
+       --location ${LOCATION} \
        --sku PerGB2018
    
    # Get workspace ID for agent configuration
@@ -385,49 +383,49 @@ echo "✅ Storage account created with Data Lake capabilities"
    
    # Create test MPI application for parallel processing
    cat > mpi_test.c << 'EOF'
-   #include <mpi.h>
-   #include <stdio.h>
-   #include <unistd.h>
-   
-   int main(int argc, char** argv) {
-       MPI_Init(&argc, &argv);
-       
-       int rank, size;
-       char hostname[256];
-       
-       MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-       MPI_Comm_size(MPI_COMM_WORLD, &size);
-       gethostname(hostname, sizeof(hostname));
-       
-       printf("Rank %d of %d running on %s\n", rank, size, hostname);
-       
-       // Simulate computational work with file I/O to Lustre
-       if (rank == 0) {
-           FILE* fp = fopen("/mnt/lustre/test_output.txt", "w");
-           fprintf(fp, "HPC test completed with %d processes\n", size);
-           fclose(fp);
-       }
-       
-       MPI_Finalize();
-       return 0;
-   }
-   EOF
+#include <mpi.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    
+    int rank, size;
+    char hostname[256];
+    
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    gethostname(hostname, sizeof(hostname));
+    
+    printf("Rank %d of %d running on %s\n", rank, size, hostname);
+    
+    // Simulate computational work with file I/O to Lustre
+    if (rank == 0) {
+        FILE* fp = fopen("/mnt/lustre/test_output.txt", "w");
+        fprintf(fp, "HPC test completed with %d processes\n", size);
+        fclose(fp);
+    }
+    
+    MPI_Finalize();
+    return 0;
+}
+EOF
    
    # Compile and submit MPI test job
    mpicc -o mpi_test mpi_test.c
    
    # Create Slurm job script
    cat > test_job.sbatch << 'EOF'
-   #!/bin/bash
-   #SBATCH --job-name=hpc-test
-   #SBATCH --nodes=2
-   #SBATCH --ntasks-per-node=8
-   #SBATCH --time=00:05:00
-   #SBATCH --output=test_output.log
-   
-   module load mpi
-   srun ./mpi_test
-   EOF
+#!/bin/bash
+#SBATCH --job-name=hpc-test
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=8
+#SBATCH --time=00:05:00
+#SBATCH --output=test_output.log
+
+module load mpi
+srun ./mpi_test
+EOF
    
    # Submit job to Slurm scheduler
    sbatch test_job.sbatch
@@ -436,7 +434,7 @@ echo "✅ Storage account created with Data Lake capabilities"
    squeue
    
    exit
-   HPC_COMMANDS
+HPC_COMMANDS
    
    echo "✅ Test HPC workload submitted successfully"
    echo "Monitor job progress through Slurm on head node: ${HEAD_NODE_IP}"
@@ -463,7 +461,7 @@ echo "✅ Storage account created with Data Lake capabilities"
        --numjobs=4 --rw=write --bs=1M --group_reporting
    
    exit
-   PERFORMANCE_TEST
+PERFORMANCE_TEST
    ```
 
    Expected output: Throughput should exceed 800 MB/s for sequential operations, demonstrating Lustre's high-performance capabilities.
@@ -513,7 +511,7 @@ echo "✅ Storage account created with Data Lake capabilities"
    ```bash
    # Delete Lustre file system (warning: destroys all data)
    az amlfs delete \
-       --name ${LUSTRE_NAME} \
+       --aml-filesystem-name ${LUSTRE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --yes
    

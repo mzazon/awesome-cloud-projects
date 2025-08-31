@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Build, Google Kubernetes Engine, Cloud Storage, Cloud Load Balancing
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: pwa, kubernetes, cicd, blue-green-deployment, container-orchestration
 recipe-generator-version: 1.3
@@ -80,7 +80,7 @@ graph TB
 ## Prerequisites
 
 1. GCP project with billing enabled and Owner or Editor role permissions
-2. Google Cloud CLI (gcloud) installed and configured (version 400.0.0+)
+2. Google Cloud CLI (gcloud) installed and configured (version 531.0.0+)
 3. Docker installed locally for container image testing
 4. Basic knowledge of Kubernetes concepts and YAML configuration
 5. Understanding of Progressive Web Application architecture and service workers
@@ -599,11 +599,11 @@ EOF
    cat > cloudbuild.yaml <<EOF
 steps:
 # Build and test the application
-- name: 'node:16'
+- name: 'node:18'
   entrypoint: 'npm'
   args: ['install']
 
-- name: 'node:16'
+- name: 'node:18'
   entrypoint: 'npm'
   args: ['test']
 
@@ -671,7 +671,7 @@ EOF
 
    # Create Dockerfile for containerization
    cat > Dockerfile <<EOF
-FROM node:16-alpine
+FROM node:18-alpine
 
 WORKDIR /app
 
@@ -733,19 +733,19 @@ EOF
    # Commit all files to repository
    git add .
    git commit -m "Initial PWA setup with blue-green deployment configuration"
-   git push origin master
+   git push origin main
    
    # Create Cloud Build trigger
    gcloud builds triggers create cloud-source-repositories \
        --repo=${REPO_NAME} \
-       --branch-pattern="^master$" \
+       --branch-pattern="^main$" \
        --build-config="cloudbuild.yaml" \
-       --description="PWA deployment trigger for master branch"
+       --description="PWA deployment trigger for main branch"
    
    echo "✅ Code committed and build trigger created"
    ```
 
-   The automated trigger is now configured to execute the complete CI/CD pipeline whenever code is pushed to the master branch, enabling continuous deployment with comprehensive testing and validation.
+   The automated trigger is now configured to execute the complete CI/CD pipeline whenever code is pushed to the main branch, enabling continuous deployment with comprehensive testing and validation.
 
 9. **Execute Initial Deployment**:
 
@@ -790,8 +790,10 @@ EOF
 
    ```bash
    # Get application URL from ingress
-   BLUE_IP=$(gcloud container clusters get-credentials ${CLUSTER_NAME_BLUE} --region=${REGION} && \
-             kubectl get ingress pwa-demo-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+   BLUE_IP=$(gcloud container clusters get-credentials ${CLUSTER_NAME_BLUE} \
+             --region=${REGION} && \
+             kubectl get ingress pwa-demo-ingress \
+             -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
    
    # Test health endpoint
    curl -s http://${BLUE_IP}/api/health | jq .
@@ -842,12 +844,13 @@ EOF
    ```bash
    # Delete build triggers
    TRIGGER_ID=$(gcloud builds triggers list \
-       --filter="description:'PWA deployment trigger for master branch'" \
+       --filter="description:'PWA deployment trigger for main branch'" \
        --format="value(id)")
    gcloud builds triggers delete ${TRIGGER_ID} --quiet
    
    # Delete container images
-   gcloud container images delete gcr.io/${PROJECT_ID}/pwa-demo --force-delete-tags --quiet
+   gcloud container images delete gcr.io/${PROJECT_ID}/pwa-demo \
+       --force-delete-tags --quiet
    
    echo "✅ Cloud Build resources cleaned up"
    ```

@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: transcribe, polly, translate, lambda
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: transcribe, polly, translate, voice-processing, multi-language, step-functions
 recipe-generator-version: 1.3
@@ -19,11 +19,11 @@ recipe-generator-version: 1.3
 
 ## Problem
 
-Global organizations with multilingual customer bases require sophisticated voice processing capabilities that can handle audio content in dozens of languages, convert speech to text with high accuracy, translate content between languages, and generate natural-sounding speech output in multiple languages and dialects. Traditional voice processing solutions struggle with language detection, accent variations, and maintaining context across translation and speech synthesis. Call centers, e-learning platforms, and content localization teams need automated pipelines that can process voice content at scale while preserving meaning, tone, and cultural nuances across language barriers.
+Global organizations require sophisticated voice processing capabilities that handle audio content in dozens of languages, convert speech to text with high accuracy, translate content between languages, and generate natural-sounding speech output. Traditional voice processing solutions struggle with language detection, accent variations, and maintaining context across translation and speech synthesis, creating barriers for call centers, e-learning platforms, and content localization teams.
 
 ## Solution
 
-Implement a comprehensive multi-language voice processing platform using Amazon Transcribe for speech recognition, Amazon Translate for language translation, and Amazon Polly for speech synthesis. This solution creates intelligent processing pipelines that automatically detect spoken languages, transcribe audio with custom vocabularies, translate content while preserving context, and generate localized audio output with appropriate voice characteristics. The architecture supports batch and real-time processing, custom voice models, and integration with content management systems for scalable voice localization workflows.
+Implement a comprehensive multi-language voice processing platform using Amazon Transcribe for speech recognition, Amazon Translate for language translation, and Amazon Polly for speech synthesis. This solution creates intelligent processing pipelines that automatically detect spoken languages, transcribe audio with custom vocabularies, translate content while preserving context, and generate localized audio output with appropriate voice characteristics.
 
 ## Architecture Diagram
 
@@ -202,7 +202,7 @@ echo "✅ Created foundational resources"
 
 1. **Create DynamoDB Table for Processing Metadata**:
 
-   DynamoDB provides a fully managed NoSQL database service that offers fast and predictable performance with seamless scalability. For our voice processing pipeline, we need a central metadata store to track job progress, status updates, and processing results across all pipeline stages. This table serves as the coordination hub that enables our Step Functions workflow to maintain state and provide real-time visibility into processing status.
+   Amazon DynamoDB provides a fully managed NoSQL database service that offers fast and predictable performance with seamless scalability. For our voice processing pipeline, we need a central metadata store to track job progress, status updates, and processing results across all pipeline stages. This table serves as the coordination hub that enables our Step Functions workflow to maintain state and provide real-time visibility into processing status.
 
    ```bash
    # Create table for job tracking
@@ -226,8 +226,6 @@ echo "✅ Created foundational resources"
    ```
 
    The table is now active and ready to track voice processing jobs. The Global Secondary Index on Status enables efficient querying of jobs by their current processing state, which is essential for monitoring and operational dashboards. This foundational data store supports our pipeline's reliability and observability requirements.
-
-   > **Note**: DynamoDB automatically scales read and write capacity based on your application's traffic patterns when using on-demand billing mode. For predictable workloads, provisioned capacity offers cost optimization opportunities.
 
 2. **Create Lambda Function for Language Detection**:
 
@@ -308,7 +306,7 @@ echo "✅ Created foundational resources"
    # Create Lambda function
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-language-detector" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler language_detector.lambda_handler \
        --zip-file fileb://language_detector.zip \
@@ -322,7 +320,7 @@ echo "✅ Created foundational resources"
 
 3. **Create Lambda Function for Transcription Processing**:
 
-   Amazon Transcribe converts speech to text with high accuracy across multiple languages and dialects. This step creates a specialized Lambda function that configures transcription jobs based on detected languages, applies custom vocabularies for domain-specific terminology, and enables advanced features like speaker diarization for English content. The function demonstrates how to optimize transcription quality through language-specific configuration and custom vocabulary integration.
+   Amazon Transcribe converts speech to text with high accuracy across multiple languages and dialects using advanced machine learning models. This step creates a specialized Lambda function that configures transcription jobs based on detected languages, applies custom vocabularies for domain-specific terminology, and enables advanced features like speaker diarization for English content. The function demonstrates how to optimize transcription quality through language-specific configuration and custom vocabulary integration.
 
    ```bash
    # Create transcription Lambda function
@@ -421,7 +419,7 @@ echo "✅ Created foundational resources"
    # Create Lambda function
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-transcription-processor" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler transcription_processor.lambda_handler \
        --zip-file fileb://transcription_processor.zip \
@@ -435,7 +433,7 @@ echo "✅ Created foundational resources"
 
 4. **Create Lambda Function for Translation**:
 
-   Amazon Translate provides neural machine translation that delivers fast, high-quality, and affordable language translation. This Lambda function processes transcribed text and translates it into multiple target languages simultaneously, supporting custom terminology for consistent translation of technical terms and brand names. The function handles language code mapping between Transcribe and Translate services while managing translation failures gracefully.
+   Amazon Translate provides neural machine translation that delivers fast, high-quality, and affordable language translation using advanced deep learning models. This Lambda function processes transcribed text and translates it into multiple target languages simultaneously, supporting custom terminology for consistent translation of technical terms and brand names. The function handles language code mapping between Transcribe and Translate services while managing translation failures gracefully.
 
    ```bash
    # Create translation Lambda function
@@ -469,8 +467,18 @@ echo "✅ Created foundational resources"
                }
            )
            
+           # Parse S3 URI to extract bucket and key
+           if transcription_uri.startswith('s3://'):
+               # Remove s3:// prefix and split on first /
+               s3_path = transcription_uri[5:]
+               bucket_name, key_path = s3_path.split('/', 1)
+           else:
+               # If it's just a key, use the current bucket
+               bucket_name = bucket
+               key_path = transcription_uri
+           
            # Download transcription results
-           transcription_obj = s3.get_object(Bucket=bucket, Key=transcription_uri)
+           transcription_obj = s3.get_object(Bucket=bucket_name, Key=key_path)
            transcription_data = json.loads(transcription_obj['Body'].read().decode('utf-8'))
            
            # Extract transcript text
@@ -581,7 +589,7 @@ echo "✅ Created foundational resources"
    # Create Lambda function
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-translation-processor" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler translation_processor.lambda_handler \
        --zip-file fileb://translation_processor.zip \
@@ -710,11 +718,11 @@ echo "✅ Created foundational resources"
            }
    
    def select_voice_for_language(language_code):
-       # Map language codes to appropriate Polly voices
+       # Map language codes to appropriate Polly voices (updated for 2025)
        voice_mapping = {
            'en': 'Joanna',  # English - Neural voice
            'es': 'Lupe',    # Spanish - Neural voice
-           'fr': 'Lea',     # French - Neural voice
+           'fr': 'Lea',     # French - Neural voice  
            'de': 'Vicki',   # German - Neural voice
            'it': 'Bianca',  # Italian - Neural voice
            'pt': 'Camila',  # Portuguese - Neural voice
@@ -724,17 +732,18 @@ echo "✅ Created foundational resources"
            'ar': 'Zeina',   # Arabic - Standard voice
            'hi': 'Aditi',   # Hindi - Standard voice
            'ru': 'Tatyana', # Russian - Standard voice
-           'nl': 'Lotte',   # Dutch - Standard voice
+           'nl': 'Laura',   # Dutch - Neural voice
            'sv': 'Astrid'   # Swedish - Standard voice
        }
        return voice_mapping.get(language_code, 'Joanna')
    
    def supports_neural_voice(voice_id):
-       # Neural voices available in Polly
+       # Updated neural voices available in Polly for 2025
        neural_voices = [
            'Joanna', 'Matthew', 'Ivy', 'Justin', 'Kendra', 'Kimberly', 'Salli',
            'Joey', 'Lupe', 'Lucia', 'Lea', 'Vicki', 'Bianca', 'Camila',
-           'Takumi', 'Zhiyu', 'Ruth', 'Stephen'
+           'Takumi', 'Zhiyu', 'Ruth', 'Stephen', 'Laura', 'Brian', 'Arthur',
+           'Emma', 'Amy', 'Aria', 'Ayanda', 'Olivia'
        ]
        return voice_id in neural_voices
    
@@ -756,7 +765,7 @@ echo "✅ Created foundational resources"
    # Create Lambda function
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-speech-synthesizer" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler speech_synthesizer.lambda_handler \
        --zip-file fileb://speech_synthesizer.zip \
@@ -766,7 +775,7 @@ echo "✅ Created foundational resources"
    echo "✅ Created speech synthesis Lambda function"
    ```
 
-   The speech synthesis function is now configured to generate high-quality audio in multiple languages. This component completes our voice processing pipeline by converting translated text back to speech using the most appropriate voices and engines for each language. The function stores generated audio files in S3 and updates job metadata with final processing results.
+   The speech synthesis function is now configured to generate high-quality audio in multiple languages using the latest neural voices. This component completes our voice processing pipeline by converting translated text back to speech using the most appropriate voices and engines for each language. The function stores generated audio files in S3 and updates job metadata with final processing results.
 
 6. **Create Job Status Checker Lambda Function**:
 
@@ -786,14 +795,9 @@ echo "✅ Created foundational resources"
        job_type = event.get('job_type', 'transcription')
        
        try:
-           if job_type == 'language_detection':
-               response = transcribe.get_transcription_job(
-                   TranscriptionJobName=job_name
-               )
-           else:
-               response = transcribe.get_transcription_job(
-                   TranscriptionJobName=job_name
-               )
+           response = transcribe.get_transcription_job(
+               TranscriptionJobName=job_name
+           )
            
            job_status = response['TranscriptionJob']['TranscriptionJobStatus']
            
@@ -840,7 +844,7 @@ echo "✅ Created foundational resources"
    # Create Lambda function
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-job-status-checker" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler job_status_checker.lambda_handler \
        --zip-file fileb://job_status_checker.zip \
@@ -853,7 +857,7 @@ echo "✅ Created foundational resources"
 
 7. **Create Step Functions Workflow**:
 
-   AWS Step Functions provides serverless orchestration for distributed applications and microservices using visual workflows. Our state machine coordinates the entire voice processing pipeline, managing the sequence of language detection, transcription, translation, and speech synthesis while handling wait states for asynchronous operations. This approach ensures reliable processing with built-in error handling and retry logic.
+   AWS Step Functions provides serverless orchestration for distributed applications and microservices using visual workflows. Our state machine coordinates the entire voice processing pipeline, managing the sequence of language detection, transcription, translation, and speech synthesis while handling wait states for asynchronous operations. This approach ensures reliable processing with built-in error handling and retry logic following AWS Well-Architected reliability principles.
 
    ```bash
    # Create Step Functions workflow definition
@@ -1015,13 +1019,14 @@ echo "✅ Created foundational resources"
        --text "Hello, this is a test of our multi-language voice processing pipeline. We will transcribe this English audio, translate it to multiple languages, and generate speech in each target language." \
        --voice-id Joanna \
        --output-format mp3 \
+       --engine neural \
        test-audio.mp3
    
    # Upload test audio to S3
    aws s3 cp test-audio.mp3 s3://${INPUT_BUCKET}/test-audio.mp3
    
    # Start the processing pipeline
-   JOB_ID=$(uuidgen)
+   JOB_ID=$(python3 -c "import uuid; print(str(uuid.uuid4()))")
    EXECUTION_ARN=$(aws stepfunctions start-execution \
        --state-machine-arn ${STATE_MACHINE_ARN} \
        --name "test-execution-$(date +%Y%m%d-%H%M%S)" \
@@ -1037,7 +1042,7 @@ echo "✅ Created foundational resources"
    echo "Job ID: ${JOB_ID}"
    ```
 
-   The voice processing pipeline is now executing with our test audio file. The Step Functions workflow will automatically progress through language detection, transcription, translation to Spanish, French, and German, and finally generate speech synthesis in each target language. You can monitor progress through the AWS Console or by querying the DynamoDB jobs table.
+   The voice processing pipeline is now executing with our test audio file using neural voice generation. The Step Functions workflow will automatically progress through language detection, transcription, translation to Spanish, French, and German, and finally generate speech synthesis in each target language. You can monitor progress through the AWS Console or by querying the DynamoDB jobs table.
 
 ## Validation & Testing
 
@@ -1128,7 +1133,7 @@ echo "✅ Created foundational resources"
 3. **Clean up IAM and Local Resources**:
 
    ```bash
-   # Delete IAM role
+   # Detach and delete IAM role
    aws iam detach-role-policy \
        --role-name ${ROLE_NAME} \
        --policy-arn arn:aws:iam::aws:policy/AmazonTranscribeFullAccess
@@ -1169,24 +1174,24 @@ echo "✅ Created foundational resources"
 
 ## Discussion
 
-This comprehensive multi-language voice processing solution demonstrates how AWS AI services can be orchestrated to create sophisticated voice localization pipelines. The integration of Transcribe, Translate, and Polly provides end-to-end voice processing capabilities that maintain high quality across language barriers while automating complex workflows that would traditionally require significant manual effort.
+This comprehensive multi-language voice processing solution demonstrates how AWS AI services can be orchestrated to create sophisticated voice localization pipelines that follow AWS Well-Architected Framework principles. The integration of Amazon Transcribe, Amazon Translate, and Amazon Polly provides end-to-end voice processing capabilities that maintain high quality across language barriers while automating complex workflows that would traditionally require significant manual effort and infrastructure management.
 
-The Step Functions orchestration ensures reliable processing with proper error handling and status tracking, while the modular Lambda architecture allows for easy customization and scaling. Language detection enables automatic processing of multilingual content, while custom vocabularies and terminologies can be added to improve accuracy for domain-specific content. The solution supports both batch processing for large content libraries and near real-time processing for interactive applications.
+The Step Functions orchestration ensures reliable processing with proper error handling and status tracking, while the modular Lambda architecture allows for easy customization and scaling based on demand. Language detection eliminates manual configuration for multilingual content, while custom vocabularies and terminologies can be added to improve accuracy for domain-specific content. The solution supports both batch processing for large content libraries and near real-time processing for interactive applications while maintaining cost efficiency through serverless compute.
 
-For production deployments, consider implementing advanced features such as speaker diarization for multi-speaker content, custom neural voices trained on specific speakers, and integration with content management systems for automated workflow triggers. The architecture can be extended to support video content by adding subtitle generation, lip-sync analysis, and video editing capabilities through AWS Elemental MediaConvert.
+For production deployments, consider implementing advanced features such as speaker diarization for multi-speaker content, custom neural voices trained on specific speakers using [Amazon Polly Brand Voice](https://docs.aws.amazon.com/polly/latest/dg/brand-voice.html), and integration with content management systems for automated workflow triggers. The architecture can be extended to support video content by adding subtitle generation and video editing capabilities through AWS Elemental MediaConvert, creating a comprehensive multimedia localization platform.
 
-> **Warning**: Monitor API quotas and service limits for Transcribe, Translate, and Polly services when processing large volumes of audio content. Implement exponential backoff and retry logic to handle throttling gracefully in production environments.
+> **Note**: This architecture follows AWS Well-Architected Framework principles by implementing automated scaling, error handling, and cost optimization. See the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) for additional guidance on building reliable, secure, and cost-effective applications.
 
-> **Tip**: Use Amazon Transcribe custom language models and custom vocabularies to improve accuracy for industry-specific terminology, and implement Amazon Translate custom terminology to ensure consistent translation of technical terms and brand names.
+> **Warning**: Monitor API quotas and service limits for Transcribe, Translate, and Polly services when processing large volumes of audio content. Implement exponential backoff and retry logic to handle throttling gracefully in production environments. Review the [Amazon Transcribe quotas](https://docs.aws.amazon.com/transcribe/latest/dg/limits-guidelines.html) documentation for current limits.
 
 ## Challenge
 
 Enhance this voice processing platform with these advanced capabilities:
 
-1. **Real-time Streaming Pipeline**: Implement real-time voice processing using Kinesis Video Streams and streaming APIs to process live audio with minimal latency for conference call translation or live event interpretation
+1. **Real-time Streaming Pipeline**: Implement real-time voice processing using Amazon Kinesis Video Streams and streaming APIs to process live audio with minimal latency for conference call translation or live event interpretation
 2. **Custom Voice Cloning**: Integrate Amazon Polly Brand Voice to create custom neural voices that match specific speakers, enabling consistent voice characteristics across all translated languages
 3. **Advanced Audio Processing**: Add audio enhancement features using machine learning to improve audio quality, remove background noise, and normalize volume levels before transcription
-4. **Content-Aware Translation**: Implement context-aware translation that maintains conversation flow and cultural nuances by analyzing surrounding content and speaker relationships
+4. **Content-Aware Translation**: Implement context-aware translation that maintains conversation flow and cultural nuances by analyzing surrounding content and speaker relationships using Amazon Comprehend
 5. **Interactive Voice Applications**: Build voice-enabled applications with Amazon Lex integration that can conduct multilingual conversations with automatic language switching and context preservation
 
 ## Infrastructure Code

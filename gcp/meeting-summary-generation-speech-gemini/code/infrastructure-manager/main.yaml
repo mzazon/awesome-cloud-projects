@@ -1,0 +1,561 @@
+# Infrastructure Manager configuration for Meeting Summary Generation with Speech-to-Text and Gemini
+# This configuration deploys a complete serverless meeting processing pipeline
+# using Google Cloud Storage, Cloud Functions, Speech-to-Text API, and Vertex AI Gemini
+
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.1"
+    archive:
+      source: "hashicorp/archive"
+      version: "~> 2.4"
+
+# Input variables for customizing the deployment
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+    
+  zone:
+    description: "Google Cloud zone for resource deployment"
+    type: string
+    default: "us-central1-a"
+    
+  bucket_location:
+    description: "Location for Cloud Storage bucket"
+    type: string
+    default: "US"
+    
+  function_memory:
+    description: "Memory allocation for Cloud Function in MB"
+    type: string
+    default: "1024"
+    
+  function_timeout:
+    description: "Timeout for Cloud Function in seconds"
+    type: number
+    default: 540
+    
+  max_instances:
+    description: "Maximum number of function instances"
+    type: number
+    default: 10
+    
+  retention_days:
+    description: "Number of days to retain audio files in storage"
+    type: number
+    default: 30
+    
+  environment:
+    description: "Environment name (dev, staging, prod)"
+    type: string
+    default: "dev"
+
+# Generate random suffix for unique resource names
+resources:
+  random_suffix:
+    type: random_id
+    properties:
+      byte_length: 3
+
+  # Enable required Google Cloud APIs
+  cloud_functions_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudfunctions.googleapis.com
+      disable_on_destroy: false
+
+  speech_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: speech.googleapis.com
+      disable_on_destroy: false
+
+  aiplatform_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: aiplatform.googleapis.com
+      disable_on_destroy: false
+
+  storage_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: storage.googleapis.com
+      disable_on_destroy: false
+
+  cloudbuild_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudbuild.googleapis.com
+      disable_on_destroy: false
+
+  run_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: run.googleapis.com
+      disable_on_destroy: false
+
+  # Service account for Cloud Function with appropriate permissions
+  function_service_account:
+    type: google_service_account
+    properties:
+      project: ${var.project_id}
+      account_id: meeting-processor-sa-${random_suffix.hex}
+      display_name: "Meeting Processor Service Account"
+      description: "Service account for meeting summary generation function"
+    depends_on:
+      - google_project_service.cloud_functions_api
+
+  # IAM binding for Storage Object Admin role
+  storage_admin_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:${function_service_account.email}
+
+  # IAM binding for Speech-to-Text User role
+  speech_user_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: roles/speech.speechuser
+      member: serviceAccount:${function_service_account.email}
+
+  # IAM binding for Vertex AI User role
+  aiplatform_user_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: roles/aiplatform.user
+      member: serviceAccount:${function_service_account.email}
+
+  # IAM binding for Cloud Functions Invoker role
+  function_invoker_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: roles/cloudfunctions.invoker
+      member: serviceAccount:${function_service_account.email}
+
+  # Cloud Storage bucket for meeting recordings with lifecycle management
+  meeting_recordings_bucket:
+    type: google_storage_bucket
+    properties:
+      project: ${var.project_id}
+      name: meeting-recordings-${random_suffix.hex}
+      location: ${var.bucket_location}
+      storage_class: STANDARD
+      uniform_bucket_level_access: true
+      
+      # Lifecycle management to control costs
+      lifecycle_rule:
+        - condition:
+            age: ${var.retention_days}
+          action:
+            type: Delete
+            
+        # Move to nearline storage after 7 days
+        - condition:
+            age: 7
+          action:
+            type: SetStorageClass
+            storage_class: NEARLINE
+            
+      # Versioning for data protection
+      versioning:
+        enabled: true
+        
+      # Labels for resource management
+      labels:
+        environment: ${var.environment}
+        purpose: meeting-processing
+        
+    depends_on:
+      - google_project_service.storage_api
+
+  # Cloud Storage bucket notification for triggering the function
+  bucket_notification:
+    type: google_storage_notification
+    properties:
+      bucket: ${meeting_recordings_bucket.name}
+      payload_format: JSON_API_V1
+      topic: ${pubsub_topic.id}
+      event_types:
+        - OBJECT_FINALIZE
+      object_name_prefix: ""
+      
+    depends_on:
+      - pubsub_topic
+      - meeting_recordings_bucket
+
+  # Pub/Sub topic for bucket notifications
+  pubsub_topic:
+    type: google_pubsub_topic
+    properties:
+      project: ${var.project_id}
+      name: meeting-processing-topic-${random_suffix.hex}
+      
+      labels:
+        environment: ${var.environment}
+        purpose: meeting-processing
+
+  # Pub/Sub topic IAM binding for Cloud Storage service account
+  pubsub_publisher_binding:
+    type: google_pubsub_topic_iam_member
+    properties:
+      project: ${var.project_id}
+      topic: ${pubsub_topic.name}
+      role: roles/pubsub.publisher
+      member: serviceAccount:service-${data.google_project.project.number}@gs-project-accounts.iam.gserviceaccount.com
+
+  # Data source to get project information
+  project_data:
+    type: google_project
+    properties:
+      project_id: ${var.project_id}
+
+  # Archive the function source code
+  function_source_archive:
+    type: archive_file
+    properties:
+      type: zip
+      output_path: /tmp/meeting-processor-${random_suffix.hex}.zip
+      source_content_filename: main.py
+      source_content: |
+        import functions_framework
+        import json
+        import os
+        from google.cloud import speech
+        from google.cloud import storage
+        import vertexai
+        from vertexai.generative_models import GenerativeModel
+        import logging
+
+        # Initialize clients
+        storage_client = storage.Client()
+        speech_client = speech.SpeechClient()
+
+        # Initialize Vertex AI
+        vertexai.init(project=os.environ.get('GCP_PROJECT'), 
+                      location='us-central1')
+        model = GenerativeModel('gemini-1.5-pro')
+
+        @functions_framework.cloud_event
+        def process_meeting(cloud_event):
+            """Process uploaded meeting audio file"""
+            try:
+                # Get file information from Cloud Storage event
+                bucket_name = cloud_event.data['bucket']
+                file_name = cloud_event.data['name']
+                
+                if not file_name.lower().endswith(('.wav', '.mp3', '.flac', '.m4a')):
+                    logging.info(f"Skipping non-audio file: {file_name}")
+                    return
+                
+                logging.info(f"Processing audio file: {file_name}")
+                
+                # Step 1: Transcribe audio using Speech-to-Text
+                transcript = transcribe_audio(bucket_name, file_name)
+                
+                if not transcript:
+                    logging.error("Transcription failed or empty")
+                    return
+                
+                # Step 2: Generate summary using Gemini
+                summary = generate_meeting_summary(transcript, file_name)
+                
+                # Step 3: Save results to Cloud Storage
+                save_results(bucket_name, file_name, transcript, summary)
+                
+                logging.info(f"Successfully processed meeting: {file_name}")
+                
+            except Exception as e:
+                logging.error(f"Error processing meeting: {str(e)}")
+                raise
+
+        def transcribe_audio(bucket_name, file_name):
+            """Transcribe audio file using Speech-to-Text API"""
+            try:
+                # Configure audio and recognition settings
+                audio = speech.RecognitionAudio(
+                    uri=f"gs://{bucket_name}/{file_name}"
+                )
+                
+                config = speech.RecognitionConfig(
+                    encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED,
+                    sample_rate_hertz=16000,
+                    language_code="en-US",
+                    enable_automatic_punctuation=True,
+                    enable_speaker_diarization=True,
+                    diarization_speaker_count_min=2,
+                    diarization_speaker_count_max=6,
+                    model="latest_long",
+                )
+                
+                # Perform transcription
+                operation = speech_client.long_running_recognize(
+                    config=config, audio=audio
+                )
+                
+                logging.info("Waiting for Speech-to-Text operation to complete...")
+                response = operation.result(timeout=300)
+                
+                # Extract transcript with speaker labels
+                transcript_parts = []
+                for result in response.results:
+                    alternative = result.alternatives[0]
+                    # For files with speaker diarization, extract speaker info
+                    if hasattr(alternative, 'words') and alternative.words:
+                        current_speaker = None
+                        speaker_words = []
+                        
+                        for word in alternative.words:
+                            if word.speaker_tag != current_speaker:
+                                if speaker_words:
+                                    transcript_parts.append(
+                                        f"Speaker {current_speaker}: {' '.join(speaker_words)}"
+                                    )
+                                current_speaker = word.speaker_tag
+                                speaker_words = [word.word]
+                            else:
+                                speaker_words.append(word.word)
+                        
+                        # Add final speaker segment
+                        if speaker_words:
+                            transcript_parts.append(
+                                f"Speaker {current_speaker}: {' '.join(speaker_words)}"
+                            )
+                    else:
+                        # Fallback for files without speaker diarization
+                        transcript_parts.append(alternative.transcript)
+                
+                full_transcript = '\n'.join(transcript_parts)
+                
+                logging.info(f"Transcription completed: {len(full_transcript)} characters")
+                return full_transcript
+                
+            except Exception as e:
+                logging.error(f"Transcription error: {str(e)}")
+                return None
+
+        def generate_meeting_summary(transcript, file_name):
+            """Generate structured meeting summary using Gemini"""
+            try:
+                prompt = f"""
+                Please analyze this meeting transcript and create a structured summary with the following sections:
+
+                **Meeting Summary for: {file_name}**
+
+                **Key Topics Discussed:**
+                - List the main topics covered in the meeting
+
+                **Important Decisions:**
+                - List any decisions that were made during the meeting
+
+                **Action Items:**
+                - List specific action items with responsible parties (if mentioned)
+                - Include deadlines if specified
+
+                **Key Insights:**
+                - Important insights, concerns, or notable discussions
+
+                **Next Steps:**
+                - What should happen following this meeting
+
+                Transcript:
+                {transcript}
+
+                Please format your response in clear markdown with the exact section headers shown above.
+                """
+                
+                response = model.generate_content(prompt)
+                summary = response.text
+                
+                logging.info(f"Summary generated: {len(summary)} characters")
+                return summary
+                
+            except Exception as e:
+                logging.error(f"Summary generation error: {str(e)}")
+                return f"Error generating summary: {str(e)}"
+
+        def save_results(bucket_name, audio_file, transcript, summary):
+            """Save transcription and summary results to Cloud Storage"""
+            try:
+                bucket = storage_client.bucket(bucket_name)
+                
+                # Save full transcript
+                transcript_blob = bucket.blob(f"transcripts/{audio_file}.txt")
+                transcript_blob.upload_from_string(transcript)
+                
+                # Save meeting summary
+                summary_blob = bucket.blob(f"summaries/{audio_file}_summary.md")
+                summary_blob.upload_from_string(summary)
+                
+                logging.info("Results saved to Cloud Storage")
+                
+            except Exception as e:
+                logging.error(f"Error saving results: {str(e)}")
+
+  # Requirements file for Cloud Function dependencies
+  requirements_archive:
+    type: archive_file
+    properties:
+      type: zip
+      output_path: /tmp/requirements-${random_suffix.hex}.zip
+      source_content_filename: requirements.txt
+      source_content: |
+        functions-framework==3.5.0
+        google-cloud-speech==2.24.0
+        google-cloud-storage==2.13.0
+        google-cloud-aiplatform==1.42.0
+        vertexai==1.42.0
+
+  # Cloud Storage bucket for function source code
+  function_source_bucket:
+    type: google_storage_bucket
+    properties:
+      project: ${var.project_id}
+      name: meeting-function-source-${random_suffix.hex}
+      location: ${var.region}
+      storage_class: STANDARD
+      uniform_bucket_level_access: true
+      
+      labels:
+        environment: ${var.environment}
+        purpose: function-source
+        
+    depends_on:
+      - google_project_service.storage_api
+
+  # Upload function source code to bucket
+  function_source_object:
+    type: google_storage_bucket_object
+    properties:
+      name: meeting-processor-${random_suffix.hex}.zip
+      bucket: ${function_source_bucket.name}
+      source: ${function_source_archive.output_path}
+      content_type: application/zip
+
+  # Cloud Function for meeting processing with Gen2 runtime
+  meeting_processor_function:
+    type: google_cloudfunctions2_function
+    properties:
+      project: ${var.project_id}
+      name: meeting-processor-${random_suffix.hex}
+      location: ${var.region}
+      description: "Processes meeting recordings to generate transcripts and summaries"
+      
+      build_config:
+        runtime: python311
+        entry_point: process_meeting
+        source:
+          storage_source:
+            bucket: ${function_source_bucket.name}
+            object: ${function_source_object.name}
+            
+      service_config:
+        max_instance_count: ${var.max_instances}
+        min_instance_count: 0
+        available_memory: ${var.function_memory}Mi
+        timeout_seconds: ${var.function_timeout}
+        
+        # Service account for secure access to other services
+        service_account_email: ${function_service_account.email}
+        
+        # Environment variables for function configuration
+        environment_variables:
+          GCP_PROJECT: ${var.project_id}
+          
+        # Ingress settings for security
+        ingress_settings: ALLOW_INTERNAL_ONLY
+        
+      # Event trigger configuration for Cloud Storage
+      event_trigger:
+        trigger_region: ${var.region}
+        event_type: google.cloud.storage.object.v1.finalized
+        retry_policy: RETRY_POLICY_RETRY
+        
+        event_filters:
+          - attribute: bucket
+            value: ${meeting_recordings_bucket.name}
+            
+      labels:
+        environment: ${var.environment}
+        purpose: meeting-processing
+        
+    depends_on:
+      - google_project_service.cloud_functions_api
+      - google_project_service.run_api
+      - function_service_account
+      - function_source_object
+      - meeting_recordings_bucket
+
+# Output values for verification and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+    
+  region:
+    description: "Deployment region"
+    value: ${var.region}
+    
+  bucket_name:
+    description: "Name of the Cloud Storage bucket for meeting recordings"
+    value: ${meeting_recordings_bucket.name}
+    
+  bucket_url:
+    description: "URL of the Cloud Storage bucket"
+    value: gs://${meeting_recordings_bucket.name}
+    
+  function_name:
+    description: "Name of the Cloud Function"
+    value: ${meeting_processor_function.name}
+    
+  function_url:
+    description: "URL of the Cloud Function"
+    value: ${meeting_processor_function.service_config[0].uri}
+    
+  service_account_email:
+    description: "Email of the service account used by the function"
+    value: ${function_service_account.email}
+    
+  pubsub_topic_name:
+    description: "Name of the Pub/Sub topic for bucket notifications"
+    value: ${pubsub_topic.name}
+    
+  upload_instructions:
+    description: "Instructions for uploading meeting recordings"
+    value: "Upload audio files (.wav, .mp3, .flac, .m4a) to gs://${meeting_recordings_bucket.name}/ to trigger automatic processing"
+    
+  transcripts_location:
+    description: "Location where transcripts are saved"
+    value: gs://${meeting_recordings_bucket.name}/transcripts/
+    
+  summaries_location:
+    description: "Location where summaries are saved"
+    value: gs://${meeting_recordings_bucket.name}/summaries/
+    
+  monitoring_command:
+    description: "Command to monitor function logs"
+    value: "gcloud functions logs read ${meeting_processor_function.name} --region ${var.region} --limit 20"

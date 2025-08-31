@@ -4,12 +4,12 @@ id: d7c9e2f8
 category: containers
 difficulty: 200
 subject: azure
-services: Azure Container Instances, Azure Files, Azure Container Registry
+services: Container Instances, Azure Files, Container Registry, Monitor
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: containers, persistent-storage, stateful-applications, azure-files, container-instances
 recipe-generator-version: 1.3
@@ -84,7 +84,7 @@ graph TB
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-stateful-containers"
+export RESOURCE_GROUP="rg-stateful-containers-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
@@ -214,7 +214,7 @@ echo "✅ Log Analytics workspace created for container monitoring"
    az container create \
        --resource-group ${RESOURCE_GROUP} \
        --name postgres-stateful \
-       --image postgres:13 \
+       --image postgres:15 \
        --cpu 1 \
        --memory 2 \
        --environment-variables \
@@ -225,7 +225,6 @@ echo "✅ Log Analytics workspace created for container monitoring"
        --azure-file-volume-account-key ${STORAGE_KEY} \
        --azure-file-volume-share-name ${FILE_SHARE_NAME} \
        --azure-file-volume-mount-path /var/lib/postgresql/data \
-       --subnet-id /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/default/subnets/default \
        --os-type Linux \
        --restart-policy Always
    
@@ -273,6 +272,13 @@ echo "✅ Log Analytics workspace created for container monitoring"
    Background processing containers often require access to shared data for processing tasks, logging, or temporary file storage. This step demonstrates deploying a worker container that can process data from the shared Azure Files storage, completing the stateful container architecture pattern.
 
    ```bash
+   # Create logs directory in file share first
+   az storage directory create \
+       --name "logs" \
+       --share-name ${FILE_SHARE_NAME} \
+       --account-name ${STORAGE_ACCOUNT} \
+       --account-key ${STORAGE_KEY}
+   
    # Deploy worker container for background processing
    az container create \
        --resource-group ${RESOURCE_GROUP} \
@@ -280,7 +286,7 @@ echo "✅ Log Analytics workspace created for container monitoring"
        --image alpine:latest \
        --cpu 0.5 \
        --memory 0.5 \
-       --command-line "sh -c 'while true; do echo \"Worker processing at $(date)\" >> /shared/logs/worker.log; sleep 60; done'" \
+       --command-line "sh -c 'while true; do echo \"Worker processing at \$(date)\" >> /shared/logs/worker.log; sleep 60; done'" \
        --azure-file-volume-account-name ${STORAGE_ACCOUNT} \
        --azure-file-volume-account-key ${STORAGE_KEY} \
        --azure-file-volume-share-name ${FILE_SHARE_NAME} \
@@ -375,9 +381,11 @@ echo "✅ Log Analytics workspace created for container monitoring"
 
    ```bash
    # Create a test file in the shared storage
+   echo "Test persistence data" > /tmp/test-file.txt
+   
    az storage file upload \
        --share-name ${FILE_SHARE_NAME} \
-       --source /dev/null \
+       --source /tmp/test-file.txt \
        --path "test-persistence.txt" \
        --account-name ${STORAGE_ACCOUNT} \
        --account-key ${STORAGE_KEY}

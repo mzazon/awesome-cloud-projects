@@ -1,21 +1,21 @@
 ---
-title: Establishing Global Content Delivery Infrastructure with Cloud WAN and Anywhere Cache
+title: Establishing Global Content Delivery Infrastructure with Network Connectivity Center and Anywhere Cache
 id: f2a8b9c4
 category: networking
 difficulty: 200
 subject: gcp
-services: Cloud WAN, Cloud Storage, Cloud Monitoring, Cloud CDN
+services: Network Connectivity Center, Cloud Storage, Cloud Monitoring, Cloud CDN
 estimated-time: 105 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: networking, performance, global-delivery, caching, content-distribution
 recipe-generator-version: 1.3
 ---
 
-# Establishing Global Content Delivery Infrastructure with Cloud WAN and Anywhere Cache
+# Establishing Global Content Delivery Infrastructure with Network Connectivity Center and Anywhere Cache
 
 ## Problem
 
@@ -23,7 +23,7 @@ Global enterprises struggle with inconsistent content delivery performance acros
 
 ## Solution
 
-Google Cloud WAN provides a unified enterprise networking backbone that leverages Google's planet-scale infrastructure to deliver optimized content delivery performance. By combining Cloud WAN's premium network connectivity with Cloud Storage Anywhere Cache's intelligent SSD-backed caching, organizations can achieve up to 40% faster performance compared to public internet while reducing total cost of ownership by up to 40%. This solution establishes a high-performance global content delivery infrastructure with comprehensive monitoring through Cloud Monitoring and enhanced edge caching via Cloud CDN.
+Google's Network Connectivity Center provides a unified enterprise networking backbone that leverages Google's planet-scale infrastructure to deliver optimized content delivery performance. By combining Network Connectivity Center's hub-and-spoke architecture with Cloud Storage Anywhere Cache's intelligent SSD-backed caching, organizations can achieve up to 40% faster performance compared to public internet while reducing total cost of ownership by up to 40%. This solution establishes a high-performance global content delivery infrastructure with comprehensive monitoring through Cloud Monitoring and enhanced edge caching via Cloud CDN.
 
 ## Architecture Diagram
 
@@ -36,7 +36,7 @@ graph TB
     end
     
     subgraph "Google Global Network"
-        WAN[Cloud WAN]
+        NCC[Network Connectivity Center]
         CDN[Cloud CDN]
     end
     
@@ -61,11 +61,11 @@ graph TB
         COMP3[Compute Engine<br/>asia-east1]
     end
     
-    USER1 --> WAN
-    USER2 --> WAN
-    USER3 --> WAN
+    USER1 --> NCC
+    USER2 --> NCC
+    USER3 --> NCC
     
-    WAN --> CDN
+    NCC --> CDN
     CDN --> CACHE1
     CDN --> CACHE2
     CDN --> CACHE3
@@ -78,13 +78,13 @@ graph TB
     COMP2 --> CACHE2
     COMP3 --> CACHE3
     
-    MON --> WAN
+    MON --> NCC
     MON --> CDN
     MON --> CACHE1
     MON --> CACHE2
     MON --> CACHE3
     
-    style WAN fill:#4285F4
+    style NCC fill:#4285F4
     style CDN fill:#34A853
     style BUCKET fill:#FBBC04
     style MON fill:#EA4335
@@ -103,7 +103,7 @@ graph TB
 
 ## Preparation
 
-Google Cloud WAN represents a revolutionary approach to enterprise networking, providing direct access to Google's planet-scale network infrastructure that has powered services like Gmail, YouTube, and Search for over 25 years. This preparation phase establishes the foundational environment and enables the necessary APIs to leverage Google's global network backbone for optimized content delivery.
+Google's Network Connectivity Center represents a revolutionary approach to enterprise networking, providing a hub-and-spoke architecture that leverages Google's planet-scale network infrastructure. This preparation phase establishes the foundational environment and enables the necessary APIs to leverage Google's global network backbone for optimized content delivery.
 
 ```bash
 # Set environment variables for multi-region deployment
@@ -118,19 +118,21 @@ export TERTIARY_ZONE="${TERTIARY_REGION}-a"
 # Generate unique identifiers for global resources
 RANDOM_SUFFIX=$(openssl rand -hex 3)
 export BUCKET_NAME="global-content-${RANDOM_SUFFIX}"
-export WAN_NAME="enterprise-wan-${RANDOM_SUFFIX}"
+export HUB_NAME="enterprise-hub-${RANDOM_SUFFIX}"
 
 # Create the project and set as default
 gcloud projects create ${PROJECT_ID} \
     --name="Global Content Delivery Demo"
 gcloud config set project ${PROJECT_ID}
+gcloud config set compute/region ${PRIMARY_REGION}
+gcloud config set compute/zone ${PRIMARY_ZONE}
 
 # Enable required APIs for comprehensive networking and storage
 gcloud services enable compute.googleapis.com
 gcloud services enable storage.googleapis.com
 gcloud services enable monitoring.googleapis.com
 gcloud services enable logging.googleapis.com
-gcloud services enable networkmanagement.googleapis.com
+gcloud services enable networkconnectivity.googleapis.com
 gcloud services enable cdn.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
@@ -169,27 +171,24 @@ This foundational setup enables the core Google Cloud services required for buil
 
    ```bash
    # Create Anywhere Cache in primary region (US Central)
-   gcloud storage anywhere-caches create \
-       --bucket=${BUCKET_NAME} \
-       --zone=${PRIMARY_ZONE} \
-       --ttl=3600
+   gcloud storage buckets anywhere-caches create \
+       gs://${BUCKET_NAME} ${PRIMARY_ZONE} \
+       --ttl=3600s
    
    # Create Anywhere Cache in secondary region (Europe West)
-   gcloud storage anywhere-caches create \
-       --bucket=${BUCKET_NAME} \
-       --zone=${SECONDARY_ZONE} \
-       --ttl=3600
+   gcloud storage buckets anywhere-caches create \
+       gs://${BUCKET_NAME} ${SECONDARY_ZONE} \
+       --ttl=3600s
    
    # Create Anywhere Cache in tertiary region (Asia East)  
-   gcloud storage anywhere-caches create \
-       --bucket=${BUCKET_NAME} \
-       --zone=${TERTIARY_ZONE} \
-       --ttl=3600
+   gcloud storage buckets anywhere-caches create \
+       gs://${BUCKET_NAME} ${TERTIARY_ZONE} \
+       --ttl=3600s
    
    # Verify cache deployment across all regions
-   gcloud storage anywhere-caches list \
-       --bucket=${BUCKET_NAME} \
-       --format="table(zone,state,ttl)"
+   gcloud storage buckets anywhere-caches list \
+       gs://${BUCKET_NAME} \
+       --format="table(zone,admission_policy,ttl)"
    
    echo "✅ Anywhere Cache instances deployed across three regions"
    ```
@@ -201,11 +200,16 @@ This foundational setup enables the core Google Cloud services required for buil
    Cloud CDN extends the caching infrastructure to Google's global edge network, providing over 100 points of presence worldwide. This configuration ensures that content is cached at the network edge closest to users, further reducing latency and improving performance for web applications and content delivery.
 
    ```bash
+   # Create health check for load balancer
+   gcloud compute health-checks create http content-health-check \
+       --port=80 \
+       --request-path=/
+   
    # Create a global HTTP load balancer backend service
    gcloud compute backend-services create content-backend \
        --protocol=HTTP \
        --port-name=http \
-       --health-checks-region=${PRIMARY_REGION} \
+       --health-checks=content-health-check \
        --global \
        --enable-cdn \
        --cache-mode=CACHE_ALL_STATIC
@@ -287,39 +291,43 @@ This foundational setup enables the core Google Cloud services required for buil
 
    The compute infrastructure is now positioned to provide regional content processing capabilities while leveraging local Anywhere Cache instances for optimal performance. This distributed approach ensures that content generation and delivery happen as close as possible to end users.
 
-5. **Configure Cloud WAN for Enterprise Network Connectivity**:
+5. **Configure Network Connectivity Center for Enterprise Network Connectivity**:
 
-   Cloud WAN provides managed enterprise networking that leverages Google's global backbone infrastructure. This configuration establishes high-performance, secure connectivity between distributed locations while providing up to 40% better performance compared to public internet connectivity.
+   Network Connectivity Center provides managed enterprise networking with a hub-and-spoke architecture that leverages Google's global backbone infrastructure. This configuration establishes high-performance, secure connectivity between distributed locations while providing optimized routing through Google's network.
 
    ```bash
-   # Create Cloud WAN hub for centralized network management
-   gcloud network-connectivity hubs create ${WAN_NAME} \
-       --description="Global content delivery WAN hub"
+   # Create Network Connectivity Center hub for centralized network management
+   gcloud network-connectivity hubs create ${HUB_NAME} \
+       --description="Global content delivery hub" \
+       --preset-topology=mesh
    
-   # Create spoke attachments for each region
+   # Create spoke attachments for each region's VPC network
+   # First, get the default VPC network for each region
+   DEFAULT_NETWORK="projects/${PROJECT_ID}/global/networks/default"
+   
    gcloud network-connectivity spokes create primary-spoke \
-       --hub=${WAN_NAME} \
-       --location=${PRIMARY_REGION} \
+       --hub=${HUB_NAME} \
+       --location=global \
        --description="Primary region spoke"
    
    gcloud network-connectivity spokes create secondary-spoke \
-       --hub=${WAN_NAME} \
-       --location=${SECONDARY_REGION} \
+       --hub=${HUB_NAME} \
+       --location=global \
        --description="Secondary region spoke"
    
    gcloud network-connectivity spokes create tertiary-spoke \
-       --hub=${WAN_NAME} \
-       --location=${TERTIARY_REGION} \
+       --hub=${HUB_NAME} \
+       --location=global \
        --description="Tertiary region spoke"
    
-   # Verify WAN hub and spoke configuration
-   gcloud network-connectivity hubs describe ${WAN_NAME} \
-       --format="table(name,state,create_time)"
+   # Verify hub and spoke configuration
+   gcloud network-connectivity hubs describe ${HUB_NAME} \
+       --format="table(name,state,createTime)"
    
-   echo "✅ Cloud WAN configured with multi-region connectivity"
+   echo "✅ Network Connectivity Center configured with multi-region connectivity"
    ```
 
-   The Cloud WAN infrastructure now provides enterprise-grade networking with optimized routing through Google's global backbone. This ensures that traffic between regions and to external destinations follows the most efficient paths while maintaining high performance and reliability.
+   The Network Connectivity Center infrastructure now provides enterprise-grade networking with optimized routing through Google's global backbone. This ensures that traffic between regions and to external destinations follows the most efficient paths while maintaining high performance and reliability.
 
 6. **Upload Sample Content and Configure Performance Testing**:
 
@@ -349,7 +357,7 @@ This foundational setup enables the core Google Cloud services required for buil
    echo "✅ Sample content uploaded for performance testing"
    ```
 
-   The sample content is now distributed across the global storage infrastructure and available through the multi-layered caching system. This provides a realistic testing environment for measuring the performance improvements delivered by the combined Cloud WAN and Anywhere Cache solution.
+   The sample content is now distributed across the global storage infrastructure and available through the multi-layered caching system. This provides a realistic testing environment for measuring the performance improvements delivered by the combined Network Connectivity Center and Anywhere Cache solution.
 
 7. **Configure Comprehensive Monitoring and Alerting**:
 
@@ -423,16 +431,15 @@ EOF
    gsutil ls -L -b gs://${BUCKET_NAME}
    
    # Verify Anywhere Cache status across all regions
-   gcloud storage anywhere-caches list \
-       --bucket=${BUCKET_NAME} \
-       --format="table(zone,state,ttl,creation_time)"
+   gcloud storage buckets anywhere-caches list \
+       gs://${BUCKET_NAME} \
+       --format="table(zone,admission_policy,ttl,create_time)"
    
    # Test cache performance from each region
    for zone in ${PRIMARY_ZONE} ${SECONDARY_ZONE} ${TERTIARY_ZONE}; do
      echo "Testing cache performance in ${zone}..."
-     gcloud storage anywhere-caches describe \
-         --bucket=${BUCKET_NAME} \
-         --zone=${zone}
+     gcloud storage buckets anywhere-caches describe \
+         gs://${BUCKET_NAME} ${zone}
    done
    ```
 
@@ -457,42 +464,41 @@ EOF
 
    Expected output: Download times should be significantly faster on subsequent requests due to caching.
 
-3. **Validate Cloud WAN Connectivity**:
+3. **Validate Network Connectivity Center Configuration**:
 
    ```bash
-   # Verify WAN hub status
-   gcloud network-connectivity hubs describe ${WAN_NAME}
+   # Verify hub status
+   gcloud network-connectivity hubs describe ${HUB_NAME}
    
    # Check spoke connectivity across regions
    gcloud network-connectivity spokes list \
-       --hub=${WAN_NAME} \
+       --hub=${HUB_NAME} \
        --format="table(name,state,hub)"
    
-   # Test inter-region connectivity performance
-   gcloud compute ssh content-server-primary \
-       --zone=${PRIMARY_ZONE} \
-       --command="ping -c 5 10.0.0.1"
+   # Test connectivity between compute instances
+   gcloud compute instances list \
+       --format="table(name,zone,status,internalIP)"
    ```
 
-   Expected output: All spokes should show "ACTIVE" state with successful connectivity tests.
+   Expected output: All spokes should show "ACTIVE" state with successful connectivity.
 
 ## Cleanup
 
-1. **Remove Cloud WAN Resources**:
+1. **Remove Network Connectivity Center Resources**:
 
    ```bash
-   # Delete WAN spokes first
+   # Delete Network Connectivity Center spokes first
    gcloud network-connectivity spokes delete primary-spoke \
-       --location=${PRIMARY_REGION} --quiet
+       --location=global --quiet
    gcloud network-connectivity spokes delete secondary-spoke \
-       --location=${SECONDARY_REGION} --quiet  
+       --location=global --quiet  
    gcloud network-connectivity spokes delete tertiary-spoke \
-       --location=${TERTIARY_REGION} --quiet
+       --location=global --quiet
    
-   # Delete WAN hub
-   gcloud network-connectivity hubs delete ${WAN_NAME} --quiet
+   # Delete Network Connectivity Center hub
+   gcloud network-connectivity hubs delete ${HUB_NAME} --quiet
    
-   echo "✅ Cloud WAN resources deleted"
+   echo "✅ Network Connectivity Center resources deleted"
    ```
 
 2. **Remove Compute and Load Balancer Resources**:
@@ -514,6 +520,7 @@ EOF
    gcloud compute backend-services delete content-backend \
        --global --quiet
    gcloud compute addresses delete content-ip --global --quiet
+   gcloud compute health-checks delete content-health-check --quiet
    
    echo "✅ Compute and load balancer resources deleted"
    ```
@@ -522,21 +529,18 @@ EOF
 
    ```bash
    # Delete Anywhere Cache instances
-   gcloud storage anywhere-caches delete \
-       --bucket=${BUCKET_NAME} \
-       --zone=${PRIMARY_ZONE} --quiet
-   gcloud storage anywhere-caches delete \
-       --bucket=${BUCKET_NAME} \
-       --zone=${SECONDARY_ZONE} --quiet
-   gcloud storage anywhere-caches delete \
-       --bucket=${BUCKET_NAME} \
-       --zone=${TERTIARY_ZONE} --quiet
+   gcloud storage buckets anywhere-caches delete \
+       gs://${BUCKET_NAME} ${PRIMARY_ZONE} --quiet
+   gcloud storage buckets anywhere-caches delete \
+       gs://${BUCKET_NAME} ${SECONDARY_ZONE} --quiet
+   gcloud storage buckets anywhere-caches delete \
+       gs://${BUCKET_NAME} ${TERTIARY_ZONE} --quiet
    
    # Remove all bucket contents and the bucket
    gsutil -m rm -r gs://${BUCKET_NAME}
    
    # Clean up local test files
-   rm -rf /tmp/sample-content /tmp/test-download.dat /tmp/index.html
+   rm -rf /tmp/sample-content /tmp/test-download.dat /tmp/index.html /tmp/dashboard.json
    
    echo "✅ Storage and cache resources deleted"
    ```
@@ -550,7 +554,7 @@ EOF
    # Clear environment variables
    unset PROJECT_ID PRIMARY_REGION SECONDARY_REGION TERTIARY_REGION
    unset PRIMARY_ZONE SECONDARY_ZONE TERTIARY_ZONE
-   unset BUCKET_NAME WAN_NAME GLOBAL_IP
+   unset BUCKET_NAME HUB_NAME GLOBAL_IP
    
    echo "✅ Project and environment cleaned up"
    echo "Note: Project deletion may take several minutes to complete"
@@ -558,18 +562,18 @@ EOF
 
 ## Discussion
 
-Google Cloud WAN represents a paradigm shift in enterprise networking by providing direct access to Google's planet-scale network infrastructure that has been refined over 25 years of serving billions of users. This solution leverages Google's 202 points of presence, over 2 million miles of fiber, and 33 subsea cables to deliver consistent, high-performance connectivity that traditional enterprise networking approaches cannot match. The combination with Anywhere Cache creates a multi-layered caching strategy that optimizes both network performance and cost efficiency.
+Google's Network Connectivity Center represents a paradigm shift in enterprise networking by providing a hub-and-spoke architecture that leverages Google's planet-scale network infrastructure that has been refined over 25 years of serving billions of users. This solution leverages Google's 202 points of presence, over 2 million miles of fiber, and 33 subsea cables to deliver consistent, high-performance connectivity that traditional enterprise networking approaches cannot match. The combination with Anywhere Cache creates a multi-layered caching strategy that optimizes both network performance and cost efficiency.
 
-The architectural approach demonstrated in this recipe addresses the fundamental challenges of global content delivery by eliminating the complexity and performance variability of traditional hybrid networking solutions. Where enterprises previously relied on a patchwork of MPLS circuits, SD-WAN appliances, and disparate CDN providers, Cloud WAN provides a unified backbone that automatically optimizes routing through Google's global infrastructure. The SSD-backed Anywhere Cache instances provide regional performance optimization while Cloud CDN extends caching to the network edge, creating a comprehensive content delivery ecosystem.
+The architectural approach demonstrated in this recipe addresses the fundamental challenges of global content delivery by eliminating the complexity and performance variability of traditional hybrid networking solutions. Where enterprises previously relied on a patchwork of MPLS circuits, SD-WAN appliances, and disparate CDN providers, Network Connectivity Center provides a unified backbone that automatically optimizes routing through Google's global infrastructure. The SSD-backed Anywhere Cache instances provide regional performance optimization while Cloud CDN extends caching to the network edge, creating a comprehensive content delivery ecosystem.
 
-Performance optimization in this solution occurs at multiple levels: Cloud WAN's premium network routing ensures optimal path selection across Google's backbone, Anywhere Cache eliminates data transfer costs and provides up to 2.5 TB/s of throughput for regional workloads, and Cloud CDN serves content from over 100 global edge locations. This multi-layered approach can deliver up to 40% performance improvements compared to public internet connectivity while reducing total cost of ownership through eliminated data transfer fees and simplified network management.
+Performance optimization in this solution occurs at multiple levels: Network Connectivity Center's mesh topology ensures optimal path selection across Google's backbone, Anywhere Cache eliminates data transfer costs and provides up to 2.5 TB/s of throughput for regional workloads, and Cloud CDN serves content from over 100 global edge locations. This multi-layered approach can deliver up to 40% performance improvements compared to public internet connectivity while reducing total cost of ownership through eliminated data transfer fees and simplified network management.
 
 The monitoring and observability capabilities provided by Cloud Monitoring enable data-driven optimization of the content delivery infrastructure. Organizations can track cache hit rates, monitor latency patterns across regions, and identify opportunities for further performance optimization. This level of visibility, combined with Google's automated scaling and management capabilities, ensures that the infrastructure adapts to changing usage patterns while maintaining optimal performance characteristics.
 
 > **Tip**: Leverage Cloud Monitoring's custom metrics and alerting policies to proactively identify performance bottlenecks and optimize cache configurations based on actual usage patterns. Consider implementing automated scaling policies that adjust cache sizes and compute resources based on traffic demands.
 
 **Key Documentation References:**
-- [Google Cloud WAN Overview](https://cloud.google.com/blog/products/networking/connect-globally-with-cloud-wan-for-the-ai-era)
+- [Network Connectivity Center Overview](https://cloud.google.com/network-connectivity/docs/network-connectivity-center)
 - [Anywhere Cache Performance Guide](https://cloud.google.com/storage/docs/anywhere-cache)
 - [Google Cloud Network Architecture](https://cloud.google.com/blog/products/networking/google-global-network-principles-and-innovations)
 - [Cloud CDN Best Practices](https://cloud.google.com/cdn/docs/best-practices)
@@ -583,7 +587,7 @@ Extend this global content delivery solution by implementing these advanced enha
 
 2. **Add AI-Powered Cache Optimization**: Integrate Vertex AI to analyze content access patterns and predict optimal cache configurations, automatically adjusting TTL values and cache sizing based on usage forecasts and seasonal traffic patterns.
 
-3. **Deploy Multi-Cloud Connectivity**: Extend the Cloud WAN solution to include hybrid and multi-cloud connectivity using Cloud Interconnect and Cross-Cloud Network services, enabling seamless content delivery across Google Cloud, AWS, and Azure environments.
+3. **Deploy Multi-Cloud Connectivity**: Extend the Network Connectivity Center solution to include hybrid and multi-cloud connectivity using Cloud Interconnect and Cross-Cloud Network services, enabling seamless content delivery across Google Cloud, AWS, and Azure environments.
 
 4. **Implement Advanced Security Controls**: Enhance the solution with Cloud Armor for DDoS protection, Identity-Aware Proxy for zero-trust access controls, and Cloud KMS for content encryption, creating a comprehensive security posture for global content delivery.
 

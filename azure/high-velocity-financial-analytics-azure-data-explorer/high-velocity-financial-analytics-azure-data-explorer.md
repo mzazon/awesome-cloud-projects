@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure Data Explorer, Azure Event Hubs, Azure Functions, Azure Event Grid
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: real-time, financial, market-data, time-series, analytics, trading, alerts
 recipe-generator-version: 1.3
@@ -89,7 +89,7 @@ graph TB
 5. Understanding of time-series analysis concepts
 6. Estimated cost: $150-300 per day for testing (production costs vary by volume)
 
-> **Note**: This recipe uses Azure Data Explorer as the primary analytics engine, replacing the retired Azure Time Series Insights service. For migration guidance, see [Azure Time Series Insights retirement documentation](https://docs.microsoft.com/en-us/azure/time-series-insights/retirement-migration-guide).
+> **Note**: This recipe uses Azure Data Explorer as the primary analytics engine, replacing the retired Azure Time Series Insights service. For migration guidance, see [Azure Time Series Insights retirement documentation](https://learn.microsoft.com/en-us/azure/time-series-insights/retirement-migration-guide).
 
 ## Preparation
 
@@ -140,7 +140,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        --cluster-name ${ADX_CLUSTER_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --sku name=Dev(No SLA)_Standard_D11_v2 tier=Basic
+       --sku name="Dev(No SLA)_Standard_D11_v2" tier="Basic"
    
    echo "✅ Azure Data Explorer cluster created: ${ADX_CLUSTER_NAME}"
    
@@ -261,7 +261,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        --storage-account ${STORAGE_ACCOUNT_NAME} \
        --consumption-plan-location ${LOCATION} \
        --runtime python \
-       --runtime-version 3.9 \
+       --runtime-version 3.12 \
        --functions-version 4 \
        --os-type Linux
    
@@ -337,17 +337,17 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        --application-type web \
        --kind web
    
-   # Get Application Insights instrumentation key
-   INSIGHTS_KEY=$(az monitor app-insights component show \
+   # Get Application Insights connection string
+   INSIGHTS_CONNECTION=$(az monitor app-insights component show \
        --app ${FUNCTION_APP_NAME}-insights \
        --resource-group ${RESOURCE_GROUP} \
-       --query instrumentationKey --output tsv)
+       --query connectionString --output tsv)
    
    # Configure Function App with Application Insights
    az functionapp config appsettings set \
        --name ${FUNCTION_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --settings "APPINSIGHTS_INSTRUMENTATIONKEY=${INSIGHTS_KEY}"
+       --settings "APPLICATIONINSIGHTS_CONNECTION_STRING=${INSIGHTS_CONNECTION}"
    
    echo "✅ Application Insights configured for monitoring"
    
@@ -579,13 +579,13 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
 
 ## Discussion
 
-This solution demonstrates a modern approach to financial market data processing using Azure's native analytics services. Azure Data Explorer serves as the analytical engine, replacing the retired Azure Time Series Insights with superior performance and scalability. The architecture supports millions of market events per second while maintaining sub-second query performance essential for algorithmic trading systems. For detailed guidance on ADX optimization, see the [Azure Data Explorer documentation](https://docs.microsoft.com/en-us/azure/data-explorer/) and [performance tuning guide](https://docs.microsoft.com/en-us/azure/data-explorer/kusto/query/best-practices).
+This solution demonstrates a modern approach to financial market data processing using Azure's native analytics services. Azure Data Explorer serves as the analytical engine, replacing the retired Azure Time Series Insights with superior performance and scalability. The architecture supports millions of market events per second while maintaining sub-second query performance essential for algorithmic trading systems. For detailed guidance on ADX optimization, see the [Azure Data Explorer documentation](https://learn.microsoft.com/en-us/azure/data-explorer/) and [performance tuning guide](https://learn.microsoft.com/en-us/azure/data-explorer/kusto/query/best-practices).
 
-The event-driven architecture using Event Hubs and Event Grid provides natural decoupling between data ingestion, processing, and alerting components. This design follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of reliability and performance efficiency. Event Hubs' partition-based scaling ensures ordered message processing within each partition while supporting massive parallel throughput across partitions, critical for maintaining data consistency in financial applications.
+The event-driven architecture using Event Hubs and Event Grid provides natural decoupling between data ingestion, processing, and alerting components. This design follows the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) principles of reliability and performance efficiency. Event Hubs' partition-based scaling ensures ordered message processing within each partition while supporting massive parallel throughput across partitions, critical for maintaining data consistency in financial applications.
 
-From a cost perspective, the serverless Functions and consumption-based pricing model for Event Hubs and ADX ensures you only pay for actual usage, making this solution cost-effective for both small trading firms and large financial institutions. The auto-scaling capabilities handle market volatility spikes automatically without manual intervention. For comprehensive cost optimization strategies, review the [Azure Data Explorer pricing documentation](https://docs.microsoft.com/en-us/azure/data-explorer/pricing) and [Event Hubs cost management guide](https://docs.microsoft.com/en-us/azure/event-hubs/event-hubs-faq#pricing).
+From a cost perspective, the serverless Functions and consumption-based pricing model for Event Hubs and ADX ensures you only pay for actual usage, making this solution cost-effective for both small trading firms and large financial institutions. The auto-scaling capabilities handle market volatility spikes automatically without manual intervention. For comprehensive cost optimization strategies, review the [Azure Data Explorer pricing documentation](https://learn.microsoft.com/en-us/azure/data-explorer/pricing) and [Event Hubs cost management guide](https://learn.microsoft.com/en-us/azure/event-hubs/event-hubs-faq#pricing).
 
-The solution provides enterprise-grade security through Azure AD integration, private endpoints, and encryption at rest and in transit. Compliance with financial regulations is supported through comprehensive auditing, data retention policies, and monitoring capabilities. For security best practices in financial services, consult the [Azure Security Center documentation](https://docs.microsoft.com/en-us/azure/security-center/) and [financial services compliance guide](https://docs.microsoft.com/en-us/azure/architecture/industries/finance/compliance).
+The solution provides enterprise-grade security through Azure AD integration, private endpoints, and encryption at rest and in transit. Compliance with financial regulations is supported through comprehensive auditing, data retention policies, and monitoring capabilities. For security best practices in financial services, consult the [Azure Security Center documentation](https://learn.microsoft.com/en-us/azure/security-center/) and [financial services compliance guide](https://learn.microsoft.com/en-us/azure/architecture/industries/finance/compliance).
 
 > **Tip**: Use ADX materialized views for frequently queried aggregations like OHLCV data and moving averages to improve query performance. Configure continuous export to Azure Storage for long-term archival and regulatory compliance. Monitor ingestion latency and throughput using Azure Monitor metrics to ensure optimal performance during peak trading hours.
 

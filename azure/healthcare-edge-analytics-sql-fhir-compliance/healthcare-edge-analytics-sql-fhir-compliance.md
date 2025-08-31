@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure SQL Edge, Azure Health Data Services, Azure IoT Hub, Azure Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: healthcare, edge-computing, iot, real-time-analytics, fhir
 recipe-generator-version: 1.3
@@ -64,17 +64,17 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with appropriate permissions to create IoT Hub, SQL Edge, Health Data Services, and Functions
-2. Azure CLI v2 installed and configured (or use Azure CloudShell)
+2. Azure CLI v2.64.0 or later installed and configured (or use Azure CloudShell)
 3. Basic understanding of IoT Edge, SQL, FHIR standards, and healthcare data requirements
 4. An IoT Edge-capable device or VM for testing (Ubuntu 20.04 LTS recommended)
 5. Estimated cost: $150-200/month for a small deployment
 
-> **Note**: Azure SQL Edge will be retired on September 30, 2025. Consider this when planning long-term deployments. Migration paths to Azure SQL Database or other edge solutions are available.
+> **Warning**: Azure SQL Edge will be retired on September 30, 2025. Consider this when planning long-term deployments. Migration paths to Azure SQL Database or alternative edge solutions are available.
 
 ## Preparation
 
 ```bash
-# Set environment variables
+# Set environment variables for Azure resources
 export LOCATION="eastus"
 export RESOURCE_GROUP="rg-healthcare-edge-${RANDOM_SUFFIX}"
 export IOT_HUB_NAME="iot-healthcare-${RANDOM_SUFFIX}"
@@ -111,7 +111,7 @@ echo "✅ Storage account created for Azure Functions"
 
 1. **Create IoT Hub for Edge Device Management**:
 
-   Azure IoT Hub provides the cloud gateway for managing IoT Edge devices and routing messages from edge to cloud. It enables secure device provisioning, configuration management, and bi-directional communication between edge devices and cloud services. For healthcare scenarios, IoT Hub ensures HIPAA-compliant data transmission with built-in security features.
+   Azure IoT Hub provides the cloud gateway for managing IoT Edge devices and routing messages from edge to cloud. It enables secure device provisioning, configuration management, and bi-directional communication between edge devices and cloud services. For healthcare scenarios, IoT Hub ensures HIPAA-compliant data transmission with built-in security features and automatic message routing to downstream processing services.
 
    ```bash
    # Create IoT Hub
@@ -130,7 +130,8 @@ echo "✅ Storage account created for Azure Functions"
        --auth-method shared_private_key
    
    # Get connection string for Edge device
-   EDGE_CONNECTION_STRING=$(az iot hub device-identity connection-string show \
+   EDGE_CONNECTION_STRING=$(az iot hub device-identity \
+       connection-string show \
        --hub-name ${IOT_HUB_NAME} \
        --device-id ${EDGE_DEVICE_ID} \
        --query connectionString \
@@ -145,7 +146,7 @@ echo "✅ Storage account created for Azure Functions"
 
 2. **Create Azure Health Data Services Workspace**:
 
-   Azure Health Data Services provides a unified workspace for managing FHIR, DICOM, and MedTech services. The workspace ensures healthcare data compliance with industry standards like HIPAA and GDPR while enabling interoperability between different healthcare systems. This foundational component manages access control and data governance across all health services.
+   Azure Health Data Services provides a unified workspace for managing FHIR, DICOM, and MedTech services. The workspace ensures healthcare data compliance with industry standards like HIPAA and GDPR while enabling interoperability between different healthcare systems. This foundational component manages access control and data governance across all health services, providing a centralized platform for healthcare data management.
 
    ```bash
    # Create Health Data Services workspace
@@ -155,7 +156,7 @@ echo "✅ Storage account created for Azure Functions"
        --location ${LOCATION}
    
    # Create FHIR service within workspace
-   az healthcareapis service fhir create \
+   az healthcareapis workspace fhir-service create \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${WORKSPACE_NAME} \
        --fhir-service-name ${FHIR_SERVICE_NAME} \
@@ -164,7 +165,7 @@ echo "✅ Storage account created for Azure Functions"
        --identity-type SystemAssigned
    
    # Get FHIR service URL
-   FHIR_URL=$(az healthcareapis service fhir show \
+   FHIR_URL=$(az healthcareapis workspace fhir-service show \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${WORKSPACE_NAME} \
        --fhir-service-name ${FHIR_SERVICE_NAME} \
@@ -179,7 +180,7 @@ echo "✅ Storage account created for Azure Functions"
 
 3. **Deploy Azure SQL Edge Module to IoT Edge**:
 
-   Azure SQL Edge brings enterprise-grade SQL capabilities to edge devices, enabling real-time data processing and analytics at the point of data generation. For healthcare scenarios, this means patient vitals can be analyzed instantly without cloud latency, critical for time-sensitive medical decisions. The module supports T-SQL queries, built-in machine learning, and time-series data processing.
+   Azure SQL Edge brings enterprise-grade SQL capabilities to edge devices, enabling real-time data processing and analytics at the point of data generation. For healthcare scenarios, this means patient vitals can be analyzed instantly without cloud latency, critical for time-sensitive medical decisions. The module supports T-SQL queries, built-in machine learning, and time-series data processing optimized for IoT workloads.
 
    ```bash
    # Create deployment manifest for SQL Edge
@@ -269,7 +270,7 @@ echo "✅ Storage account created for Azure Functions"
 
 4. **Create Log Analytics Workspace for Monitoring**:
 
-   Azure Log Analytics provides centralized monitoring and diagnostics for both edge and cloud components. For healthcare deployments, this ensures full audit trails and compliance reporting while enabling proactive issue detection. The workspace collects metrics from SQL Edge, IoT Hub, and Functions to provide end-to-end visibility.
+   Azure Log Analytics provides centralized monitoring and diagnostics for both edge and cloud components. For healthcare deployments, this ensures full audit trails and compliance reporting while enabling proactive issue detection. The workspace collects metrics from SQL Edge, IoT Hub, and Functions to provide end-to-end visibility into system performance and health.
 
    ```bash
    # Create Log Analytics workspace
@@ -285,7 +286,8 @@ echo "✅ Storage account created for Azure Functions"
        --query customerId \
        --output tsv)
    
-   WORKSPACE_KEY=$(az monitor log-analytics workspace get-shared-keys \
+   WORKSPACE_KEY=$(az monitor log-analytics workspace \
+       get-shared-keys \
        --name ${LOG_ANALYTICS_WORKSPACE} \
        --resource-group ${RESOURCE_GROUP} \
        --query primarySharedKey \
@@ -309,7 +311,7 @@ echo "✅ Storage account created for Azure Functions"
 
 5. **Deploy Azure Functions for Alert Processing**:
 
-   Azure Functions provides serverless compute for processing healthcare alerts and transforming data into FHIR format. The event-driven architecture ensures automatic scaling based on alert volume while maintaining cost efficiency. Functions integrate with IoT Hub to process critical patient events in real-time.
+   Azure Functions provides serverless compute for processing healthcare alerts and transforming data into FHIR format. The event-driven architecture ensures automatic scaling based on alert volume while maintaining cost efficiency. Functions integrate with IoT Hub to process critical patient events in real-time, transforming raw sensor data into standardized healthcare formats.
 
    ```bash
    # Create Function App
@@ -331,12 +333,25 @@ echo "✅ Storage account created for Azure Functions"
                       --policy-name iothubowner \
                       --query connectionString --output tsv)"
    
-   # Enable Application Insights
+   # Create and configure Application Insights
    az monitor app-insights component create \
        --app ${FUNCTION_APP_NAME} \
        --location ${LOCATION} \
        --resource-group ${RESOURCE_GROUP} \
        --application-type web
+   
+   # Get Application Insights connection string
+   AI_CONNECTION_STRING=$(az monitor app-insights component show \
+       --app ${FUNCTION_APP_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query connectionString \
+       --output tsv)
+   
+   # Set Application Insights connection string
+   az functionapp config appsettings set \
+       --name ${FUNCTION_APP_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --settings "APPLICATIONINSIGHTS_CONNECTION_STRING=${AI_CONNECTION_STRING}"
    
    echo "✅ Azure Functions deployed for alert processing"
    ```
@@ -388,12 +403,13 @@ echo "✅ Storage account created for Azure Functions"
 
 7. **Set Up FHIR Data Transformation**:
 
-   Healthcare data from IoT devices must be transformed into FHIR-compliant resources for interoperability. This step creates the mapping logic to convert raw sensor data into standardized FHIR Observation resources, ensuring compatibility with electronic health records and other healthcare systems.
+   Healthcare data from IoT devices must be transformed into FHIR-compliant resources for interoperability. This step creates the mapping logic to convert raw sensor data into standardized FHIR Observation resources, ensuring compatibility with electronic health records and other healthcare systems while maintaining data integrity and clinical context.
 
    ```bash
    # Create FHIR transformation function code
    cat > fhir-transform.cs << EOF
    using System;
+   using System.Collections.Generic;
    using Microsoft.Azure.WebJobs;
    using Microsoft.Extensions.Logging;
    using Newtonsoft.Json;
@@ -404,7 +420,8 @@ echo "✅ Storage account created for Azure Functions"
    {
        [FunctionName("TransformToFHIR")]
        public static void Run(
-           [EventHubTrigger("health-alerts", Connection = "IOT_HUB_CONNECTION")] string message,
+           [EventHubTrigger("health-alerts", 
+             Connection = "IOT_HUB_CONNECTION")] string message,
            ILogger log)
        {
            dynamic data = JsonConvert.DeserializeObject(message);

@@ -4,12 +4,12 @@ id: 9f4e8d7c
 category: gaming
 difficulty: 200
 subject: gcp
-services: Game Servers, Cloud Firestore, Cloud Run, Cloud Load Balancing
+services: Google Kubernetes Engine, Cloud Firestore, Cloud Run, Cloud Load Balancing
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: gaming, multiplayer, real-time, serverless, database, kubernetes
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Modern multiplayer games require real-time synchronization between hundreds or t
 
 ## Solution
 
-This solution leverages Google Cloud's managed gaming services to create a serverless, auto-scaling multiplayer infrastructure. Game Servers API automatically provisions and manages dedicated game server instances, while Cloud Firestore provides real-time database synchronization for game state. Cloud Run handles matchmaking and player session management, with Cloud Load Balancing distributing traffic across regions for optimal player experience.
+This solution leverages Google Cloud's managed gaming services to create a serverless, auto-scaling multiplayer infrastructure. Google Kubernetes Engine with Agones automatically provisions and manages dedicated game server instances, while Cloud Firestore provides real-time database synchronization for game state. Cloud Run handles matchmaking and player session management, with Cloud Load Balancing distributing traffic across regions for optimal player experience.
 
 ## Architecture Diagram
 
@@ -45,7 +45,6 @@ graph TB
     end
     
     subgraph "Game Infrastructure"
-        GS[Game Servers API]
         GKE[Google Kubernetes Engine]
         AGO[Agones Game Server Controller]
     end
@@ -65,9 +64,8 @@ graph TB
     P3 --> LB
     LB --> CR
     CR --> AUTH
-    CR --> GS
+    CR --> GKE
     CR --> CF
-    GS --> GKE
     GKE --> AGO
     AGO --> CF
     CF --> RT
@@ -75,10 +73,10 @@ graph TB
     RT --> P2
     RT --> P3
     
-    GS --> CM
+    GKE --> CM
     CR --> CL
     
-    style GS fill:#FF9900
+    style GKE fill:#FF9900
     style CF fill:#4285F4
     style CR fill:#34A853
     style LB fill:#EA4335
@@ -86,13 +84,13 @@ graph TB
 
 ## Prerequisites
 
-1. Google Cloud account with billing enabled and Game Servers API quota
+1. Google Cloud account with billing enabled and GKE API access
 2. Google Cloud CLI installed and configured (or Cloud Shell)
 3. Docker installed for containerizing game server applications
 4. Basic knowledge of Kubernetes concepts and serverless architecture
 5. Estimated cost: $50-100/month for development environment with moderate usage
 
-> **Note**: Game Servers API requires special access approval and may have regional availability limitations. Check current service availability in your target regions.
+> **Note**: Google recommends using GKE with Agones for game server hosting instead of the deprecated Game Servers API. Agones provides the same capabilities with better Kubernetes integration.
 
 ## Preparation
 
@@ -105,7 +103,7 @@ export CLUSTER_NAME="game-cluster"
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
-export GAME_SERVER_CONFIG="game-config-${RANDOM_SUFFIX}"
+export GAME_SERVER_FLEET="game-fleet-${RANDOM_SUFFIX}"
 export FIRESTORE_DATABASE="game-db-${RANDOM_SUFFIX}"
 export CLOUD_RUN_SERVICE="matchmaking-api-${RANDOM_SUFFIX}"
 
@@ -115,11 +113,11 @@ gcloud config set compute/region ${REGION}
 gcloud config set compute/zone ${ZONE}
 
 # Enable required APIs
-gcloud services enable gameservices.googleapis.com
 gcloud services enable container.googleapis.com
 gcloud services enable run.googleapis.com
 gcloud services enable firestore.googleapis.com
 gcloud services enable compute.googleapis.com
+gcloud services enable cloudbuild.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
@@ -141,7 +139,8 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
        --min-nodes=1 \
        --max-nodes=10 \
        --enable-network-policy \
-       --enable-ip-alias
+       --enable-ip-alias \
+       --disk-size=50GB
 
    # Get cluster credentials
    gcloud container clusters get-credentials ${CLUSTER_NAME} \
@@ -157,19 +156,12 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
    Agones transforms Kubernetes into a game server orchestration platform, providing custom resource definitions for game servers, fleets, and allocations. The controller manages the entire lifecycle of game server instances, from creation through allocation to cleanup, enabling seamless multiplayer experiences.
 
    ```bash
-   # Install Agones using Helm
+   # Install Agones using Kubectl with official manifests
    kubectl create namespace agones-system
    
-   # Add Agones Helm repository
-   helm repo add agones https://agones.dev/chart/stable
-   helm repo update
-   
-   # Install Agones with gaming-optimized settings
-   helm install agones agones/agones \
-       --namespace agones-system \
-       --set "gameservers.minPort=7000" \
-       --set "gameservers.maxPort=8000" \
-       --set "gameservers.podPreserveUnknownFields=false"
+   # Install Agones with the latest stable version
+   kubectl apply --server-side \
+       -f https://raw.githubusercontent.com/googleforgames/agones/release-1.41.0/install/yaml/install.yaml
    
    # Wait for Agones to be ready
    kubectl wait --for=condition=available deployment \
@@ -185,10 +177,11 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
    Cloud Firestore provides a NoSQL document database with built-in real-time synchronization capabilities essential for multiplayer gaming. Its multi-region replication and strong consistency guarantees ensure that game state updates are immediately visible to all players, while offline support handles network interruptions gracefully.
 
    ```bash
-   # Create Firestore database in native mode
+   # Create Firestore database with proper syntax
    gcloud firestore databases create \
+       --database=${FIRESTORE_DATABASE} \
        --location=${REGION} \
-       --database=${FIRESTORE_DATABASE}
+       --type=firestore-native
    
    # Create initial game collections structure
    cat > game-schema.json << EOF
@@ -197,6 +190,8 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
        "game-session-id": {
          "players": {},
          "gameState": {},
+         "gameMode": "string",
+         "maxPlayers": 4,
          "metadata": {
            "created": "timestamp",
            "lastUpdated": "timestamp",
@@ -208,7 +203,8 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
        "player-id": {
          "currentGame": "game-session-id",
          "profile": {},
-         "stats": {}
+         "stats": {},
+         "lastSeen": "timestamp"
        }
      }
    }
@@ -229,7 +225,7 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
    apiVersion: "agones.dev/v1"
    kind: Fleet
    metadata:
-     name: simple-game-server-fleet
+     name: ${GAME_SERVER_FLEET}
    spec:
      replicas: 2
      template:
@@ -247,7 +243,7 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
            spec:
              containers:
              - name: simple-game-server
-               image: gcr.io/agones-images/simple-game-server:0.12
+               image: us-docker.pkg.dev/agones-images/examples/simple-server:0.17
                resources:
                  requests:
                    memory: "64Mi"
@@ -261,7 +257,7 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
    kubectl apply -f gameserver-fleet.yaml
    
    # Wait for fleet to be ready
-   kubectl wait --for=condition=ready fleet/simple-game-server-fleet \
+   kubectl wait --for=condition=ready fleet/${GAME_SERVER_FLEET} \
        --timeout=300s
    
    echo "✅ Game server fleet deployed and ready"
@@ -285,9 +281,9 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
      "version": "1.0.0",
      "main": "index.js",
      "dependencies": {
-       "express": "^4.18.2",
-       "@google-cloud/firestore": "^7.1.0",
-       "kubernetes-client": "^12.0.0"
+       "express": "^4.19.0",
+       "@google-cloud/firestore": "^7.10.0",
+       "@kubernetes/client-node": "^0.21.0"
      }
    }
    EOF
@@ -296,17 +292,29 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
    cat > index.js << 'EOF'
    const express = require('express');
    const { Firestore } = require('@google-cloud/firestore');
-   const k8s = require('kubernetes-client');
+   const k8s = require('@kubernetes/client-node');
    
    const app = express();
    const port = process.env.PORT || 8080;
-   const firestore = new Firestore();
+   const firestore = new Firestore({
+     databaseId: process.env.FIRESTORE_DATABASE || 'default'
+   });
    
    app.use(express.json());
+   
+   app.get('/health', (req, res) => {
+     res.status(200).json({ status: 'healthy' });
+   });
    
    app.post('/matchmake', async (req, res) => {
      try {
        const { playerId, gameMode } = req.body;
+       
+       if (!playerId || !gameMode) {
+         return res.status(400).json({ 
+           error: 'Missing required fields: playerId and gameMode' 
+         });
+       }
        
        // Find or create game session
        const gameSession = await findOrCreateGameSession(gameMode);
@@ -316,10 +324,11 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
        
        res.json({ 
          gameSessionId: gameSession.id,
-         serverEndpoint: gameSession.serverEndpoint,
+         serverEndpoint: gameSession.serverEndpoint || 'pending',
          status: 'matched'
        });
      } catch (error) {
+       console.error('Matchmaking error:', error);
        res.status(500).json({ error: error.message });
      }
    });
@@ -329,30 +338,47 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
      const availableGames = await gamesRef
        .where('status', '==', 'waiting')
        .where('gameMode', '==', gameMode)
+       .where('playerCount', '<', 4)
        .limit(1)
        .get();
    
      if (!availableGames.empty) {
-       return availableGames.docs[0];
+       const doc = availableGames.docs[0];
+       return { id: doc.id, ...doc.data() };
      }
    
      // Create new game session
-     const newGame = await gamesRef.add({
+     const newGameRef = await gamesRef.add({
        gameMode,
        status: 'waiting',
        players: [],
+       playerCount: 0,
        created: new Date(),
-       maxPlayers: 4
+       maxPlayers: 4,
+       lastUpdated: new Date()
      });
    
-     return { id: newGame.id };
+     return { id: newGameRef.id };
    }
    
    async function addPlayerToSession(gameSession, playerId) {
-     await firestore.collection('games').doc(gameSession.id).update({
+     const gameRef = firestore.collection('games').doc(gameSession.id);
+     const playerRef = firestore.collection('players').doc(playerId);
+     
+     const batch = firestore.batch();
+     
+     batch.update(gameRef, {
        players: firestore.FieldValue.arrayUnion(playerId),
+       playerCount: firestore.FieldValue.increment(1),
        lastUpdated: new Date()
      });
+     
+     batch.set(playerRef, {
+       currentGame: gameSession.id,
+       lastSeen: new Date()
+     }, { merge: true });
+     
+     await batch.commit();
    }
    
    app.listen(port, () => {
@@ -362,10 +388,10 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
    
    # Create Dockerfile
    cat > Dockerfile << EOF
-   FROM node:18-slim
+   FROM node:20-slim
    WORKDIR /app
    COPY package*.json ./
-   RUN npm install
+   RUN npm ci --only=production
    COPY . .
    EXPOSE 8080
    CMD ["node", "index.js"]
@@ -380,7 +406,8 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
        --region ${REGION} \
        --allow-unauthenticated \
        --memory 512Mi \
-       --cpu 1000m
+       --cpu 1000m \
+       --set-env-vars FIRESTORE_DATABASE=${FIRESTORE_DATABASE}
    
    # Get service URL
    export MATCHMAKING_URL=$(gcloud run services describe ${CLOUD_RUN_SERVICE} \
@@ -448,8 +475,10 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
    const { Firestore } = require('@google-cloud/firestore');
    
    class GameStateSyncer {
-     constructor(gameSessionId) {
-       this.firestore = new Firestore();
+     constructor(gameSessionId, databaseId = 'default') {
+       this.firestore = new Firestore({
+         databaseId: databaseId
+       });
        this.gameSessionId = gameSessionId;
        this.gameRef = this.firestore.collection('games').doc(gameSessionId);
      }
@@ -473,7 +502,11 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
        batch.update(this.gameRef, {
          gameState: playerAction.newState,
          lastUpdated: new Date(),
-         lastAction: playerAction
+         lastAction: {
+           playerId: playerAction.playerId,
+           action: playerAction.action,
+           timestamp: new Date()
+         }
        });
    
        // Update player stats
@@ -488,10 +521,21 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
    
      // Handle player disconnection
      async handlePlayerDisconnect(playerId) {
-       await this.gameRef.update({
+       const batch = this.firestore.batch();
+       
+       batch.update(this.gameRef, {
          players: this.firestore.FieldValue.arrayRemove(playerId),
+         playerCount: this.firestore.FieldValue.increment(-1),
          lastUpdated: new Date()
        });
+       
+       const playerRef = this.firestore.collection('players').doc(playerId);
+       batch.update(playerRef, {
+         currentGame: null,
+         lastSeen: new Date()
+       });
+       
+       await batch.commit();
      }
    }
    
@@ -504,10 +548,12 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
    service cloud.firestore {
      match /databases/{database}/documents {
        match /games/{gameId} {
-         allow read, write: if resource.data.players.hasAny([request.auth.uid]);
+         allow read, write: if request.auth != null && 
+           resource.data.players.hasAny([request.auth.uid]);
        }
        match /players/{playerId} {
-         allow read, write: if request.auth.uid == playerId;
+         allow read, write: if request.auth != null && 
+           request.auth.uid == playerId;
        }
      }
    }
@@ -528,8 +574,8 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
 
    ```bash
    # Check fleet status and ready game servers
-   kubectl get fleet simple-game-server-fleet -o wide
-   kubectl get gameservers -l "agones.dev/fleet=simple-game-server-fleet"
+   kubectl get fleet ${GAME_SERVER_FLEET} -o wide
+   kubectl get gameservers -l "agones.dev/fleet=${GAME_SERVER_FLEET}"
    ```
 
    Expected output: Shows fleet with desired replicas and multiple game servers in "Ready" state.
@@ -546,9 +592,12 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
    curl -X POST http://${LB_IP}/matchmake \
        -H "Content-Type: application/json" \
        -d '{"playerId": "player456", "gameMode": "battle-royale"}'
+   
+   # Test health endpoint
+   curl ${MATCHMAKING_URL}/health
    ```
 
-   Expected output: JSON response with game session ID and server endpoint information.
+   Expected output: JSON response with game session ID and server endpoint information, plus healthy status.
 
 3. **Verify Firestore Real-Time Synchronization**:
 
@@ -559,7 +608,7 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
        --limit=5 \
        --database=${FIRESTORE_DATABASE}
    
-   # Monitor real-time updates
+   # Monitor recent game updates
    gcloud firestore query --collection=games \
        --order-by=lastUpdated \
        --limit=1 \
@@ -575,11 +624,9 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
    gcloud compute backend-services get-health game-backend \
        --global
    
-   # Test response times from different regions
-   for region in us-central1 europe-west1 asia-east1; do
-     echo "Testing from ${region}:"
-     time curl -s http://${LB_IP}/matchmake > /dev/null
-   done
+   # Test response times
+   echo "Testing load balancer response time:"
+   time curl -s http://${LB_IP}/health > /dev/null
    ```
 
    Expected output: All backends showing "HEALTHY" status with consistent response times.
@@ -637,7 +684,7 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
 
    ```bash
    # Delete Agones fleet
-   kubectl delete fleet simple-game-server-fleet
+   kubectl delete fleet ${GAME_SERVER_FLEET}
    
    # Delete GKE cluster
    gcloud container clusters delete ${CLUSTER_NAME} \
@@ -652,7 +699,7 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
    ```bash
    # Remove exported variables
    unset PROJECT_ID REGION ZONE CLUSTER_NAME RANDOM_SUFFIX
-   unset GAME_SERVER_CONFIG FIRESTORE_DATABASE CLOUD_RUN_SERVICE
+   unset GAME_SERVER_FLEET FIRESTORE_DATABASE CLOUD_RUN_SERVICE
    unset MATCHMAKING_URL LB_IP
    
    # Remove local files
@@ -664,13 +711,13 @@ echo "✅ Game infrastructure prefix: ${RANDOM_SUFFIX}"
 
 ## Discussion
 
-This multiplayer gaming infrastructure leverages Google Cloud's specialized gaming services to create a comprehensive, scalable solution for real-time multiplayer experiences. The architecture combines Google Kubernetes Engine with Agones for dedicated game server management, providing automatic scaling, health monitoring, and efficient resource allocation. By using Agones, the infrastructure can dynamically provision game servers based on player demand while maintaining optimal performance and cost efficiency.
+This multiplayer gaming infrastructure leverages Google Cloud's specialized gaming services to create a comprehensive, scalable solution for real-time multiplayer experiences. The architecture combines Google Kubernetes Engine with Agones for dedicated game server management, providing automatic scaling, health monitoring, and efficient resource allocation. By using Agones instead of the deprecated Google Cloud Game Servers API, the infrastructure maintains better Kubernetes integration while providing the same game server orchestration capabilities.
 
 Cloud Firestore serves as the backbone for real-time state synchronization, utilizing its native real-time listeners and strong consistency guarantees to ensure all players see game state updates immediately. The NoSQL document structure naturally maps to game entities and player data, while automatic multi-region replication provides global availability and disaster recovery capabilities. The serverless matchmaking service built on Cloud Run handles player connections and session management with automatic scaling, eliminating the need for infrastructure management while maintaining low latency for critical operations.
 
-The global load balancing configuration ensures optimal player experience regardless of geographic location, with automatic failover and content delivery optimization. This approach follows [Google Cloud's gaming architecture best practices](https://cloud.google.com/solutions/games) and leverages the global infrastructure for consistent performance worldwide. The combination of managed services reduces operational overhead while providing enterprise-grade security, monitoring, and compliance capabilities essential for production gaming environments.
+The global load balancing configuration ensures optimal player experience regardless of geographic location, with automatic failover and content delivery optimization. This approach follows [Google Cloud's gaming architecture best practices](https://cloud.google.com/solutions/gaming) and leverages the global infrastructure for consistent performance worldwide. The combination of managed services reduces operational overhead while providing enterprise-grade security, monitoring, and compliance capabilities essential for production gaming environments.
 
-Security is integrated throughout the stack with IAM for service authentication, Firestore security rules for data access control, and VPC networking for secure communication between services. The infrastructure automatically handles common gaming challenges like player session management, server allocation, and state synchronization while providing detailed monitoring and logging for operational visibility.
+Security is integrated throughout the stack with IAM for service authentication, Firestore security rules for data access control, and VPC networking for secure communication between services. The infrastructure automatically handles common gaming challenges like player session management, server allocation, and state synchronization while providing detailed monitoring and logging for operational visibility. The use of [Agones](https://agones.dev/site/) provides industry-standard game server orchestration with active community support and regular updates.
 
 > **Tip**: Monitor player latency and server allocation patterns using Cloud Monitoring to optimize resource placement and scaling policies for your specific game requirements and player demographics.
 
@@ -678,7 +725,7 @@ Security is integrated throughout the stack with IAM for service authentication,
 
 Extend this multiplayer gaming infrastructure with these advanced features:
 
-1. **Implement Anti-Cheat System**: Add Cloud Functions to analyze player actions in real-time, detecting suspicious behavior patterns and automatically flagging or removing cheating players using machine learning models.
+1. **Implement Anti-Cheat System**: Add Cloud Functions to analyze player actions in real-time, detecting suspicious behavior patterns and automatically flagging or removing cheating players using Vertex AI machine learning models.
 
 2. **Add Global Player Leaderboards**: Create a BigQuery-based analytics pipeline that processes game results from Firestore, maintaining real-time leaderboards with historical statistics and seasonal rankings across all game modes.
 

@@ -1,0 +1,1200 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simple URL Shortener with API Gateway, Lambda, and DynamoDB - Serverless architecture for creating and redirecting short URLs'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+          - ApiStageName
+      - Label:
+          default: "DynamoDB Configuration"
+        Parameters:
+          - TableBillingMode
+          - PointInTimeRecovery
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "API Gateway Configuration"
+        Parameters:
+          - EnableCORS
+          - ApiGatewayLoggingLevel
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableXRayTracing
+          - LogRetentionDays
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      ApiStageName:
+        default: "API Stage Name"
+      TableBillingMode:
+        default: "DynamoDB Billing Mode"
+      PointInTimeRecovery:
+        default: "Enable Point-in-Time Recovery"
+      LambdaRuntime:
+        default: "Lambda Runtime Version"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      EnableCORS:
+        default: "Enable CORS"
+      ApiGatewayLoggingLevel:
+        default: "API Gateway Logging Level"
+      EnableXRayTracing:
+        default: "Enable X-Ray Tracing"
+      LogRetentionDays:
+        default: "CloudWatch Log Retention (days)"
+
+# Input Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'url-shortener'
+    Description: 'Name of the project used for resource naming and tagging'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name for deployment (dev, test, staging, prod)'
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+
+  ApiStageName:
+    Type: String
+    Default: 'prod'
+    Description: 'API Gateway deployment stage name'
+    AllowedPattern: '^[a-zA-Z0-9]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters'
+    MinLength: 1
+    MaxLength: 64
+
+  TableBillingMode:
+    Type: String
+    Default: 'PAY_PER_REQUEST'
+    Description: 'DynamoDB billing mode for cost optimization'
+    AllowedValues:
+      - PAY_PER_REQUEST
+      - PROVISIONED
+
+  PointInTimeRecovery:
+    Type: String
+    Default: 'false'
+    Description: 'Enable point-in-time recovery for DynamoDB table'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.12'
+    Description: 'Lambda function runtime version'
+    AllowedValues:
+      - python3.11
+      - python3.12
+
+  LambdaTimeout:
+    Type: Number
+    Default: 10
+    Description: 'Lambda function timeout in seconds'
+    MinValue: 3
+    MaxValue: 900
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    Description: 'Lambda function memory allocation in MB'
+    AllowedValues:
+      - 128
+      - 256
+      - 512
+      - 1024
+
+  EnableCORS:
+    Type: String
+    Default: 'true'
+    Description: 'Enable Cross-Origin Resource Sharing (CORS) for API Gateway'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  ApiGatewayLoggingLevel:
+    Type: String
+    Default: 'INFO'
+    Description: 'API Gateway execution logging level'
+    AllowedValues:
+      - 'OFF'
+      - 'ERROR'
+      - 'INFO'
+
+  EnableXRayTracing:
+    Type: String
+    Default: 'false'
+    Description: 'Enable AWS X-Ray tracing for Lambda functions'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    Description: 'CloudWatch log retention period in days'
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+
+# Conditional Logic
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnablePITR: !Equals [!Ref PointInTimeRecovery, 'true']
+  EnableCORSCondition: !Equals [!Ref EnableCORS, 'true']
+  EnableXRayCondition: !Equals [!Ref EnableXRayTracing, 'true']
+  EnableApiLogging: !Not [!Equals [!Ref ApiGatewayLoggingLevel, 'OFF']]
+
+# AWS Resources
+Resources:
+  # DynamoDB Table for URL Mappings
+  URLMappingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-url-mappings'
+      BillingMode: !Ref TableBillingMode
+      AttributeDefinitions:
+        - AttributeName: shortCode
+          AttributeType: S
+      KeySchema:
+        - AttributeName: shortCode
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePITR, true, false]
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: alias/aws/dynamodb
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-url-mappings'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+  # CloudWatch Log Groups for Lambda Functions
+  CreateFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-create-function'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt LogsKMSKey.Arn
+
+  RedirectFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-redirect-function'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt LogsKMSKey.Arn
+
+  # KMS Key for CloudWatch Logs Encryption
+  LogsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for CloudWatch Logs encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                kms:EncryptionContext:aws:logs:arn: 
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${Environment}-create-function'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${Environment}-redirect-function'
+
+  LogsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}-logs'
+      TargetKeyId: !Ref LogsKMSKey
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If 
+          - EnableXRayCondition
+          - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt URLMappingTable.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${Environment}-*'
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !GetAtt LogsKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-execution-role'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for URL Creation
+  CreateURLFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-create-function'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref URLMappingTable
+          CORS_ENABLED: !Ref EnableCORS
+      TracingConfig:
+        Mode: !If [EnableXRayCondition, 'Active', 'PassThrough']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import string
+          import random
+          import os
+          import logging
+          from urllib.parse import urlparse
+          from datetime import datetime, timedelta
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          cors_enabled = os.environ.get('CORS_ENABLED', 'true').lower() == 'true'
+          
+          def get_cors_headers():
+              if cors_enabled:
+                  return {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'POST, OPTIONS'
+                  }
+              return {}
+          
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Received event: {json.dumps(event, default=str)}")
+                  
+                  # Handle OPTIONS request for CORS preflight
+                  if event.get('httpMethod') == 'OPTIONS':
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              **get_cors_headers()
+                          },
+                          'body': json.dumps({'message': 'CORS preflight successful'})
+                      }
+                  
+                  # Parse request body
+                  if not event.get('body'):
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              **get_cors_headers()
+                          },
+                          'body': json.dumps({'error': 'Request body is required'})
+                      }
+                  
+                  try:
+                      body = json.loads(event['body'])
+                  except json.JSONDecodeError:
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              **get_cors_headers()
+                          },
+                          'body': json.dumps({'error': 'Invalid JSON in request body'})
+                      }
+                  
+                  original_url = body.get('url')
+                  custom_code = body.get('customCode')
+                  expiry_days = body.get('expiryDays', 30)  # Default 30 days
+                  
+                  # Validate URL presence
+                  if not original_url:
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              **get_cors_headers()
+                          },
+                          'body': json.dumps({'error': 'URL is required'})
+                      }
+                  
+                  # Validate URL format
+                  try:
+                      parsed_url = urlparse(original_url)
+                      if not all([parsed_url.scheme, parsed_url.netloc]):
+                          return {
+                              'statusCode': 400,
+                              'headers': {
+                                  'Content-Type': 'application/json',
+                                  **get_cors_headers()
+                              },
+                              'body': json.dumps({'error': 'Invalid URL format. URL must include protocol (http:// or https://)'})
+                          }
+                      if parsed_url.scheme not in ['http', 'https']:
+                          return {
+                              'statusCode': 400,
+                              'headers': {
+                                  'Content-Type': 'application/json',
+                                  **get_cors_headers()
+                              },
+                              'body': json.dumps({'error': 'URL must use http or https protocol'})
+                          }
+                  except Exception as e:
+                      logger.error(f"URL parsing error: {str(e)}")
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              **get_cors_headers()
+                          },
+                          'body': json.dumps({'error': 'Invalid URL format'})
+                      }
+                  
+                  # Generate or validate short code
+                  if custom_code:
+                      # Validate custom code format
+                      if not custom_code.isalnum() or len(custom_code) < 3 or len(custom_code) > 10:
+                          return {
+                              'statusCode': 400,
+                              'headers': {
+                                  'Content-Type': 'application/json',
+                                  **get_cors_headers()
+                              },
+                              'body': json.dumps({'error': 'Custom code must be 3-10 alphanumeric characters'})
+                          }
+                      short_code = custom_code
+                      max_retries = 1
+                  else:
+                      short_code = None
+                      max_retries = 5
+                  
+                  # Calculate TTL (Time To Live) for expiration
+                  expiry_timestamp = int((datetime.now() + timedelta(days=expiry_days)).timestamp())
+                  
+                  # Generate short code or use custom code
+                  for attempt in range(max_retries):
+                      if not custom_code:
+                          short_code = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+                      
+                      try:
+                          # Use conditional write to prevent overwriting existing codes
+                          table.put_item(
+                              Item={
+                                  'shortCode': short_code,
+                                  'originalUrl': original_url,
+                                  'createdAt': datetime.now().isoformat(),
+                                  'ttl': expiry_timestamp,
+                                  'clickCount': 0
+                              },
+                              ConditionExpression='attribute_not_exists(shortCode)'
+                          )
+                          break
+                      except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+                          if custom_code:
+                              return {
+                                  'statusCode': 409,
+                                  'headers': {
+                                      'Content-Type': 'application/json',
+                                      **get_cors_headers()
+                                  },
+                                  'body': json.dumps({'error': 'Custom short code already exists'})
+                              }
+                          if attempt == max_retries - 1:
+                              raise Exception("Unable to generate unique short code after multiple attempts")
+                          continue
+                  
+                  logger.info(f"Created short URL: {short_code} -> {original_url}")
+                  
+                  # Get API Gateway URL from request context
+                  domain_name = event.get('requestContext', {}).get('domainName')
+                  stage = event.get('requestContext', {}).get('stage')
+                  
+                  if domain_name and stage:
+                      short_url = f"https://{domain_name}/{stage}/{short_code}"
+                  else:
+                      short_url = f"https://your-api-gateway-url/{short_code}"
+                  
+                  return {
+                      'statusCode': 201,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          **get_cors_headers()
+                      },
+                      'body': json.dumps({
+                          'shortCode': short_code,
+                          'shortUrl': short_url,
+                          'originalUrl': original_url,
+                          'expiresAt': datetime.fromtimestamp(expiry_timestamp).isoformat(),
+                          'message': 'Short URL created successfully'
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error creating short URL: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          **get_cors_headers()
+                      },
+                      'body': json.dumps({'error': 'Internal server error', 'message': 'Unable to create short URL'})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-create-function'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for URL Redirection
+  RedirectURLFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-redirect-function'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref URLMappingTable
+      TracingConfig:
+        Mode: !If [EnableXRayCondition, 'Active', 'PassThrough']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from botocore.exceptions import ClientError
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Received event: {json.dumps(event, default=str)}")
+                  
+                  # Get short code from path parameters
+                  if not event.get('pathParameters') or not event['pathParameters'].get('shortCode'):
+                      return {
+                          'statusCode': 400,
+                          'headers': {'Content-Type': 'text/html'},
+                          'body': '''
+                          <!DOCTYPE html>
+                          <html>
+                          <head><title>400 - Bad Request</title></head>
+                          <body>
+                              <h1>400 - Bad Request</h1>
+                              <p>Short code parameter is required</p>
+                              <p>Please check your URL format and try again.</p>
+                          </body>
+                          </html>
+                          '''
+                      }
+                  
+                  short_code = event['pathParameters']['shortCode']
+                  
+                  # Validate short code format
+                  if not short_code or not short_code.isalnum() or len(short_code) < 3 or len(short_code) > 10:
+                      return {
+                          'statusCode': 400,
+                          'headers': {'Content-Type': 'text/html'},
+                          'body': '''
+                          <!DOCTYPE html>
+                          <html>
+                          <head><title>400 - Bad Request</title></head>
+                          <body>
+                              <h1>400 - Bad Request</h1>
+                              <p>Invalid short code format</p>
+                              <p>Short codes must be alphanumeric and 3-10 characters long.</p>
+                          </body>
+                          </html>
+                          '''
+                      }
+                  
+                  # Lookup original URL in DynamoDB
+                  response = table.get_item(
+                      Key={'shortCode': short_code}
+                  )
+                  
+                  if 'Item' in response:
+                      item = response['Item']
+                      original_url = item['originalUrl']
+                      
+                      # Check if URL has expired (if TTL is set)
+                      current_timestamp = int(datetime.now().timestamp())
+                      if 'ttl' in item and item['ttl'] < current_timestamp:
+                          logger.warning(f"Expired short code accessed: {short_code}")
+                          return {
+                              'statusCode': 410,
+                              'headers': {'Content-Type': 'text/html'},
+                              'body': '''
+                              <!DOCTYPE html>
+                              <html>
+                              <head><title>410 - Gone</title></head>
+                              <body>
+                                  <h1>410 - Short URL Expired</h1>
+                                  <p>This short URL has expired and is no longer available.</p>
+                                  <p>Please contact the sender for a new link.</p>
+                              </body>
+                              </html>
+                              '''
+                          }
+                      
+                      # Increment click counter (fire and forget - don't block redirect)
+                      try:
+                          table.update_item(
+                              Key={'shortCode': short_code},
+                              UpdateExpression='ADD clickCount :inc SET lastAccessed = :timestamp',
+                              ExpressionAttributeValues={
+                                  ':inc': 1,
+                                  ':timestamp': datetime.now().isoformat()
+                              }
+                          )
+                      except Exception as e:
+                          logger.warning(f"Failed to update click count for {short_code}: {str(e)}")
+                      
+                      logger.info(f"Redirecting {short_code} to {original_url}")
+                      return {
+                          'statusCode': 302,
+                          'headers': {
+                              'Location': original_url,
+                              'Cache-Control': 'no-cache, no-store, must-revalidate',
+                              'Pragma': 'no-cache',
+                              'Expires': '0'
+                          }
+                      }
+                  else:
+                      logger.warning(f"Short code not found: {short_code}")
+                      return {
+                          'statusCode': 404,
+                          'headers': {'Content-Type': 'text/html'},
+                          'body': '''
+                          <!DOCTYPE html>
+                          <html>
+                          <head><title>404 - Short URL Not Found</title></head>
+                          <body>
+                              <h1>404 - Short URL Not Found</h1>
+                              <p>The requested short URL does not exist or has been removed.</p>
+                              <p>Please check the URL and try again, or contact the sender for a valid link.</p>
+                          </body>
+                          </html>
+                          '''
+                      }
+                      
+              except ClientError as e:
+                  logger.error(f"DynamoDB error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'text/html'},
+                      'body': '''
+                      <!DOCTYPE html>
+                      <html>
+                      <head><title>500 - Internal Server Error</title></head>
+                      <body>
+                          <h1>500 - Internal Server Error</h1>
+                          <p>A database error occurred while processing your request.</p>
+                          <p>Please try again later.</p>
+                      </body>
+                      </html>
+                      '''
+                  }
+              except Exception as e:
+                  logger.error(f"Unexpected error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'text/html'},
+                      'body': '''
+                      <!DOCTYPE html>
+                      <html>
+                      <head><title>500 - Internal Server Error</title></head>
+                      <body>
+                          <h1>500 - Internal Server Error</h1>
+                          <p>An unexpected error occurred while processing your request.</p>
+                          <p>Please try again later.</p>
+                      </body>
+                      </html>
+                      '''
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-redirect-function'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for API Gateway
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableApiLogging
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-${Environment}-api'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt LogsKMSKey.Arn
+
+  # IAM Role for API Gateway CloudWatch Logging
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Condition: EnableApiLogging
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-apigateway-cloudwatch-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # API Gateway Account Configuration for Logging
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Condition: EnableApiLogging
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  # API Gateway REST API
+  URLShortenerAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api'
+      Description: 'Serverless URL Shortener REST API'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+            Condition:
+              IpAddress:
+                aws:SourceIp:
+                  - '0.0.0.0/0'
+                  - '::/0'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-api'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway Resource for /shorten endpoint
+  ShortenResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref URLShortenerAPI
+      ParentId: !GetAtt URLShortenerAPI.RootResourceId
+      PathPart: shorten
+
+  # API Gateway Method for POST /shorten
+  ShortenMethodPOST:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref URLShortenerAPI
+      ResourceId: !Ref ShortenResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      RequestValidatorId: !Ref RequestValidator
+      RequestModels:
+        application/json: !Ref ShortenRequestModel
+      MethodResponses:
+        - StatusCode: '201'
+          ResponseModels:
+            application/json: !Ref ShortenResponseModel
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: !If [EnableCORSCondition, true, false]
+        - StatusCode: '400'
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: !If [EnableCORSCondition, true, false]
+        - StatusCode: '409'
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: !If [EnableCORSCondition, true, false]
+        - StatusCode: '500'
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: !If [EnableCORSCondition, true, false]
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateURLFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: '201'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !If [EnableCORSCondition, "'*'", !Ref AWS::NoValue]
+
+  # API Gateway Method for OPTIONS /shorten (CORS preflight)
+  ShortenMethodOPTIONS:
+    Type: AWS::ApiGateway::Method
+    Condition: EnableCORSCondition
+    Properties:
+      RestApiId: !Ref URLShortenerAPI
+      ResourceId: !Ref ShortenResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+
+  # API Gateway Resource for /{shortCode} endpoint
+  ShortCodeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref URLShortenerAPI
+      ParentId: !GetAtt URLShortenerAPI.RootResourceId
+      PathPart: '{shortCode}'
+
+  # API Gateway Method for GET /{shortCode}
+  ShortCodeMethodGET:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref URLShortenerAPI
+      ResourceId: !Ref ShortCodeResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.shortCode: true
+      MethodResponses:
+        - StatusCode: '302'
+          ResponseParameters:
+            method.response.header.Location: true
+            method.response.header.Cache-Control: true
+        - StatusCode: '400'
+        - StatusCode: '404'
+        - StatusCode: '410'
+        - StatusCode: '500'
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RedirectURLFunction.Arn}/invocations'
+
+  # Request Validator for API Gateway
+  RequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref URLShortenerAPI
+      Name: 'request-validator'
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  # API Gateway Models for Request/Response Validation
+  ShortenRequestModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref URLShortenerAPI
+      ContentType: application/json
+      Name: ShortenRequest
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Shorten URL Request
+        type: object
+        properties:
+          url:
+            type: string
+            pattern: '^https?://.*'
+            description: 'The URL to shorten (must include http:// or https://)'
+          customCode:
+            type: string
+            pattern: '^[a-zA-Z0-9]{3,10}$'
+            description: 'Optional custom short code (3-10 alphanumeric characters)'
+          expiryDays:
+            type: integer
+            minimum: 1
+            maximum: 365
+            description: 'Number of days until the short URL expires (1-365 days)'
+        required:
+          - url
+        additionalProperties: false
+
+  ShortenResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref URLShortenerAPI
+      ContentType: application/json
+      Name: ShortenResponse
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Shorten URL Response
+        type: object
+        properties:
+          shortCode:
+            type: string
+            description: 'The generated short code'
+          shortUrl:
+            type: string
+            description: 'The complete short URL'
+          originalUrl:
+            type: string
+            description: 'The original URL that was shortened'
+          expiresAt:
+            type: string
+            description: 'ISO timestamp when the short URL expires'
+          message:
+            type: string
+            description: 'Success message'
+        required:
+          - shortCode
+          - shortUrl
+          - originalUrl
+          - message
+
+  ErrorResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref URLShortenerAPI
+      ContentType: application/json
+      Name: ErrorResponse
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Error Response
+        type: object
+        properties:
+          error:
+            type: string
+            description: 'Error message'
+          message:
+            type: string
+            description: 'Detailed error message'
+        required:
+          - error
+
+  # Lambda Permissions for API Gateway
+  CreateFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateURLFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${URLShortenerAPI}/*/*'
+
+  RedirectFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RedirectURLFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${URLShortenerAPI}/*/*'
+
+  # API Gateway Deployment
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ShortenMethodPOST
+      - ShortCodeMethodGET
+    Properties:
+      RestApiId: !Ref URLShortenerAPI
+      StageName: !Ref ApiStageName
+      StageDescription:
+        LoggingLevel: !If [EnableApiLogging, !Ref ApiGatewayLoggingLevel, !Ref AWS::NoValue]
+        MetricsEnabled: true
+        DataTraceEnabled: !If [EnableApiLogging, true, false]
+        AccessLogDestinationArn: !If 
+          - EnableApiLogging
+          - !GetAtt ApiGatewayLogGroup.Arn
+          - !Ref AWS::NoValue
+        AccessLogFormat: '$context.requestId $context.status $context.error.message $context.error.messageString'
+        TracingEnabled: !If [EnableXRayCondition, true, false]
+        Variables:
+          environment: !Ref Environment
+          version: '1.0'
+
+  # CloudWatch Alarms for Monitoring
+  CreateFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      Alarmname: !Sub '${ProjectName}-${Environment}-create-function-errors'
+      AlarmDescription: 'High error rate for URL creation function'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CreateURLFunction
+      TreatMissingData: notBreaching
+
+  RedirectFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-redirect-function-errors'
+      AlarmDescription: 'High error rate for URL redirect function'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RedirectURLFunction
+      TreatMissingData: notBreaching
+
+  APIGatewayErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-api-4xx-errors'
+      AlarmDescription: 'High 4XX error rate for API Gateway'
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 20
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref URLShortenerAPI
+        - Name: Stage
+          Value: !Ref ApiStageName
+      TreatMissingData: notBreaching
+
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-dynamodb-throttles'
+      AlarmDescription: 'DynamoDB read/write throttling detected'
+      MetricName: ThrottledRequests
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref URLMappingTable
+      TreatMissingData: notBreaching
+
+# CloudFormation Outputs
+Outputs:
+  APIGatewayURL:
+    Description: 'URL of the API Gateway endpoint for the URL shortener service'
+    Value: !Sub 'https://${URLShortenerAPI}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-APIGatewayURL'
+
+  APIGatewayId:
+    Description: 'API Gateway REST API ID'
+    Value: !Ref URLShortenerAPI
+    Export:
+      Name: !Sub '${AWS::StackName}-APIGatewayId'
+
+  DynamoDBTableName:
+    Description: 'Name of the DynamoDB table storing URL mappings'
+    Value: !Ref URLMappingTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+
+  DynamoDBTableArn:
+    Description: 'ARN of the DynamoDB table'
+    Value: !GetAtt URLMappingTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+
+  CreateFunctionName:
+    Description: 'Name of the Lambda function for creating short URLs'
+    Value: !Ref CreateURLFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-CreateFunctionName'
+
+  CreateFunctionArn:
+    Description: 'ARN of the Lambda function for creating short URLs'
+    Value: !GetAtt CreateURLFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CreateFunctionArn'
+
+  RedirectFunctionName:
+    Description: 'Name of the Lambda function for URL redirection'
+    Value: !Ref RedirectURLFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-RedirectFunctionName'
+
+  RedirectFunctionArn:
+    Description: 'ARN of the Lambda function for URL redirection'
+    Value: !GetAtt RedirectURLFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RedirectFunctionArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the IAM role used by Lambda functions'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  ShortenEndpoint:
+    Description: 'Endpoint for creating short URLs (POST request)'
+    Value: !Sub 'https://${URLShortenerAPI}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/shorten'
+    Export:
+      Name: !Sub '${AWS::StackName}-ShortenEndpoint'
+
+  RedirectEndpoint:
+    Description: 'Base endpoint for short URL redirects (GET request)'
+    Value: !Sub 'https://${URLShortenerAPI}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/'
+    Export:
+      Name: !Sub '${AWS::StackName}-RedirectEndpoint'
+
+  StackEnvironment:
+    Description: 'Environment tag for this deployment'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  StackProjectName:
+    Description: 'Project name tag for this deployment'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  CURLCreateExample:
+    Description: 'Example cURL command to create a short URL'
+    Value: !Sub |
+      curl -X POST https://${URLShortenerAPI}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/shorten \
+        -H "Content-Type: application/json" \
+        -d '{"url": "https://example.com/very/long/url", "expiryDays": 30}'
+
+  CURLRedirectExample:
+    Description: 'Example cURL command to test URL redirection'
+    Value: !Sub 'curl -I https://${URLShortenerAPI}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/abc123'
+
+  MonitoringDashboard:
+    Condition: IsProduction
+    Description: 'CloudWatch Dashboard URL for monitoring (available in production environment)'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-url-shortener'

@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Virtual Desktop, Azure Bastion, Azure Active Directory, Azure Key Vault
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: virtual-desktop, remote-access, multi-session, security, bastion, vdi, remote-work
 recipe-generator-version: 1.3
@@ -291,7 +291,7 @@ echo "✅ Key Vault created: ${KEYVAULT_NAME}"
        --image "MicrosoftWindowsDesktop:Windows-11:win11-22h2-ent:latest" \
        --size Standard_D4s_v3 \
        --admin-username "avdadmin" \
-       --generate-ssh-keys \
+       --admin-password "$(openssl rand -base64 32)" \
        --vnet-name ${VNET_NAME} \
        --subnet ${AVD_SUBNET_NAME} \
        --nsg "nsg-avd-hosts" \
@@ -306,7 +306,7 @@ echo "✅ Key Vault created: ${KEYVAULT_NAME}"
        --image "MicrosoftWindowsDesktop:Windows-11:win11-22h2-ent:latest" \
        --size Standard_D4s_v3 \
        --admin-username "avdadmin" \
-       --generate-ssh-keys \
+       --admin-password "$(openssl rand -base64 32)" \
        --vnet-name ${VNET_NAME} \
        --subnet ${AVD_SUBNET_NAME} \
        --nsg "nsg-avd-hosts" \
@@ -320,31 +320,57 @@ echo "✅ Key Vault created: ${KEYVAULT_NAME}"
 
 6. **Configure Session Hosts with AVD Agent**:
 
-   The Azure Virtual Desktop agent enables session hosts to register with the host pool and participate in user session management. This agent handles session brokering, load balancing, and communication with the Azure Virtual Desktop service, making session hosts discoverable and manageable.
+   The Azure Virtual Desktop agent enables session hosts to register with the host pool and participate in user session management. This agent handles session brokering, load balancing, and communication with the Azure Virtual Desktop service, making session hosts discoverable and manageable through automated installation.
 
    ```bash
-   # Install AVD agent on first session host
-   az vm extension set \
-       --name "Microsoft.Powershell.DSC" \
-       --publisher "Microsoft.Powershell" \
-       --version "2.77" \
-       --vm-name "vm-avd-host-01-${RANDOM_SUFFIX}" \
+   # Download and install AVD agent on first session host
+   az vm run-command invoke \
+       --name "vm-avd-host-01-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
-       --settings "{\"ModulesUrl\":\"https://wvdportalstorageblob.blob.core.windows.net/galleryartifacts/Configuration_1.0.02507.240.zip\",\"ConfigurationFunction\":\"Configuration.ps1\\Configuration\",\"Properties\":{\"RegistrationInfoToken\":\"${REGISTRATION_TOKEN}\",\"aadJoin\":false}}"
+       --command-id RunPowerShellScript \
+       --scripts "
+         # Download and install Azure Virtual Desktop Agent
+         Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2310011' \
+           -OutFile 'C:\AVDAgent.msi'
+         Start-Process msiexec.exe -ArgumentList '/i', 'C:\AVDAgent.msi', \
+           '/quiet', '/qn', '/norestart', '/passive', \
+           'REGISTRATIONTOKEN=${REGISTRATION_TOKEN}' -Wait
+         
+         # Download and install Azure Virtual Desktop Agent Bootloader
+         Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2311028' \
+           -OutFile 'C:\AVDBootloader.msi'
+         Start-Process msiexec.exe -ArgumentList '/i', 'C:\AVDBootloader.msi', \
+           '/quiet', '/qn', '/norestart', '/passive' -Wait
+         
+         Restart-Computer -Force
+       "
    
-   # Install AVD agent on second session host
-   az vm extension set \
-       --name "Microsoft.Powershell.DSC" \
-       --publisher "Microsoft.Powershell" \
-       --version "2.77" \
-       --vm-name "vm-avd-host-02-${RANDOM_SUFFIX}" \
+   # Download and install AVD agent on second session host
+   az vm run-command invoke \
+       --name "vm-avd-host-02-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
-       --settings "{\"ModulesUrl\":\"https://wvdportalstorageblob.blob.core.windows.net/galleryartifacts/Configuration_1.0.02507.240.zip\",\"ConfigurationFunction\":\"Configuration.ps1\\Configuration\",\"Properties\":{\"RegistrationInfoToken\":\"${REGISTRATION_TOKEN}\",\"aadJoin\":false}}"
+       --command-id RunPowerShellScript \
+       --scripts "
+         # Download and install Azure Virtual Desktop Agent
+         Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2310011' \
+           -OutFile 'C:\AVDAgent.msi'
+         Start-Process msiexec.exe -ArgumentList '/i', 'C:\AVDAgent.msi', \
+           '/quiet', '/qn', '/norestart', '/passive', \
+           'REGISTRATIONTOKEN=${REGISTRATION_TOKEN}' -Wait
+         
+         # Download and install Azure Virtual Desktop Agent Bootloader
+         Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2311028' \
+           -OutFile 'C:\AVDBootloader.msi'
+         Start-Process msiexec.exe -ArgumentList '/i', 'C:\AVDBootloader.msi', \
+           '/quiet', '/qn', '/norestart', '/passive' -Wait
+         
+         Restart-Computer -Force
+       "
    
    echo "✅ AVD agents installed on session hosts"
    ```
 
-   The session hosts are now registered with the host pool and ready to accept user sessions. The AVD agents handle session management, load balancing, and provide the necessary communication channel with Azure Virtual Desktop services.
+   The session hosts are now registered with the host pool and ready to accept user sessions. The AVD agents handle session management, load balancing, and provide the necessary communication channel with Azure Virtual Desktop services using the latest production version.
 
 7. **Create Application Group and Workspace**:
 

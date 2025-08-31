@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: kinesis, lambda, cloudwatch, s3
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: analytics, streaming, real-time, kinesis, lambda
 recipe-generator-version: 1.3
@@ -110,8 +110,18 @@ export IAM_ROLE_NAME="KinesisAnalyticsRole-${RANDOM_SUFFIX}"
 # Create S3 bucket for analytics data storage
 aws s3 mb s3://${S3_BUCKET_NAME} --region ${AWS_REGION}
 
+# Enable S3 bucket versioning and encryption for production readiness
+aws s3api put-bucket-versioning \
+    --bucket ${S3_BUCKET_NAME} \
+    --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption \
+    --bucket ${S3_BUCKET_NAME} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
 echo "✅ Environment prepared with stream: ${STREAM_NAME}"
-echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
+echo "✅ S3 bucket created with security features: ${S3_BUCKET_NAME}"
 ```
 
 ## Steps
@@ -119,8 +129,6 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
 1. **Create IAM Role for Lambda Stream Processing**:
 
    IAM roles provide secure, temporary credential delegation for AWS services without exposing long-term access keys. Lambda functions require specific permissions to read from Kinesis streams, write to S3, and publish metrics to CloudWatch. This security foundation implements the principle of least privilege, ensuring your stream processing function accesses only the resources it needs for analytics operations. Understanding IAM roles is essential for building secure, scalable serverless architectures that can process sensitive streaming data.
-
-> **Warning**: Always follow the principle of least privilege when configuring IAM permissions. Avoid using wildcard (*) permissions in production environments to maintain security best practices.
 
    ```bash
    # Create trust policy for Lambda
@@ -153,11 +161,13 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
                "Effect": "Allow",
                "Action": [
                    "kinesis:DescribeStream",
+                   "kinesis:DescribeStreamSummary",
                    "kinesis:GetShardIterator",
                    "kinesis:GetRecords",
-                   "kinesis:ListStreams"
+                   "kinesis:ListStreams",
+                   "kinesis:ListShards"
                ],
-               "Resource": "*"
+               "Resource": "arn:aws:kinesis:${AWS_REGION}:${AWS_ACCOUNT_ID}:stream/${STREAM_NAME}"
            },
            {
                "Effect": "Allow",
@@ -174,7 +184,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
                    "logs:CreateLogStream",
                    "logs:PutLogEvents"
                ],
-               "Resource": "*"
+               "Resource": "arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:*"
            },
            {
                "Effect": "Allow",
@@ -197,6 +207,9 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
        --policy-name StreamProcessorPolicy \
        --policy-document file://stream-processor-policy.json
    
+   # Wait for role propagation
+   sleep 10
+   
    # Get role ARN
    export LAMBDA_ROLE_ARN=$(aws iam get-role \
        --role-name ${IAM_ROLE_NAME} \
@@ -204,6 +217,8 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    
    echo "✅ IAM role created: ${LAMBDA_ROLE_ARN}"
    ```
+
+   > **Warning**: Always follow the principle of least privilege when configuring IAM permissions. This policy restricts Kinesis access to the specific stream and S3 access to the designated bucket only.
 
    The IAM role is now configured with appropriate permissions for stream processing operations. This security foundation enables Lambda to securely read Kinesis data, store processed results in S3, and publish custom metrics to CloudWatch without hardcoded credentials. The role-based security model ensures scalable, auditable access control for your real-time analytics pipeline.
 
@@ -223,11 +238,11 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
        --stream-name ${STREAM_NAME}
    
    # Verify stream creation and get details
-   aws kinesis describe-stream \
+   STREAM_STATUS=$(aws kinesis describe-stream \
        --stream-name ${STREAM_NAME} \
-       --query 'StreamDescription.{Name:StreamName,Status:StreamStatus,Shards:length(Shards)}'
+       --query 'StreamDescription.{Name:StreamName,Status:StreamStatus,Shards:length(Shards)}')
    
-   echo "✅ Kinesis stream created with 3 shards"
+   echo "✅ Kinesis stream created: ${STREAM_STATUS}"
    ```
 
    Your Kinesis stream is now active and ready to receive streaming data from multiple producers. The three-shard configuration provides 3,000 records per second ingestion capacity with built-in redundancy for high availability. This foundational streaming infrastructure enables real-time data collection from web applications, IoT devices, and other data sources while maintaining data ordering and durability guarantees.
@@ -252,76 +267,103 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    def lambda_handler(event, context):
        processed_records = 0
        total_amount = 0
+       error_count = 0
        
-       for record in event['Records']:
-           # Decode Kinesis data
-           payload = base64.b64decode(record['kinesis']['data']).decode('utf-8')
-           data = json.loads(payload)
+       try:
+           for record in event['Records']:
+               try:
+                   # Decode Kinesis data
+                   payload = base64.b64decode(record['kinesis']['data']).decode('utf-8')
+                   data = json.loads(payload)
+                   
+                   # Process analytics data
+                   processed_records += 1
+                   
+                   # Example: Extract transaction amount for financial data
+                   if 'amount' in data:
+                       total_amount += float(data['amount'])
+                   
+                   # Store processed record to S3
+                   timestamp = datetime.datetime.now().isoformat()
+                   s3_key = f"analytics-data/{timestamp[:10]}/{record['kinesis']['sequenceNumber']}.json"
+                   
+                   # Add processing metadata
+                   enhanced_data = {
+                       'original_data': data,
+                       'processed_at': timestamp,
+                       'shard_id': record['kinesis']['partitionKey'],
+                       'sequence_number': record['kinesis']['sequenceNumber'],
+                       'approximate_arrival_timestamp': record['kinesis']['approximateArrivalTimestamp']
+                   }
+                   
+                   s3_client.put_object(
+                       Bucket=os.environ['S3_BUCKET'],
+                       Key=s3_key,
+                       Body=json.dumps(enhanced_data, default=str),
+                       ContentType='application/json'
+                   )
+                   
+               except Exception as record_error:
+                   error_count += 1
+                   print(f"Error processing record: {record_error}")
+                   continue
            
-           # Process analytics data
-           processed_records += 1
+           # Send custom metrics to CloudWatch
+           cloudwatch.put_metric_data(
+               Namespace='KinesisAnalytics',
+               MetricData=[
+                   {
+                       'MetricName': 'ProcessedRecords',
+                       'Value': processed_records,
+                       'Unit': 'Count',
+                       'Timestamp': datetime.datetime.now()
+                   },
+                   {
+                       'MetricName': 'TotalAmount',
+                       'Value': total_amount,
+                       'Unit': 'None',
+                       'Timestamp': datetime.datetime.now()
+                   },
+                   {
+                       'MetricName': 'ErrorCount',
+                       'Value': error_count,
+                       'Unit': 'Count',
+                       'Timestamp': datetime.datetime.now()
+                   }
+               ]
+           )
            
-           # Example: Extract transaction amount for financial data
-           if 'amount' in data:
-               total_amount += float(data['amount'])
-           
-           # Store processed record to S3
-           timestamp = datetime.datetime.now().isoformat()
-           s3_key = f"analytics-data/{timestamp[:10]}/{record['kinesis']['sequenceNumber']}.json"
-           
-           # Add processing metadata
-           enhanced_data = {
-               'original_data': data,
-               'processed_at': timestamp,
-               'shard_id': record['kinesis']['partitionKey'],
-               'sequence_number': record['kinesis']['sequenceNumber']
+           return {
+               'statusCode': 200,
+               'body': json.dumps({
+                   'processed_records': processed_records,
+                   'total_amount': total_amount,
+                   'error_count': error_count
+               })
            }
            
-           s3_client.put_object(
-               Bucket=os.environ['S3_BUCKET'],
-               Key=s3_key,
-               Body=json.dumps(enhanced_data),
-               ContentType='application/json'
-           )
-       
-       # Send custom metrics to CloudWatch
-       cloudwatch.put_metric_data(
-           Namespace='KinesisAnalytics',
-           MetricData=[
-               {
-                   'MetricName': 'ProcessedRecords',
-                   'Value': processed_records,
-                   'Unit': 'Count'
-               },
-               {
-                   'MetricName': 'TotalAmount',
-                   'Value': total_amount,
-                   'Unit': 'None'
-               }
-           ]
-       )
-       
-       return {
-           'statusCode': 200,
-           'body': json.dumps({
-               'processed_records': processed_records,
-               'total_amount': total_amount
-           })
-       }
+       except Exception as e:
+           print(f"Critical error in Lambda function: {e}")
+           return {
+               'statusCode': 500,
+               'body': json.dumps({'error': str(e)})
+           }
    EOF
    
    # Create deployment package
    zip function.zip stream_processor.py
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler stream_processor.lambda_handler \
        --zip-file fileb://function.zip \
        --environment Variables="{S3_BUCKET=${S3_BUCKET_NAME}}" \
-       --timeout 60
+       --timeout 60 \
+       --memory-size 256 \
+       --description "Kinesis stream processor for real-time analytics"
    
    echo "✅ Lambda function created for stream processing"
    ```
@@ -339,7 +381,11 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
        --function-name ${LAMBDA_FUNCTION_NAME} \
        --starting-position LATEST \
        --batch-size 10 \
-       --maximum-batching-window-in-seconds 5
+       --maximum-batching-window-in-seconds 5 \
+       --parallelization-factor 1
+   
+   # Wait for mapping to become active
+   sleep 5
    
    # Get event source mapping details
    export EVENT_SOURCE_UUID=$(aws lambda list-event-source-mappings \
@@ -378,7 +424,9 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
            'product_id': f"product_{random.randint(100, 999)}",
            'session_id': f"session_{random.randint(10000, 99999)}",
            'location': random.choice(['US', 'UK', 'CA', 'DE', 'FR']),
-           'device_type': random.choice(['mobile', 'desktop', 'tablet'])
+           'device_type': random.choice(['mobile', 'desktop', 'tablet']),
+           'page_url': f"/page_{random.randint(1, 20)}",
+           'referrer': random.choice(['google', 'facebook', 'direct', 'email'])
        }
    
    def send_to_kinesis(stream_name, data, partition_key):
@@ -400,18 +448,25 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
        
        print(f"Sending {records_to_send} records to stream: {stream_name}")
        
+       success_count = 0
+       error_count = 0
+       
        for i in range(records_to_send):
            data = generate_sample_data()
            partition_key = data['user_id']
            
            response = send_to_kinesis(stream_name, data, partition_key)
            if response:
-               print(f"Record {i+1} sent - Shard: {response['ShardId']}")
+               success_count += 1
+               if i % 10 == 0:  # Print every 10th record
+                   print(f"Record {i+1} sent - Shard: {response['ShardId']}")
+           else:
+               error_count += 1
            
            # Add small delay to simulate real-time streaming
            time.sleep(0.1)
        
-       print(f"✅ Completed sending {records_to_send} records")
+       print(f"✅ Completed sending records - Success: {success_count}, Errors: {error_count}")
    
    if __name__ == "__main__":
        main()
@@ -430,7 +485,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    # Enable enhanced monitoring for detailed metrics
    aws kinesis enable-enhanced-monitoring \
        --stream-name ${STREAM_NAME} \
-       --shard-level-metrics ALL
+       --shard-level-metrics IncomingRecords,OutgoingRecords,WriteProvisionedThroughputExceeded,ReadProvisionedThroughputExceeded
    
    # Create CloudWatch alarm for high incoming records
    aws cloudwatch put-metric-alarm \
@@ -443,7 +498,8 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
        --evaluation-periods 2 \
        --threshold 1000 \
        --comparison-operator GreaterThanThreshold \
-       --dimensions Name=StreamName,Value=${STREAM_NAME}
+       --dimensions Name=StreamName,Value=${STREAM_NAME} \
+       --treat-missing-data notBreaching
    
    # Create alarm for Lambda function errors
    aws cloudwatch put-metric-alarm \
@@ -456,7 +512,22 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
        --evaluation-periods 1 \
        --threshold 1 \
        --comparison-operator GreaterThanOrEqualToThreshold \
-       --dimensions Name=FunctionName,Value=${LAMBDA_FUNCTION_NAME}
+       --dimensions Name=FunctionName,Value=${LAMBDA_FUNCTION_NAME} \
+       --treat-missing-data notBreaching
+   
+   # Create alarm for Lambda throttles
+   aws cloudwatch put-metric-alarm \
+       --alarm-name "LambdaThrottles-${RANDOM_SUFFIX}" \
+       --alarm-description "Alert on Lambda throttling" \
+       --metric-name Throttles \
+       --namespace AWS/Lambda \
+       --statistic Sum \
+       --period 300 \
+       --evaluation-periods 1 \
+       --threshold 1 \
+       --comparison-operator GreaterThanOrEqualToThreshold \
+       --dimensions Name=FunctionName,Value=${LAMBDA_FUNCTION_NAME} \
+       --treat-missing-data notBreaching
    
    echo "✅ Enhanced monitoring and alerting configured"
    ```
@@ -484,7 +555,12 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    aws kinesis wait stream-exists \
        --stream-name ${STREAM_NAME}
    
-   echo "✅ Stream retention and scaling configured"
+   # Verify scaling completion
+   UPDATED_STREAM_INFO=$(aws kinesis describe-stream \
+       --stream-name ${STREAM_NAME} \
+       --query 'StreamDescription.{Status:StreamStatus,Shards:length(Shards),Retention:RetentionPeriodHours}')
+   
+   echo "✅ Stream retention and scaling configured: ${UPDATED_STREAM_INFO}"
    ```
 
    Stream retention and scaling are optimized for production operations with 7-day retention enabling data replay and 5-shard capacity supporting higher throughput requirements. These configurations provide operational flexibility for handling peak loads, recovering from processing failures, and implementing advanced analytics scenarios that require historical data access.
@@ -506,64 +582,78 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    
    def get_shard_iterator(stream_name, shard_id):
        """Get shard iterator for reading from stream"""
-       response = kinesis_client.get_shard_iterator(
-           StreamName=stream_name,
-           ShardId=shard_id,
-           ShardIteratorType='LATEST'
-       )
-       return response['ShardIterator']
+       try:
+           response = kinesis_client.get_shard_iterator(
+               StreamName=stream_name,
+               ShardId=shard_id,
+               ShardIteratorType='LATEST'
+           )
+           return response['ShardIterator']
+       except Exception as e:
+           print(f"Error getting shard iterator for {shard_id}: {e}")
+           return None
    
    def read_from_stream(stream_name, duration_seconds=60):
        """Read records from stream for specified duration"""
-       # Get stream description
-       stream_desc = kinesis_client.describe_stream(StreamName=stream_name)
-       shards = stream_desc['StreamDescription']['Shards']
-       
-       print(f"Monitoring stream: {stream_name}")
-       print(f"Shards: {len(shards)}")
-       print(f"Duration: {duration_seconds} seconds")
-       print("-" * 50)
-       
-       # Create shard iterators
-       shard_iterators = {}
-       for shard in shards:
-           shard_id = shard['ShardId']
-           shard_iterators[shard_id] = get_shard_iterator(stream_name, shard_id)
-       
-       start_time = time.time()
-       total_records = 0
-       
-       while (time.time() - start_time) < duration_seconds:
-           for shard_id, iterator in shard_iterators.items():
-               if iterator:
-                   try:
-                       response = kinesis_client.get_records(
-                           ShardIterator=iterator,
-                           Limit=25
-                       )
-                       
-                       records = response['Records']
-                       if records:
-                           total_records += len(records)
-                           print(f"[{datetime.now().strftime('%H:%M:%S')}] "
-                                 f"Shard {shard_id}: {len(records)} records")
-                           
-                           # Process records
-                           for record in records:
-                               data = json.loads(record['Data'])
-                               print(f"  └─ {data.get('event_type', 'unknown')} "
-                                     f"by {data.get('user_id', 'unknown')}")
-                       
-                       # Update iterator
-                       shard_iterators[shard_id] = response.get('NextShardIterator')
-                       
-                   except Exception as e:
-                       print(f"Error reading from shard {shard_id}: {e}")
-                       shard_iterators[shard_id] = None
+       try:
+           # Get stream description
+           stream_desc = kinesis_client.describe_stream(StreamName=stream_name)
+           shards = stream_desc['StreamDescription']['Shards']
            
-           time.sleep(1)
-       
-       print(f"\n✅ Monitoring complete. Total records processed: {total_records}")
+           print(f"Monitoring stream: {stream_name}")
+           print(f"Shards: {len(shards)}")
+           print(f"Duration: {duration_seconds} seconds")
+           print("-" * 50)
+           
+           # Create shard iterators
+           shard_iterators = {}
+           for shard in shards:
+               shard_id = shard['ShardId']
+               iterator = get_shard_iterator(stream_name, shard_id)
+               if iterator:
+                   shard_iterators[shard_id] = iterator
+           
+           start_time = time.time()
+           total_records = 0
+           
+           while (time.time() - start_time) < duration_seconds:
+               for shard_id, iterator in list(shard_iterators.items()):
+                   if iterator:
+                       try:
+                           response = kinesis_client.get_records(
+                               ShardIterator=iterator,
+                               Limit=25
+                           )
+                           
+                           records = response['Records']
+                           if records:
+                               total_records += len(records)
+                               print(f"[{datetime.now().strftime('%H:%M:%S')}] "
+                                     f"Shard {shard_id}: {len(records)} records")
+                               
+                               # Process records
+                               for record in records:
+                                   try:
+                                       data = json.loads(record['Data'])
+                                       print(f"  └─ {data.get('event_type', 'unknown')} "
+                                             f"by {data.get('user_id', 'unknown')} "
+                                             f"({data.get('amount', 0)})")
+                                   except json.JSONDecodeError:
+                                       print(f"  └─ Invalid JSON data")
+                           
+                           # Update iterator
+                           shard_iterators[shard_id] = response.get('NextShardIterator')
+                           
+                       except Exception as e:
+                           print(f"Error reading from shard {shard_id}: {e}")
+                           shard_iterators[shard_id] = None
+               
+               time.sleep(1)
+           
+           print(f"\n✅ Monitoring complete. Total records processed: {total_records}")
+           
+       except Exception as e:
+           print(f"Error in stream monitoring: {e}")
    
    def main():
        stream_name = sys.argv[1] if len(sys.argv) > 1 else 'analytics-stream'
@@ -591,12 +681,24 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    
    # Wait for Lambda processing
    echo "⏳ Waiting for Lambda processing..."
-   sleep 10
+   sleep 15
    
-   # Check Lambda function logs
-   aws logs describe-log-groups \
-       --log-group-name-prefix "/aws/lambda/${LAMBDA_FUNCTION_NAME}" \
-       --query 'logGroups[0].logGroupName' --output text
+   # Check Lambda function logs and get recent log events
+   LOG_GROUP_NAME="/aws/lambda/${LAMBDA_FUNCTION_NAME}"
+   
+   echo "📋 Recent Lambda function logs:"
+   aws logs describe-log-streams \
+       --log-group-name ${LOG_GROUP_NAME} \
+       --order-by LastEventTime \
+       --descending \
+       --max-items 1 \
+       --query 'logStreams[0].logStreamName' \
+       --output text | xargs -I {} aws logs get-log-events \
+       --log-group-name ${LOG_GROUP_NAME} \
+       --log-stream-name {} \
+       --limit 10 \
+       --query 'events[].message' \
+       --output text
    
    echo "✅ Sample data sent and processed"
    ```
@@ -614,17 +716,50 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
         "widgets": [
             {
                 "type": "metric",
+                "x": 0,
+                "y": 0,
+                "width": 12,
+                "height": 6,
                 "properties": {
                     "metrics": [
                         ["AWS/Kinesis", "IncomingRecords", "StreamName", "${STREAM_NAME}"],
-                        ["AWS/Kinesis", "OutgoingRecords", "StreamName", "${STREAM_NAME}"],
+                        [".", "OutgoingRecords", ".", "."],
                         ["AWS/Lambda", "Invocations", "FunctionName", "${LAMBDA_FUNCTION_NAME}"],
-                        ["KinesisAnalytics", "ProcessedRecords"]
+                        [".", "Duration", ".", "."],
+                        [".", "Errors", ".", "."],
+                        ["KinesisAnalytics", "ProcessedRecords"],
+                        [".", "ErrorCount"]
                     ],
                     "period": 300,
                     "stat": "Sum",
                     "region": "${AWS_REGION}",
-                    "title": "Real-Time Analytics Metrics"
+                    "title": "Real-Time Analytics Metrics",
+                    "yAxis": {
+                        "left": {
+                            "min": 0
+                        }
+                    }
+                }
+            },
+            {
+                "type": "metric",
+                "x": 0,
+                "y": 6,
+                "width": 12,
+                "height": 6,
+                "properties": {
+                    "metrics": [
+                        ["KinesisAnalytics", "TotalAmount"]
+                    ],
+                    "period": 300,
+                    "stat": "Sum",
+                    "region": "${AWS_REGION}",
+                    "title": "Business Metrics - Transaction Volume",
+                    "yAxis": {
+                        "left": {
+                            "min": 0
+                        }
+                    }
                 }
             }
         ]
@@ -637,6 +772,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
         --dashboard-body file://dashboard_config.json
     
     echo "✅ Analytics dashboard created"
+    echo "🔗 Dashboard URL: https://${AWS_REGION}.console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#dashboards:name=KinesisAnalytics-${RANDOM_SUFFIX}"
     ```
 
     The analytics dashboard provides comprehensive monitoring of your streaming pipeline, combining infrastructure metrics with custom business metrics in a unified view. This operational visibility enables proactive monitoring, rapid troubleshooting, and data-driven optimization of your real-time analytics architecture. The dashboard serves as the central command center for monitoring streaming operations and business performance.
@@ -673,8 +809,8 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
        --metric-name Invocations \
        --dimensions Name=FunctionName,Value=${LAMBDA_FUNCTION_NAME} \
        --statistics Sum \
-       --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
-       --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+       --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ) \
+       --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
        --period 300
    
    # Verify S3 data storage
@@ -693,8 +829,8 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
        --metric-name IncomingRecords \
        --dimensions Name=StreamName,Value=${STREAM_NAME} \
        --statistics Sum \
-       --start-time $(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%S) \
-       --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+       --start-time $(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
+       --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
        --period 60
    ```
 
@@ -726,7 +862,8 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    # Delete CloudWatch alarms
    aws cloudwatch delete-alarms \
        --alarm-names "KinesisHighIncomingRecords-${RANDOM_SUFFIX}" \
-                    "LambdaProcessingErrors-${RANDOM_SUFFIX}"
+                    "LambdaProcessingErrors-${RANDOM_SUFFIX}" \
+                    "LambdaThrottles-${RANDOM_SUFFIX}"
    
    # Delete dashboard
    aws cloudwatch delete-dashboards \
@@ -740,7 +877,8 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    ```bash
    # Delete Kinesis stream
    aws kinesis delete-stream \
-       --stream-name ${STREAM_NAME}
+       --stream-name ${STREAM_NAME} \
+       --enforce-consumer-deletion
    
    echo "✅ Kinesis stream deleted"
    ```
@@ -776,9 +914,9 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
 
 Amazon Kinesis Data Streams provides a robust foundation for real-time analytics by offering durable, scalable data ingestion with configurable retention periods up to 365 days. The architecture demonstrated here showcases key streaming patterns including data sharding for parallel processing, Lambda-based stream processing, and integration with downstream analytics services. The use of multiple shards enables horizontal scaling and fault tolerance, while the event-driven Lambda processing ensures automatic scaling based on data volume.
 
-The implementation emphasizes several critical design decisions. First, the choice of partition keys determines data distribution across shards, which directly impacts processing parallelism and hotspot prevention. Second, the Lambda function design includes error handling, custom metrics, and structured data storage to S3, creating a complete analytics pipeline. Third, the monitoring strategy combines AWS native metrics with custom business metrics, providing comprehensive visibility into both infrastructure and application performance.
+The implementation emphasizes several critical design decisions. First, the choice of partition keys determines data distribution across shards, which directly impacts processing parallelism and hotspot prevention. Second, the Lambda function design includes comprehensive error handling, custom metrics, and structured data storage to S3, creating a complete analytics pipeline. Third, the monitoring strategy combines AWS native metrics with custom business metrics, providing comprehensive visibility into both infrastructure and application performance. The updated Python 3.12 runtime ensures long-term support and access to the latest language features.
 
-This solution handles various real-world scenarios including data replay capabilities through extended retention periods, automatic scaling through shard count adjustments, and multi-consumer patterns for different processing requirements. The architecture supports both real-time processing for immediate insights and batch processing for historical analysis through S3 storage. For production environments, consider implementing dead letter queues for failed processing, cross-region replication for disaster recovery, and enhanced encryption for sensitive data.
+This solution handles various real-world scenarios including data replay capabilities through extended retention periods, automatic scaling through shard count adjustments, and multi-consumer patterns for different processing requirements. The architecture supports both real-time processing for immediate insights and batch processing for historical analysis through S3 storage. For production environments, consider implementing dead letter queues for failed processing, cross-region replication for disaster recovery, and enhanced encryption for sensitive data. The enhanced monitoring and alerting configuration provides proactive visibility into system health and business metrics.
 
 > **Tip**: Use meaningful partition keys that distribute data evenly across shards to avoid hot partitions and maximize throughput. Learn more about partition key strategies in the [Kinesis Data Streams Developer Guide](https://docs.aws.amazon.com/kinesis/latest/dev/key-concepts.html#partition-key).
 
@@ -786,7 +924,7 @@ This solution handles various real-world scenarios including data replay capabil
 
 Extend this solution by implementing these enhancements:
 
-1. **Add Kinesis Data Firehose integration** for automatic data delivery to Amazon Redshift or OpenSearch for advanced analytics and visualization capabilities.
+1. **Add Kinesis Data Firehose integration** for automatic data delivery to Amazon Redshift or OpenSearch for advanced analytics and visualization capabilities with built-in data transformation.
 
 2. **Implement stream aggregation** using tumbling windows in Lambda to calculate real-time metrics like average transaction values, user session counts, or event frequencies per time window.
 
@@ -794,7 +932,7 @@ Extend this solution by implementing these enhancements:
 
 4. **Build a multi-consumer architecture** with different Lambda functions processing the same stream for various use cases like real-time dashboards, ML model inference, and fraud detection.
 
-5. **Add cross-region replication** by implementing stream replication to a secondary region for disaster recovery and global data distribution scenarios.
+5. **Add cross-region replication** by implementing stream replication to a secondary region for disaster recovery and global data distribution scenarios using Kinesis Cross-Region Replication.
 
 ## Infrastructure Code
 

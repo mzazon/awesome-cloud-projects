@@ -1,0 +1,395 @@
+# Infrastructure Manager Configuration for Simple Website Uptime Monitoring
+# This configuration deploys Cloud Monitoring uptime checks, Pub/Sub messaging,
+# and Cloud Functions for automated website availability monitoring and alerting.
+
+# Template metadata and import declarations
+imports:
+  # No additional imports needed - using built-in GCP resource types
+
+# Input parameters for customizing the deployment
+properties:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud project ID where resources will be created"
+  
+  # Regional configuration
+  region:
+    type: string
+    description: "Primary region for regional resources (e.g., us-central1)"
+    default: "us-central1"
+  
+  # Resource naming configuration  
+  resource_suffix:
+    type: string
+    description: "Unique suffix for resource names to avoid conflicts"
+    default: "monitor"
+  
+  # Notification configuration
+  notification_email:
+    type: string
+    description: "Email address for receiving uptime notifications"
+    default: "admin@example.com"
+  
+  # Websites to monitor configuration
+  monitored_websites:
+    type: array
+    description: "List of websites to monitor with uptime checks"
+    default:
+      - "https://www.google.com"
+      - "https://www.github.com"
+      - "https://www.stackoverflow.com"
+  
+  # Monitoring configuration
+  uptime_check_period:
+    type: string
+    description: "Period between uptime checks (60s, 300s, 600s, 900s)"
+    default: "60s"
+  
+  uptime_check_timeout:
+    type: string
+    description: "Timeout for uptime checks (1s to 60s)"
+    default: "10s"
+  
+  # Function configuration
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Function (128Mi, 256Mi, 512Mi, 1Gi)"
+    default: "256Mi"
+  
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Function execution (1s to 540s)"
+    default: "60s"
+
+# Main resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ properties["project_id"] }}/services/monitoring.googleapis.com
+      consumerId: projects/{{ properties["project_id"] }}
+    metadata:
+      dependsOn: []
+
+  - name: pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ properties["project_id"] }}/services/pubsub.googleapis.com
+      consumerId: projects/{{ properties["project_id"] }}
+    metadata:
+      dependsOn: []
+
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ properties["project_id"] }}/services/cloudfunctions.googleapis.com
+      consumerId: projects/{{ properties["project_id"] }}
+    metadata:
+      dependsOn: []
+
+  - name: cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ properties["project_id"] }}/services/cloudbuild.googleapis.com
+      consumerId: projects/{{ properties["project_id"] }}
+    metadata:
+      dependsOn: []
+
+  # Pub/Sub Topic for alert message distribution
+  # This topic receives monitoring alerts and distributes them to subscribers
+  - name: uptime-alerts-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/{{ properties["project_id"] }}/topics/uptime-alerts-{{ properties["resource_suffix"] }}
+      labels:
+        purpose: "uptime-monitoring"
+        environment: "production"
+        component: "alerting"
+    metadata:
+      dependsOn:
+        - pubsub-api
+
+  # Cloud Storage bucket for Cloud Function source code
+  # Required for deploying Cloud Functions via Infrastructure Manager
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: {{ properties["project_id"] }}-function-source-{{ properties["resource_suffix"] }}
+      location: {{ properties["region"] }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30  # Delete old function versions after 30 days
+      labels:
+        purpose: "function-source"
+        component: "serverless"
+
+  # Cloud Function for processing uptime monitoring alerts
+  # Processes Pub/Sub messages and formats notification content
+  - name: uptime-processor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/{{ properties["project_id"] }}/locations/{{ properties["region"] }}/functions/uptime-processor-{{ properties["resource_suffix"] }}
+      location: {{ properties["region"] }}
+      sourceArchiveUrl: gs://{{ properties["project_id"] }}-function-source-{{ properties["resource_suffix"] }}/function-source.zip
+      entryPoint: process_uptime_alert
+      runtime: python312
+      availableMemoryMb: {{ properties["function_memory"].replace("Mi", "").replace("Gi", "000") }}
+      timeout: {{ properties["function_timeout"] }}
+      maxInstances: 10
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: projects/{{ properties["project_id"] }}/topics/uptime-alerts-{{ properties["resource_suffix"] }}
+        failurePolicy:
+          retry: {}
+      environmentVariables:
+        NOTIFICATION_EMAIL: {{ properties["notification_email"] }}
+        PROJECT_ID: {{ properties["project_id"] }}
+        TOPIC_NAME: uptime-alerts-{{ properties["resource_suffix"] }}
+      labels:
+        purpose: "alert-processing"
+        component: "serverless"
+        deployment-tool: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - cloudbuild-api
+        - uptime-alerts-topic
+        - function-source-bucket
+
+  # Cloud Monitoring Notification Channel for Pub/Sub integration
+  # Connects monitoring alerts to the Pub/Sub topic for automated processing
+  - name: pubsub-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      name: projects/{{ properties["project_id"] }}/notificationChannels/pubsub-channel-{{ properties["resource_suffix"] }}
+      type: pubsub
+      displayName: Uptime Alerts Pub/Sub Channel
+      description: Delivers uptime monitoring alerts to Pub/Sub topic for automated processing
+      labels:
+        topic: projects/{{ properties["project_id"] }}/topics/uptime-alerts-{{ properties["resource_suffix"] }}
+      enabled: true
+      userLabels:
+        purpose: "uptime-monitoring"
+        component: "alerting"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - monitoring-api
+        - uptime-alerts-topic
+
+  # Uptime Checks for monitored websites
+  # Creates synthetic monitoring checks for each configured website
+  {% for website in properties["monitored_websites"] %}
+  {% set hostname = website.replace("https://", "").replace("http://", "").split("/")[0] %}
+  {% set safe_hostname = hostname.replace(".", "-").replace("_", "-") %}
+  - name: uptime-check-{{ safe_hostname }}
+    type: gcp-types/monitoring-v1:projects.uptimeCheckConfigs
+    properties:
+      name: projects/{{ properties["project_id"] }}/uptimeCheckConfigs/uptime-check-{{ safe_hostname }}-{{ properties["resource_suffix"] }}
+      displayName: "Uptime Check - {{ hostname }}"
+      monitoredResource:
+        type: uptime_url
+        labels:
+          project_id: {{ properties["project_id"] }}
+          host: {{ hostname }}
+      httpCheck:
+        path: /
+        port: 443
+        useSsl: true
+        validateSsl: true
+        requestMethod: GET
+        acceptedResponseStatusCodes:
+          - statusClass: STATUS_CLASS_2XX
+      period: {{ properties["uptime_check_period"] }}
+      timeout: {{ properties["uptime_check_timeout"] }}
+      selectedRegions:
+        - USA_OREGON
+        - EUROPE_IRELAND  
+        - ASIA_SINGAPORE
+      contentMatchers: []
+      userLabels:
+        website: {{ hostname }}
+        purpose: "availability-monitoring"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - monitoring-api
+  {% endfor %}
+
+  # Alerting Policy for uptime check failures
+  # Defines when and how to trigger notifications based on uptime check results
+  - name: uptime-alerting-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      name: projects/{{ properties["project_id"] }}/alertPolicies/website-uptime-policy-{{ properties["resource_suffix"] }}
+      displayName: Website Uptime Alert Policy
+      documentation:
+        content: |
+          # Website Uptime Monitoring Alert
+          
+          This alert triggers when websites fail uptime checks from multiple regions.
+          
+          ## Troubleshooting Steps
+          1. Check the affected website directly in a browser
+          2. Verify DNS resolution is working correctly
+          3. Check SSL certificate validity and expiration
+          4. Review server logs for error patterns
+          5. Test from multiple geographic locations
+          
+          ## Escalation
+          If the issue persists for more than 5 minutes, escalate to the on-call engineer.
+        mimeType: text/markdown
+      combiner: OR
+      enabled: true
+      conditions:
+        - displayName: Uptime check failures across multiple regions
+          conditionThreshold:
+            filter: |
+              resource.type="uptime_url"
+              metric.type="monitoring.googleapis.com/uptime_check/check_passed"
+            comparison: COMPARISON_LESS_THAN
+            thresholdValue: 1.0
+            duration: 120s  # Alert after 2 minutes of failures
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_FRACTION_TRUE
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.label.host
+            trigger:
+              count: 1
+            evaluationMissingData: EVALUATION_MISSING_DATA_INACTIVE
+      alertStrategy:
+        autoClose: 1800s  # Auto-close alerts after 30 minutes
+      notificationChannels:
+        - projects/{{ properties["project_id"] }}/notificationChannels/pubsub-channel-{{ properties["resource_suffix"] }}
+      userLabels:
+        purpose: "uptime-monitoring"
+        severity: "critical"
+        component: "alerting"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - monitoring-api
+        - pubsub-notification-channel
+        {% for website in properties["monitored_websites"] %}
+        {% set hostname = website.replace("https://", "").replace("http://", "").split("/")[0] %}
+        {% set safe_hostname = hostname.replace(".", "-").replace("_", "-") %}
+        - uptime-check-{{ safe_hostname }}
+        {% endfor %}
+
+  # IAM binding for Cloud Function to access Pub/Sub
+  # Grants the Cloud Function service account permissions to receive Pub/Sub messages
+  - name: function-pubsub-invoker-binding
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+    properties:
+      resource: projects/{{ properties["project_id"] }}/locations/{{ properties["region"] }}/functions/uptime-processor-{{ properties["resource_suffix"] }}
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - serviceAccount:service-{{ properties["project_id"] }}@gcp-sa-pubsub.iam.gserviceaccount.com
+        version: 1
+    metadata:
+      dependsOn:
+        - uptime-processor-function
+
+  # IAM binding for Pub/Sub to invoke Cloud Function
+  # Allows the Pub/Sub service to trigger the Cloud Function when messages are published
+  - name: pubsub-publisher-binding
+    type: gcp-types/pubsub-v1:projects.topics.setIamPolicy
+    properties:
+      resource: projects/{{ properties["project_id"] }}/topics/uptime-alerts-{{ properties["resource_suffix"] }}
+      policy:
+        bindings:
+          - role: roles/pubsub.publisher
+            members:
+              - serviceAccount:service-{{ properties["project_id"] }}@container-analysis.iam.gserviceaccount.com
+              - serviceAccount:service-{{ properties["project_id"] }}@gcp-sa-monitoring-notification.iam.gserviceaccount.com
+        version: 1
+    metadata:
+      dependsOn:
+        - uptime-alerts-topic
+
+# Output values for reference and integration with other systems
+outputs:
+  # Project and regional information
+  - name: project_id
+    value: {{ properties["project_id"] }}
+    description: "Google Cloud project ID where resources were created"
+
+  - name: region
+    value: {{ properties["region"] }}
+    description: "Primary region used for regional resources"
+
+  # Pub/Sub topic information
+  - name: pubsub_topic_name
+    value: uptime-alerts-{{ properties["resource_suffix"] }}
+    description: "Name of the Pub/Sub topic receiving uptime alerts"
+
+  - name: pubsub_topic_full_name
+    value: projects/{{ properties["project_id"] }}/topics/uptime-alerts-{{ properties["resource_suffix"] }}
+    description: "Full resource name of the Pub/Sub topic"
+
+  # Cloud Function information
+  - name: function_name
+    value: uptime-processor-{{ properties["resource_suffix"] }}
+    description: "Name of the Cloud Function processing uptime alerts"
+
+  - name: function_full_name
+    value: projects/{{ properties["project_id"] }}/locations/{{ properties["region"] }}/functions/uptime-processor-{{ properties["resource_suffix"] }}
+    description: "Full resource name of the Cloud Function"
+
+  # Notification channel information
+  - name: notification_channel_name
+    value: pubsub-channel-{{ properties["resource_suffix"] }}
+    description: "Name of the monitoring notification channel"
+
+  # Uptime check information
+  - name: monitored_websites
+    value: {{ properties["monitored_websites"] }}
+    description: "List of websites being monitored for uptime"
+
+  - name: uptime_check_regions
+    value: ["USA_OREGON", "EUROPE_IRELAND", "ASIA_SINGAPORE"]
+    description: "Geographic regions from which uptime checks are performed"
+
+  # Alerting policy information
+  - name: alerting_policy_name
+    value: website-uptime-policy-{{ properties["resource_suffix"] }}
+    description: "Name of the uptime monitoring alerting policy"
+
+  # Configuration information
+  - name: check_frequency
+    value: {{ properties["uptime_check_period"] }}
+    description: "Frequency of uptime checks"
+
+  - name: check_timeout
+    value: {{ properties["uptime_check_timeout"] }}
+    description: "Timeout duration for uptime checks"
+
+  # Storage bucket information
+  - name: function_source_bucket
+    value: {{ properties["project_id"] }}-function-source-{{ properties["resource_suffix"] }}
+    description: "Cloud Storage bucket containing Cloud Function source code"
+
+  # Access information for manual verification
+  - name: monitoring_console_url
+    value: https://console.cloud.google.com/monitoring/uptime?project={{ properties["project_id"] }}
+    description: "URL to view uptime checks in the Google Cloud Console"
+
+  - name: pubsub_console_url
+    value: https://console.cloud.google.com/cloudpubsub/topic/detail/uptime-alerts-{{ properties["resource_suffix"] }}?project={{ properties["project_id"] }}
+    description: "URL to view Pub/Sub topic in the Google Cloud Console"
+
+  - name: function_console_url
+    value: https://console.cloud.google.com/functions/details/{{ properties["region"] }}/uptime-processor-{{ properties["resource_suffix"] }}?project={{ properties["project_id"] }}
+    description: "URL to view Cloud Function in the Google Cloud Console"

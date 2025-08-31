@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: datasync,s3,iam,cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: aws-datasync,data-transfer,automation,storage,migration,s3,cloudwatch
 recipe-generator-version: 1.3
@@ -88,7 +88,7 @@ graph TB
 5. Understanding of data transfer patterns and network bandwidth considerations
 6. Estimated cost: $0.04-0.08 per GB transferred plus storage costs
 
-> **Note**: DataSync charges are based on the amount of data transferred. Review the DataSync pricing page for current rates and factor in your data volume when estimating costs.
+> **Note**: DataSync charges are based on the amount of data transferred. Review the [DataSync pricing page](https://aws.amazon.com/datasync/pricing/) for current rates and factor in your data volume when estimating costs.
 
 ## Preparation
 
@@ -111,16 +111,28 @@ export DATASYNC_ROLE_NAME="DataSyncServiceRole-${RANDOM_SUFFIX}"
 export DATASYNC_TASK_NAME="DataSyncTask-${RANDOM_SUFFIX}"
 
 # Create source S3 bucket for demonstration
-aws s3api create-bucket \
-    --bucket ${SOURCE_BUCKET_NAME} \
-    --region ${AWS_REGION} \
-    --create-bucket-configuration LocationConstraint=${AWS_REGION}
+if [ "${AWS_REGION}" = "us-east-1" ]; then
+    aws s3api create-bucket \
+        --bucket ${SOURCE_BUCKET_NAME} \
+        --region ${AWS_REGION}
+else
+    aws s3api create-bucket \
+        --bucket ${SOURCE_BUCKET_NAME} \
+        --region ${AWS_REGION} \
+        --create-bucket-configuration LocationConstraint=${AWS_REGION}
+fi
 
 # Create destination S3 bucket
-aws s3api create-bucket \
-    --bucket ${DEST_BUCKET_NAME} \
-    --region ${AWS_REGION} \
-    --create-bucket-configuration LocationConstraint=${AWS_REGION}
+if [ "${AWS_REGION}" = "us-east-1" ]; then
+    aws s3api create-bucket \
+        --bucket ${DEST_BUCKET_NAME} \
+        --region ${AWS_REGION}
+else
+    aws s3api create-bucket \
+        --bucket ${DEST_BUCKET_NAME} \
+        --region ${AWS_REGION} \
+        --create-bucket-configuration LocationConstraint=${AWS_REGION}
+fi
 
 # Upload sample data to source bucket
 echo "Sample data for DataSync transfer" > sample-file.txt
@@ -347,14 +359,19 @@ echo "✅ Preparation complete with buckets and sample data"
 
    ```bash
    # Create task report configuration
-   aws datasync put-task-report \
+   aws datasync put-task \
        --task-arn ${TASK_ARN} \
-       --s3-destination '{
-           "BucketArn": "arn:aws:s3:::'"${DEST_BUCKET_NAME}"'",
-           "Subdirectory": "datasync-reports",
-           "BucketAccessRoleArn": "'"${DATASYNC_ROLE_ARN}"'"
-       }' \
-       --report-level ERRORS_ONLY
+       --task-report-config '{
+           "Destination": {
+               "S3": {
+                   "BucketArn": "arn:aws:s3:::'"${DEST_BUCKET_NAME}"'",
+                   "Subdirectory": "datasync-reports",
+                   "BucketAccessRoleArn": "'"${DATASYNC_ROLE_ARN}"'"
+               }
+           },
+           "OutputType": "STANDARD",
+           "ReportLevel": "ERRORS_ONLY"
+       }'
    
    echo "✅ Configured task reporting"
    ```

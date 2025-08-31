@@ -6,17 +6,16 @@ difficulty: 200
 subject: aws
 services: AWS Budgets, SNS, Lambda, CloudWatch
 estimated-time: 60 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: budgets, cost-control, alerts, automation
 recipe-generator-version: 1.3
 ---
 
 # Budget Alerts and Automated Cost Actions
-
 
 ## Problem
 
@@ -232,6 +231,7 @@ echo "Lambda Function: ${LAMBDA_FUNCTION_NAME}"
    import json
    import boto3
    import logging
+   import os
    
    logger = logging.getLogger()
    logger.setLevel(logging.INFO)
@@ -267,12 +267,14 @@ echo "Lambda Function: ${LAMBDA_FUNCTION_NAME}"
                ec2.stop_instances(InstanceIds=instances_to_stop)
                logger.info(f"Stopped {len(instances_to_stop)} development instances")
                
-               # Send notification
-               sns.publish(
-                   TopicArn=context.invoked_function_arn.replace(':function:', ':topic:').replace(context.function_name, 'budget-alerts'),
-                   Subject=f'Budget Action Executed - {budget_name}',
-                   Message=f'Automatically stopped {len(instances_to_stop)} development instances due to budget alert.\n\nInstances: {", ".join(instances_to_stop)}'
-               )
+               # Get SNS topic ARN from environment variable
+               sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+               if sns_topic_arn:
+                   sns.publish(
+                       TopicArn=sns_topic_arn,
+                       Subject=f'Budget Action Executed - {budget_name}',
+                       Message=f'Automatically stopped {len(instances_to_stop)} development instances due to budget alert.\n\nInstances: {", ".join(instances_to_stop)}'
+                   )
            else:
                logger.info("No development instances found to stop")
            
@@ -293,15 +295,16 @@ echo "Lambda Function: ${LAMBDA_FUNCTION_NAME}"
    cd /tmp
    zip budget-action-function.zip budget-action-function.py
    
-   # Create Lambda function
+   # Create Lambda function with updated runtime
    LAMBDA_FUNCTION_ARN=$(aws lambda create-function \
        --function-name "${LAMBDA_FUNCTION_NAME}" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "${IAM_ROLE_ARN}" \
        --handler budget-action-function.lambda_handler \
        --zip-file fileb://budget-action-function.zip \
        --description "Automated budget action function" \
        --timeout 60 \
+       --environment Variables="{SNS_TOPIC_ARN=${SNS_TOPIC_ARN}}" \
        --query FunctionArn --output text)
    
    echo "✅ Lambda function created: ${LAMBDA_FUNCTION_ARN}"
@@ -314,7 +317,10 @@ echo "Lambda Function: ${LAMBDA_FUNCTION_NAME}"
    AWS Budgets offers comprehensive cost monitoring with both actual and forecasted alerts, enabling proactive financial management. The multi-threshold configuration creates a graduated response system: early warnings at 80% enable preventive measures, forecasted alerts at 90% trigger escalation procedures, and critical alerts at 100% activate immediate cost controls. This approach transforms reactive cost management into predictive financial governance, as detailed in the [AWS Budgets User Guide](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html).
 
    ```bash
-   # Create budget configuration
+   # Create budget configuration with proper timestamp format
+   CURRENT_MONTH_START=$(date -d "$(date +%Y-%m-01)" +%s)
+   BUDGET_END_DATE=$(date -d "$(date +%Y-%m-01) +2 years" +%s)
+   
    cat > /tmp/budget-config.json << EOF
    {
        "BudgetName": "${BUDGET_NAME}",
@@ -338,8 +344,8 @@ echo "Lambda Function: ${LAMBDA_FUNCTION_NAME}"
        },
        "TimeUnit": "MONTHLY",
        "TimePeriod": {
-           "Start": $(date -d "$(date +%Y-%m-01)" +%s),
-           "End": $(date -d "$(date +%Y-%m-01) +2 years" +%s)
+           "Start": ${CURRENT_MONTH_START},
+           "End": ${BUDGET_END_DATE}
        }
    }
    EOF
@@ -452,18 +458,30 @@ echo "Lambda Function: ${LAMBDA_FUNCTION_NAME}"
            {
                "Effect": "Deny",
                "Action": [
-                   "ec2:RunInstances",
-                   "ec2:StartInstances",
-                   "rds:CreateDBInstance",
-                   "rds:StartDBInstance"
+                   "ec2:RunInstances"
                ],
-               "Resource": "*",
+               "Resource": "arn:aws:ec2:*:*:instance/*",
                "Condition": {
                    "StringNotEquals": {
                        "ec2:InstanceType": [
                            "t3.nano",
                            "t3.micro",
                            "t3.small"
+                       ]
+                   }
+               }
+           },
+           {
+               "Effect": "Deny",
+               "Action": [
+                   "rds:CreateDBInstance"
+               ],
+               "Resource": "*",
+               "Condition": {
+                   "StringNotEquals": {
+                       "rds:db-instance-class": [
+                           "db.t3.micro",
+                           "db.t3.small"
                        ]
                    }
                }
@@ -550,12 +568,17 @@ echo "Lambda Function: ${LAMBDA_FUNCTION_NAME}"
    # Check Lambda function logs
    aws logs describe-log-groups \
        --log-group-name-prefix "/aws/lambda/${LAMBDA_FUNCTION_NAME}"
+   
+   # View recent log events
+   aws logs describe-log-streams \
+       --log-group-name "/aws/lambda/${LAMBDA_FUNCTION_NAME}" \
+       --order-by LastEventTime --descending
    ```
 
 3. **Verify Budget Subscribers**:
 
    ```bash
-   # Check email subscription
+   # Check email subscription status
    aws budgets describe-subscribers-for-notification \
        --account-id "${AWS_ACCOUNT_ID}" \
        --budget-name "${BUDGET_NAME}" \
@@ -567,7 +590,7 @@ echo "Lambda Function: ${LAMBDA_FUNCTION_NAME}"
 4. **Test Budget Action Permissions**:
 
    ```bash
-   # Verify Lambda function can be invoked
+   # Verify Lambda function configuration
    aws lambda get-function \
        --function-name "${LAMBDA_FUNCTION_NAME}" \
        --query Configuration.State
@@ -653,13 +676,13 @@ echo "Lambda Function: ${LAMBDA_FUNCTION_NAME}"
 
 ## Discussion
 
-AWS Budgets provides a comprehensive cost management solution that goes beyond simple spending alerts. The multi-threshold approach implemented in this recipe creates a graduated response system where stakeholders receive early warnings at 80% of budget, forecasted alerts at 90%, and critical alerts at 100% actual spend. This layered notification system enables proactive cost management rather than reactive damage control.
+AWS Budgets provides a comprehensive cost management solution that goes beyond simple spending alerts. The multi-threshold approach implemented in this recipe creates a graduated response system where stakeholders receive early warnings at 80% of budget, forecasted alerts at 90%, and critical alerts at 100% actual spend. This layered notification system enables proactive cost management rather than reactive damage control, following principles outlined in the [AWS Well-Architected Cost Optimization Pillar](https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html).
 
-The automated action component demonstrates how Lambda functions can serve as intelligent cost control mechanisms. By automatically stopping non-production instances when budget thresholds are exceeded, organizations can implement immediate cost containment measures without manual intervention. The tagging-based approach ensures that only development resources are affected, protecting production workloads from automated actions.
+The automated action component demonstrates how Lambda functions can serve as intelligent cost control mechanisms. By automatically stopping non-production instances when budget thresholds are exceeded, organizations can implement immediate cost containment measures without manual intervention. The tagging-based approach ensures that only development resources are affected, protecting production workloads from automated actions while maintaining operational continuity.
 
 Budget actions can also apply IAM policies to restrict resource provisioning, providing another layer of cost control. The sample policy restricts users to only small instance types when budgets are exceeded, preventing the launch of expensive compute resources. This approach balances cost control with operational continuity, as referenced in the [AWS Budgets Best Practices Guide](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-best-practices.html).
 
-The SNS integration enables flexible notification routing, supporting email, SMS, and even integration with chat platforms like Slack through Lambda functions. This multi-channel approach ensures that budget alerts reach the right stakeholders through their preferred communication methods, improving response times and accountability.
+The SNS integration enables flexible notification routing, supporting email, SMS, and even integration with chat platforms like Slack through Lambda functions. This multi-channel approach ensures that budget alerts reach the right stakeholders through their preferred communication methods, improving response times and accountability. The pub/sub architecture also supports adding additional automated responses without modifying existing components.
 
 > **Tip**: Use separate budgets for different cost categories (compute, storage, data transfer) to get granular insights into spending patterns and implement targeted cost controls.
 
@@ -667,15 +690,15 @@ The SNS integration enables flexible notification routing, supporting email, SMS
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Account Budget Management**: Create organization-level budgets that aggregate costs across multiple AWS accounts and implement centralized budget actions through AWS Organizations.
+1. **Multi-Account Budget Management**: Create organization-level budgets that aggregate costs across multiple AWS accounts and implement centralized budget actions through AWS Organizations and AWS Control Tower.
 
-2. **Dynamic Budget Thresholds**: Implement a Lambda function that adjusts budget limits based on historical spending patterns and seasonal variations using CloudWatch metrics and machine learning.
+2. **Dynamic Budget Thresholds**: Implement a Lambda function that adjusts budget limits based on historical spending patterns and seasonal variations using CloudWatch metrics and Amazon Forecast machine learning.
 
-3. **Advanced Automated Actions**: Create more sophisticated budget actions that can resize RDS instances, modify Auto Scaling group configurations, or temporarily disable non-essential services based on budget thresholds.
+3. **Advanced Automated Actions**: Create more sophisticated budget actions that can resize RDS instances, modify Auto Scaling group configurations, or temporarily disable non-essential services based on budget thresholds and business criticality tags.
 
-4. **Cost Anomaly Integration**: Combine AWS Budgets with AWS Cost Anomaly Detection to create intelligent alerts that distinguish between expected budget overruns and unusual spending patterns.
+4. **Cost Anomaly Integration**: Combine AWS Budgets with AWS Cost Anomaly Detection to create intelligent alerts that distinguish between expected budget overruns and unusual spending patterns requiring immediate investigation.
 
-5. **Slack Integration with Action Approvals**: Build a Slack bot that not only sends budget alerts but also allows managers to approve or reject automated actions through interactive Slack messages.
+5. **Slack Integration with Action Approvals**: Build a Slack bot that not only sends budget alerts but also allows managers to approve or reject automated actions through interactive Slack messages with audit trails.
 
 ## Infrastructure Code
 

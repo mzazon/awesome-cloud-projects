@@ -4,12 +4,12 @@ id: 7a2b8c9d
 category: storage
 difficulty: 200
 subject: azure
-services: Azure Elastic SAN, Azure Virtual Machine Scale Sets, Azure Database for PostgreSQL, Azure Load Balancer
+services: Elastic SAN, Virtual Machine Scale Sets, Database for PostgreSQL, Load Balancer
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: elastic-san, vmss, postgresql, high-performance, database, storage, scaling
 recipe-generator-version: 1.3
@@ -43,9 +43,8 @@ graph TB
     subgraph "Storage Layer"
         ESAN[Azure Elastic SAN]
         VG1[Volume Group 1]
-        VG2[Volume Group 2]
-        VOL1[Volume 1]
-        VOL2[Volume 2]
+        VOL1[Data Volume]
+        VOL2[Log Volume]
     end
     
     subgraph "Database Layer"
@@ -69,9 +68,8 @@ graph TB
     VM3 --> ESAN
     
     ESAN --> VG1
-    ESAN --> VG2
     VG1 --> VOL1
-    VG2 --> VOL2
+    VG1 --> VOL2
     
     VM1 --> PG
     VM2 --> PG
@@ -88,18 +86,18 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with appropriate permissions for creating Elastic SAN, VMSS, and PostgreSQL resources
-2. Azure CLI v2.50.0 or later installed and configured (or Azure Cloud Shell)
+2. Azure CLI v2.61.0 or later installed and configured (or Azure Cloud Shell)
 3. Basic understanding of Azure networking, storage concepts, and database administration
 4. Familiarity with PostgreSQL database management and performance tuning
 5. Estimated cost: $200-400 per month for moderate workloads (varies based on storage size, compute instances, and data transfer)
 
-> **Note**: Azure Elastic SAN is available in select Azure regions. Verify availability in your target region before proceeding. Check the [Azure Elastic SAN documentation](https://docs.microsoft.com/en-us/azure/storage/elastic-san/) for current regional availability.
+> **Note**: Azure Elastic SAN is available in select Azure regions. Verify availability in your target region before proceeding. Check the [Azure Elastic SAN documentation](https://learn.microsoft.com/en-us/azure/storage/elastic-san/) for current regional availability.
 
 ## Preparation
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-elastic-san-demo"
+export RESOURCE_GROUP="rg-elastic-san-demo-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
@@ -116,7 +114,7 @@ export PG_SERVER_NAME="pg-db-${RANDOM_SUFFIX}"
 az group create \
     --name ${RESOURCE_GROUP} \
     --location ${LOCATION} \
-    --tags purpose=demo environment=elastic-san-demo
+    --tags purpose=recipe environment=elastic-san-demo
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
@@ -146,7 +144,7 @@ echo "✅ Virtual network and subnet created"
        --location ${LOCATION} \
        --base-size-tib 1 \
        --extended-capacity-size-tib 2 \
-       --sku Premium_LRS \
+       --sku '{name:Premium_LRS,tier:Premium}' \
        --tags workload=database performance=high
 
    echo "✅ Elastic SAN created: ${ELASTIC_SAN_NAME}"
@@ -165,8 +163,7 @@ echo "✅ Virtual network and subnet created"
        --elastic-san-name ${ELASTIC_SAN_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --protocol-type iSCSI \
-       --network-acls-virtual-network-rules \
-           "[{\"id\":\"/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/${VNET_NAME}/subnets/${SUBNET_NAME}\",\"action\":\"Allow\"}]"
+       --network-acls '{virtualNetworkRules:[{id:"/subscriptions/'${SUBSCRIPTION_ID}'/resourceGroups/'${RESOURCE_GROUP}'/providers/Microsoft.Network/virtualNetworks/'${VNET_NAME}'/subnets/'${SUBNET_NAME}'",action:"Allow"}]}'
 
    echo "✅ Volume group created with network access controls"
    ```
@@ -185,7 +182,7 @@ echo "✅ Virtual network and subnet created"
        --elastic-san-name ${ELASTIC_SAN_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --size-gib 500 \
-       --creation-data-source-type None
+       --creation-data '{createSource:None}'
 
    # Create log volume for PostgreSQL transaction logs
    az elastic-san volume create \
@@ -194,7 +191,7 @@ echo "✅ Virtual network and subnet created"
        --elastic-san-name ${ELASTIC_SAN_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --size-gib 200 \
-       --creation-data-source-type None
+       --creation-data '{createSource:None}'
 
    echo "✅ Storage volumes created for data and logs"
    ```
@@ -210,8 +207,10 @@ echo "✅ Virtual network and subnet created"
    cat << 'EOF' > setup-postgres.sh
    #!/bin/bash
    
-   # Install PostgreSQL
+   # Update system packages
    sudo apt-get update
+   
+   # Install PostgreSQL and utilities
    sudo apt-get install -y postgresql postgresql-contrib
    
    # Install iSCSI utilities for Elastic SAN
@@ -241,8 +240,9 @@ echo "✅ Virtual network and subnet created"
        --vnet-name ${VNET_NAME} \
        --subnet ${SUBNET_NAME} \
        --lb ${LB_NAME} \
-       --upgrade-policy-mode manual \
-       --custom-data setup-postgres.sh
+       --upgrade-policy-mode Manual \
+       --custom-data setup-postgres.sh \
+       --orchestration-mode Flexible
 
    echo "✅ Virtual Machine Scale Set created with PostgreSQL configuration"
    ```
@@ -309,10 +309,10 @@ echo "✅ Virtual network and subnet created"
        --tier GeneralPurpose \
        --storage-size 128 \
        --storage-type Premium_LRS \
-       --version 14 \
+       --version 16 \
        --vnet ${VNET_NAME} \
        --subnet ${SUBNET_NAME} \
-       --high-availability Enabled \
+       --high-availability ZoneRedundant \
        --zone 1 \
        --standby-zone 2
 
@@ -570,15 +570,15 @@ echo "✅ Virtual network and subnet created"
 
 ## Discussion
 
-Azure Elastic SAN represents a significant advancement in cloud-native storage solutions, providing enterprise-grade storage area network capabilities without the complexity of traditional SAN infrastructure. When combined with Azure Virtual Machine Scale Sets, this architecture creates a powerful foundation for high-performance database workloads that can scale dynamically based on demand. The integration of these services enables organizations to achieve consistent storage performance while optimizing costs through automated scaling and centralized storage management. For comprehensive guidance on storage optimization, see the [Azure Elastic SAN documentation](https://docs.microsoft.com/en-us/azure/storage/elastic-san/) and [Azure Well-Architected Framework storage guidance](https://docs.microsoft.com/en-us/azure/architecture/framework/services/storage/storage-area-network).
+Azure Elastic SAN represents a significant advancement in cloud-native storage solutions, providing enterprise-grade storage area network capabilities without the complexity of traditional SAN infrastructure. When combined with Azure Virtual Machine Scale Sets, this architecture creates a powerful foundation for high-performance database workloads that can scale dynamically based on demand. The integration of these services enables organizations to achieve consistent storage performance while optimizing costs through automated scaling and centralized storage management. For comprehensive guidance on storage optimization, see the [Azure Elastic SAN documentation](https://learn.microsoft.com/en-us/azure/storage/elastic-san/) and [Azure Well-Architected Framework storage guidance](https://learn.microsoft.com/en-us/azure/architecture/framework/services/storage/storage-area-network).
 
-The architectural pattern demonstrated here follows cloud-native principles by leveraging managed services for critical components while maintaining flexibility for application-specific requirements. Azure Database for PostgreSQL Flexible Server provides additional managed database capabilities that can complement the VMSS-based approach, offering options for read replicas, point-in-time recovery, and automated maintenance. This hybrid approach allows organizations to optimize their database architecture based on specific workload requirements while maintaining operational simplicity. The [Azure Database for PostgreSQL documentation](https://docs.microsoft.com/en-us/azure/postgresql/flexible-server/) provides detailed guidance on performance optimization and scaling strategies.
+The architectural pattern demonstrated here follows cloud-native principles by leveraging managed services for critical components while maintaining flexibility for application-specific requirements. Azure Database for PostgreSQL Flexible Server provides additional managed database capabilities that can complement the VMSS-based approach, offering options for read replicas, point-in-time recovery, and automated maintenance. This hybrid approach allows organizations to optimize their database architecture based on specific workload requirements while maintaining operational simplicity. The [Azure Database for PostgreSQL documentation](https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/) provides detailed guidance on performance optimization and scaling strategies.
 
 From a cost optimization perspective, the combination of Elastic SAN's usage-based pricing with VMSS auto-scaling ensures that organizations only pay for the resources they actually consume. The ability to automatically scale both compute and storage resources based on real-time demand patterns enables significant cost savings compared to traditional over-provisioned infrastructure. Azure Monitor and Azure Advisor provide ongoing recommendations for further optimization, helping organizations continuously improve their cost efficiency while maintaining performance requirements.
 
-> **Tip**: Enable Azure Elastic SAN auto-scaling (currently in preview) to automatically adjust storage capacity based on usage patterns. This feature further reduces operational overhead and ensures optimal storage allocation. Review the [Azure Elastic SAN auto-scaling documentation](https://docs.microsoft.com/en-us/azure/storage/elastic-san/elastic-san-autoscale) for configuration guidance and best practices.
+> **Tip**: Enable Azure Elastic SAN auto-scaling (currently in preview) to automatically adjust storage capacity based on usage patterns. This feature further reduces operational overhead and ensures optimal storage allocation. Review the [Azure Elastic SAN auto-scaling documentation](https://learn.microsoft.com/en-us/azure/storage/elastic-san/elastic-san-planning#autoscaling-preview) for configuration guidance and best practices.
 
-The monitoring and alerting configuration provides comprehensive visibility into both storage and compute performance, enabling proactive management of database workloads. Integration with Azure Monitor enables custom metrics and dashboards that can track database-specific performance indicators, helping database administrators optimize query performance and resource utilization. For production deployments, consider implementing additional monitoring through [Azure Application Insights](https://docs.microsoft.com/en-us/azure/azure-monitor/app/app-insights-overview) for application-level telemetry and performance tracking.
+The monitoring and alerting configuration provides comprehensive visibility into both storage and compute performance, enabling proactive management of database workloads. Integration with Azure Monitor enables custom metrics and dashboards that can track database-specific performance indicators, helping database administrators optimize query performance and resource utilization. For production deployments, consider implementing additional monitoring through [Azure Application Insights](https://learn.microsoft.com/en-us/azure/azure-monitor/app/app-insights-overview) for application-level telemetry and performance tracking.
 
 ## Challenge
 

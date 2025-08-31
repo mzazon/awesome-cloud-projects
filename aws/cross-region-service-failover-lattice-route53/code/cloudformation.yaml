@@ -1,0 +1,858 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cross-Region Service Failover with VPC Lattice and Route53 - Production-ready template for resilient multi-region microservices architecture'
+
+# =====================================================
+# PARAMETERS
+# =====================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment name for resource tagging and configuration
+
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - ap-southeast-1
+    Description: Primary AWS region for the failover setup
+
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - ap-southeast-1
+    Description: Secondary AWS region for the failover setup
+
+  DomainName:
+    Type: String
+    Description: Domain name for the health check endpoints (e.g., api.example.com)
+    AllowedPattern: ^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]?(\.[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]?)*$
+    ConstraintDescription: Must be a valid domain name
+
+  ResourceNameSuffix:
+    Type: String
+    Default: ''
+    Description: Optional suffix for resource names to ensure uniqueness
+    MaxLength: 10
+    AllowedPattern: ^[a-z0-9]*$
+
+  HealthCheckInterval:
+    Type: Number
+    Default: 30
+    AllowedValues: [10, 30]
+    Description: Health check interval in seconds (10 or 30)
+
+  HealthCheckFailureThreshold:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of consecutive health check failures before marking endpoint as unhealthy
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024]
+    Description: Lambda function memory allocation in MB
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudWatch alarms for health check monitoring
+
+  SimulateFailure:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Simulate failure for testing purposes (sets SIMULATE_FAILURE environment variable)
+
+# =====================================================
+# CONDITIONS
+# =====================================================
+Conditions:
+  CreateCloudWatchAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  HasResourceSuffix: !Not [!Equals [!Ref ResourceNameSuffix, '']]
+  IsPrimaryRegion: !Equals [!Ref 'AWS::Region', !Ref PrimaryRegion]
+  IsSecondaryRegion: !Equals [!Ref 'AWS::Region', !Ref SecondaryRegion]
+  IsValidRegion: !Or [!Condition IsPrimaryRegion, !Condition IsSecondaryRegion]
+
+# =====================================================
+# MAPPINGS
+# =====================================================
+Mappings:
+  LambdaRuntimeConfig:
+    Settings:
+      Runtime: python3.11
+      Handler: health-check-function.lambda_handler
+      
+  VPCConfig:
+    PrimaryCIDR:
+      VPC: 10.0.0.0/16
+      Subnet1: 10.0.1.0/24
+      Subnet2: 10.0.2.0/24
+    SecondaryCIDR:
+      VPC: 10.1.0.0/16
+      Subnet1: 10.1.1.0/24
+      Subnet2: 10.1.2.0/24
+
+# =====================================================
+# RESOURCES
+# =====================================================
+Resources:
+
+  # =====================================================
+  # VPC INFRASTRUCTURE
+  # =====================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Condition: IsValidRegion
+    Properties:
+      CidrBlock: !If 
+        - IsPrimaryRegion
+        - !FindInMap [VPCConfig, PrimaryCIDR, VPC]
+        - !FindInMap [VPCConfig, SecondaryCIDR, VPC]
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - '${Environment}-vpc-lattice-${Region}${Suffix}'
+            - Region: !If [IsPrimaryRegion, 'primary', 'secondary']
+              Suffix: !If [HasResourceSuffix, !Sub '-${ResourceNameSuffix}', '']
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: IsValidRegion
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - '${Environment}-igw-${Region}${Suffix}'
+            - Region: !If [IsPrimaryRegion, 'primary', 'secondary']
+              Suffix: !If [HasResourceSuffix, !Sub '-${ResourceNameSuffix}', '']
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: IsValidRegion
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # =====================================================
+  # IAM ROLES AND POLICIES
+  # =====================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: IsValidRegion
+    Properties:
+      RoleName: !Sub 
+        - 'lambda-health-check-role-${Region}${Suffix}'
+        - Region: !If [IsPrimaryRegion, 'primary', 'secondary']
+          Suffix: !If [HasResourceSuffix, !Sub '-${ResourceNameSuffix}', '']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchMetricsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+
+  VPCLatticeServiceRole:
+    Type: AWS::IAM::Role
+    Condition: IsValidRegion
+    Properties:
+      RoleName: !Sub 
+        - 'vpc-lattice-service-role-${Region}${Suffix}'
+        - Region: !If [IsPrimaryRegion, 'primary', 'secondary']
+          Suffix: !If [HasResourceSuffix, !Sub '-${ResourceNameSuffix}', '']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-lattice.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: VPCLatticeServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt HealthCheckLambda.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+
+  # =====================================================
+  # LAMBDA FUNCTION
+  # =====================================================
+  HealthCheckLambda:
+    Type: AWS::Lambda::Function
+    Condition: IsValidRegion
+    Properties:
+      FunctionName: !Sub 
+        - '${Environment}-health-check-service-${Region}${Suffix}'
+        - Region: !If [IsPrimaryRegion, 'primary', 'secondary']
+          Suffix: !If [HasResourceSuffix, !Sub '-${ResourceNameSuffix}', '']
+      Runtime: !FindInMap [LambdaRuntimeConfig, Settings, Runtime]
+      Handler: !FindInMap [LambdaRuntimeConfig, Settings, Handler]
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          SIMULATE_FAILURE: !Ref SimulateFailure
+          ENVIRONMENT: !Ref Environment
+          REGION_TYPE: !If [IsPrimaryRegion, 'primary', 'secondary']
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          from datetime import datetime
+          import boto3
+
+          def lambda_handler(event, context):
+              """
+              Health check endpoint that validates service availability
+              Returns HTTP 200 for healthy, 503 for unhealthy
+              """
+              region = os.environ.get('AWS_REGION', 'unknown')
+              region_type = os.environ.get('REGION_TYPE', 'unknown')
+              environment = os.environ.get('ENVIRONMENT', 'unknown')
+              simulate_failure = os.environ.get('SIMULATE_FAILURE', 'false').lower()
+              
+              try:
+                  current_time = datetime.utcnow().isoformat()
+                  
+                  # Check for simulated failure from environment variable
+                  if simulate_failure == 'true':
+                      health_status = False
+                      failure_reason = 'Simulated failure enabled'
+                  else:
+                      # Perform actual health validation
+                      health_status, failure_reason = check_service_health()
+                  
+                  if health_status:
+                      response = {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'X-Health-Check': 'pass',
+                              'X-Region': region,
+                              'X-Region-Type': region_type,
+                              'Cache-Control': 'no-cache'
+                          },
+                          'body': json.dumps({
+                              'status': 'healthy',
+                              'region': region,
+                              'region_type': region_type,
+                              'environment': environment,
+                              'timestamp': current_time,
+                              'version': '1.1',
+                              'checks': {
+                                  'lambda': 'pass',
+                                  'memory': check_memory_usage(),
+                                  'runtime': 'pass'
+                              }
+                          })
+                      }
+                  else:
+                      response = {
+                          'statusCode': 503,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'X-Health-Check': 'fail',
+                              'X-Region': region,
+                              'X-Region-Type': region_type,
+                              'Cache-Control': 'no-cache'
+                          },
+                          'body': json.dumps({
+                              'status': 'unhealthy',
+                              'region': region,
+                              'region_type': region_type,
+                              'environment': environment,
+                              'timestamp': current_time,
+                              'failure_reason': failure_reason
+                          })
+                      }
+                      
+                  # Send metrics to CloudWatch
+                  send_health_metrics(health_status, region_type)
+                  
+                  return response
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Cache-Control': 'no-cache'
+                      },
+                      'body': json.dumps({
+                          'status': 'error',
+                          'message': str(e),
+                          'region': region,
+                          'region_type': region_type,
+                          'environment': environment
+                      })
+                  }
+
+          def check_service_health():
+              """
+              Implement comprehensive health check logic
+              Returns (True/False, failure_reason)
+              """
+              try:
+                  # Example health checks - customize based on your application needs
+                  
+                  # Check 1: Basic Lambda runtime health
+                  runtime_check = check_lambda_runtime()
+                  if not runtime_check[0]:
+                      return False, f"Lambda runtime check failed: {runtime_check[1]}"
+                  
+                  # Check 2: Memory usage validation
+                  memory_check = check_memory_usage()
+                  if memory_check > 90:  # If memory usage > 90%
+                      return False, f"High memory usage: {memory_check}%"
+                  
+                  # Check 3: Simulate external dependency checks
+                  # In a real implementation, you would check:
+                  # - Database connectivity
+                  # - External API availability
+                  # - Cache service status
+                  # - Queue service connectivity
+                  dependency_check = check_external_dependencies()
+                  if not dependency_check[0]:
+                      return False, f"External dependency check failed: {dependency_check[1]}"
+                  
+                  return True, "All health checks passed"
+                  
+              except Exception as e:
+                  return False, f"Health check exception: {str(e)}"
+
+          def check_lambda_runtime():
+              """Check Lambda runtime environment"""
+              try:
+                  # Basic runtime checks
+                  import sys
+                  python_version = sys.version_info
+                  if python_version.major < 3 or python_version.minor < 8:
+                      return False, f"Unsupported Python version: {python_version}"
+                  return True, "Runtime check passed"
+              except Exception as e:
+                  return False, str(e)
+
+          def check_memory_usage():
+              """Check current memory usage percentage"""
+              try:
+                  import psutil
+                  return psutil.virtual_memory().percent
+              except ImportError:
+                  # psutil not available, return a mock value
+                  return 25.0
+              except Exception:
+                  return 50.0
+
+          def check_external_dependencies():
+              """
+              Check external dependencies
+              In production, implement actual dependency checks
+              """
+              try:
+                  # Example: Check if we can access AWS services
+                  # In production, add actual dependency validation
+                  
+                  # Simulate dependency check
+                  import random
+                  if random.random() > 0.95:  # 5% chance of simulated dependency failure
+                      return False, "Simulated dependency failure"
+                  
+                  return True, "All dependencies available"
+              except Exception as e:
+                  return False, str(e)
+
+          def send_health_metrics(health_status, region_type):
+              """Send custom metrics to CloudWatch"""
+              try:
+                  cloudwatch = boto3.client('cloudwatch')
+                  
+                  # Send health status metric
+                  cloudwatch.put_metric_data(
+                      Namespace='CustomApp/HealthCheck',
+                      MetricData=[
+                          {
+                              'MetricName': 'HealthStatus',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'Region',
+                                      'Value': region_type
+                                  },
+                                  {
+                                      'Name': 'Environment',
+                                      'Value': os.environ.get('ENVIRONMENT', 'unknown')
+                                  }
+                              ],
+                              'Value': 1.0 if health_status else 0.0,
+                              'Unit': 'None'
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  print(f"Failed to send metrics: {str(e)}")
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+
+  # Grant Route53 permission to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsValidRegion
+    Properties:
+      FunctionName: !Ref HealthCheckLambda
+      Action: lambda:InvokeFunction
+      Principal: route53.amazonaws.com
+      SourceArn: !Sub 'arn:aws:route53:::healthcheck/*'
+
+  # =====================================================
+  # VPC LATTICE RESOURCES
+  # =====================================================
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Condition: IsValidRegion
+    Properties:
+      Name: !Sub 
+        - '${Environment}-microservices-network-${Region}${Suffix}'
+        - Region: !If [IsPrimaryRegion, 'primary', 'secondary']
+          Suffix: !If [HasResourceSuffix, !Sub '-${ResourceNameSuffix}', '']
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+
+  ServiceNetworkVpcAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Condition: IsValidRegion
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      VpcIdentifier: !Ref VPC
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+
+  TargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Condition: IsValidRegion
+    Properties:
+      Name: !Sub 
+        - 'health-check-targets-${Region}${Suffix}'
+        - Region: !If [IsPrimaryRegion, 'primary', 'secondary']
+          Suffix: !If [HasResourceSuffix, !Sub '-${ResourceNameSuffix}', '']
+      Type: LAMBDA
+      Config:
+        HealthCheck:
+          Enabled: true
+          HealthCheckIntervalSeconds: 30
+          HealthCheckTimeoutSeconds: 5
+          HealthyThresholdCount: 2
+          UnhealthyThresholdCount: 3
+          Protocol: HTTPS
+          ProtocolVersion: HTTP1
+          Path: /
+          Matcher:
+            HttpCode: '200'
+      Targets:
+        - Id: !GetAtt HealthCheckLambda.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+
+  LatticeService:
+    Type: AWS::VpcLattice::Service
+    Condition: IsValidRegion
+    Properties:
+      Name: !Sub 
+        - '${Environment}-api-service-${Region}${Suffix}'
+        - Region: !If [IsPrimaryRegion, 'primary', 'secondary']
+          Suffix: !If [HasResourceSuffix, !Sub '-${ResourceNameSuffix}', '']
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+
+  ServiceListener:
+    Type: AWS::VpcLattice::Listener
+    Condition: IsValidRegion
+    Properties:
+      ServiceIdentifier: !Ref LatticeService
+      Name: health-check-listener
+      Protocol: HTTPS
+      Port: 443
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref TargetGroup
+              Weight: 100
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+
+  ServiceNetworkServiceAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Condition: IsValidRegion
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      ServiceIdentifier: !Ref LatticeService
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+
+  # =====================================================
+  # ROUTE53 HEALTH CHECKS (Primary Region Only)
+  # =====================================================
+  HealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Condition: IsPrimaryRegion
+    Properties:
+      Type: HTTPS
+      ResourcePath: /
+      FullyQualifiedDomainName: !GetAtt LatticeService.DnsEntry.DomainName
+      Port: 443
+      RequestInterval: !Ref HealthCheckInterval
+      FailureThreshold: !Ref HealthCheckFailureThreshold
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - '${Environment}-service-health-${Region}${Suffix}'
+            - Region: !If [IsPrimaryRegion, 'primary', 'secondary']
+              Suffix: !If [HasResourceSuffix, !Sub '-${ResourceNameSuffix}', '']
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+
+  # =====================================================
+  # ROUTE53 HOSTED ZONE AND DNS RECORDS (Primary Region Only)
+  # =====================================================
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Condition: IsPrimaryRegion
+    Properties:
+      Name: !Ref DomainName
+      HostedZoneConfig:
+        Comment: !Sub 'Hosted zone for ${Environment} failover setup'
+      HostedZoneTags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: cross-region-failover
+
+  PrimaryDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: IsPrimaryRegion
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Ref DomainName
+      Type: CNAME
+      TTL: 60
+      SetIdentifier: primary
+      Failover: PRIMARY
+      ResourceRecords:
+        - !GetAtt LatticeService.DnsEntry.DomainName
+      HealthCheckId: !Ref HealthCheck
+
+  # Note: Secondary DNS record would be created by the secondary region stack
+  # with a separate health check for the secondary service
+
+  # =====================================================
+  # CLOUDWATCH ALARMS (Optional)
+  # =====================================================
+  HealthCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub 
+        - '${Environment}-Service-Health-${Region}${Suffix}'
+        - Region: !If [IsPrimaryRegion, 'primary', 'secondary']
+          Suffix: !If [HasResourceSuffix, !Sub '-${ResourceNameSuffix}', '']
+      AlarmDescription: !Sub 
+        - 'Monitor ${Region} region service health'
+        - Region: !If [IsPrimaryRegion, 'primary', 'secondary']
+      MetricName: HealthCheckStatus
+      Namespace: AWS/Route53
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: HealthCheckId
+          Value: !If [IsPrimaryRegion, !Ref HealthCheck, !Ref 'AWS::NoValue']
+      TreatMissingData: breaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+
+  CustomHealthMetricAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub 
+        - '${Environment}-Custom-Health-${Region}${Suffix}'
+        - Region: !If [IsPrimaryRegion, 'primary', 'secondary']
+          Suffix: !If [HasResourceSuffix, !Sub '-${ResourceNameSuffix}', '']
+      AlarmDescription: Monitor custom health metrics from Lambda function
+      MetricName: HealthStatus
+      Namespace: CustomApp/HealthCheck
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0.5
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: Region
+          Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+        - Name: Environment
+          Value: !Ref Environment
+      TreatMissingData: breaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+
+# =====================================================
+# OUTPUTS
+# =====================================================
+Outputs:
+  VPCId:
+    Description: ID of the created VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub 
+        - '${AWS::StackName}-VPC-${Region}'
+        - Region: !If [IsPrimaryRegion, 'Primary', 'Secondary']
+
+  ServiceNetworkId:
+    Description: ID of the VPC Lattice Service Network
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub 
+        - '${AWS::StackName}-ServiceNetwork-${Region}'
+        - Region: !If [IsPrimaryRegion, 'Primary', 'Secondary']
+
+  LatticeServiceId:
+    Description: ID of the VPC Lattice Service
+    Value: !Ref LatticeService
+    Export:
+      Name: !Sub 
+        - '${AWS::StackName}-LatticeService-${Region}'
+        - Region: !If [IsPrimaryRegion, 'Primary', 'Secondary']
+
+  ServiceDNS:
+    Description: DNS name of the VPC Lattice Service
+    Value: !GetAtt LatticeService.DnsEntry.DomainName
+    Export:
+      Name: !Sub 
+        - '${AWS::StackName}-ServiceDNS-${Region}'
+        - Region: !If [IsPrimaryRegion, 'Primary', 'Secondary']
+
+  LambdaFunctionArn:
+    Description: ARN of the health check Lambda function
+    Value: !GetAtt HealthCheckLambda.Arn
+    Export:
+      Name: !Sub 
+        - '${AWS::StackName}-LambdaArn-${Region}'
+        - Region: !If [IsPrimaryRegion, 'Primary', 'Secondary']
+
+  HealthCheckId:
+    Condition: IsPrimaryRegion
+    Description: ID of the Route53 health check (Primary region only)
+    Value: !Ref HealthCheck
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthCheck-Primary'
+
+  HostedZoneId:
+    Condition: IsPrimaryRegion
+    Description: ID of the Route53 hosted zone (Primary region only)
+    Value: !Ref HostedZone
+    Export:
+      Name: !Sub '${AWS::StackName}-HostedZone'
+
+  DomainName:
+    Condition: IsPrimaryRegion
+    Description: Domain name for the failover setup
+    Value: !Ref DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-DomainName'
+
+  NameServers:
+    Condition: IsPrimaryRegion
+    Description: Name servers for the hosted zone (update your domain registrar)
+    Value: !Join [', ', !GetAtt HostedZone.NameServers]
+
+  StackRegion:
+    Description: AWS Region where this stack is deployed
+    Value: !Ref 'AWS::Region'
+
+  RegionType:
+    Description: Whether this is the primary or secondary region
+    Value: !If [IsPrimaryRegion, 'primary', 'secondary']
+
+  # Test URLs for validation
+  HealthCheckTestURL:
+    Description: URL to test the health check endpoint directly
+    Value: !Sub 
+      - 'https://${ServiceDNS}/'
+      - ServiceDNS: !GetAtt LatticeService.DnsEntry.DomainName
+
+  DNSTestURL:
+    Condition: IsPrimaryRegion
+    Description: URL to test DNS resolution (Primary region only)
+    Value: !Sub 'https://${DomainName}/'
+
+# =====================================================
+# METADATA
+# =====================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ResourceNameSuffix
+      - Label:
+          default: "Region Configuration"
+        Parameters:
+          - PrimaryRegion
+          - SecondaryRegion
+      - Label:
+          default: "DNS Configuration"
+        Parameters:
+          - DomainName
+      - Label:
+          default: "Health Check Configuration"
+        Parameters:
+          - HealthCheckInterval
+          - HealthCheckFailureThreshold
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+          - SimulateFailure
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchAlarms
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      PrimaryRegion:
+        default: "Primary AWS Region"
+      SecondaryRegion:
+        default: "Secondary AWS Region"
+      DomainName:
+        default: "DNS Domain Name"
+      ResourceNameSuffix:
+        default: "Resource Name Suffix"
+      HealthCheckInterval:
+        default: "Health Check Interval (seconds)"
+      HealthCheckFailureThreshold:
+        default: "Health Check Failure Threshold"
+      LambdaTimeout:
+        default: "Lambda Function Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      EnableCloudWatchAlarms:
+        default: "Enable CloudWatch Alarms"
+      SimulateFailure:
+        default: "Simulate Failure for Testing"
+
+  AWS::CloudFormation::Description: |
+    This template creates a cross-region service failover solution using VPC Lattice and Route53.
+    
+    Deploy this template in both your primary and secondary regions. The template automatically
+    detects which region it's deployed in and configures resources appropriately.
+    
+    Key Features:
+    - VPC Lattice service networks for secure service communication
+    - Lambda-based health check endpoints with comprehensive validation
+    - Route53 health checks and DNS failover configuration
+    - CloudWatch monitoring and alerting
+    - Production-ready security and best practices
+    
+    Prerequisites:
+    - Deploy in both primary and secondary regions
+    - Ensure you have a valid domain name for health checks
+    - Configure appropriate IAM permissions
+    
+    Post-deployment:
+    - Update your domain registrar with the Route53 name servers (from primary region output)
+    - Configure additional health check logic in Lambda functions as needed
+    - Set up SNS notifications for CloudWatch alarms
+    
+    For more information, see the AWS VPC Lattice and Route53 documentation.

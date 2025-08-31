@@ -6,10 +6,10 @@ difficulty: 400
 subject: azure
 services: Azure Deployment Stacks, Azure Workload Identity, Azure Resource Manager, Azure Policy
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: multi-tenant, saas, deployment-stacks, workload-identity, resource-isolation, governance
 recipe-generator-version: 1.3
@@ -96,13 +96,13 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with Owner or Contributor permissions for resource creation
-2. Azure CLI v2.45.0 or later installed and configured (or Azure Cloud Shell)
+2. Azure CLI v2.57.0 or later installed and configured (or Azure Cloud Shell)
 3. Understanding of Azure Resource Manager templates and multi-tenant architecture patterns
 4. Familiarity with Azure Policy and governance concepts
 5. Basic knowledge of OAuth 2.0 and OpenID Connect protocols
 6. Estimated cost: $50-100 per tenant per month (varies by resource consumption)
 
-> **Note**: This recipe requires advanced Azure permissions and demonstrates enterprise-grade multi-tenant patterns. Review the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) for additional guidance on scalable architectures.
+> **Note**: This recipe requires advanced Azure permissions and demonstrates enterprise-grade multi-tenant patterns. Review the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) for additional guidance on scalable architectures.
 
 ## Preparation
 
@@ -242,7 +242,7 @@ echo "✅ Control plane infrastructure created"
    Azure Workload Identity eliminates the need for secrets-based authentication by providing secure, token-based access to Azure resources. This federated identity approach enables tenant-specific workloads to authenticate using JWT tokens, improving security posture while simplifying credential management. Each tenant's workload identity is scoped to access only their designated resources.
 
    ```bash
-   # Create workload identity for tenant operations
+   # Create workload identity application for tenant operations
    az ad app create \
        --display-name "SaaS-Tenant-Workload-${SAAS_PREFIX}" \
        --sign-in-audience AzureADMyOrg
@@ -277,7 +277,7 @@ echo "✅ Control plane infrastructure created"
    # Grant necessary permissions to the workload identity
    az role assignment create \
        --assignee ${WORKLOAD_SP_ID} \
-       --role "Deployment Stack Contributor" \
+       --role "Contributor" \
        --scope /subscriptions/${SUBSCRIPTION_ID}
    
    echo "✅ Workload identity configured for tenant authentication"
@@ -290,131 +290,98 @@ echo "✅ Control plane infrastructure created"
    Azure Deployment Stacks provide declarative resource lifecycle management with built-in governance and dependency tracking. Unlike traditional ARM templates, Deployment Stacks maintain state awareness and can automatically manage resource updates, deletions, and policy compliance. This approach ensures consistent tenant resource provisioning while enabling automated governance and compliance reporting.
 
    ```bash
-   # Create base tenant deployment stack template
-   cat > tenant-stack-template.json << 'EOF'
-   {
-     "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-     "contentVersion": "1.0.0.0",
-     "parameters": {
-       "tenantId": {
-         "type": "string",
-         "metadata": {
-           "description": "Unique identifier for the tenant"
-         }
-       },
-       "tenantName": {
-         "type": "string",
-         "metadata": {
-           "description": "Display name for the tenant"
-         }
-       },
-       "environment": {
-         "type": "string",
-         "defaultValue": "production",
-         "allowedValues": ["development", "staging", "production"]
-       },
-       "location": {
-         "type": "string",
-         "defaultValue": "[resourceGroup().location]"
-       }
-     },
-     "variables": {
-       "resourcePrefix": "[concat('tenant-', parameters('tenantId'))]",
-       "tags": {
-         "TenantId": "[parameters('tenantId')]",
-         "TenantName": "[parameters('tenantName')]",
-         "Environment": "[parameters('environment')]",
-         "ManagedBy": "DeploymentStack"
-       }
-     },
-     "resources": [
-       {
-         "type": "Microsoft.Storage/storageAccounts",
-         "apiVersion": "2023-01-01",
-         "name": "[concat(variables('resourcePrefix'), 'storage')]",
-         "location": "[parameters('location')]",
-         "tags": "[variables('tags')]",
-         "sku": {
-           "name": "Standard_LRS"
-         },
-         "kind": "StorageV2",
-         "properties": {
-           "supportsHttpsTrafficOnly": true,
-           "minimumTlsVersion": "TLS1_2",
-           "allowBlobPublicAccess": false,
-           "networkAcls": {
-             "defaultAction": "Deny"
+   # Create base tenant deployment stack template (Bicep format)
+   cat > tenant-stack-template.bicep << 'EOF'
+   @description('Unique identifier for the tenant')
+   param tenantId string
+   
+   @description('Display name for the tenant')
+   param tenantName string
+   
+   @description('Environment type')
+   @allowed(['development', 'staging', 'production'])
+   param environment string = 'production'
+   
+   @description('Location for resources')
+   param location string = resourceGroup().location
+   
+   var resourcePrefix = 'tenant-${tenantId}'
+   var commonTags = {
+     TenantId: tenantId
+     TenantName: tenantName
+     Environment: environment
+     ManagedBy: 'DeploymentStack'
+   }
+   
+   // Network Security Group
+   resource nsg 'Microsoft.Network/networkSecurityGroups@2023-02-01' = {
+     name: '${resourcePrefix}-nsg'
+     location: location
+     tags: commonTags
+     properties: {
+       securityRules: [
+         {
+           name: 'DenyAllInbound'
+           properties: {
+             protocol: '*'
+             sourceAddressPrefix: '*'
+             sourcePortRange: '*'
+             destinationAddressPrefix: '*'
+             destinationPortRange: '*'
+             access: 'Deny'
+             priority: 1000
+             direction: 'Inbound'
            }
          }
-       },
-       {
-         "type": "Microsoft.Network/virtualNetworks",
-         "apiVersion": "2023-02-01",
-         "name": "[concat(variables('resourcePrefix'), '-vnet')]",
-         "location": "[parameters('location')]",
-         "tags": "[variables('tags')]",
-         "properties": {
-           "addressSpace": {
-             "addressPrefixes": [
-               "10.0.0.0/16"
-             ]
-           },
-           "subnets": [
-             {
-               "name": "tenant-subnet",
-               "properties": {
-                 "addressPrefix": "10.0.1.0/24",
-                 "networkSecurityGroup": {
-                   "id": "[resourceId('Microsoft.Network/networkSecurityGroups', concat(variables('resourcePrefix'), '-nsg'))]"
-                 }
-               }
-             }
-           ]
-         },
-         "dependsOn": [
-           "[resourceId('Microsoft.Network/networkSecurityGroups', concat(variables('resourcePrefix'), '-nsg'))]"
-         ]
-       },
-       {
-         "type": "Microsoft.Network/networkSecurityGroups",
-         "apiVersion": "2023-02-01",
-         "name": "[concat(variables('resourcePrefix'), '-nsg')]",
-         "location": "[parameters('location')]",
-         "tags": "[variables('tags')]",
-         "properties": {
-           "securityRules": [
-             {
-               "name": "DenyAllInbound",
-               "properties": {
-                 "protocol": "*",
-                 "sourceAddressPrefix": "*",
-                 "sourcePortRange": "*",
-                 "destinationAddressPrefix": "*",
-                 "destinationPortRange": "*",
-                 "access": "Deny",
-                 "priority": 1000,
-                 "direction": "Inbound"
-               }
-             }
-           ]
-         }
+       ]
+     }
+   }
+   
+   // Virtual Network
+   resource vnet 'Microsoft.Network/virtualNetworks@2023-02-01' = {
+     name: '${resourcePrefix}-vnet'
+     location: location
+     tags: commonTags
+     properties: {
+       addressSpace: {
+         addressPrefixes: ['10.0.0.0/16']
        }
-     ],
-     "outputs": {
-       "tenantId": {
-         "type": "string",
-         "value": "[parameters('tenantId')]"
-       },
-       "storageAccountId": {
-         "type": "string",
-         "value": "[resourceId('Microsoft.Storage/storageAccounts', concat(variables('resourcePrefix'), 'storage'))]"
-       },
-       "virtualNetworkId": {
-         "type": "string",
-         "value": "[resourceId('Microsoft.Network/virtualNetworks', concat(variables('resourcePrefix'), '-vnet'))]"
+       subnets: [
+         {
+           name: 'tenant-subnet'
+           properties: {
+             addressPrefix: '10.0.1.0/24'
+             networkSecurityGroup: {
+               id: nsg.id
+             }
+           }
+         }
+       ]
+     }
+   }
+   
+   // Storage Account
+   resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
+     name: '${replace(resourcePrefix, '-', '')}storage'
+     location: location
+     tags: commonTags
+     sku: {
+       name: 'Standard_LRS'
+     }
+     kind: 'StorageV2'
+     properties: {
+       supportsHttpsTrafficOnly: true
+       minimumTlsVersion: 'TLS1_2'
+       allowBlobPublicAccess: false
+       networkAcls: {
+         defaultAction: 'Deny'
        }
      }
    }
+   
+   output tenantId string = tenantId
+   output storageAccountId string = storageAccount.id
+   output virtualNetworkId string = vnet.id
    EOF
    
    echo "✅ Deployment stack template created for tenant isolation"
@@ -427,7 +394,7 @@ echo "✅ Control plane infrastructure created"
    Deployment Stacks enable automated tenant provisioning with built-in lifecycle management and governance enforcement. This approach ensures that tenant resources are created consistently, maintained properly, and can be easily updated or decommissioned. The stack-based approach provides atomic operations and rollback capabilities for tenant management.
 
    ```bash
-   # Create function to provision a new tenant
+   # Create function to provision a new tenant using deployment stacks
    provision_tenant() {
        local tenant_id=$1
        local tenant_name=$2
@@ -440,14 +407,16 @@ echo "✅ Control plane infrastructure created"
            --tags TenantId=${tenant_id} TenantName="${tenant_name}" Environment=${environment}
        
        # Deploy tenant resources using deployment stack
-       az deployment group create \
+       az stack group create \
+           --name "stack-tenant-${tenant_id}" \
            --resource-group "rg-tenant-${tenant_id}" \
-           --template-file tenant-stack-template.json \
+           --template-file tenant-stack-template.bicep \
            --parameters \
                tenantId=${tenant_id} \
                tenantName="${tenant_name}" \
                environment=${environment} \
-           --name "tenant-${tenant_id}-deployment"
+           --action-on-unmanage detachAll \
+           --deny-settings-mode none
        
        # Assign workload identity permissions to tenant resources
        az role assignment create \
@@ -455,7 +424,7 @@ echo "✅ Control plane infrastructure created"
            --role "Storage Blob Data Contributor" \
            --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/rg-tenant-${tenant_id}"
        
-       echo "✅ Tenant ${tenant_id} provisioned successfully"
+       echo "✅ Tenant ${tenant_id} provisioned successfully with deployment stack"
    }
    
    # Provision sample tenants
@@ -465,7 +434,7 @@ echo "✅ Control plane infrastructure created"
    echo "✅ Sample tenants provisioned with deployment stacks"
    ```
 
-   The tenant provisioning process creates isolated resource groups with dedicated resources for each tenant. Each tenant receives their own storage account, virtual network, and security groups, ensuring complete isolation while maintaining consistent security policies.
+   The tenant provisioning process creates isolated resource groups with dedicated resources for each tenant using Azure Deployment Stacks. Each tenant receives their own storage account, virtual network, and security groups, ensuring complete isolation while maintaining consistent security policies through the stack-based deployment approach.
 
 5. **Configure Cross-Tenant Access Controls and RBAC**:
 
@@ -558,7 +527,7 @@ echo "✅ Control plane infrastructure created"
        
        echo "🚀 Onboarding tenant: ${tenant_id}"
        
-       # Create tenant resources
+       # Create tenant resources using deployment stack
        provision_tenant ${tenant_id} "${tenant_name}" "production"
        
        # Apply tenant-specific policies
@@ -571,7 +540,8 @@ echo "✅ Control plane infrastructure created"
        # Configure monitoring and alerts
        az monitor log-analytics workspace create \
            --resource-group "rg-tenant-${tenant_id}" \
-           --workspace-name "law-tenant-${tenant_id}"
+           --workspace-name "law-tenant-${tenant_id}" \
+           --location ${LOCATION}
        
        # Store tenant configuration in Key Vault
        az keyvault secret set \
@@ -593,7 +563,14 @@ echo "✅ Control plane infrastructure created"
            --name "tenant-${tenant_id}-tagging" \
            --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/rg-tenant-${tenant_id}"
        
-       # Delete tenant resource group and all resources
+       # Delete deployment stack (which will handle resource cleanup)
+       az stack group delete \
+           --name "stack-tenant-${tenant_id}" \
+           --resource-group "rg-tenant-${tenant_id}" \
+           --action-on-unmanage deleteAll \
+           --yes
+       
+       # Delete tenant resource group
        az group delete \
            --name "rg-tenant-${tenant_id}" \
            --yes \
@@ -615,11 +592,13 @@ echo "✅ Control plane infrastructure created"
        echo "🔄 Updating tenant: ${tenant_id}"
        
        # Update tenant resources using deployment stack
-       az deployment group create \
+       az stack group create \
+           --name "stack-tenant-${tenant_id}" \
            --resource-group "rg-tenant-${tenant_id}" \
-           --template-file tenant-stack-template.json \
+           --template-file tenant-stack-template.bicep \
            --parameters ${updates} \
-           --name "tenant-${tenant_id}-update"
+           --action-on-unmanage detachAll \
+           --deny-settings-mode none
        
        echo "✅ Tenant ${tenant_id} updated successfully"
    }
@@ -634,7 +613,7 @@ echo "✅ Control plane infrastructure created"
    echo "✅ Tenant lifecycle management functions created and tested"
    ```
 
-   The lifecycle management system provides automated functions for tenant onboarding, updates, and offboarding. This automation ensures consistent processes while maintaining security and compliance standards across all tenant operations.
+   The lifecycle management system provides automated functions for tenant onboarding, updates, and offboarding using Azure Deployment Stacks. This automation ensures consistent processes while maintaining security and compliance standards across all tenant operations, with proper cleanup handled by the deployment stack framework.
 
 7. **Configure Monitoring and Governance Reporting**:
 
@@ -663,28 +642,20 @@ echo "✅ Control plane infrastructure created"
    configure_tenant_monitoring() {
        local tenant_id=$1
        
-       # Get tenant storage account ID
+       # Get tenant storage account ID - using corrected naming from Bicep template
        local storage_account_id=$(az storage account show \
            --name "tenant${tenant_id}storage" \
            --resource-group "rg-tenant-${tenant_id}" \
            --query id --output tsv)
        
-       # Configure diagnostic settings
+       # Configure diagnostic settings for storage account
        az monitor diagnostic-settings create \
            --resource ${storage_account_id} \
            --name "tenant-${tenant_id}-diagnostics" \
            --workspace ${WORKSPACE_ID} \
            --logs '[
                {
-                   "category": "StorageRead",
-                   "enabled": true,
-                   "retentionPolicy": {
-                       "days": 90,
-                       "enabled": true
-                   }
-               },
-               {
-                   "category": "StorageWrite",
+                   "categoryGroup": "allLogs",
                    "enabled": true,
                    "retentionPolicy": {
                        "days": 90,
@@ -730,7 +701,7 @@ echo "✅ Control plane infrastructure created"
    // Storage access patterns by tenant
    StorageBlobLogs
    | where TimeGenerated > ago(24h)
-   | extend TenantId = extract(@"tenant-(\w+)", 1, AccountName)
+   | extend TenantId = extract(@"tenant(\w+)", 1, AccountName)
    | where isnotempty(TenantId)
    | summarize Requests = count(), DataTransferred = sum(ResponseBodySize) by TenantId
    | order by DataTransferred desc
@@ -739,20 +710,21 @@ echo "✅ Control plane infrastructure created"
    echo "✅ Monitoring and governance reporting configured"
    ```
 
-   The monitoring system provides comprehensive visibility into tenant operations, resource usage, and security events. Custom KQL queries enable detailed analysis of tenant behavior and help identify potential security issues or resource optimization opportunities.
+   The monitoring system provides comprehensive visibility into tenant operations, resource usage, and security events using Azure Monitor and Log Analytics. Custom KQL queries enable detailed analysis of tenant behavior and help identify potential security issues or resource optimization opportunities.
 
 ## Validation & Testing
 
-1. **Verify Tenant Isolation and Resource Deployment**:
+1. **Verify Tenant Isolation and Deployment Stack Status**:
 
    ```bash
    # Verify tenant resource groups exist
    az group list --query "[?contains(name, 'rg-tenant-')].{Name:name, Location:location, Tags:tags}" --output table
    
    # Check deployment stack status for each tenant
-   az deployment group list \
+   az stack group show \
+       --name "stack-tenant-tenant001" \
        --resource-group "rg-tenant-tenant001" \
-       --query "[].{Name:name, Status:properties.provisioningState, Timestamp:properties.timestamp}" \
+       --query "{Name:name, Status:provisioningState, Resources:resources}" \
        --output table
    
    # Verify tenant-specific resources are properly tagged
@@ -762,7 +734,7 @@ echo "✅ Control plane infrastructure created"
        --output table
    ```
 
-   Expected output: All tenant resources should be properly deployed with correct tags and isolation boundaries.
+   Expected output: All tenant resources should be properly deployed with correct tags and isolation boundaries managed by deployment stacks.
 
 2. **Test Workload Identity Authentication**:
 
@@ -797,7 +769,7 @@ echo "✅ Control plane infrastructure created"
        --query "[].{Name:displayName, Policy:policyDefinitionId}" \
        --output table
    
-   # Test policy compliance
+   # Test policy compliance state
    az policy state list \
        --resource "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/rg-tenant-tenant001" \
        --query "[].{Resource:resourceId, Compliance:complianceState}" \
@@ -817,7 +789,7 @@ echo "✅ Control plane infrastructure created"
 1. **Remove Tenant Resources and Deployment Stacks**:
 
    ```bash
-   # Offboard test tenants
+   # Offboard test tenants (this will use deployment stacks cleanup)
    offboard_tenant "tenant001"
    offboard_tenant "tenant002"
    offboard_tenant "tenant003"
@@ -826,7 +798,7 @@ echo "✅ Control plane infrastructure created"
    echo "Waiting for tenant resource group deletions..."
    sleep 60
    
-   echo "✅ Tenant resources removed"
+   echo "✅ Tenant resources removed using deployment stacks"
    ```
 
 2. **Clean Up Control Plane Resources**:
@@ -863,7 +835,7 @@ echo "✅ Control plane infrastructure created"
        --no-wait
    
    # Clean up local files
-   rm -f tenant-stack-template.json
+   rm -f tenant-stack-template.bicep
    rm -f tenant-tagging-policy.json
    rm -f network-isolation-policy.json
    rm -f federated-credential.json
@@ -880,13 +852,13 @@ echo "✅ Control plane infrastructure created"
 
 Azure Deployment Stacks combined with Azure Workload Identity provides a sophisticated approach to multi-tenant SaaS resource isolation that addresses the fundamental challenges of secure, scalable tenant management. This architecture pattern leverages Azure's native governance capabilities to ensure consistent security policies while enabling automated tenant lifecycle management. The combination of declarative resource management through Deployment Stacks and secrets-free authentication through Workload Identity creates a robust foundation for enterprise-grade multi-tenant solutions.
 
-The deployment stack approach offers significant advantages over traditional ARM template deployments by maintaining state awareness and providing automatic drift detection. This capability ensures that tenant resources remain compliant with organizational policies and can be easily updated or rolled back as needed. The integration with Azure Policy provides continuous compliance monitoring and automatic remediation capabilities that are essential for maintaining security standards across hundreds or thousands of tenants. For comprehensive guidance on multi-tenant architecture patterns, see the [Azure multi-tenant architecture guide](https://docs.microsoft.com/en-us/azure/architecture/guide/multitenant/) and [Azure Well-Architected Framework security pillar](https://docs.microsoft.com/en-us/azure/architecture/framework/security/).
+The deployment stack approach offers significant advantages over traditional ARM template deployments by maintaining state awareness and providing automatic drift detection and resource lifecycle management. This capability ensures that tenant resources remain compliant with organizational policies and can be easily updated or rolled back as needed. The integration with Azure Policy provides continuous compliance monitoring and automatic remediation capabilities that are essential for maintaining security standards across hundreds or thousands of tenants. For comprehensive guidance on multi-tenant architecture patterns, see the [Azure multi-tenant architecture guide](https://learn.microsoft.com/en-us/azure/architecture/guide/multitenant/) and [Azure Well-Architected Framework security pillar](https://learn.microsoft.com/en-us/azure/architecture/framework/security/).
 
 From an operational perspective, the workload identity pattern eliminates the security risks associated with long-lived secrets and certificates while providing fine-grained access control. This approach aligns with zero-trust security principles and enables seamless integration with CI/CD pipelines and automated deployment processes. The federated identity capabilities allow for secure cross-tenant operations without compromising isolation boundaries, making it ideal for SaaS providers who need to manage resources across multiple customer tenants. The monitoring and governance reporting capabilities provide essential visibility into tenant resource usage and security compliance, enabling proactive management and cost optimization.
 
-The scalability characteristics of this architecture support both horizontal and vertical scaling patterns, allowing SaaS providers to grow from dozens to thousands of tenants without significant architectural changes. The policy-driven governance model ensures that new tenants automatically inherit appropriate security configurations, while the automated lifecycle management reduces operational overhead and human error. For detailed implementation guidance, review the [Azure Deployment Stacks documentation](https://docs.microsoft.com/en-us/azure/azure-resource-manager/bicep/deployment-stacks) and [Workload Identity best practices](https://docs.microsoft.com/en-us/azure/active-directory/workload-identities/workload-identity-federation).
+The scalability characteristics of this architecture support both horizontal and vertical scaling patterns, allowing SaaS providers to grow from dozens to thousands of tenants without significant architectural changes. The policy-driven governance model ensures that new tenants automatically inherit appropriate security configurations, while the automated lifecycle management reduces operational overhead and human error. The use of Azure Deployment Stacks provides built-in resource management capabilities including deny settings for resource protection and action-on-unmanage policies for clean resource lifecycle management. For detailed implementation guidance, review the [Azure Deployment Stacks documentation](https://learn.microsoft.com/en-us/azure/azure-resource-manager/bicep/deployment-stacks) and [Workload Identity best practices](https://learn.microsoft.com/en-us/azure/active-directory/workload-identities/workload-identity-federation).
 
-> **Tip**: Use Azure Cost Management APIs to implement automated cost allocation and chargeback mechanisms for individual tenants. This enables transparent billing and helps identify cost optimization opportunities across your multi-tenant infrastructure. The [Azure Cost Management documentation](https://docs.microsoft.com/en-us/azure/cost-management-billing/) provides comprehensive guidance on implementing these capabilities.
+> **Tip**: Use Azure Cost Management APIs to implement automated cost allocation and chargeback mechanisms for individual tenants. This enables transparent billing and helps identify cost optimization opportunities across your multi-tenant infrastructure. The [Azure Cost Management documentation](https://learn.microsoft.com/en-us/azure/cost-management-billing/) provides comprehensive guidance on implementing these capabilities.
 
 ## Challenge
 

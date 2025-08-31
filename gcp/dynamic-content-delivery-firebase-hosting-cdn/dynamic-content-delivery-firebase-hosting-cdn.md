@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Firebase Hosting, Cloud CDN, Cloud Functions, Cloud Storage
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: content-delivery, firebase, cdn, performance, optimization, web-hosting
 recipe-generator-version: 1.3
@@ -79,8 +79,8 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with billing enabled and appropriate permissions
-2. Node.js v18+ and npm installed locally
-3. Firebase CLI v13+ installed (`npm install -g firebase-tools`)
+2. Node.js v20+ and npm installed locally
+3. Firebase CLI v14+ installed (`npm install -g firebase-tools`)
 4. gcloud CLI v450+ installed and configured
 5. Basic understanding of web development and CDN concepts
 6. Estimated cost: $5-15 for resources created during this recipe
@@ -237,75 +237,77 @@ echo "✅ Site ID: ${SITE_ID}"
        npm init -y
    fi
    
-   # Install required dependencies
-   npm install firebase-functions firebase-admin cors
+   # Install required dependencies for Node.js 20
+   npm install firebase-functions@^5.0.0 firebase-admin@^12.0.0 cors
    
    # Create main functions file
    cat > index.js << 'EOF'
-   const functions = require('firebase-functions');
+   const { onRequest } = require('firebase-functions/v2/https');
    const admin = require('firebase-admin');
    const cors = require('cors')({origin: true});
    
    admin.initializeApp();
    
    // Dynamic product catalog function
-   exports.getProducts = functions.https.onRequest((req, res) => {
-       cors(req, res, () => {
-           const products = [
-               {
-                   id: 1,
-                   name: "Premium Headphones",
-                   price: "$299",
-                   image: "/images/headphones.jpg",
-                   category: "electronics"
-               },
-               {
-                   id: 2,
-                   name: "Smart Watch",
-                   price: "$399",
-                   image: "/images/smartwatch.jpg",
-                   category: "electronics"
-               },
-               {
-                   id: 3,
-                   name: "Designer Backpack",
-                   price: "$159",
-                   image: "/images/backpack.jpg",
-                   category: "fashion"
-               }
-           ];
-           
-           // Simulate personalization based on region
-           const userRegion = req.headers['cf-ipcountry'] || 'US';
-           const personalizedProducts = products.map(product => ({
-               ...product,
-               regionPrice: userRegion === 'EU' ? 
-                   `€${Math.floor(parseInt(product.price.slice(1)) * 0.85)}` : 
-                   product.price
-           }));
-           
-           // Set caching headers for CDN optimization
-           res.set('Cache-Control', 'public, max-age=300, s-maxage=600');
-           res.json({ products: personalizedProducts, region: userRegion });
-       });
+   exports.getProducts = onRequest({
+       cors: true,
+       region: 'us-central1'
+   }, (req, res) => {
+       const products = [
+           {
+               id: 1,
+               name: "Premium Headphones",
+               price: "$299",
+               image: "/images/headphones.jpg",
+               category: "electronics"
+           },
+           {
+               id: 2,
+               name: "Smart Watch",
+               price: "$399",
+               image: "/images/smartwatch.jpg",
+               category: "electronics"
+           },
+           {
+               id: 3,
+               name: "Designer Backpack",
+               price: "$159",
+               image: "/images/backpack.jpg",
+               category: "fashion"
+           }
+       ];
+       
+       // Simulate personalization based on region
+       const userRegion = req.headers['cf-ipcountry'] || 'US';
+       const personalizedProducts = products.map(product => ({
+           ...product,
+           regionPrice: userRegion === 'EU' ? 
+               `€${Math.floor(parseInt(product.price.slice(1)) * 0.85)}` : 
+               product.price
+       }));
+       
+       // Set caching headers for CDN optimization
+       res.set('Cache-Control', 'public, max-age=300, s-maxage=600');
+       res.json({ products: personalizedProducts, region: userRegion });
    });
    
    // User recommendations function
-   exports.getRecommendations = functions.https.onRequest((req, res) => {
-       cors(req, res, () => {
-           const userId = req.query.userId || 'anonymous';
-           
-           // Simulate ML-based recommendations
-           const recommendations = [
-               { id: 'rec1', title: 'Similar items viewed', count: 5 },
-               { id: 'rec2', title: 'Trending in your area', count: 8 },
-               { id: 'rec3', title: 'Recently purchased', count: 3 }
-           ];
-           
-           // Cache recommendations for 5 minutes
-           res.set('Cache-Control', 'public, max-age=300');
-           res.json({ recommendations, userId });
-       });
+   exports.getRecommendations = onRequest({
+       cors: true,
+       region: 'us-central1'
+   }, (req, res) => {
+       const userId = req.query.userId || 'anonymous';
+       
+       // Simulate ML-based recommendations
+       const recommendations = [
+           { id: 'rec1', title: 'Similar items viewed', count: 5 },
+           { id: 'rec2', title: 'Trending in your area', count: 8 },
+           { id: 'rec3', title: 'Recently purchased', count: 3 }
+       ];
+       
+       // Cache recommendations for 5 minutes
+       res.set('Cache-Control', 'public, max-age=300');
+       res.json({ recommendations, userId });
    });
    EOF
    
@@ -313,7 +315,7 @@ echo "✅ Site ID: ${SITE_ID}"
    echo "✅ Cloud Functions implemented with caching strategies"
    ```
 
-   The Cloud Functions now provide dynamic content generation with intelligent caching headers that work with Cloud CDN to optimize performance while maintaining content freshness, demonstrating how serverless backends can scale globally.
+   The Cloud Functions now provide dynamic content generation with intelligent caching headers that work with Cloud CDN to optimize performance while maintaining content freshness, demonstrating how serverless backends can scale globally using the latest Firebase Functions v2 API.
 
 4. **Create JavaScript Client for Dynamic Content Loading**:
 
@@ -421,10 +423,10 @@ echo "✅ Site ID: ${SITE_ID}"
 
    ```bash
    # Create comprehensive Firebase configuration
-   cat > firebase.json << 'EOF'
+   cat > firebase.json << EOF
    {
      "hosting": {
-       "site": "'${SITE_ID}'",
+       "site": "${SITE_ID}",
        "public": "public",
        "ignore": [
          "firebase.json",
@@ -485,23 +487,25 @@ echo "✅ Site ID: ${SITE_ID}"
        "cleanUrls": true,
        "trailingSlash": false
      },
-     "functions": {
-       "predeploy": [
-         "npm --prefix \"$RESOURCE_DIR\" run lint",
-         "npm --prefix \"$RESOURCE_DIR\" run build"
-       ],
-       "source": "functions"
-     }
+     "functions": [
+       {
+         "source": "functions",
+         "codebase": "default",
+         "ignore": [
+           "node_modules/.cache"
+         ],
+         "predeploy": [
+           "npm --prefix \"\$RESOURCE_DIR\" run lint"
+         ]
+       }
+     ]
    }
    EOF
-   
-   # Replace placeholder with actual site ID
-   sed -i "s/'${SITE_ID}'/${SITE_ID}/g" firebase.json
    
    echo "✅ Advanced Firebase hosting configuration created"
    ```
 
-   The hosting configuration now implements sophisticated caching strategies with long-term caching for static assets, short-term caching for dynamic content, and security headers that work optimally with Google's CDN infrastructure.
+   The hosting configuration now implements sophisticated caching strategies with long-term caching for static assets, short-term caching for dynamic content, and security headers that work optimally with Google's CDN infrastructure using the updated Firebase configuration format.
 
 6. **Deploy Application with Cloud Functions Integration**:
 
@@ -546,7 +550,7 @@ echo "✅ Site ID: ${SITE_ID}"
    # Create sample images directory and upload demo content
    mkdir -p media-assets/images
    
-   # Create placeholder images (using ImageMagick or simple files)
+   # Create placeholder images (using simple text files for demo)
    echo "Sample product image content" > media-assets/images/headphones.jpg
    echo "Sample smartwatch image content" > media-assets/images/smartwatch.jpg
    echo "Sample backpack image content" > media-assets/images/backpack.jpg
@@ -653,9 +657,6 @@ echo "✅ Site ID: ${SITE_ID}"
 4. **Performance Testing with Load Simulation**:
 
    ```bash
-   # Install Apache Bench for load testing (if available)
-   # ab -n 100 -c 10 ${HOSTING_URL}
-   
    # Alternative: Test with curl timing
    echo "Testing CDN performance from multiple regions..."
    time curl -o /dev/null -s ${HOSTING_URL}
@@ -728,7 +729,7 @@ The integration between Firebase Hosting and Cloud CDN creates a powerful hybrid
 
 Firebase Hosting's automatic SSL certificate provisioning, compression, and HTTP/2 support combine with Cloud CDN's advanced caching policies to create a production-ready content delivery infrastructure. The architecture supports modern web development patterns including single-page applications, progressive web apps, and jamstack architectures while providing the scalability needed for global applications. Performance optimization occurs automatically through Google's machine learning algorithms that optimize routing and caching based on traffic patterns and user behavior.
 
-The monitoring and analytics capabilities built into Firebase provide insights into content delivery performance, cache hit ratios, and user engagement metrics. This data enables continuous optimization of caching strategies and content delivery patterns. For enterprise applications requiring additional control, the custom Load Balancer configuration demonstrates how to implement advanced routing policies, custom domains, and specialized caching rules while maintaining integration with the Firebase ecosystem.
+The latest Firebase Functions v2 API provides enhanced security, performance, and configuration options with improved cold start times and better integration with Google Cloud services. Using Node.js 20 runtime ensures access to the latest JavaScript features and security updates while maintaining compatibility with Firebase's ecosystem. The monitoring and analytics capabilities built into Firebase provide insights into content delivery performance, cache hit ratios, and user engagement metrics, enabling continuous optimization of caching strategies and content delivery patterns.
 
 > **Tip**: Use Firebase Performance Monitoring SDK to track real user metrics (RUM) including page load times, network latency, and success rates across different geographical regions and device types.
 
@@ -740,6 +741,7 @@ Key architectural benefits include automatic scaling without capacity planning, 
 - [Firebase Hosting with Cloud Functions](https://firebase.google.com/docs/hosting/serverless-overview)
 - [Cloud Storage CDN Integration](https://cloud.google.com/storage/docs/hosting-static-website)
 - [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework)
+- [Firebase Functions v2 Documentation](https://firebase.google.com/docs/functions/get-started)
 
 ## Challenge
 

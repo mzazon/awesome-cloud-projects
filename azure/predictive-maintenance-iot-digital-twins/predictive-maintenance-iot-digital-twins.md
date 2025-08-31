@@ -4,12 +4,12 @@ id: f3a8b2c4
 category: iot
 difficulty: 300
 subject: azure
-services: Azure Digital Twins, Azure Data Explorer, Azure IoT Central, Azure Time Series Insights
+services: Azure Digital Twins, Azure Data Explorer, Azure IoT Central, Event Hubs
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: iot, digital-twins, time-series, predictive-maintenance, anomaly-detection
 recipe-generator-version: 1.3
@@ -36,7 +36,6 @@ graph TB
     
     subgraph "Device Management"
         IOTC[Azure IoT Central]
-        TSI[Azure Time Series Insights]
     end
     
     subgraph "Digital Twin Layer"
@@ -48,7 +47,7 @@ graph TB
     subgraph "Analytics Layer"
         ADX[Azure Data Explorer]
         FUNC2[Analytics Function]
-        EH[Event Hub]
+        EH[Event Hubs]
     end
     
     subgraph "Visualization"
@@ -58,7 +57,6 @@ graph TB
     
     DEVICES --> IOTC
     SENSORS --> IOTC
-    IOTC --> TSI
     IOTC --> FUNC1
     FUNC1 --> ADT
     ADT --> EH
@@ -71,7 +69,7 @@ graph TB
     style ADT fill:#0078D4
     style ADX fill:#00BCF2
     style IOTC fill:#5C2D91
-    style TSI fill:#FF6F00
+    style EH fill:#FF6F00
 ```
 
 ## Prerequisites
@@ -104,7 +102,6 @@ export FUNC_APP="func-iot-${RANDOM_SUFFIX}"
 export STORAGE_ACCOUNT="stiotfunc${RANDOM_SUFFIX}"
 export EVENT_HUB_NS="ehns-iot-${RANDOM_SUFFIX}"
 export EVENT_HUB_NAME="telemetry-hub"
-export TSI_ENV="tsi-iot-${RANDOM_SUFFIX}"
 
 # Create resource group
 az group create \
@@ -236,7 +233,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --cluster-name ${ADX_CLUSTER} \
        --database-name ${ADX_DATABASE} \
        --resource-group ${RESOURCE_GROUP} \
-       --read-write-database soft-delete-period="P30D" \
+       --read-write-database \
+           soft-delete-period="P30D" \
            hot-cache-period="P7D"
    
    echo "✅ Azure Data Explorer cluster deployed: ${ADX_CLUSTER}"
@@ -324,7 +322,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    az functionapp config appsettings set \
        --name ${FUNC_APP} \
        --resource-group ${RESOURCE_GROUP} \
-       --settings "ADT_SERVICE_URL=https://${ADT_NAME}.api.${LOCATION}.digitaltwins.azure.net" \
+       --settings \
+           "ADT_SERVICE_URL=https://${ADT_NAME}.api.${LOCATION}.digitaltwins.azure.net" \
            "EventHubConnection=${EH_CONNECTION}" \
            "AzureWebJobsStorage=DefaultEndpointsProtocol=https;AccountName=${STORAGE_ACCOUNT};EndpointSuffix=core.windows.net;AccountKey=$(az storage account keys list --account-name ${STORAGE_ACCOUNT} --resource-group ${RESOURCE_GROUP} --query '[0].value' -o tsv)"
    
@@ -392,36 +391,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
    The ingestion pipeline now automatically streams telemetry data from Event Hub into Azure Data Explorer, where it's stored in an optimized columnar format for fast time-series queries and analytics.
 
-8. **Set Up Time Series Insights Environment**:
-
-   Azure Time Series Insights provides a complementary analytics layer specifically designed for IoT time-series data. It offers out-of-the-box visualizations, automatic data modeling, and contextual analytics that help identify patterns and anomalies. TSI Gen2 integrates with Azure Digital Twins to provide hierarchical views of your IoT data based on your digital twin relationships.
-
-   ```bash
-   # Create Time Series Insights Gen2 environment
-   az tsi environment gen2 create \
-       --name ${TSI_ENV} \
-       --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --sku name="L1" capacity=1 \
-       --time-series-id-properties name=deviceId type=String \
-       --storage-configuration account-name=${STORAGE_ACCOUNT} \
-           management-key=$(az storage account keys list --account-name ${STORAGE_ACCOUNT} --resource-group ${RESOURCE_GROUP} --query '[0].value' -o tsv)
-   
-   # Create event source from IoT Central
-   IOTC_EVENTHUB=$(az iot central app show \
-       --name ${IOTC_APP} \
-       --resource-group ${RESOURCE_GROUP} \
-       --query id --output tsv)
-   
-   # Note: In production, you would configure IoT Central data export
-   # to Event Hub and connect TSI to that Event Hub
-   
-   echo "✅ Time Series Insights environment created"
-   ```
-
-   Time Series Insights now provides an additional analytics layer with pre-built visualizations and exploration tools, complementing the advanced analytics capabilities of Azure Data Explorer.
-
-9. **Implement Anomaly Detection Queries**:
+8. **Implement Anomaly Detection Queries**:
 
    Anomaly detection in Azure Data Explorer leverages built-in machine learning functions to identify unusual patterns in time-series data. These algorithms can detect point anomalies, trend changes, and seasonal variations that might indicate equipment failures or maintenance needs. The queries can be automated through Functions or Logic Apps to trigger real-time alerts and update digital twin properties.
 
@@ -462,39 +432,39 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
    These KQL functions provide reusable analytics capabilities that can detect temperature anomalies using time-series decomposition and predict maintenance needs based on vibration patterns and operating hours.
 
-10. **Create Digital Twin Instances**:
+9. **Create Digital Twin Instances**:
 
-    Creating digital twin instances brings your model to life by instantiating specific equipment representations. Each twin maintains its own state, properties, and relationships, creating a living digital replica of your physical assets. This step demonstrates how to programmatically create twins that will be updated with real-time telemetry from IoT devices.
+   Creating digital twin instances brings your model to life by instantiating specific equipment representations. Each twin maintains its own state, properties, and relationships, creating a living digital replica of your physical assets. This step demonstrates how to programmatically create twins that will be updated with real-time telemetry from IoT devices.
 
-    ```bash
-    # Create sample digital twin instances
-    for i in {1..3}; do
-        TWIN_ID="equipment-${i}"
-        TWIN_INIT="{
-            \"\$metadata\": {
-                \"\$model\": \"dtmi:com:example:IndustrialEquipment;1\"
-            },
-            \"temperature\": 25.0,
-            \"vibration\": 5.0,
-            \"operatingHours\": 100,
-            \"maintenanceStatus\": \"Normal\"
-        }"
-        
-        az dt twin create \
-            --dt-name ${ADT_NAME} \
-            --twin-id ${TWIN_ID} \
-            --twin-init "${TWIN_INIT}"
-        
-        echo "✅ Created digital twin: ${TWIN_ID}"
-    done
-    
-    # Query all twins
-    az dt twin query \
-        --dt-name ${ADT_NAME} \
-        --query-command "SELECT * FROM digitaltwins"
-    ```
+   ```bash
+   # Create sample digital twin instances
+   for i in {1..3}; do
+       TWIN_ID="equipment-${i}"
+       TWIN_INIT="{
+           \"\$metadata\": {
+               \"\$model\": \"dtmi:com:example:IndustrialEquipment;1\"
+           },
+           \"temperature\": 25.0,
+           \"vibration\": 5.0,
+           \"operatingHours\": 100,
+           \"maintenanceStatus\": \"Normal\"
+       }"
+       
+       az dt twin create \
+           --dt-name ${ADT_NAME} \
+           --twin-id ${TWIN_ID} \
+           --properties "${TWIN_INIT}"
+       
+       echo "✅ Created digital twin: ${TWIN_ID}"
+   done
+   
+   # Query all twins
+   az dt twin query \
+       --dt-name ${ADT_NAME} \
+       --query-command "SELECT * FROM digitaltwins"
+   ```
 
-    Digital twin instances now represent your physical equipment in the digital realm. These twins will receive real-time updates from IoT devices and maintain synchronized state for analytics and visualization.
+   Digital twin instances now represent your physical equipment in the digital realm. These twins will receive real-time updates from IoT devices and maintain synchronized state for analytics and visualization.
 
 ## Validation & Testing
 
@@ -548,7 +518,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
    Expected output: Metrics showing message flow (may be zero initially)
 
-> **Tip**: Use Azure Digital Twins Explorer (https://${ADT_NAME}.api.${LOCATION}.digitaltwins.azure.net/explorer) to visualize your twin graph and relationships in real-time.
+> **Tip**: Use Azure Digital Twins Explorer (https://explorer.digitaltwins.azure.net/) to visualize your twin graph and relationships in real-time.
 
 ## Cleanup
 
@@ -583,11 +553,11 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
 ## Discussion
 
-Azure Digital Twins combined with Azure Data Explorer creates a powerful platform for industrial IoT solutions that require both real-time digital representation and advanced time-series analytics. This architecture follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles by providing scalability through serverless components, reliability through managed services, and security through managed identities and RBAC. For comprehensive implementation guidance, refer to the [Azure Digital Twins documentation](https://docs.microsoft.com/en-us/azure/digital-twins/) and [Azure Data Explorer best practices](https://docs.microsoft.com/en-us/azure/data-explorer/best-practices).
+Azure Digital Twins combined with Azure Data Explorer creates a powerful platform for industrial IoT solutions that require both real-time digital representation and advanced time-series analytics. This architecture follows the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) principles by providing scalability through serverless components, reliability through managed services, and security through managed identities and RBAC. For comprehensive implementation guidance, refer to the [Azure Digital Twins documentation](https://learn.microsoft.com/en-us/azure/digital-twins/) and [Azure Data Explorer best practices](https://learn.microsoft.com/en-us/azure/data-explorer/best-practices).
 
-The solution's strength lies in its ability to maintain synchronized digital models while performing complex analytics on streaming telemetry data. Azure Digital Twins provides the semantic layer that gives context to raw IoT data, while Azure Data Explorer enables sophisticated time-series analysis including anomaly detection, pattern recognition, and predictive maintenance algorithms. This combination is particularly effective for scenarios requiring both real-time monitoring and historical analysis, as outlined in the [IoT analytics architecture guide](https://docs.microsoft.com/en-us/azure/architecture/example-scenario/data/iot-analytics-architecture).
+The solution's strength lies in its ability to maintain synchronized digital models while performing complex analytics on streaming telemetry data. Azure Digital Twins provides the semantic layer that gives context to raw IoT data, while Azure Data Explorer enables sophisticated time-series analysis including anomaly detection, pattern recognition, and predictive maintenance algorithms. This combination is particularly effective for scenarios requiring both real-time monitoring and historical analysis, as outlined in the [IoT analytics architecture guide](https://learn.microsoft.com/en-us/azure/architecture/example-scenario/data/iot-analytics-architecture).
 
-From a cost optimization perspective, the architecture uses consumption-based pricing for Functions and development SKUs for proof-of-concepts, allowing organizations to validate their use cases before scaling to production. The use of Event Hubs for data routing provides a buffer between data producers and consumers, ensuring system resilience during traffic spikes. For production deployments, consider implementing the [Azure IoT reference architecture](https://docs.microsoft.com/en-us/azure/architecture/reference-architectures/iot) with additional considerations for data partitioning, retention policies, and multi-region deployments.
+From a cost optimization perspective, the architecture uses consumption-based pricing for Functions and development SKUs for proof-of-concepts, allowing organizations to validate their use cases before scaling to production. The use of Event Hubs for data routing provides a buffer between data producers and consumers, ensuring system resilience during traffic spikes. For production deployments, consider implementing the [Azure IoT reference architecture](https://learn.microsoft.com/en-us/azure/architecture/reference-architectures/iot) with additional considerations for data partitioning, retention policies, and multi-region deployments.
 
 > **Warning**: Production deployments should use Standard or Premium SKUs for Azure Data Explorer and implement proper data retention policies to manage costs. Monitor ingestion rates and query performance to optimize cluster sizing based on actual workload patterns.
 

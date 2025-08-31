@@ -1,0 +1,723 @@
+# Infrastructure Manager Configuration for Automated Accessibility Compliance
+# This configuration deploys Document AI, Cloud Build, Security Command Center,
+# and supporting services for automated WCAG compliance testing
+
+# Copyright 2025 Google LLC
+# Licensed under the Apache License, Version 2.0
+
+# Terraform configuration block with required providers
+terraform:
+  required_version: ">= 1.5"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.4"
+
+# Variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID where resources will be created"
+    
+  region:
+    type: string
+    description: "GCP region for regional resources"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "GCP zone for zonal resources"
+    default: "us-central1-a"
+    
+  organization_id:
+    type: string
+    description: "Organization ID for Security Command Center configuration"
+    
+  github_repo_owner:
+    type: string
+    description: "GitHub repository owner for build triggers"
+    default: ""
+    
+  github_repo_name:
+    type: string
+    description: "GitHub repository name for build triggers"
+    default: ""
+    
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+    validation:
+      condition: contains(["dev", "staging", "prod"], var.environment)
+      error_message: "Environment must be dev, staging, or prod."
+
+# Local values for resource naming and configuration
+locals:
+  # Generate random suffix for unique resource names
+  random_suffix: "${random_id.suffix.hex}"
+  
+  # Resource naming with environment and random suffix
+  name_prefix: "accessibility-compliance-${var.environment}"
+  bucket_name: "${local.name_prefix}-artifacts-${local.random_suffix}"
+  topic_name: "${local.name_prefix}-alerts"
+  function_name: "${local.name_prefix}-notifier"
+  processor_name: "${local.name_prefix}-content-processor"
+  scc_source_name: "${local.name_prefix}-scanner"
+  
+  # API services required for the solution
+  required_apis:
+    - "documentai.googleapis.com"
+    - "cloudbuild.googleapis.com"
+    - "securitycenter.googleapis.com"
+    - "storage.googleapis.com"
+    - "pubsub.googleapis.com"
+    - "cloudfunctions.googleapis.com"
+    - "cloudresourcemanager.googleapis.com"
+    - "iam.googleapis.com"
+    - "logging.googleapis.com"
+    - "monitoring.googleapis.com"
+  
+  # IAM roles for Cloud Build service account
+  build_service_roles:
+    - "roles/documentai.editor"
+    - "roles/storage.objectAdmin"
+    - "roles/securitycenter.findingsEditor"
+    - "roles/pubsub.publisher"
+    - "roles/logging.logWriter"
+  
+  # Common labels for resource management
+  common_labels:
+    environment: var.environment
+    solution: "accessibility-compliance"
+    managed-by: "infrastructure-manager"
+    recipe-id: "f4e7c2a9"
+
+# Random ID generator for unique resource names
+resource "random_id" "suffix":
+  byte_length: 3
+
+# Enable required Google Cloud APIs
+resource "google_project_service" "required_apis":
+  for_each = toset(local.required_apis)
+  
+  project = var.project_id
+  service = each.value
+  
+  # Prevent accidental API disabling during destroy
+  disable_on_destroy = false
+  
+  # Ensure dependencies are created in correct order
+  timeouts:
+    create: "10m"
+    update: "10m"
+
+# Cloud Storage bucket for build artifacts and compliance reports
+resource "google_storage_bucket" "compliance_artifacts":
+  name     = local.bucket_name
+  project  = var.project_id
+  location = var.region
+  
+  # Enable uniform bucket-level access for better security
+  uniform_bucket_level_access = true
+  
+  # Configure lifecycle management to control costs
+  lifecycle_rule:
+    condition:
+      age = 90 # days
+    action:
+      type = "Delete"
+  
+  lifecycle_rule:
+    condition:
+      age = 30 # days
+    action:
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+  
+  # Enable versioning for compliance audit trails
+  versioning:
+    enabled = true
+  
+  # Server-side encryption with Google-managed keys
+  encryption:
+    default_kms_key_name = google_kms_crypto_key.compliance_key.id
+  
+  # Add labels for resource management
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_kms_crypto_key.compliance_key
+  ]
+
+# Cloud KMS key for encryption
+resource "google_kms_key_ring" "compliance_keyring":
+  name     = "${local.name_prefix}-keyring"
+  project  = var.project_id
+  location = var.region
+  
+  depends_on = [google_project_service.required_apis]
+
+resource "google_kms_crypto_key" "compliance_key":
+  name     = "${local.name_prefix}-key"
+  key_ring = google_kms_key_ring.compliance_keyring.id
+  
+  # Key rotation policy for security
+  rotation_period = "7776000s" # 90 days
+  
+  # Prevent accidental key deletion
+  lifecycle:
+    prevent_destroy = true
+
+# Grant Cloud Storage service account access to KMS key
+resource "google_kms_crypto_key_iam_member" "storage_key_access":
+  crypto_key_id = google_kms_crypto_key.compliance_key.id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = "serviceAccount:service-${data.google_project.current.number}@gs-project-accounts.iam.gserviceaccount.com"
+}
+
+# Document AI processor for content analysis
+resource "google_document_ai_processor" "accessibility_processor":
+  project          = var.project_id
+  location         = var.region
+  display_name     = local.processor_name
+  type             = "OCR_PROCESSOR"
+  
+  # Processor configuration for optimal accessibility analysis
+  # Note: Additional configuration would be added as Document AI evolves
+  
+  depends_on = [google_project_service.required_apis]
+
+# Pub/Sub topic for compliance notifications
+resource "google_pubsub_topic" "compliance_alerts":
+  name    = local.topic_name
+  project = var.project_id
+  
+  # Message retention for compliance audit
+  message_retention_duration = "604800s" # 7 days
+  
+  # Add labels for resource management
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+
+# Pub/Sub topic IAM binding for Security Command Center
+resource "google_pubsub_topic_iam_member" "scc_publisher":
+  project = var.project_id
+  topic   = google_pubsub_topic.compliance_alerts.name
+  role    = "roles/pubsub.publisher"
+  member  = "serviceAccount:service-${data.google_project.current.number}@gcp-sa-securitycenter.iam.gserviceaccount.com"
+}
+
+# Cloud Build service account with enhanced permissions
+resource "google_service_account" "build_service_account":
+  account_id   = "${local.name_prefix}-build-sa"
+  project      = var.project_id
+  display_name = "Accessibility Compliance Build Service Account"
+  description  = "Service account for Cloud Build accessibility compliance testing"
+}
+
+# IAM bindings for Cloud Build service account
+resource "google_project_iam_member" "build_service_roles":
+  for_each = toset(local.build_service_roles)
+  
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.build_service_account.email}"
+}
+
+# Additional IAM binding for Security Command Center source creation
+resource "google_organization_iam_member" "scc_source_admin":
+  count = var.organization_id != "" ? 1 : 0
+  
+  org_id = var.organization_id
+  role   = "roles/securitycenter.sourcesAdmin"
+  member = "serviceAccount:${google_service_account.build_service_account.email}"
+}
+
+# Security Command Center notification configuration
+# Note: SCC source creation requires organization-level permissions
+resource "google_scc_notification_config" "accessibility_alerts":
+  count = var.organization_id != "" ? 1 : 0
+  
+  config_id    = "accessibility-compliance-alerts"
+  organization = var.organization_id
+  description  = "Accessibility compliance violation notifications"
+  pubsub_topic = google_pubsub_topic.compliance_alerts.id
+  
+  streaming_config:
+    filter = "category=\"ACCESSIBILITY_COMPLIANCE\""
+  
+  depends_on = [
+    google_pubsub_topic_iam_member.scc_publisher,
+    google_organization_iam_member.scc_source_admin
+  ]
+}
+
+# Cloud Build trigger for GitHub integration (optional)
+resource "google_cloudbuild_trigger" "accessibility_testing":
+  count = var.github_repo_owner != "" && var.github_repo_name != "" ? 1 : 0
+  
+  project     = var.project_id
+  name        = "${local.name_prefix}-github-trigger"
+  description = "Automated accessibility compliance testing"
+  
+  # GitHub repository configuration
+  github:
+    owner = var.github_repo_owner
+    name  = var.github_repo_name
+    push:
+      branch = "^main$"
+  
+  # Build configuration
+  build:
+    # Use custom service account
+    service_account = google_service_account.build_service_account.id
+    
+    # Build timeout
+    timeout = "1200s" # 20 minutes
+    
+    # Build steps for accessibility analysis
+    step:
+      # Install Python dependencies
+      - name: "python:3.9"
+        entrypoint: "pip"
+        args: [
+          "install",
+          "google-cloud-documentai",
+          "google-cloud-storage",
+          "google-cloud-securitycenter",
+          "beautifulsoup4",
+          "requests"
+        ]
+      
+      # Run accessibility analysis
+      - name: "python:3.9"
+        entrypoint: "bash"
+        args:
+          - "-c"
+          - |
+            # Set environment variables
+            export PROJECT_ID=${var.project_id}
+            export PROCESSOR_ID=${google_document_ai_processor.accessibility_processor.name}
+            export BUCKET_NAME=${google_storage_bucket.compliance_artifacts.name}
+            export REGION=${var.region}
+            
+            # Find and analyze HTML files
+            find . -name "*.html" -type f | while read html_file; do
+              echo "Analyzing: $$html_file"
+              python3 accessibility_analyzer.py \
+                "$$PROJECT_ID" "$$PROCESSOR_ID" "$$html_file" > "$${html_file}.accessibility.json"
+            done
+            
+            # Upload reports to Cloud Storage
+            gsutil -m cp *.accessibility.json gs://${google_storage_bucket.compliance_artifacts.name}/reports/
+    
+    # Build options
+    options:
+      logging: "CLOUD_LOGGING_ONLY"
+      log_streaming_option: "STREAM_ON"
+      machine_type: "E2_MEDIUM"
+  
+  # Substitution variables
+  substitutions:
+    _PROCESSOR_ID: google_document_ai_processor.accessibility_processor.name
+    _BUCKET_NAME: google_storage_bucket.compliance_artifacts.name
+    _REGION: var.region
+    _ENVIRONMENT: var.environment
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_service_account.build_service_account
+  ]
+
+# Manual Cloud Build trigger for testing
+resource "google_cloudbuild_trigger" "manual_accessibility_testing":
+  project     = var.project_id
+  name        = "${local.name_prefix}-manual-trigger"
+  description = "Manual accessibility compliance testing trigger"
+  
+  # Manual trigger configuration
+  source_to_build:
+    uri       = "https://github.com/${var.github_repo_owner}/${var.github_repo_name}"
+    ref       = "refs/heads/main"
+    repo_type = "GITHUB"
+  
+  # Same build configuration as automated trigger
+  build:
+    service_account = google_service_account.build_service_account.id
+    timeout         = "1200s"
+    
+    step:
+      - name: "python:3.9"
+        entrypoint: "pip"
+        args: [
+          "install",
+          "google-cloud-documentai",
+          "google-cloud-storage",
+          "google-cloud-securitycenter",
+          "beautifulsoup4",
+          "requests"
+        ]
+      
+      - name: "python:3.9"
+        entrypoint: "bash"
+        args:
+          - "-c"
+          - |
+            export PROJECT_ID=${var.project_id}
+            export PROCESSOR_ID=${google_document_ai_processor.accessibility_processor.name}
+            export BUCKET_NAME=${google_storage_bucket.compliance_artifacts.name}
+            export REGION=${var.region}
+            
+            # Create sample test content if no HTML files exist
+            if [ ! -f *.html ]; then
+              cat > test-sample.html << 'EOF'
+            <!DOCTYPE html>
+            <html>
+            <head><title>Test Page</title></head>
+            <body>
+              <h1>Test</h1>
+              <img src="test.png">
+              <input type="text" placeholder="Name">
+            </body>
+            </html>
+            EOF
+            fi
+            
+            find . -name "*.html" -type f | while read html_file; do
+              echo "Analyzing: $$html_file"
+              python3 accessibility_analyzer.py \
+                "$$PROJECT_ID" "$$PROCESSOR_ID" "$$html_file" > "$${html_file}.accessibility.json" || true
+            done
+            
+            gsutil -m cp *.accessibility.json gs://${google_storage_bucket.compliance_artifacts.name}/reports/ || true
+    
+    options:
+      logging: "CLOUD_LOGGING_ONLY"
+      machine_type: "E2_MEDIUM"
+  
+  substitutions:
+    _PROCESSOR_ID: google_document_ai_processor.accessibility_processor.name
+    _BUCKET_NAME: google_storage_bucket.compliance_artifacts.name
+    _REGION: var.region
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_service_account.build_service_account
+  ]
+
+# Cloud Function for compliance notifications
+resource "google_storage_bucket_object" "function_source":
+  name   = "compliance-notifier-source.zip"
+  bucket = google_storage_bucket.compliance_artifacts.name
+  source = data.archive_file.function_source.output_path
+  
+  depends_on = [google_storage_bucket.compliance_artifacts]
+}
+
+# Create function source code archive
+data "archive_file" "function_source":
+  type        = "zip"
+  output_path = "/tmp/compliance-notifier-source.zip"
+  
+  source:
+    content = <<EOF
+import json
+import base64
+from google.cloud import logging as cloud_logging
+
+def process_compliance_alert(event, context):
+    """Process Security Command Center findings for accessibility compliance."""
+    
+    # Initialize Cloud Logging client
+    client = cloud_logging.Client()
+    client.setup_logging()
+    
+    try:
+        # Decode Pub/Sub message
+        if 'data' in event:
+            message = base64.b64decode(event['data']).decode('utf-8')
+            finding_data = json.loads(message)
+            
+            # Check if it's an accessibility finding
+            if finding_data.get('category') == 'ACCESSIBILITY_COMPLIANCE':
+                severity = 'HIGH' if int(finding_data.get('source_properties', {}).get('high_severity', '0')) > 0 else 'MEDIUM'
+                
+                alert_message = f"""
+                Accessibility Compliance Alert
+                
+                Severity: {severity}
+                File: {finding_data.get('source_properties', {}).get('file_path', 'Unknown')}
+                Violations: {finding_data.get('source_properties', {}).get('violations_count', '0')}
+                High Severity Issues: {finding_data.get('source_properties', {}).get('high_severity', '0')}
+                
+                Please review the compliance report for detailed remediation steps.
+                """
+                
+                print(f"Accessibility compliance alert: {alert_message}")
+                
+                # Log structured data for monitoring
+                cloud_logging.info({
+                    'message': 'Accessibility compliance violation detected',
+                    'severity': severity,
+                    'file_path': finding_data.get('source_properties', {}).get('file_path'),
+                    'violations_count': finding_data.get('source_properties', {}).get('violations_count'),
+                    'high_severity_count': finding_data.get('source_properties', {}).get('high_severity')
+                })
+                
+        return 'Alert processed successfully'
+        
+    except Exception as e:
+        print(f"Error processing compliance alert: {str(e)}")
+        return f'Error: {str(e)}'
+
+# Requirements for the Cloud Function
+# google-cloud-logging==3.8.0
+EOF
+    filename = "main.py"
+  
+  source:
+    content = "google-cloud-logging==3.8.0"
+    filename = "requirements.txt"
+}
+
+# Cloud Function for processing compliance alerts
+resource "google_cloudfunctions_function" "compliance_notifier":
+  name    = local.function_name
+  project = var.project_id
+  region  = var.region
+  
+  # Function configuration
+  description = "Process accessibility compliance alerts from Security Command Center"
+  runtime     = "python39"
+  entry_point = "process_compliance_alert"
+  
+  # Source code configuration
+  source_archive_bucket = google_storage_bucket.compliance_artifacts.name
+  source_archive_object = google_storage_bucket_object.function_source.name
+  
+  # Event trigger configuration
+  event_trigger:
+    event_type = "google.pubsub.topic.publish"
+    resource   = google_pubsub_topic.compliance_alerts.name
+  
+  # Function resources
+  available_memory_mb = 256
+  timeout             = 60
+  
+  # Environment variables
+  environment_variables:
+    ENVIRONMENT: var.environment
+    PROJECT_ID: var.project_id
+  
+  # Service account for the function
+  service_account_email = google_service_account.function_service_account.email
+  
+  # Labels for resource management
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_storage_bucket_object.function_source
+  ]
+}
+
+# Service account for Cloud Function
+resource "google_service_account" "function_service_account":
+  account_id   = "${local.name_prefix}-function-sa"
+  project      = var.project_id
+  display_name = "Compliance Notification Function Service Account"
+  description  = "Service account for accessibility compliance notification function"
+}
+
+# IAM binding for Cloud Function service account
+resource "google_project_iam_member" "function_logging":
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.function_service_account.email}"
+}
+
+# Monitoring and alerting configuration
+resource "google_monitoring_notification_channel" "email_alerts":
+  count = 1 # Set to 0 to disable, or use variable for email
+  
+  project      = var.project_id
+  display_name = "Accessibility Compliance Email Alerts"
+  type         = "email"
+  
+  labels:
+    email_address = "admin@example.com" # Replace with actual email
+  
+  description = "Email notifications for accessibility compliance violations"
+  enabled     = true
+}
+
+# Log-based metric for compliance violations
+resource "google_logging_metric" "compliance_violations":
+  project = var.project_id
+  name    = "${local.name_prefix}-violations-metric"
+  
+  description = "Count of accessibility compliance violations"
+  filter      = "jsonPayload.message=\"Accessibility compliance violation detected\""
+  
+  metric_descriptor:
+    metric_kind = "GAUGE"
+    value_type  = "INT64"
+    unit        = "1"
+    display_name = "Accessibility Compliance Violations"
+  
+  label_extractors:
+    severity = "EXTRACT(jsonPayload.severity)"
+    file_path = "EXTRACT(jsonPayload.file_path)"
+}
+
+# Alerting policy for high-severity violations
+resource "google_monitoring_alert_policy" "high_severity_violations":
+  project      = var.project_id
+  display_name = "High Severity Accessibility Violations"
+  
+  documentation:
+    content   = "Alert triggered when high-severity accessibility violations are detected"
+    mime_type = "text/markdown"
+  
+  conditions:
+    display_name = "High severity accessibility violations detected"
+    
+    condition_threshold:
+      filter         = "resource.type=\"gce_instance\" AND metric.type=\"logging.googleapis.com/user/${google_logging_metric.compliance_violations.name}\""
+      duration       = "300s"
+      comparison     = "COMPARISON_GT"
+      threshold_value = 0
+      
+      aggregations:
+        alignment_period   = "300s"
+        per_series_aligner = "ALIGN_COUNT"
+  
+  # Notification channels
+  dynamic "notification_channels":
+    for_each = google_monitoring_notification_channel.email_alerts
+    content:
+      notification_channels = [notification_channels.value.name]
+  
+  alert_strategy:
+    auto_close = "1800s" # 30 minutes
+  
+  enabled = true
+}
+
+# Data source for current project information
+data "google_project" "current":
+  project_id = var.project_id
+}
+
+# Outputs for integration and verification
+outputs:
+  # Project information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: var.project_id
+  
+  region:
+    description: "Google Cloud region"
+    value: var.region
+  
+  # Document AI processor information
+  processor_id:
+    description: "Document AI processor ID for accessibility analysis"
+    value: google_document_ai_processor.accessibility_processor.name
+  
+  processor_full_name:
+    description: "Full Document AI processor resource name"
+    value: google_document_ai_processor.accessibility_processor.name
+  
+  # Storage bucket information
+  bucket_name:
+    description: "Cloud Storage bucket for compliance artifacts"
+    value: google_storage_bucket.compliance_artifacts.name
+  
+  bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: google_storage_bucket.compliance_artifacts.url
+  
+  # Pub/Sub topic information
+  pubsub_topic:
+    description: "Pub/Sub topic for compliance alerts"
+    value: google_pubsub_topic.compliance_alerts.name
+  
+  pubsub_topic_id:
+    description: "Pub/Sub topic ID"
+    value: google_pubsub_topic.compliance_alerts.id
+  
+  # Cloud Build information
+  build_service_account:
+    description: "Cloud Build service account email"
+    value: google_service_account.build_service_account.email
+  
+  manual_trigger_name:
+    description: "Manual Cloud Build trigger name"
+    value: google_cloudbuild_trigger.manual_accessibility_testing.name
+  
+  github_trigger_name:
+    description: "GitHub Cloud Build trigger name (if configured)"
+    value: var.github_repo_owner != "" && var.github_repo_name != "" ? google_cloudbuild_trigger.accessibility_testing[0].name : "Not configured"
+  
+  # Cloud Function information
+  function_name:
+    description: "Cloud Function name for compliance notifications"
+    value: google_cloudfunctions_function.compliance_notifier.name
+  
+  function_url:
+    description: "Cloud Function trigger URL"
+    value: google_cloudfunctions_function.compliance_notifier.https_trigger_url
+  
+  # Security Command Center information
+  scc_notification_config:
+    description: "Security Command Center notification configuration name"
+    value: var.organization_id != "" ? google_scc_notification_config.accessibility_alerts[0].name : "Not configured - organization_id required"
+  
+  # KMS information
+  kms_key_name:
+    description: "Cloud KMS key for encryption"
+    value: google_kms_crypto_key.compliance_key.name
+  
+  # Monitoring information
+  log_metric_name:
+    description: "Log-based metric for compliance violations"
+    value: google_logging_metric.compliance_violations.name
+  
+  alert_policy_name:
+    description: "Monitoring alert policy for high-severity violations"
+    value: google_monitoring_alert_policy.high_severity_violations.name
+  
+  # Usage instructions
+  deployment_instructions:
+    description: "Instructions for using the deployed infrastructure"
+    value: <<-EOT
+    Accessibility Compliance Infrastructure Deployed Successfully!
+    
+    Next Steps:
+    1. Configure GitHub repository integration (if not already done):
+       - Repository: ${var.github_repo_owner}/${var.github_repo_name}
+       - Build trigger: ${var.github_repo_owner != "" && var.github_repo_name != "" ? google_cloudbuild_trigger.accessibility_testing[0].name : "Configure manually"}
+    
+    2. Run manual build to test the pipeline:
+       gcloud builds triggers run ${google_cloudbuild_trigger.manual_accessibility_testing.name} --region=${var.region}
+    
+    3. Monitor compliance reports in Cloud Storage:
+       gsutil ls gs://${google_storage_bucket.compliance_artifacts.name}/reports/
+    
+    4. View Security Command Center findings:
+       gcloud scc findings list --organization=${var.organization_id} --filter="category=\"ACCESSIBILITY_COMPLIANCE\""
+    
+    5. Check Cloud Function logs:
+       gcloud functions logs read ${google_cloudfunctions_function.compliance_notifier.name} --region=${var.region}
+    
+    For detailed usage instructions, refer to the recipe documentation.
+    EOT

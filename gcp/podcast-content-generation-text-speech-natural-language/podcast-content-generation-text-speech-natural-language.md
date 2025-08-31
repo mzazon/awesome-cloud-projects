@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Text-to-Speech, Natural Language API, Cloud Storage, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ai, audio, content-generation, nlp, automation
 recipe-generator-version: 1.3
@@ -174,10 +174,6 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    gsutil cp ~/podcast-content/input/sample-article.txt \
        gs://${BUCKET_NAME}/input/
    
-   # Create metadata structure for tracking
-   gsutil cp ~/podcast-content/input/ \
-       gs://${BUCKET_NAME}/input/ -r
-   
    echo "✅ Sample content uploaded and organized"
    ```
 
@@ -194,8 +190,8 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    
    # Create requirements.txt for Python dependencies
    cat > requirements.txt << 'EOF'
-   google-cloud-language==2.13.0
-   google-cloud-texttospeech==2.16.3
+   google-cloud-language==2.13.1
+   google-cloud-texttospeech==2.16.4
    google-cloud-storage==2.10.0
    functions-framework==3.5.0
    EOF
@@ -204,7 +200,6 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    cat > main.py << 'EOF'
    import json
    import os
-   import base64
    from google.cloud import language_v1
    from google.cloud import texttospeech
    from google.cloud import storage
@@ -213,79 +208,94 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    def analyze_and_generate(request):
        """Cloud Function to analyze text and generate podcast audio"""
        
-       # Initialize clients
-       language_client = language_v1.LanguageServiceClient()
-       tts_client = texttospeech.TextToSpeechClient()
-       storage_client = storage.Client()
-       
-       # Get request data
-       request_json = request.get_json(silent=True)
-       bucket_name = request_json.get('bucket_name')
-       file_name = request_json.get('file_name')
-       
-       # Download text content
-       bucket = storage_client.bucket(bucket_name)
-       blob = bucket.blob(f"input/{file_name}")
-       text_content = blob.download_as_text()
-       
-       # Analyze sentiment and entities
-       document = language_v1.Document(
-           content=text_content,
-           type_=language_v1.Document.Type.PLAIN_TEXT
-       )
-       
-       # Perform sentiment analysis
-       sentiment_response = language_client.analyze_sentiment(
-           request={"document": document}
-       )
-       
-       # Extract entities
-       entities_response = language_client.analyze_entities(
-           request={"document": document}
-       )
-       
-       # Generate SSML based on analysis
-       ssml_content = create_ssml_from_analysis(
-           text_content, 
-           sentiment_response.document_sentiment,
-           entities_response.entities
-       )
-       
-       # Configure voice based on sentiment
-       voice_config = configure_voice_for_sentiment(
-           sentiment_response.document_sentiment.score
-       )
-       
-       # Generate speech
-       synthesis_input = texttospeech.SynthesisInput(ssml=ssml_content)
-       response = tts_client.synthesize_speech(
-           input=synthesis_input,
-           voice=voice_config,
-           audio_config=texttospeech.AudioConfig(
-               audio_encoding=texttospeech.AudioEncoding.MP3,
-               speaking_rate=1.0,
-               pitch=0.0
+       try:
+           # Initialize clients
+           language_client = language_v1.LanguageServiceClient()
+           tts_client = texttospeech.TextToSpeechClient()
+           storage_client = storage.Client()
+           
+           # Get request data
+           request_json = request.get_json(silent=True)
+           if not request_json:
+               return {"error": "Invalid JSON request"}, 400
+               
+           bucket_name = request_json.get('bucket_name')
+           file_name = request_json.get('file_name')
+           
+           if not bucket_name or not file_name:
+               return {"error": "Missing bucket_name or file_name"}, 400
+           
+           # Download text content
+           bucket = storage_client.bucket(bucket_name)
+           blob = bucket.blob(f"input/{file_name}")
+           
+           if not blob.exists():
+               return {"error": f"File {file_name} not found"}, 404
+               
+           text_content = blob.download_as_text()
+           
+           # Analyze sentiment and entities
+           document = language_v1.Document(
+               content=text_content,
+               type_=language_v1.Document.Type.PLAIN_TEXT
            )
-       )
-       
-       # Save audio file
-       audio_blob = bucket.blob(f"audio/{file_name.replace('.txt', '.mp3')}")
-       audio_blob.upload_from_string(response.audio_content)
-       
-       # Save analysis metadata
-       metadata = {
-           "sentiment_score": sentiment_response.document_sentiment.score,
-           "sentiment_magnitude": sentiment_response.document_sentiment.magnitude,
-           "entities": [{"name": entity.name, "type": entity.type_.name} 
-                       for entity in entities_response.entities[:5]],
-           "processing_timestamp": os.environ.get('TIMESTAMP'),
-           "audio_file": f"audio/{file_name.replace('.txt', '.mp3')}"
-       }
-       
-       metadata_blob = bucket.blob(f"processed/{file_name.replace('.txt', '_analysis.json')}")
-       metadata_blob.upload_from_string(json.dumps(metadata, indent=2))
-       
-       return {"status": "success", "metadata": metadata}
+           
+           # Perform sentiment analysis
+           sentiment_response = language_client.analyze_sentiment(
+               request={"document": document}
+           )
+           
+           # Extract entities
+           entities_response = language_client.analyze_entities(
+               request={"document": document}
+           )
+           
+           # Generate SSML based on analysis
+           ssml_content = create_ssml_from_analysis(
+               text_content, 
+               sentiment_response.document_sentiment,
+               entities_response.entities
+           )
+           
+           # Configure voice based on sentiment
+           voice_config = configure_voice_for_sentiment(
+               sentiment_response.document_sentiment.score
+           )
+           
+           # Generate speech
+           synthesis_input = texttospeech.SynthesisInput(ssml=ssml_content)
+           response = tts_client.synthesize_speech(
+               input=synthesis_input,
+               voice=voice_config,
+               audio_config=texttospeech.AudioConfig(
+                   audio_encoding=texttospeech.AudioEncoding.MP3,
+                   speaking_rate=1.0,
+                   pitch=0.0
+               )
+           )
+           
+           # Save audio file
+           audio_blob = bucket.blob(f"audio/{file_name.replace('.txt', '.mp3')}")
+           audio_blob.upload_from_string(response.audio_content)
+           
+           # Save analysis metadata
+           metadata = {
+               "sentiment_score": sentiment_response.document_sentiment.score,
+               "sentiment_magnitude": sentiment_response.document_sentiment.magnitude,
+               "entities": [{"name": entity.name, "type": entity.type_.name} 
+                           for entity in entities_response.entities[:5]],
+               "processing_timestamp": str(os.environ.get('X_GOOGLE_FUNCTION_EXECUTION_ID', 'unknown')),
+               "audio_file": f"audio/{file_name.replace('.txt', '.mp3')}"
+           }
+           
+           metadata_blob = bucket.blob(f"processed/{file_name.replace('.txt', '_analysis.json')}")
+           metadata_blob.upload_from_string(json.dumps(metadata, indent=2))
+           
+           return {"status": "success", "metadata": metadata}
+           
+       except Exception as e:
+           print(f"Error processing request: {str(e)}")
+           return {"error": f"Processing failed: {str(e)}"}, 500
    
    def create_ssml_from_analysis(text, sentiment, entities):
        """Create SSML markup based on content analysis"""
@@ -487,8 +497,9 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    import json
    import re
    from google.cloud import language_v1
+   from google.cloud import storage
    
-   def create_advanced_ssml(text, sentiment, entities, syntax_tokens):
+   def create_advanced_ssml(text, sentiment, entities, syntax_tokens=None):
        """Generate sophisticated SSML with advanced speech patterns"""
        
        ssml = '<speak>'
@@ -505,7 +516,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
            ssml += '<prosody rate="100%" pitch="0st" volume="medium">'
        
        # Process text with intelligent emphasis and pacing
-       processed_text = enhance_text_with_nlp(text, entities, syntax_tokens)
+       processed_text = enhance_text_with_nlp(text, entities)
        
        # Add paragraph-level breathing
        processed_text = re.sub(r'\n\n+', '<break time="1.5s"/>\n\n', processed_text)
@@ -519,7 +530,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        
        return ssml
    
-   def enhance_text_with_nlp(text, entities, tokens):
+   def enhance_text_with_nlp(text, entities):
        """Use NLP analysis to enhance speech delivery"""
        
        # Emphasize important entities
@@ -567,10 +578,9 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        # Multiple analysis types
        sentiment = language_client.analyze_sentiment(request={"document": document}).document_sentiment
        entities = language_client.analyze_entities(request={"document": document}).entities
-       syntax = language_client.analyze_syntax(request={"document": document}).tokens
        
        # Generate enhanced SSML
-       enhanced_ssml = create_advanced_ssml(text_content, sentiment, entities, syntax)
+       enhanced_ssml = create_advanced_ssml(text_content, sentiment, entities)
        
        # Save enhanced SSML for review
        ssml_blob = bucket.blob(f"processed/{content_file.replace('.txt', '_enhanced.ssml')}")
@@ -593,40 +603,6 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    Comprehensive monitoring provides insights into podcast generation performance, API usage patterns, and content analysis trends. Cloud Monitoring integration enables real-time tracking of processing metrics, error rates, and cost optimization opportunities, ensuring the system operates efficiently at scale while maintaining high-quality output.
 
    ```bash
-   # Create monitoring configuration
-   cat > ~/monitoring-config.yaml << 'EOF'
-   displayName: "Podcast Generation Monitoring"
-   
-   dashboardFilters:
-     - filterType: RESOURCE_LABEL
-       labelKey: function_name
-       stringValue: podcast-processor
-   
-   widgets:
-     - title: "Function Executions"
-       scorecard:
-         sparkChartView:
-           sparkChartType: SPARK_LINE
-         gaugeView:
-           lowerBound: 0
-           upperBound: 100
-   
-     - title: "Processing Duration"
-       scorecard:
-         timeSeriesQuery:
-           timeSeriesFilter:
-             filter: 'resource.type="cloud_function"'
-             aggregation:
-               alignmentPeriod: "60s"
-               perSeriesAligner: ALIGN_MEAN
-   
-     - title: "API Costs"
-       scorecard:
-         timeSeriesQuery:
-           timeSeriesFilter:
-             filter: 'resource.type="consumed_api"'
-   EOF
-   
    # Enable monitoring APIs
    gcloud services enable monitoring.googleapis.com
    gcloud services enable logging.googleapis.com
@@ -636,7 +612,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        --description="Count of podcast generation requests" \
        --log-filter='resource.type="cloud_function" AND 
                     resource.labels.function_name="'${FUNCTION_NAME}'" AND 
-                    textPayload:"podcast generation"'
+                    textPayload:"Processing successful"'
    
    # Create alerting policy for function errors
    cat > ~/alert-policy.json << 'EOF'
@@ -661,7 +637,8 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    EOF
    
    # Apply alerting policy
-   gcloud alpha monitoring policies create --policy-from-file=~/alert-policy.json
+   gcloud alpha monitoring policies create \
+       --policy-from-file=~/alert-policy.json
    
    echo "✅ Monitoring and alerting configured"
    echo "View metrics: https://console.cloud.google.com/monitoring"
@@ -762,8 +739,8 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    # Clean up local files
    rm -rf ~/podcast-content ~/podcast-function
    rm ~/podcast-key.json ~/batch-podcast-generator.sh
-   rm ~/enhanced-ssml-processor.py ~/monitoring-config.yaml
-   rm ~/alert-policy.json *.json *.ssml
+   rm ~/enhanced-ssml-processor.py
+   rm ~/alert-policy.json *.json *.ssml 2>/dev/null || true
    
    echo "✅ All resources and files cleaned up"
    ```

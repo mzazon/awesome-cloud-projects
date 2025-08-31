@@ -1,0 +1,512 @@
+# Infrastructure Manager Configuration for Simple File Sharing with Cloud Storage and Functions
+# This configuration deploys a serverless file sharing solution using:
+# - Cloud Storage bucket for file storage with CORS configuration
+# - Cloud Functions for file upload and link generation
+# - IAM service accounts with least privilege access
+# - Required API enablement
+
+# Import terraform provider blocks
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.4"
+    archive:
+      source: "hashicorp/archive"
+      version: "~> 2.4"
+
+# Variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    validation:
+      condition: length(var.project_id) > 0
+      error_message: "Project ID must not be empty."
+
+  region:
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+    validation:
+      condition: can(regex("^[a-z]+-[a-z]+[0-9]+$", var.region))
+      error_message: "Region must be a valid Google Cloud region format."
+
+  bucket_name:
+    description: "Name for the Cloud Storage bucket (must be globally unique)"
+    type: string
+    default: ""
+    validation:
+      condition: can(regex("^[a-z0-9][a-z0-9._-]*[a-z0-9]$", var.bucket_name)) || var.bucket_name == ""
+      error_message: "Bucket name must contain only lowercase letters, numbers, hyphens, underscores, and periods."
+
+  upload_function_name:
+    description: "Name for the upload Cloud Function"
+    type: string
+    default: "upload-file"
+    validation:
+      condition: can(regex("^[a-z][a-z0-9-]*[a-z0-9]$", var.upload_function_name))
+      error_message: "Function name must start with a letter and contain only lowercase letters, numbers, and hyphens."
+
+  link_function_name:
+    description: "Name for the link generation Cloud Function"
+    type: string
+    default: "generate-link"
+    validation:
+      condition: can(regex("^[a-z][a-z0-9-]*[a-z0-9]$", var.link_function_name))
+      error_message: "Function name must start with a letter and contain only lowercase letters, numbers, and hyphens."
+
+  environment_labels:
+    description: "Labels to apply to all resources"
+    type: map(string)
+    default:
+      environment: "dev"
+      recipe: "file-sharing-storage-functions"
+      created-by: "infrastructure-manager"
+
+# Local values for computed resources
+locals:
+  # Generate unique suffix for resource names if not provided
+  random_suffix = random_id.suffix.hex
+  
+  # Use provided bucket name or generate one with suffix
+  bucket_name = var.bucket_name != "" ? var.bucket_name : "file-share-bucket-${local.random_suffix}"
+  
+  # Function names with suffix to ensure uniqueness
+  upload_function_name = "${var.upload_function_name}-${local.random_suffix}"
+  link_function_name = "${var.link_function_name}-${local.random_suffix}"
+  
+  # Service account name
+  service_account_name = "file-share-sa-${local.random_suffix}"
+  
+  # Required APIs for the solution
+  required_apis = [
+    "storage.googleapis.com",
+    "cloudfunctions.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "run.googleapis.com"
+  ]
+
+# Resources
+
+# Generate random suffix for unique resource names
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+# Enable required Google Cloud APIs
+resource "google_project_service" "required_apis" {
+  for_each = toset(local.required_apis)
+  
+  project = var.project_id
+  service = each.value
+  
+  # Prevent disabling APIs when destroying
+  disable_dependent_services = false
+  disable_on_destroy         = false
+  
+  # Add timeouts for API enablement
+  timeouts {
+    create = "10m"
+  }
+}
+
+# Create service account for Cloud Functions with least privilege access
+resource "google_service_account" "function_sa" {
+  account_id   = local.service_account_name
+  display_name = "File Sharing Functions Service Account"
+  description  = "Service account for file sharing upload and link generation functions"
+  project      = var.project_id
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Grant necessary permissions to service account for Cloud Storage operations
+resource "google_project_iam_member" "storage_object_admin" {
+  project = var.project_id
+  role    = "roles/storage.objectAdmin"
+  member  = "serviceAccount:${google_service_account.function_sa.email}"
+}
+
+# Grant logging permissions for Cloud Functions
+resource "google_project_iam_member" "logging_writer" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.function_sa.email}"
+}
+
+# Create Cloud Storage bucket for file storage
+resource "google_storage_bucket" "file_storage" {
+  name     = local.bucket_name
+  location = var.region
+  project  = var.project_id
+  
+  # Standard storage class for frequently accessed files
+  storage_class = "STANDARD"
+  
+  # Enable uniform bucket-level access for consistent IAM
+  uniform_bucket_level_access = true
+  
+  # Prevent accidental deletion in production
+  lifecycle {
+    prevent_destroy = false
+  }
+  
+  # CORS configuration to allow web uploads
+  cors {
+    origin          = ["*"]
+    method          = ["GET", "POST", "PUT", "OPTIONS"]
+    response_header = ["Content-Type", "Access-Control-Allow-Origin"]
+    max_age_seconds = 3600
+  }
+  
+  # Versioning for file recovery (optional)
+  versioning {
+    enabled = false
+  }
+  
+  # Apply resource labels
+  labels = var.environment_labels
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Grant the service account access to the specific bucket
+resource "google_storage_bucket_iam_member" "bucket_object_admin" {
+  bucket = google_storage_bucket.file_storage.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.function_sa.email}"
+}
+
+# Create ZIP archive for upload function source code
+data "archive_file" "upload_function_zip" {
+  type        = "zip"
+  output_path = "/tmp/upload_function.zip"
+  source {
+    content = <<-EOT
+import functions_framework
+from google.cloud import storage
+import os
+from werkzeug.utils import secure_filename
+import logging
+
+# Initialize Cloud Storage client
+storage_client = storage.Client()
+bucket_name = os.environ.get('BUCKET_NAME')
+
+@functions_framework.http
+def upload_file(request):
+    """HTTP Cloud Function for file uploads."""
+    # Enable CORS
+    if request.method == 'OPTIONS':
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST',
+            'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Max-Age': '3600'
+        }
+        return ('', 204, headers)
+    
+    headers = {'Access-Control-Allow-Origin': '*'}
+    
+    if request.method != 'POST':
+        return ('Method not allowed', 405, headers)
+    
+    try:
+        # Get uploaded file
+        uploaded_file = request.files.get('file')
+        if not uploaded_file:
+            return ('No file provided', 400, headers)
+        
+        # Secure the filename
+        filename = secure_filename(uploaded_file.filename)
+        if not filename:
+            return ('Invalid filename', 400, headers)
+        
+        # Upload to Cloud Storage
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(filename)
+        blob.upload_from_file(uploaded_file)
+        
+        logging.info(f'File {filename} uploaded successfully')
+        return ({'message': f'File {filename} uploaded successfully', 'filename': filename}, 200, headers)
+        
+    except Exception as e:
+        logging.error(f'Upload error: {str(e)}')
+        return ('Upload failed', 500, headers)
+EOT
+    filename = "main.py"
+  }
+  source {
+    content = <<-EOT
+functions-framework==3.*
+google-cloud-storage==2.*
+Werkzeug==3.*
+EOT
+    filename = "requirements.txt"
+  }
+}
+
+# Create ZIP archive for link generation function source code
+data "archive_file" "link_function_zip" {
+  type        = "zip"
+  output_path = "/tmp/link_function.zip"
+  source {
+    content = <<-EOT
+import functions_framework
+from google.cloud import storage
+from datetime import datetime, timedelta
+import json
+import os
+import logging
+
+# Initialize Cloud Storage client
+storage_client = storage.Client()
+bucket_name = os.environ.get('BUCKET_NAME')
+
+@functions_framework.http
+def generate_link(request):
+    """HTTP Cloud Function for generating shareable links."""
+    # Enable CORS
+    if request.method == 'OPTIONS':
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST',
+            'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Max-Age': '3600'
+        }
+        return ('', 204, headers)
+    
+    headers = {'Access-Control-Allow-Origin': '*'}
+    
+    try:
+        # Get filename from request
+        if request.method == 'POST':
+            data = request.get_json()
+            filename = data.get('filename') if data else None
+        else:
+            filename = request.args.get('filename')
+        
+        if not filename:
+            return ('Filename required', 400, headers)
+        
+        # Generate signed URL (valid for 1 hour)
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(filename)
+        
+        # Check if file exists
+        if not blob.exists():
+            return ('File not found', 404, headers)
+        
+        # Generate signed URL with 1 hour expiration
+        url = blob.generate_signed_url(
+            version="v4",
+            expiration=datetime.utcnow() + timedelta(hours=1),
+            method="GET"
+        )
+        
+        logging.info(f'Generated signed URL for {filename}')
+        return ({
+            'filename': filename,
+            'download_url': url,
+            'expires_in': '1 hour'
+        }, 200, headers)
+        
+    except Exception as e:
+        logging.error(f'Link generation error: {str(e)}')
+        return ('Link generation failed', 500, headers)
+EOT
+    filename = "main.py"
+  }
+  source {
+    content = <<-EOT
+functions-framework==3.*
+google-cloud-storage==2.*
+EOT
+    filename = "requirements.txt"
+  }
+}
+
+# Upload function source to Cloud Storage for deployment
+resource "google_storage_bucket_object" "upload_function_source" {
+  name   = "sources/upload_function_${random_id.suffix.hex}.zip"
+  bucket = google_storage_bucket.file_storage.name
+  source = data.archive_file.upload_function_zip.output_path
+  
+  depends_on = [data.archive_file.upload_function_zip]
+}
+
+# Upload link function source to Cloud Storage for deployment
+resource "google_storage_bucket_object" "link_function_source" {
+  name   = "sources/link_function_${random_id.suffix.hex}.zip"
+  bucket = google_storage_bucket.file_storage.name
+  source = data.archive_file.link_function_zip.output_path
+  
+  depends_on = [data.archive_file.link_function_zip]
+}
+
+# Deploy upload Cloud Function
+resource "google_cloudfunctions_function" "upload_function" {
+  name    = local.upload_function_name
+  region  = var.region
+  project = var.project_id
+  
+  # Function configuration
+  runtime             = "python312"
+  available_memory_mb = 256
+  timeout             = 60
+  entry_point         = "upload_file"
+  
+  # Source code configuration
+  source_archive_bucket = google_storage_bucket.file_storage.name
+  source_archive_object = google_storage_bucket_object.upload_function_source.name
+  
+  # HTTP trigger configuration
+  trigger {
+    https_trigger {
+      security_level = "SECURE_ALWAYS"
+    }
+  }
+  
+  # Environment variables
+  environment_variables = {
+    BUCKET_NAME = google_storage_bucket.file_storage.name
+  }
+  
+  # Service account for secure access
+  service_account_email = google_service_account.function_sa.email
+  
+  # Apply resource labels
+  labels = var.environment_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_storage_bucket_object.upload_function_source,
+    google_project_iam_member.storage_object_admin,
+    google_project_iam_member.logging_writer
+  ]
+}
+
+# Deploy link generation Cloud Function
+resource "google_cloudfunctions_function" "link_function" {
+  name    = local.link_function_name
+  region  = var.region
+  project = var.project_id
+  
+  # Function configuration
+  runtime             = "python312"
+  available_memory_mb = 256
+  timeout             = 30
+  entry_point         = "generate_link"
+  
+  # Source code configuration
+  source_archive_bucket = google_storage_bucket.file_storage.name
+  source_archive_object = google_storage_bucket_object.link_function_source.name
+  
+  # HTTP trigger configuration
+  trigger {
+    https_trigger {
+      security_level = "SECURE_ALWAYS"
+    }
+  }
+  
+  # Environment variables
+  environment_variables = {
+    BUCKET_NAME = google_storage_bucket.file_storage.name
+  }
+  
+  # Service account for secure access
+  service_account_email = google_service_account.function_sa.email
+  
+  # Apply resource labels
+  labels = var.environment_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_storage_bucket_object.link_function_source,
+    google_project_iam_member.storage_object_admin,
+    google_project_iam_member.logging_writer
+  ]
+}
+
+# Allow unauthenticated access to upload function (required for web uploads)
+resource "google_cloudfunctions_function_iam_member" "upload_function_invoker" {
+  project        = var.project_id
+  region         = var.region
+  cloud_function = google_cloudfunctions_function.upload_function.name
+  role           = "roles/cloudfunctions.invoker"
+  member         = "allUsers"
+}
+
+# Allow unauthenticated access to link generation function
+resource "google_cloudfunctions_function_iam_member" "link_function_invoker" {
+  project        = var.project_id
+  region         = var.region
+  cloud_function = google_cloudfunctions_function.link_function.name
+  role           = "roles/cloudfunctions.invoker"
+  member         = "allUsers"
+}
+
+# Outputs for verification and integration
+outputs:
+  # Storage bucket information
+  bucket_name:
+    description: "Name of the created Cloud Storage bucket"
+    value: google_storage_bucket.file_storage.name
+
+  bucket_url:
+    description: "URL of the Cloud Storage bucket"
+    value: google_storage_bucket.file_storage.url
+
+  # Cloud Functions information
+  upload_function_name:
+    description: "Name of the upload Cloud Function"
+    value: google_cloudfunctions_function.upload_function.name
+
+  upload_function_url:
+    description: "HTTPS trigger URL for the upload function"
+    value: google_cloudfunctions_function.upload_function.https_trigger_url
+
+  link_function_name:
+    description: "Name of the link generation Cloud Function"
+    value: google_cloudfunctions_function.link_function.name
+
+  link_function_url:
+    description: "HTTPS trigger URL for the link generation function"
+    value: google_cloudfunctions_function.link_function.https_trigger_url
+
+  # Service account information
+  service_account_email:
+    description: "Email of the service account used by Cloud Functions"
+    value: google_service_account.function_sa.email
+
+  # Region and project information
+  deployment_region:
+    description: "Region where resources were deployed"
+    value: var.region
+
+  project_id:
+    description: "Google Cloud Project ID"
+    value: var.project_id
+
+  # Testing URLs for web interface
+  web_interface_config:
+    description: "Configuration for web interface testing"
+    value: {
+      upload_url = google_cloudfunctions_function.upload_function.https_trigger_url
+      link_url   = google_cloudfunctions_function.link_function.https_trigger_url
+      bucket_name = google_storage_bucket.file_storage.name
+    }
+
+  # Cost estimation information
+  estimated_monthly_cost:
+    description: "Estimated monthly cost for typical usage (USD)"
+    value: "0.10-2.00 (based on free tier allowances and typical small team usage)"

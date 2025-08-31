@@ -1,0 +1,389 @@
+# Google Cloud Infrastructure Manager Configuration
+# Recipe: Web Application Deployment with App Engine
+# Description: Deploy a Python Flask web application using Google App Engine
+# with automatic scaling, monitoring, and built-in SSL/HTTPS support
+
+# Import blocks for required resource modules
+imports:
+  # Import the Google Cloud provider for App Engine resources
+  - path: modules/project-apis.yaml
+  - path: modules/app-engine-app.yaml
+  - path: modules/app-engine-version.yaml
+
+# Global variables accessible to all modules
+variables:
+  # Project configuration
+  project_id:
+    description: "Google Cloud Project ID for the web application"
+    type: string
+    default: "webapp-demo-${random_id}"
+  
+  # Regional configuration
+  region:
+    description: "Google Cloud region for App Engine deployment"
+    type: string
+    default: "us-central1"
+    
+  # Application configuration
+  app_name:
+    description: "Name of the web application"
+    type: string
+    default: "flask-webapp"
+    
+  # Runtime configuration
+  python_runtime:
+    description: "Python runtime version for App Engine"
+    type: string
+    default: "python312"
+    
+  # Scaling configuration
+  min_instances:
+    description: "Minimum number of instances for automatic scaling"
+    type: integer
+    default: 0
+    
+  max_instances:
+    description: "Maximum number of instances for automatic scaling"
+    type: integer
+    default: 10
+    
+  target_cpu_utilization:
+    description: "Target CPU utilization for scaling (0.0 to 1.0)"
+    type: number
+    default: 0.6
+    
+  # Environment configuration
+  flask_env:
+    description: "Flask environment setting"
+    type: string
+    default: "production"
+
+# Resource definitions
+resources:
+  # Random ID generator for unique project naming
+  random_project_suffix:
+    type: gcp-types/cloudresourcemanager-v1:projects
+    metadata:
+      runtimePolicy:
+        - CREATE
+    properties:
+      projectId: $(ref.random_id.hex)
+      name: "Web App Demo Project"
+      
+  # Random ID for generating unique resource names
+  random_id:
+    type: gcp-types/cloudfunctions-v1:random_id
+    properties:
+      byte_length: 4
+
+  # Enable required Google Cloud APIs
+  enable_app_engine_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(variables.project_id)/services/appengine.googleapis.com
+      parent: projects/$(variables.project_id)
+    metadata:
+      dependsOn:
+        - random_project_suffix
+
+  enable_cloud_build_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(variables.project_id)/services/cloudbuild.googleapis.com
+      parent: projects/$(variables.project_id)
+    metadata:
+      dependsOn:
+        - random_project_suffix
+
+  enable_cloud_resource_manager_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(variables.project_id)/services/cloudresourcemanager.googleapis.com
+      parent: projects/$(variables.project_id)
+    metadata:
+      dependsOn:
+        - random_project_suffix
+
+  # Create App Engine application
+  app_engine_application:
+    type: gcp-types/appengine-v1:apps
+    properties:
+      id: $(variables.project_id)
+      locationId: $(variables.region)
+      # Configure application settings
+      servingStatus: SERVING
+      # Enable Firebase integration for enhanced features
+      databaseType: CLOUD_FIRESTORE_COMPATIBILITY_MODE
+    metadata:
+      dependsOn:
+        - enable_app_engine_api
+        - enable_cloud_build_api
+        - enable_cloud_resource_manager_api
+
+  # Create App Engine service (default service)
+  app_engine_service:
+    type: gcp-types/appengine-v1:apps.services
+    properties:
+      appsId: $(variables.project_id)
+      id: default
+      # Traffic allocation configuration
+      split:
+        allocations:
+          # 100% traffic to the latest version
+          $(ref.app_engine_version.id): 1.0
+    metadata:
+      dependsOn:
+        - app_engine_application
+        - app_engine_version
+
+  # Deploy App Engine version with Flask application
+  app_engine_version:
+    type: gcp-types/appengine-v1:apps.services.versions
+    properties:
+      appsId: $(variables.project_id)
+      servicesId: default
+      # Automatic version ID generation
+      id: v$(ref.random_id.hex)
+      
+      # Runtime configuration
+      runtime: $(variables.python_runtime)
+      
+      # Application source configuration
+      deployment:
+        # Source files for the Flask application
+        files:
+          # Main Python application file
+          main.py:
+            sourceUrl: "gs://$(ref.source_bucket.name)/main.py"
+          # Requirements for Python dependencies
+          requirements.txt:
+            sourceUrl: "gs://$(ref.source_bucket.name)/requirements.txt"
+          # App Engine configuration
+          app.yaml:
+            sourceUrl: "gs://$(ref.source_bucket.name)/app.yaml"
+          # HTML templates
+          templates/index.html:
+            sourceUrl: "gs://$(ref.source_bucket.name)/templates/index.html"
+          # Static assets
+          static/style.css:
+            sourceUrl: "gs://$(ref.source_bucket.name)/static/style.css"
+          static/script.js:
+            sourceUrl: "gs://$(ref.source_bucket.name)/static/script.js"
+      
+      # Automatic scaling configuration
+      automaticScaling:
+        minTotalInstances: $(variables.min_instances)
+        maxTotalInstances: $(variables.max_instances)
+        targetCpuUtilization: $(variables.target_cpu_utilization)
+        # Cool down periods for scaling decisions
+        coolDownPeriod: 180s
+        # Request utilization targeting
+        targetRequestUtilization: 0.7
+        # Maximum concurrent requests per instance
+        maxConcurrentRequests: 80
+        
+      # Network configuration
+      network:
+        # Forward traffic from all IPs
+        forwardedPorts:
+          - 8080
+        # Enable session affinity for better performance
+        sessionAffinity: true
+        
+      # Request handlers configuration
+      handlers:
+        # Static file handler for CSS, JS, images
+        - urlRegex: "/static/(.*)"
+          staticFiles:
+            path: "static/\\1"
+            uploadPathRegex: "static/(.*)"
+          # Cache static files for 1 hour
+          httpHeaders:
+            Cache-Control: "public, max-age=3600"
+            
+        # Main application handler
+        - urlRegex: ".*"
+          script:
+            scriptPath: "auto"
+          # Security headers for all requests
+          httpHeaders:
+            X-Frame-Options: "DENY"
+            X-Content-Type-Options: "nosniff"
+            X-XSS-Protection: "1; mode=block"
+            Strict-Transport-Security: "max-age=31536000; includeSubDomains"
+      
+      # Environment variables for the Flask application
+      envVariables:
+        FLASK_ENV: $(variables.flask_env)
+        GAE_APPLICATION: $(variables.project_id)
+        GAE_VERSION: $(ref.app_engine_version.id)
+        
+      # Health check configuration
+      livenessCheck:
+        path: "/health"
+        checkInterval: 30s
+        timeout: 4s
+        failureThreshold: 2
+        successThreshold: 2
+        
+      readinessCheck:
+        path: "/health"
+        checkInterval: 5s
+        timeout: 4s
+        failureThreshold: 2
+        successThreshold: 2
+        
+    metadata:
+      dependsOn:
+        - app_engine_application
+        - source_bucket
+        - upload_source_files
+
+  # Cloud Storage bucket for source code deployment
+  source_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(variables.project_id)-source-$(ref.random_id.hex)
+      project: $(variables.project_id)
+      location: $(variables.region)
+      # Configure bucket for temporary source storage
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 7
+      # Enable versioning for deployment rollbacks
+      versioning:
+        enabled: true
+      # Security configuration
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+    metadata:
+      dependsOn:
+        - enable_cloud_build_api
+
+  # Upload source files to Cloud Storage (placeholder for actual implementation)
+  upload_source_files:
+    type: gcp-types/cloudbuild-v1:projects.builds
+    properties:
+      projectId: $(variables.project_id)
+      source:
+        repoSource:
+          # This would typically reference a Cloud Source Repository
+          # In practice, files would be uploaded via gsutil or Cloud Build
+          projectId: $(variables.project_id)
+          repoName: webapp-source
+          branchName: main
+      steps:
+        # Build step to prepare application files
+        - name: gcr.io/cloud-builders/gsutil
+          args:
+            - cp
+            - -r
+            - ./*
+            - gs://$(ref.source_bucket.name)/
+          env:
+            - FLASK_ENV=$(variables.flask_env)
+      # Build configuration
+      options:
+        logging: CLOUD_LOGGING_ONLY
+        logStreamingOption: STREAM_ON
+    metadata:
+      dependsOn:
+        - source_bucket
+        - enable_cloud_build_api
+
+  # IAM binding for App Engine default service account
+  app_engine_service_account_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(variables.project_id)
+      role: roles/editor
+      member: serviceAccount:$(variables.project_id)@appspot.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - app_engine_application
+
+  # Cloud Monitoring notification channel (optional)
+  monitoring_notification_channel:
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      name: projects/$(variables.project_id)/notificationChannels/webapp-alerts
+      type: email
+      displayName: "Web App Alerts"
+      description: "Email notifications for App Engine application alerts"
+      labels:
+        email_address: "admin@example.com"
+      enabled: true
+    metadata:
+      dependsOn:
+        - app_engine_application
+
+# Output values for verification and integration
+outputs:
+  # Application URL for accessing the deployed web app
+  application_url:
+    description: "URL of the deployed App Engine application"
+    value: https://$(variables.project_id).appspot.com
+    
+  # App Engine service information
+  app_engine_service_name:
+    description: "Name of the App Engine service"
+    value: $(ref.app_engine_service.id)
+    
+  # Current application version
+  app_version:
+    description: "Deployed application version ID"
+    value: $(ref.app_engine_version.id)
+    
+  # Project information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(variables.project_id)
+    
+  # Regional deployment information
+  deployment_region:
+    description: "App Engine deployment region"
+    value: $(variables.region)
+    
+  # Source bucket for deployment artifacts
+  source_bucket_name:
+    description: "Cloud Storage bucket containing source code"
+    value: $(ref.source_bucket.name)
+    
+  # Monitoring and management URLs
+  app_engine_console_url:
+    description: "App Engine console URL for management"
+    value: https://console.cloud.google.com/appengine?project=$(variables.project_id)
+    
+  cloud_logging_url:
+    description: "Cloud Logging URL for application logs"
+    value: https://console.cloud.google.com/logs/query;query=resource.type%3D%22gae_app%22?project=$(variables.project_id)
+    
+  cloud_monitoring_url:
+    description: "Cloud Monitoring URL for application metrics"
+    value: https://console.cloud.google.com/monitoring?project=$(variables.project_id)
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "Infrastructure Manager configuration for Flask web application deployment on Google App Engine"
+  author: "Generated from GCP Recipe"
+  created: "2025-01-27"
+  # Dependencies and requirements
+  dependencies:
+    - "Google Cloud Project with billing enabled"
+    - "App Engine API enabled"
+    - "Cloud Build API enabled"
+    - "Cloud Resource Manager API enabled"
+  # Estimated deployment time
+  deployment_time: "5-10 minutes"
+  # Cost considerations
+  cost_notes: |
+    App Engine provides generous free quotas including:
+    - 28 instance hours per day
+    - 1 GB outbound data per day
+    - 5 GB Cloud Storage
+    Additional usage charged per instance hour and data transfer.

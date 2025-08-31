@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Translation API, Cloud Scheduler, Cloud Storage, Pub/Sub
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: translation, localization, automation, ai-ml, content-management, workflow
 recipe-generator-version: 1.3
@@ -86,12 +86,12 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with appropriate permissions for Translation API, Cloud Storage, Pub/Sub, and Cloud Functions
-2. gcloud CLI v2 installed and configured (or Google Cloud Shell)
+2. gcloud CLI v400.0+ installed and configured (or Google Cloud Shell)
 3. Basic understanding of cloud-native application architecture and event-driven systems
 4. Knowledge of document processing workflows and content management systems
 5. Estimated cost: $50-100 for tutorial resources (includes Translation API usage, storage, and compute)
 
-> **Note**: Cloud Translation Advanced replaces the deprecated AutoML Translation service. Custom translation models provide superior accuracy for domain-specific content compared to generic translation services. See [Cloud Translation documentation](https://cloud.google.com/translate/docs) for current service offerings.
+> **Note**: Cloud Translation Advanced provides superior accuracy for domain-specific content compared to generic translation services. Custom translation models can improve accuracy by 15-30% for industry-specific terminology. See [Cloud Translation documentation](https://cloud.google.com/translate/docs/advanced/translating-text-v3) for current service offerings.
 
 ## Preparation
 
@@ -218,33 +218,45 @@ echo "✅ APIs enabled successfully"
    import base64
    from google.cloud import translate_v3
    from google.cloud import storage
-   from google.cloud import pubsub_v1
    import os
+   import logging
+   
+   # Configure logging
+   logging.basicConfig(level=logging.INFO)
+   logger = logging.getLogger(__name__)
    
    def translate_document(event, context):
        """Cloud Function triggered by Pub/Sub to translate documents."""
        
-       # Initialize clients
-       translate_client = translate_v3.TranslationServiceClient()
-       storage_client = storage.Client()
-       
-       # Parse Pub/Sub message
-       pubsub_message = base64.b64decode(event['data']).decode('utf-8')
-       message_data = json.loads(pubsub_message)
-       
-       # Extract file information
-       bucket_name = message_data['bucketId']
-       file_name = message_data['objectId']
-       
-       # Define target languages
-       target_languages = ['es', 'fr', 'de', 'it', 'pt']
-       project_id = os.environ['GCP_PROJECT']
-       location = 'us-central1'
-       
        try:
+           # Initialize clients
+           translate_client = translate_v3.TranslationServiceClient()
+           storage_client = storage.Client()
+           
+           # Parse Pub/Sub message
+           pubsub_message = base64.b64decode(event['data']).decode('utf-8')
+           message_data = json.loads(pubsub_message)
+           
+           # Extract file information from Cloud Storage notification
+           bucket_name = message_data.get('bucketId')
+           file_name = message_data.get('objectId')
+           
+           if not bucket_name or not file_name:
+               logger.error(f"Missing bucket or file information: {message_data}")
+               return "Error: Missing file information"
+           
+           # Define target languages
+           target_languages = ['es', 'fr', 'de', 'it', 'pt']
+           project_id = os.environ.get('GOOGLE_CLOUD_PROJECT')
+           location = 'us-central1'
+           
            # Download source file
            bucket = storage_client.bucket(bucket_name)
            blob = bucket.blob(file_name)
+           
+           if not blob.exists():
+               logger.error(f"File does not exist: {file_name}")
+               return "Error: File not found"
            
            if blob.name.endswith('.txt'):
                content = blob.download_as_text()
@@ -257,47 +269,54 @@ echo "✅ APIs enabled successfully"
                )
                
                source_language = response.languages[0].language_code
-               print(f"Detected language: {source_language}")
+               logger.info(f"Detected language: {source_language}")
                
                # Translate to each target language
                for target_lang in target_languages:
                    if target_lang != source_language:
-                       translation = translate_client.translate_text(
-                           parent=parent,
-                           contents=[content],
-                           source_language_code=source_language,
-                           target_language_code=target_lang
-                       )
-                       
-                       # Save translated content
-                       translated_bucket = storage_client.bucket(
-                           os.environ['TRANSLATED_BUCKET']
-                       )
-                       translated_blob_name = f"{target_lang}/{file_name}"
-                       translated_blob = translated_bucket.blob(translated_blob_name)
-                       translated_blob.upload_from_string(
-                           translation.translations[0].translated_text
-                       )
-                       
-                       print(f"Translated {file_name} to {target_lang}")
+                       try:
+                           translation = translate_client.translate_text(
+                               parent=parent,
+                               contents=[content],
+                               source_language_code=source_language,
+                               target_language_code=target_lang
+                           )
+                           
+                           # Save translated content
+                           translated_bucket = storage_client.bucket(
+                               os.environ['TRANSLATED_BUCKET']
+                           )
+                           translated_blob_name = f"{target_lang}/{file_name}"
+                           translated_blob = translated_bucket.blob(translated_blob_name)
+                           translated_blob.upload_from_string(
+                               translation.translations[0].translated_text
+                           )
+                           
+                           logger.info(f"Translated {file_name} to {target_lang}")
+                       except Exception as e:
+                           logger.error(f"Translation error for {target_lang}: {str(e)}")
+                           continue
                
-               return f"Successfully translated {file_name}"
+               return f"Successfully processed {file_name}"
+           else:
+               logger.warning(f"Unsupported file type: {file_name}")
+               return f"Skipped unsupported file: {file_name}"
                
        except Exception as e:
-           print(f"Error processing {file_name}: {str(e)}")
+           logger.error(f"Error processing file: {str(e)}")
            raise e
    EOF
    
-   # Create requirements file
+   # Create requirements file with current versions
    cat > requirements.txt << 'EOF'
-   google-cloud-translate==3.15.0
-   google-cloud-storage==2.10.0
-   google-cloud-pubsub==2.18.0
+   google-cloud-translate==3.16.0
+   google-cloud-storage==2.14.0
+   google-cloud-pubsub==2.23.0
    EOF
    
    # Deploy the Cloud Function
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python39 \
+       --runtime python311 \
        --trigger-topic ${TOPIC_NAME} \
        --entry-point translate_document \
        --memory 512MB \
@@ -433,7 +452,7 @@ echo "✅ APIs enabled successfully"
    
    # Set up Cloud Logging for translation tracking
    gcloud logging sinks create translation-audit \
-       storage.googleapis.com/${BUCKET_TRANSLATED}/logs/ \
+       "storage.googleapis.com/${BUCKET_TRANSLATED}/logs/" \
        --log-filter='resource.type="cloud_function" AND resource.labels.function_name="'${FUNCTION_NAME}'"'
    
    echo "✅ Monitoring and alerting configured"
@@ -509,8 +528,11 @@ echo "✅ APIs enabled successfully"
    gcloud functions delete ${FUNCTION_NAME} --quiet
    
    # Remove storage notifications
-   gsutil notification delete \
-       $(gsutil notification list gs://${BUCKET_SOURCE} | grep ${TOPIC_NAME} | awk '{print $1}')
+   NOTIFICATION_ID=$(gsutil notification list gs://${BUCKET_SOURCE} | \
+       grep ${TOPIC_NAME} | awk '{print $1}')
+   if [ ! -z "$NOTIFICATION_ID" ]; then
+       gsutil notification delete $NOTIFICATION_ID
+   fi
    
    # Delete storage buckets and contents
    gsutil -m rm -r gs://${BUCKET_SOURCE}
@@ -545,9 +567,9 @@ The serverless architecture automatically scales from processing single document
 
 Security and compliance considerations are built into the architecture through Google Cloud's shared responsibility model. Cloud Translation Advanced processes content within Google's secure infrastructure without storing translation data beyond the processing session. IAM roles ensure least-privilege access to resources, while Cloud Logging provides comprehensive audit trails for compliance requirements. Organizations can also implement Cloud KMS for additional encryption controls and Cloud DLP for sensitive content detection.
 
-The solution's extensibility allows organizations to enhance the workflow with additional features like translation quality scoring, human review integration, and multi-format document support. Integration with content management systems, version control platforms, and collaboration tools enables seamless workflows that fit existing business processes. For more advanced scenarios, organizations can explore [Cloud Translation's custom model training](https://cloud.google.com/translate/docs/advanced/custom-translations) for domain-specific accuracy improvements.
+The solution's extensibility allows organizations to enhance the workflow with additional features like translation quality scoring, human review integration, and multi-format document support. Integration with content management systems, version control platforms, and collaboration tools enables seamless workflows that fit existing business processes. For more advanced scenarios, organizations can explore [Cloud Translation's custom model training](https://cloud.google.com/translate/docs/advanced/custom-translations) for domain-specific accuracy improvements and [Translation Hub](https://cloud.google.com/translate/docs/hub) for enterprise workflow management.
 
-> **Tip**: Implement translation glossaries using Cloud Translation's glossary feature to ensure consistent translation of brand terms and technical vocabulary across all content types. This maintains brand consistency and improves translation accuracy for industry-specific terminology.
+> **Tip**: Implement translation glossaries using Cloud Translation's glossary feature to ensure consistent translation of brand terms and technical vocabulary across all content types. This maintains brand consistency and improves translation accuracy for industry-specific terminology by up to 25%.
 
 ## Challenge
 
@@ -559,7 +581,7 @@ Extend this content localization solution by implementing these enhancements:
 
 3. **Content Management System Integration**: Connect the pipeline to popular CMS platforms like WordPress or Drupal using Cloud Endpoints and API Gateway, enabling direct publication of translated content to multiple websites.
 
-4. **Advanced Monitoring Dashboard**: Build a comprehensive monitoring dashboard using Cloud Monitoring and Data Studio that tracks translation volumes, quality metrics, cost optimization opportunities, and system performance across multiple languages and content types.
+4. **Advanced Monitoring Dashboard**: Build a comprehensive monitoring dashboard using Cloud Monitoring and Looker Studio that tracks translation volumes, quality metrics, cost optimization opportunities, and system performance across multiple languages and content types.
 
 5. **Intelligent Content Routing**: Develop smart content classification using Vertex AI to automatically determine optimal translation strategies based on content type, urgency, and target audience, routing technical documentation through specialized models while handling marketing content with brand-aware translation workflows.
 

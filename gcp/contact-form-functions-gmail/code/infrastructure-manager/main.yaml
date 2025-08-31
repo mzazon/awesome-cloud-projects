@@ -1,0 +1,562 @@
+# Infrastructure Manager Configuration for Website Contact Form with Cloud Functions and Gmail API
+# This configuration deploys a serverless contact form solution using Google Cloud Functions
+# to process form submissions and the Gmail API to send email notifications.
+
+# The template creates:
+# - 2nd generation Cloud Function with HTTP trigger for form processing
+# - Required API enablement for Cloud Functions, Cloud Build, and Gmail
+# - IAM roles and permissions for secure function execution
+# - Storage bucket for Cloud Functions source code deployment
+# - Function source code archive and deployment configuration
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: infrastructure-manager-deployment
+  labels:
+    app: contact-form-serverless
+    version: "1.1"
+data:
+  # Infrastructure Manager YAML configuration
+  config.yaml: |
+    # Google Cloud Infrastructure Manager Template
+    # Website Contact Form with Cloud Functions and Gmail API
+    
+    # Template metadata and version information
+    info:
+      title: "Contact Form Serverless Infrastructure"
+      description: "Deploy serverless contact form with Cloud Functions and Gmail API integration"
+      version: "1.1"
+      author: "Google Cloud Infrastructure Manager"
+    
+    # Import required Google Cloud resource templates
+    imports:
+    - path: gcp-types/cloudfunctions-v1:projects.locations.functions
+      name: cloud-function
+    - path: gcp-types/storage-v1:buckets
+      name: storage-bucket
+    - path: gcp-types/servicemanagement-v1:services
+      name: api-service
+    
+    # Input parameters for customization
+    resources:
+    
+    # Enable required Google Cloud APIs
+    # Cloud Functions API - Required for deploying and managing Cloud Functions
+    - name: cloudfunctions-api
+      type: gcp-types/servicemanagement-v1:services
+      properties:
+        serviceName: cloudfunctions.googleapis.com
+        consumerId: {{ env["project"] }}
+      metadata:
+        dependsOn: []
+    
+    # Cloud Build API - Required for building Cloud Functions source code
+    - name: cloudbuild-api
+      type: gcp-types/servicemanagement-v1:services
+      properties:
+        serviceName: cloudbuild.googleapis.com
+        consumerId: {{ env["project"] }}
+      metadata:
+        dependsOn: []
+    
+    # Gmail API - Required for sending emails via Gmail service
+    - name: gmail-api
+      type: gcp-types/servicemanagement-v1:services
+      properties:
+        serviceName: gmail.googleapis.com
+        consumerId: {{ env["project"] }}
+      metadata:
+        dependsOn: []
+    
+    # Cloud Storage bucket for storing Cloud Function source code
+    # This bucket will contain the function's source code archive for deployment
+    - name: function-source-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        # Generate unique bucket name using project ID and timestamp
+        name: {{ env["project"] }}-contact-form-source-{{ env["deployment"] }}
+        location: US-CENTRAL1
+        # Configure bucket for function source storage with appropriate lifecycle
+        storageClass: STANDARD
+        lifecycle:
+          rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30  # Clean up old source archives after 30 days
+        # Apply security settings for function source bucket
+        iamConfiguration:
+          uniformBucketLevelAccess:
+            enabled: true
+        # Enable versioning for source code management
+        versioning:
+          enabled: true
+      metadata:
+        dependsOn:
+        - cloudfunctions-api
+        - cloudbuild-api
+    
+    # Cloud Storage bucket object for function source code archive
+    # This contains the Python function code and dependencies
+    - name: function-source-archive
+      type: gcp-types/storage-v1:objects
+      properties:
+        bucket: $(ref.function-source-bucket.name)
+        name: contact-form-handler-source.zip
+        # Source code is provided as base64-encoded ZIP archive
+        # In production, this would be generated from actual source files
+        data: |
+          # Base64-encoded ZIP file containing:
+          # - main.py: Contact form handler function implementation
+          # - requirements.txt: Python dependencies (google-auth, google-api-python-client, etc.)
+          # - token.pickle: OAuth 2.0 credentials for Gmail API access
+          
+          # Note: This is a placeholder. In actual deployment, you would:
+          # 1. Create the function source code files (main.py, requirements.txt)
+          # 2. Include your OAuth 2.0 token.pickle file for Gmail API access
+          # 3. Create a ZIP archive of these files
+          # 4. Base64 encode the ZIP file content
+          # 5. Replace this placeholder with the actual encoded content
+          
+          UEsDBAoAAAAAAIdVUVMAAAAAAAAAAAAAAAAQAAAAZnVuY3Rpb24tc291cmNlLwA=
+      metadata:
+        dependsOn:
+        - function-source-bucket
+    
+    # IAM service account for Cloud Function execution
+    # This service account provides the function with necessary permissions
+    - name: contact-form-function-sa
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: contact-form-handler-sa
+        displayName: "Contact Form Handler Service Account"
+        description: "Service account for contact form Cloud Function execution"
+        # Configure service account for least privilege access
+        serviceAccount:
+          displayName: "Contact Form Handler SA"
+          description: "Executes contact form processing function with Gmail API access"
+      metadata:
+        dependsOn:
+        - gmail-api
+    
+    # IAM binding for Gmail API access
+    # Grants the service account permission to send emails via Gmail API
+    - name: gmail-api-binding
+      type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+      properties:
+        resource: {{ env["project"] }}
+        policy:
+          bindings:
+          - role: roles/gmail.send
+            members:
+            - serviceAccount:$(ref.contact-form-function-sa.email)
+          # Additional IAM bindings for function execution
+          - role: roles/cloudsql.client
+            members:
+            - serviceAccount:$(ref.contact-form-function-sa.email)
+      metadata:
+        dependsOn:
+        - contact-form-function-sa
+    
+    # 2nd Generation Cloud Function for contact form processing
+    # This function handles HTTP requests from contact forms and sends emails
+    - name: contact-form-handler
+      type: gcp-types/cloudfunctions-v2beta:projects.locations.functions
+      properties:
+        parent: projects/{{ env["project"] }}/locations/us-central1
+        functionId: contact-form-handler
+        function:
+          # Function description and metadata
+          description: "Serverless contact form handler with Gmail API integration"
+          # Configure function source code location
+          buildConfig:
+            runtime: python312
+            entryPoint: contact_form_handler
+            source:
+              storageSource:
+                bucket: $(ref.function-source-bucket.name)
+                object: $(ref.function-source-archive.name)
+          # Configure function service and execution settings
+          serviceConfig:
+            # Set memory allocation for optimal performance
+            availableMemory: 512Mi
+            # Configure timeout for email sending operations
+            timeoutSeconds: 60
+            # Set maximum instances to control costs
+            maxInstanceCount: 100
+            # Configure service account for secure execution
+            serviceAccountEmail: $(ref.contact-form-function-sa.email)
+            # Environment variables for function configuration
+            environmentVariables:
+              FUNCTION_TARGET: contact_form_handler
+              PYTHON_VERSION: "3.12"
+            # Configure ingress settings for web access
+            ingressSettings: ALLOW_ALL
+            # Enable all traffic for public HTTP access
+            allTrafficOnLatestRevision: true
+          # Configure HTTP trigger for contact form submissions
+          eventTrigger:
+            triggerRegion: us-central1
+            eventType: providers/cloud.firestore/eventTypes/document.write
+            service: cloudfunctions.googleapis.com
+        # Configure function location for optimal performance
+        location: us-central1
+      metadata:
+        dependsOn:
+        - function-source-archive
+        - contact-form-function-sa
+        - gmail-api-binding
+        - cloudfunctions-api
+        - cloudbuild-api
+
+---
+# Infrastructure Manager deployment configuration
+# This section defines deployment-specific settings and parameters
+
+apiVersion: config.infra.google.com/v1beta1
+kind: Deployment
+metadata:
+  name: contact-form-deployment
+  labels:
+    app: contact-form
+    environment: production
+spec:
+  # Deployment location and project settings
+  location: us-central1
+  # Reference to the configuration template above
+  blueprint:
+    inputValues:
+      # Project-specific configuration
+      project_id: "${PROJECT_ID}"
+      region: "us-central1"
+      function_name: "contact-form-handler"
+      
+      # Function configuration parameters
+      function_memory: "512Mi"
+      function_timeout: "60s"
+      max_instances: 100
+      
+      # Storage configuration for function source
+      source_bucket_location: "US-CENTRAL1"
+      source_archive_name: "contact-form-handler-source.zip"
+      
+      # Service account configuration
+      service_account_name: "contact-form-handler-sa"
+      service_account_display_name: "Contact Form Handler Service Account"
+      
+      # API configuration
+      required_apis:
+        - cloudfunctions.googleapis.com
+        - cloudbuild.googleapis.com
+        - gmail.googleapis.com
+      
+      # Security and IAM configuration
+      gmail_scope: "https://www.googleapis.com/auth/gmail.send"
+      cors_origins: "*"
+      
+      # Function runtime configuration
+      python_version: "3.12"
+      entry_point: "contact_form_handler"
+      
+      # Monitoring and logging settings
+      enable_logging: true
+      log_level: "INFO"
+      
+      # Cost optimization settings
+      min_instances: 0  # Scale to zero when not in use
+      max_concurrent_requests: 1000
+      
+      # Security settings
+      allow_unauthenticated: true  # Required for public contact form access
+      vpc_connector: ""  # Leave empty for public internet access
+      
+      # Additional metadata
+      labels:
+        application: "contact-form"
+        component: "serverless-backend"
+        environment: "production"
+        managed-by: "infrastructure-manager"
+
+---
+# Configuration for function source code and dependencies
+# This ConfigMap contains the actual Python code and requirements
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: function-source-code
+  labels:
+    app: contact-form
+    component: source-code
+data:
+  # Python function implementation
+  main.py: |
+    import json
+    import base64
+    import pickle
+    from email.message import EmailMessage
+    from googleapiclient.discovery import build
+    from google.auth.transport.requests import Request
+    import functions_framework
+    
+    def load_credentials():
+        """Load Gmail API credentials from token.pickle file"""
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+        
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        
+        return creds
+    
+    def send_email(name, email, subject, message):
+        """Send email using Gmail API"""
+        creds = load_credentials()
+        service = build('gmail', 'v1', credentials=creds)
+        
+        # Create email message
+        msg = EmailMessage()
+        msg['Subject'] = f'Contact Form: {subject}'
+        msg['From'] = 'me'  # 'me' represents the authenticated user
+        msg['To'] = 'your-email@gmail.com'  # Replace with your email
+        
+        # Email body with proper formatting
+        email_body = f"""
+        New contact form submission:
+        
+        Name: {name}
+        Email: {email}
+        Subject: {subject}
+        
+        Message:
+        {message}
+        
+        ---
+        This email was sent automatically from your website contact form.
+        """
+        
+        msg.set_content(email_body)
+        
+        # Send email
+        raw_message = base64.urlsafe_b64encode(
+            msg.as_bytes()).decode('utf-8')
+        
+        service.users().messages().send(
+            userId='me',
+            body={'raw': raw_message}
+        ).execute()
+    
+    @functions_framework.http
+    def contact_form_handler(request):
+        """HTTP Cloud Function to handle contact form submissions"""
+        
+        # Handle CORS preflight requests
+        if request.method == 'OPTIONS':
+            headers = {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'POST',
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Max-Age': '3600'
+            }
+            return ('', 204, headers)
+        
+        # Set CORS headers for actual requests
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Content-Type': 'application/json'
+        }
+        
+        if request.method != 'POST':
+            return ({'error': 'Method not allowed'}, 405, headers)
+        
+        try:
+            # Parse form data
+            request_json = request.get_json(silent=True)
+            
+            if not request_json:
+                return ({'error': 'Invalid JSON'}, 400, headers)
+            
+            # Extract form fields
+            name = request_json.get('name', '').strip()
+            email = request_json.get('email', '').strip()
+            subject = request_json.get('subject', '').strip()
+            message = request_json.get('message', '').strip()
+            
+            # Validate required fields
+            if not all([name, email, subject, message]):
+                return ({'error': 'All fields are required'}, 400, headers)
+            
+            # Basic email validation
+            if '@' not in email or '.' not in email.split('@')[1]:
+                return ({'error': 'Invalid email address'}, 400, headers)
+            
+            # Send email
+            send_email(name, email, subject, message)
+            
+            return ({'success': True, 'message': 'Email sent successfully'}, 200, headers)
+            
+        except Exception as e:
+            print(f'Error: {str(e)}')
+            return ({'error': 'Internal server error'}, 500, headers)
+
+  # Python dependencies specification
+  requirements.txt: |
+    google-auth==2.30.0
+    google-auth-oauthlib==1.2.1
+    google-auth-httplib2==0.2.0
+    google-api-python-client==2.150.0
+    functions-framework==3.8.0
+
+  # Deployment instructions and notes
+  README.md: |
+    # Contact Form Infrastructure Manager Deployment
+    
+    This Infrastructure Manager configuration deploys a complete serverless
+    contact form solution using Google Cloud Functions and Gmail API.
+    
+    ## Prerequisites
+    
+    1. Google Cloud project with billing enabled
+    2. Gmail account for sending emails  
+    3. OAuth 2.0 credentials for Gmail API access
+    4. Infrastructure Manager API enabled
+    
+    ## Pre-deployment Steps
+    
+    1. **Create OAuth 2.0 Credentials**:
+       - Go to Google Cloud Console > APIs & Credentials > Credentials
+       - Create OAuth client ID for desktop application
+       - Download credentials.json file
+    
+    2. **Generate Gmail API Token**:
+       - Run the token generation script to create token.pickle
+       - This file contains your OAuth 2.0 refresh token for Gmail API
+    
+    3. **Prepare Source Code**:
+       - Create ZIP archive containing main.py, requirements.txt, and token.pickle
+       - Base64 encode the ZIP file for inclusion in the configuration
+    
+    ## Deployment
+    
+    ```bash
+    # Set environment variables
+    export PROJECT_ID="your-project-id"
+    export REGION="us-central1"
+    
+    # Deploy using Infrastructure Manager
+    gcloud infra-manager deployments apply contact-form-deployment \
+        --location=${REGION} \
+        --file=main.yaml \
+        --input-values=project_id=${PROJECT_ID}
+    ```
+    
+    ## Post-deployment Configuration
+    
+    1. Update the email address in the function code (line 23 in main.py)
+    2. Test the function endpoint with a sample form submission
+    3. Configure your website's contact form to POST to the function URL
+    
+    ## Security Considerations
+    
+    - The function allows unauthenticated access for public form submissions
+    - Input validation is performed server-side to prevent malicious requests
+    - Gmail API access is limited to sending emails only
+    - Consider implementing rate limiting for production use
+    
+    ## Monitoring and Maintenance
+    
+    - Function logs are available in Cloud Logging
+    - Monitor function execution metrics in Cloud Monitoring
+    - Update OAuth tokens before they expire
+    - Regularly review and update dependencies
+    
+    ## Cost Optimization
+    
+    - Function scales to zero when not in use
+    - Pay only for actual request processing
+    - Source code bucket has lifecycle policies to minimize storage costs
+    - Consider setting budget alerts for cost monitoring
+
+---
+# Output configuration for Infrastructure Manager deployment
+# This section defines the values that will be output after successful deployment
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deployment-outputs
+  labels:
+    app: contact-form
+    component: outputs
+data:
+  outputs.yaml: |
+    # Infrastructure Manager deployment outputs
+    # These values are available after successful deployment
+    
+    outputs:
+      # Cloud Function information
+      function_name:
+        description: "Name of the deployed Cloud Function"
+        value: $(ref.contact-form-handler.name)
+      
+      function_url:
+        description: "HTTP trigger URL for the contact form function"
+        value: $(ref.contact-form-handler.httpsTrigger.url)
+        
+      function_region:
+        description: "Region where the function is deployed"
+        value: "us-central1"
+      
+      # Storage bucket information
+      source_bucket:
+        description: "Name of the Cloud Storage bucket containing function source"
+        value: $(ref.function-source-bucket.name)
+        
+      source_bucket_url:
+        description: "URL of the source storage bucket"
+        value: "gs://$(ref.function-source-bucket.name)"
+      
+      # Service account information
+      service_account_email:
+        description: "Email of the service account used by the function"
+        value: $(ref.contact-form-function-sa.email)
+        
+      # API status information
+      enabled_apis:
+        description: "List of enabled Google Cloud APIs"
+        value:
+          - "cloudfunctions.googleapis.com"
+          - "cloudbuild.googleapis.com"
+          - "gmail.googleapis.com"
+      
+      # Deployment metadata
+      deployment_time:
+        description: "Timestamp of deployment"
+        value: $(timestamp())
+        
+      project_id:
+        description: "Google Cloud project ID where resources are deployed"
+        value: {{ env["project"] }}
+        
+      # Security configuration
+      function_security:
+        description: "Security configuration summary"
+        value:
+          allow_unauthenticated: true
+          cors_enabled: true
+          gmail_api_scope: "https://www.googleapis.com/auth/gmail.send"
+          
+      # Usage instructions
+      usage_instructions:
+        description: "Instructions for using the deployed contact form"
+        value: |
+          1. Configure your website's contact form to POST JSON data to: $(ref.contact-form-handler.httpsTrigger.url)
+          2. Ensure your OAuth 2.0 token.pickle file is included in the function deployment
+          3. Update the recipient email address in the function code
+          4. Test the form with sample data to verify email delivery
+          
+          Sample POST request:
+          curl -X POST $(ref.contact-form-handler.httpsTrigger.url) \
+            -H "Content-Type: application/json" \
+            -d '{"name":"Test User","email":"test@example.com","subject":"Test","message":"Hello"}'

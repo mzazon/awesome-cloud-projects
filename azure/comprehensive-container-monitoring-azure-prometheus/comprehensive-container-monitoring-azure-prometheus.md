@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Container Storage, Azure Managed Prometheus, Azure Container Apps, Azure Monitor
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: monitoring, containers, stateful-workloads, prometheus, storage, observability
 recipe-generator-version: 1.3
@@ -160,8 +160,8 @@ echo "✅ Log Analytics workspace created for monitoring"
            --workspace-name ${LOG_ANALYTICS_WORKSPACE} \
            --query primarySharedKey --output tsv)
    
-   # Enable Container Apps monitoring add-on
-   az containerapp env enable-monitoring \
+   # Enable Managed Prometheus for Container Apps environment
+   az containerapp env enable-managed-prometheus \
        --name ${CONTAINER_APP_ENV} \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-id ${MONITOR_WORKSPACE_ID}
@@ -186,11 +186,10 @@ echo "✅ Log Analytics workspace created for monitoring"
        --access-tier Hot \
        --https-only true
    
-   # Get storage account key for container storage configuration
-   STORAGE_KEY=$(az storage account keys list \
-       --resource-group ${RESOURCE_GROUP} \
-       --account-name ${STORAGE_ACCOUNT} \
-       --query '[0].value' --output tsv)
+   # Create file share for persistent storage
+   az storage share create \
+       --name postgresql-data \
+       --account-name ${STORAGE_ACCOUNT}
    
    echo "✅ Premium storage account created for Container Storage"
    ```
@@ -216,18 +215,19 @@ echo "✅ Log Analytics workspace created for monitoring"
        --memory 2.0Gi \
        --env-vars POSTGRES_DB=sampledb \
                   POSTGRES_USER=sampleuser \
-                  POSTGRES_PASSWORD=samplepass123 \
-       --volume-mounts data-volume:/var/lib/postgresql/data
+                  POSTGRES_PASSWORD=samplepass123
    
-   # Add persistent volume to the container app
-   az containerapp volume add \
+   # Update container app with persistent volume mount
+   az containerapp update \
        --name ${CONTAINER_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --volume-name data-volume \
+       --set-env-vars POSTGRES_DB=sampledb \
+                      POSTGRES_USER=sampleuser \
+                      POSTGRES_PASSWORD=samplepass123 \
+       --mount-volume data-volume:/var/lib/postgresql/data \
        --volume-type AzureFile \
-       --storage-account ${STORAGE_ACCOUNT} \
-       --storage-share-name postgresql-data \
-       --access-mode ReadWrite
+       --storage-name ${STORAGE_ACCOUNT} \
+       --share-name postgresql-data
    
    echo "✅ Stateful application deployed with persistent storage"
    ```
@@ -239,12 +239,6 @@ echo "✅ Log Analytics workspace created for monitoring"
    Azure Managed Prometheus automatically discovers and scrapes metrics from containerized applications running in Azure Container Apps. This configuration enables the collection of both application-specific metrics and container infrastructure metrics, providing comprehensive visibility into workload performance and resource utilization.
 
    ```bash
-   # Enable Managed Prometheus for Container Apps environment
-   az containerapp env prometheus enable \
-       --name ${CONTAINER_APP_ENV} \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-id ${MONITOR_WORKSPACE_ID}
-   
    # Configure Prometheus scraping for application metrics
    az monitor prometheus rule-group create \
        --resource-group ${RESOURCE_GROUP} \
@@ -345,16 +339,7 @@ echo "✅ Log Analytics workspace created for monitoring"
        --cpu 0.25 \
        --memory 0.5Gi \
        --command "/bin/node_exporter" \
-       --args "--path.rootfs=/host" \
-       --volume-mounts host-volume:/host:ro
-   
-   # Configure sidecar to expose custom metrics
-   az containerapp ingress enable \
-       --name "monitoring-sidecar-${RANDOM_SUFFIX}" \
-       --resource-group ${RESOURCE_GROUP} \
-       --type internal \
-       --target-port 9100 \
-       --transport http
+       --args "--path.rootfs=/host"
    
    echo "✅ Monitoring sidecar container deployed with metrics endpoint"
    ```
@@ -455,16 +440,16 @@ echo "✅ Log Analytics workspace created for monitoring"
 
    ```bash
    # Query Prometheus metrics from Azure Monitor workspace
-   az monitor prometheus query \
-       --workspace-id ${MONITOR_WORKSPACE_ID} \
-       --query "container_cpu_usage_rate" \
-       --time-range "PT1H"
+   az monitor metrics list \
+       --resource ${MONITOR_WORKSPACE_ID} \
+       --metric-names "container_cpu_usage_rate" \
+       --interval PT1H
    
    # Check storage pool metrics availability
-   az monitor prometheus query \
-       --workspace-id ${MONITOR_WORKSPACE_ID} \
-       --query "storage_pool_capacity_used_bytes" \
-       --time-range "PT30M"
+   az monitor metrics list \
+       --resource ${MONITOR_WORKSPACE_ID} \
+       --metric-names "storage_pool_capacity_used_bytes" \
+       --interval PT30M
    ```
 
    Expected output: Metrics data should be returned showing CPU usage rates and storage pool utilization over the specified time ranges.
@@ -502,7 +487,7 @@ echo "✅ Log Analytics workspace created for monitoring"
    az containerapp exec \
        --name ${CONTAINER_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --command "stress --cpu 2 --timeout 300"
+       --command "apt-get update && apt-get install -y stress && stress --cpu 2 --timeout 300"
    ```
 
    Expected output: Alert rules should be listed with proper rule counts, and stress testing should eventually trigger CPU usage alerts.

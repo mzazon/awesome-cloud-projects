@@ -1,0 +1,435 @@
+# Google Cloud Infrastructure Manager Configuration
+# Color Palette Generator with Cloud Functions and Storage
+# 
+# This configuration deploys a serverless color palette generation API using:
+# - Cloud Functions for HTTP-triggered palette generation
+# - Cloud Storage for persistent palette data storage
+# - Required APIs and IAM permissions
+#
+# Prerequisites:
+# - Google Cloud project with billing enabled
+# - Infrastructure Manager API enabled
+# - Appropriate IAM permissions for deployment
+
+apiVersion: v1
+kind: InfrastructureManager
+metadata:
+  name: color-palette-generator
+  description: "Serverless color palette generator with Cloud Functions and Storage"
+  labels:
+    recipe: "color-palette-generator-functions-storage"
+    category: "serverless"
+    difficulty: "100"
+
+# Configuration variables for customization
+variables:
+  # Project and location configuration
+  project_id:
+    description: "Google Cloud Project ID for resource deployment"
+    type: string
+    required: true
+  
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+    validation:
+      - condition: "contains(['us-central1', 'us-east1', 'us-west1', 'europe-west1', 'asia-east1'], var.region)"
+        error_message: "Region must be one of the supported Cloud Functions regions"
+  
+  # Resource naming configuration
+  function_name:
+    description: "Name for the Cloud Function"
+    type: string
+    default: "generate-color-palette"
+    validation:
+      - condition: "can(regex('^[a-z][a-z0-9-]*[a-z0-9]$', var.function_name))"
+        error_message: "Function name must start with lowercase letter, contain only lowercase letters, numbers, and hyphens"
+  
+  bucket_name:
+    description: "Name for the Cloud Storage bucket (must be globally unique)"
+    type: string
+    required: true
+    validation:
+      - condition: "can(regex('^[a-z0-9][a-z0-9._-]*[a-z0-9]$', var.bucket_name))"
+        error_message: "Bucket name must be lowercase and follow Google Cloud Storage naming conventions"
+  
+  # Function configuration
+  function_memory:
+    description: "Memory allocation for Cloud Function in MB"
+    type: number
+    default: 256
+    validation:
+      - condition: "contains([128, 256, 512, 1024, 2048, 4096], var.function_memory)"
+        error_message: "Function memory must be one of: 128, 256, 512, 1024, 2048, 4096"
+  
+  function_timeout:
+    description: "Timeout for Cloud Function in seconds"
+    type: number
+    default: 60
+    validation:
+      - condition: "var.function_timeout >= 1 && var.function_timeout <= 540"
+        error_message: "Function timeout must be between 1 and 540 seconds"
+  
+  # Storage configuration
+  storage_class:
+    description: "Storage class for the Cloud Storage bucket"
+    type: string
+    default: "STANDARD"
+    validation:
+      - condition: "contains(['STANDARD', 'NEARLINE', 'COLDLINE', 'ARCHIVE'], var.storage_class)"
+        error_message: "Storage class must be one of: STANDARD, NEARLINE, COLDLINE, ARCHIVE"
+  
+  enable_public_access:
+    description: "Enable public read access to stored color palettes"
+    type: bool
+    default: true
+
+# Required APIs for the solution
+resources:
+  # Enable required Google Cloud APIs
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudfunctions.googleapis.com
+      project: ${var.project_id}
+    metadata:
+      description: "Enable Cloud Functions API for serverless function deployment"
+  
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/storage.googleapis.com
+      project: ${var.project_id}
+    metadata:
+      description: "Enable Cloud Storage API for palette data persistence"
+  
+  - name: cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+      project: ${var.project_id}
+    metadata:
+      description: "Enable Cloud Build API for function deployment automation"
+  
+  - name: artifactregistry-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/artifactregistry.googleapis.com
+      project: ${var.project_id}
+    metadata:
+      description: "Enable Artifact Registry API for container image storage"
+
+  # Cloud Storage bucket for color palette persistence
+  - name: palette-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.bucket_name}
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: ${var.storage_class}
+      # Bucket configuration for optimal performance and cost
+      billing:
+        requesterPays: false
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365
+              matchesStorageClass: [${var.storage_class}]
+      # Versioning disabled for palette files (simple overwrite)
+      versioning:
+        enabled: false
+      # CORS configuration for web application access
+      cors:
+        - origin: ["*"]
+          method: ["GET", "HEAD"]
+          responseHeader: ["Content-Type", "Access-Control-Allow-Origin"]
+          maxAgeSeconds: 3600
+      # Public access configuration
+      iamConfiguration:
+        publicAccessPrevention: "inherited"
+        uniformBucketLevelAccess:
+          enabled: true
+    depends_on:
+      - storage-api
+    metadata:
+      description: "Cloud Storage bucket for persistent color palette data storage"
+
+  # IAM binding for public read access (conditional)
+  - name: bucket-public-access
+    type: gcp-types/storage-v1:buckets/iam
+    properties:
+      bucket: ${palette-storage-bucket.name}
+      policy:
+        bindings:
+          - role: roles/storage.objectViewer
+            members:
+              - allUsers
+    condition: ${var.enable_public_access}
+    depends_on:
+      - palette-storage-bucket
+    metadata:
+      description: "Enable public read access for palette sharing (conditional)"
+
+  # Service Account for Cloud Function execution
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      project: ${var.project_id}
+      accountId: palette-function-sa
+      serviceAccount:
+        displayName: "Color Palette Generator Function Service Account"
+        description: "Service account for Cloud Function with minimal required permissions"
+    metadata:
+      description: "Dedicated service account following least privilege principle"
+
+  # IAM binding for Cloud Function to access Cloud Storage
+  - name: function-storage-access
+    type: gcp-types/cloudresourcemanager-v1:projects/iam
+    properties:
+      resource: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/storage.objectCreator
+            members:
+              - serviceAccount:${function-service-account.email}
+          - role: roles/storage.objectViewer
+            members:
+              - serviceAccount:${function-service-account.email}
+    depends_on:
+      - function-service-account
+      - palette-storage-bucket
+    metadata:
+      description: "Grant Cloud Function minimal permissions for palette storage operations"
+
+  # Cloud Function source code deployment
+  - name: function-source-archive
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: ${palette-storage-bucket.name}
+      name: function-source/source.zip
+      # Note: In production, source code would be uploaded separately
+      # This is a placeholder for the ZIP archive containing main.py and requirements.txt
+    depends_on:
+      - palette-storage-bucket
+    metadata:
+      description: "Function source code archive storage"
+
+  # Cloud Function for color palette generation
+  - name: color-palette-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      function:
+        name: projects/${var.project_id}/locations/${var.region}/functions/${var.function_name}
+        description: "HTTP-triggered function for harmonious color palette generation"
+        # Function source configuration
+        sourceArchiveUrl: gs://${palette-storage-bucket.name}/function-source/source.zip
+        entryPoint: generate_color_palette
+        runtime: python312
+        # Resource allocation and timeout configuration
+        availableMemoryMb: ${var.function_memory}
+        timeout: ${var.function_timeout}s
+        # Service account configuration for secure execution
+        serviceAccountEmail: ${function-service-account.email}
+        # HTTP trigger configuration for API access
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        # Environment variables for function configuration
+        environmentVariables:
+          BUCKET_NAME: ${palette-storage-bucket.name}
+          FUNCTION_REGION: ${var.region}
+        # Labels for resource organization and billing
+        labels:
+          recipe: color-palette-generator
+          component: api-function
+          environment: production
+    depends_on:
+      - cloudfunctions-api
+      - cloudbuild-api
+      - artifactregistry-api
+      - function-service-account
+      - function-storage-access
+      - function-source-archive
+    metadata:
+      description: "HTTP-triggered Cloud Function for color palette generation with mathematical color theory algorithms"
+
+  # IAM policy for function invocation (public access)
+  - name: function-invoker-policy
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions/iam
+    properties:
+      resource: ${color-palette-function.name}
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    depends_on:
+      - color-palette-function
+    metadata:
+      description: "Allow public HTTP invocation of the color palette generation function"
+
+# Output values for integration and verification
+outputs:
+  # Function deployment information
+  function_name:
+    description: "Name of the deployed Cloud Function"
+    value: ${color-palette-function.name}
+  
+  function_url:
+    description: "HTTPS URL for the color palette generation API"
+    value: ${color-palette-function.httpsTrigger.url}
+  
+  function_region:
+    description: "Deployment region for the Cloud Function"
+    value: ${var.region}
+  
+  # Storage configuration outputs
+  bucket_name:
+    description: "Name of the Cloud Storage bucket for palette data"
+    value: ${palette-storage-bucket.name}
+  
+  bucket_url:
+    description: "Public URL for accessing stored palettes"
+    value: "https://storage.googleapis.com/${palette-storage-bucket.name}"
+  
+  # Service account information
+  service_account_email:
+    description: "Email of the function's service account"
+    value: ${function-service-account.email}
+  
+  # API testing information
+  example_curl_command:
+    description: "Example curl command for testing the API"
+    value: |
+      curl -X POST ${color-palette-function.httpsTrigger.url} \
+           -H "Content-Type: application/json" \
+           -d '{"base_color": "#3498db"}'
+  
+  # Resource management outputs
+  deployment_region:
+    description: "Primary deployment region for all resources"
+    value: ${var.region}
+  
+  project_id:
+    description: "Google Cloud Project ID used for deployment"
+    value: ${var.project_id}
+
+# Deployment metadata and configuration
+metadata:
+  # Resource dependencies and deployment order
+  deployment_order:
+    - "API enablement (cloudfunctions, storage, cloudbuild, artifactregistry)"
+    - "Cloud Storage bucket creation with lifecycle and CORS configuration"
+    - "Service account creation with least privilege IAM policies"
+    - "Function source code upload to Cloud Storage"
+    - "Cloud Function deployment with HTTP trigger and environment configuration"
+    - "Public access IAM policy configuration for API and storage"
+  
+  # Security considerations
+  security_features:
+    - "Dedicated service account with minimal required permissions"
+    - "HTTPS-only function trigger with secure communication"
+    - "Uniform bucket-level access for consistent security policies"
+    - "CORS configuration for controlled web application access"
+  
+  # Cost optimization features
+  cost_optimization:
+    - "Pay-per-invocation pricing model for Cloud Functions"
+    - "Optimized memory allocation (256MB default, configurable)"
+    - "Lifecycle management for automatic palette cleanup after 365 days"
+    - "Standard storage class for balanced cost and performance"
+  
+  # Monitoring and observability
+  monitoring_capabilities:
+    - "Built-in Cloud Functions metrics and logging"
+    - "Cloud Storage access and usage metrics"
+    - "Error tracking and performance monitoring through Cloud Operations"
+  
+  # Scalability characteristics
+  scalability:
+    - "Automatic scaling from zero to handle traffic spikes"
+    - "Global Cloud Storage availability for palette access"
+    - "Serverless architecture eliminating infrastructure management"
+  
+  # Integration recommendations
+  integration_patterns:
+    - "RESTful API design for easy integration with web applications"
+    - "JSON response format for programmatic consumption"
+    - "Direct storage URL access for palette sharing and caching"
+    - "CORS support for cross-origin web requests"
+
+# Validation and testing configuration
+validation:
+  # Resource creation validation
+  resource_validation:
+    - name: "API enablement verification"
+      description: "Verify all required APIs are enabled and accessible"
+      command: "gcloud services list --enabled --filter='name:(cloudfunctions.googleapis.com OR storage.googleapis.com)'"
+    
+    - name: "Storage bucket accessibility"
+      description: "Verify bucket creation and public access configuration"
+      command: "gsutil ls -b gs://${var.bucket_name}"
+    
+    - name: "Function deployment verification"
+      description: "Verify Cloud Function is deployed and accessible"
+      command: "gcloud functions describe ${var.function_name} --region=${var.region}"
+  
+  # Functional testing
+  functional_tests:
+    - name: "Color palette generation test"
+      description: "Test API with valid color input"
+      test_data:
+        base_color: "#3498db"
+      expected_response:
+        - "palette object with harmonious colors"
+        - "storage_url for accessing saved palette"
+        - "success: true status indicator"
+    
+    - name: "Error handling validation"
+      description: "Test API error handling with invalid input"
+      test_data:
+        base_color: "invalid"
+      expected_response:
+        - "error message for invalid format"
+        - "HTTP 400 status code"
+    
+    - name: "Storage verification"
+      description: "Verify palette persistence in Cloud Storage"
+      validation_steps:
+        - "Generate palette via API"
+        - "Check palette file exists in bucket"
+        - "Verify JSON structure and content"
+
+# Deployment recommendations and best practices
+recommendations:
+  # Security best practices
+  security:
+    - "Regular review of IAM permissions and service account usage"
+    - "Enable Cloud Audit Logs for comprehensive security monitoring"
+    - "Consider VPC-native function deployment for enhanced network security"
+    - "Implement API key or OAuth authentication for production environments"
+  
+  # Performance optimization
+  performance:
+    - "Monitor function cold start times and consider concurrency settings"
+    - "Implement Cloud CDN for global palette access acceleration"
+    - "Use Cloud Monitoring to track API response times and error rates"
+    - "Consider function warm-up strategies for consistent performance"
+  
+  # Cost management
+  cost_management:
+    - "Set up billing alerts for unexpected cost increases"
+    - "Review storage lifecycle policies based on usage patterns"
+    - "Monitor function invocation patterns for optimization opportunities"
+    - "Consider committed use discounts for predictable workloads"
+  
+  # Operational excellence
+  operations:
+    - "Implement structured logging for better debugging and monitoring"
+    - "Set up alerting for function errors and high latency"
+    - "Regular backup and disaster recovery planning"
+    - "Version control for function source code and infrastructure configuration"

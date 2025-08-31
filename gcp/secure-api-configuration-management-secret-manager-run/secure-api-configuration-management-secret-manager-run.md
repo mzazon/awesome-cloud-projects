@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Secret Manager, Cloud Run, API Gateway
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: security, secrets-management, api-configuration, container-security, secure-deployment
 recipe-generator-version: 1.3
@@ -96,7 +96,8 @@ export SA_NAME="secure-api-sa-${RANDOM_SUFFIX}"
 export GATEWAY_NAME="api-gateway-${RANDOM_SUFFIX}"
 
 # Create new project for this recipe
-gcloud projects create ${PROJECT_ID} --name="Secure API Configuration"
+gcloud projects create ${PROJECT_ID} \
+    --name="Secure API Configuration"
 
 # Set default project and region
 gcloud config set project ${PROJECT_ID}
@@ -250,7 +251,7 @@ echo "✅ Secret name: ${SECRET_NAME}"
        
        return jsonify({
            "data": "sensitive_api_data",
-           "timestamp": "2025-07-12T10:00:00Z",
+           "timestamp": "2025-07-23T10:00:00Z",
            "source": "secure-api"
        })
    
@@ -260,9 +261,9 @@ echo "✅ Secret name: ${SECRET_NAME}"
    
    # Create requirements file
    cat > requirements.txt << 'EOF'
-   Flask==2.3.3
-   google-cloud-secret-manager==2.18.1
-   gunicorn==21.2.0
+   Flask==3.0.3
+   google-cloud-secret-manager==2.21.1
+   gunicorn==22.0.0
    EOF
    
    # Create Dockerfile with security best practices
@@ -329,11 +330,15 @@ echo "✅ Secret name: ${SECRET_NAME}"
 
    The Cloud Run service is now running with secure secret access, automatic scaling, and the ability to retrieve updated secret values without redeployment, providing both security and operational flexibility.
 
-5. **Create OpenAPI Specification for API Gateway**:
+5. **Create API Gateway and Configuration**:
 
-   Define a comprehensive OpenAPI specification that includes authentication requirements, rate limiting, and request validation. API Gateway uses this specification to enforce security policies and provide managed API access with built-in monitoring and analytics.
+   Create an API Gateway API resource and deploy it with an OpenAPI specification that includes authentication requirements and proper backend routing. This approach provides centralized API management with built-in monitoring, authentication, and rate limiting capabilities.
 
    ```bash
+   # Create API Gateway API
+   gcloud api-gateway apis create ${GATEWAY_NAME} \
+       --project=${PROJECT_ID}
+   
    # Create OpenAPI specification with security definitions
    cat > api-spec.yaml << EOF
    swagger: '2.0'
@@ -408,12 +413,12 @@ echo "✅ Secret name: ${SECRET_NAME}"
            address: ${SERVICE_URL}
    EOF
    
-   echo "✅ OpenAPI specification created"
+   echo "✅ API Gateway API and OpenAPI specification created"
    ```
 
-   The API specification now defines secure endpoints with authentication requirements and proper backend routing to the Cloud Run service.
+   The API Gateway API is now ready with a comprehensive OpenAPI specification that defines secure endpoints with authentication requirements and proper backend routing to the Cloud Run service.
 
-6. **Deploy API Gateway with Security Configuration**:
+6. **Deploy API Gateway Configuration**:
 
    Create and deploy an API Gateway configuration that enforces authentication, implements rate limiting, and provides centralized API management. This adds an additional security layer between clients and the backend service while enabling API versioning and monitoring capabilities.
 
@@ -452,17 +457,16 @@ echo "✅ Secret name: ${SECRET_NAME}"
 
    ```bash
    # Create API key for gateway access
-   gcloud alpha services api-keys create \
-       --display-name="Secure API Gateway Key" \
-       --api-target-service=apigateway.googleapis.com
+   gcloud services api-keys create \
+       --display-name="Secure API Gateway Key"
    
    # List API keys to get the key value
-   export API_KEY=$(gcloud alpha services api-keys list \
+   export API_KEY=$(gcloud services api-keys list \
        --filter="displayName:Secure API Gateway Key" \
        --format='value(name)' | head -1)
    
    # Get the actual key string
-   export API_KEY_STRING=$(gcloud alpha services api-keys get-key-string $API_KEY)
+   export API_KEY_STRING=$(gcloud services api-keys get-key-string $API_KEY)
    
    echo "✅ API key created successfully"
    echo "API Key: ${API_KEY_STRING}"
@@ -503,9 +507,9 @@ echo "✅ Secret name: ${SECRET_NAME}"
    EOF
    )
    
-   # Enable audit logs for Secret Manager
+   # Create audit log sink for Secret Manager
    gcloud logging sinks create secret-manager-audit \
-       cloudstorage.googleapis.com/projects/${PROJECT_ID}/buckets/${PROJECT_ID}-audit-logs \
+       bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/audit_logs \
        --log-filter='protoPayload.serviceName="secretmanager.googleapis.com"'
    
    echo "✅ Secret rotation and monitoring configured"

@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Policy Simulator, Resource Manager, Cloud Billing API, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: governance, policy-management, automation, cost-optimization, compliance
 recipe-generator-version: 1.3
@@ -111,6 +111,7 @@ gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable pubsub.googleapis.com
 gcloud services enable cloudasset.googleapis.com
 gcloud services enable bigquery.googleapis.com
+gcloud services enable cloudscheduler.googleapis.com
 
 echo "✅ Project configured for automated governance: ${PROJECT_ID}"
 ```
@@ -123,17 +124,17 @@ echo "✅ Project configured for automated governance: ${PROJECT_ID}"
 
    ```bash
    # Create custom constraint for compute instance locations
-   cat > location-constraint.yaml << 'EOF'
-   name: organizations/${ORGANIZATION_ID}/customConstraints/custom.restrictComputeLocations
-   resourceTypes:
-   - compute.googleapis.com/Instance
-   methodTypes:
-   - CREATE
-   condition: "resource.location in ['us-central1', 'us-east1', 'us-west1']"
-   actionType: ALLOW
-   displayName: "Restrict Compute Instance Locations"
-   description: "Only allow compute instances in approved US regions"
-   EOF
+   cat > location-constraint.yaml << EOF
+name: organizations/${ORGANIZATION_ID}/customConstraints/custom.restrictComputeLocations
+resourceTypes:
+- compute.googleapis.com/Instance
+methodTypes:
+- CREATE
+condition: "resource.zone in ['us-central1-a', 'us-central1-b', 'us-east1-a', 'us-west1-a']"
+actionType: ALLOW
+displayName: "Restrict Compute Instance Locations"
+description: "Only allow compute instances in approved US regions and zones"
+EOF
    
    # Deploy the custom constraint
    gcloud org-policies set-custom-constraint location-constraint.yaml
@@ -161,6 +162,11 @@ echo "✅ Project configured for automated governance: ${PROJECT_ID}"
    gcloud organizations add-iam-policy-binding ${ORGANIZATION_ID} \
        --member="serviceAccount:policy-simulator-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/iam.securityReviewer"
+   
+   # Grant Cloud Asset Inventory permissions for resource analysis
+   gcloud organizations add-iam-policy-binding ${ORGANIZATION_ID} \
+       --member="serviceAccount:policy-simulator-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --role="roles/cloudasset.viewer"
    
    echo "✅ Policy simulation service account configured with appropriate permissions"
    ```
@@ -192,9 +198,13 @@ from google.cloud import functions_v1
 from google.cloud import policysimulator_v1
 from google.cloud import resourcemanager_v3
 import base64
+import os
 
 def governance_automation(cloud_event):
     """Main function for automated governance operations."""
+    
+    # Configure logging
+    logging.basicConfig(level=logging.INFO)
     
     # Initialize clients for Google Cloud services
     asset_client = asset_v1.AssetServiceClient()
@@ -202,7 +212,11 @@ def governance_automation(cloud_event):
     policy_client = policysimulator_v1.SimulatorClient()
     
     # Parse incoming event data
-    event_data = json.loads(base64.b64decode(cloud_event.data).decode())
+    try:
+        event_data = json.loads(base64.b64decode(cloud_event.data).decode())
+    except Exception as e:
+        logging.error(f"Failed to parse event data: {str(e)}")
+        return
     
     try:
         # Perform resource governance checks
@@ -223,7 +237,11 @@ def governance_automation(cloud_event):
 
 def check_resource_compliance(client, event_data):
     """Check resource compliance against organization policies."""
-    project_id = event_data.get('project_id')
+    project_id = event_data.get('project_id', os.environ.get('PROJECT_ID'))
+    
+    if not project_id:
+        logging.warning("No project ID provided for compliance check")
+        return []
     
     # Query asset inventory for compliance analysis
     parent = f"projects/{project_id}"
@@ -234,73 +252,106 @@ def check_resource_compliance(client, event_data):
         asset_types=asset_types
     )
     
-    assets = client.list_assets(request=request)
-    compliance_issues = []
-    
-    for asset in assets:
-        # Check location compliance
-        if hasattr(asset.resource, 'location'):
-            if asset.resource.location not in ['us-central1', 'us-east1', 'us-west1']:
+    try:
+        assets = client.list_assets(request=request)
+        compliance_issues = []
+        
+        for asset in assets:
+            # Check location compliance for compute instances
+            if "compute.googleapis.com/Instance" in asset.asset_type:
+                zone = getattr(asset.resource.data, 'zone', '').split('/')[-1]
+                approved_zones = ['us-central1-a', 'us-central1-b', 'us-east1-a', 'us-west1-a']
+                
+                if zone and zone not in approved_zones:
+                    compliance_issues.append({
+                        'resource': asset.name,
+                        'issue': 'Non-compliant zone',
+                        'zone': zone
+                    })
+            
+            # Check resource labels for cost allocation
+            labels = getattr(asset.resource.data, 'labels', {})
+            required_labels = ['environment', 'team', 'cost-center']
+            
+            missing_labels = [label for label in required_labels if label not in labels]
+            if missing_labels:
                 compliance_issues.append({
                     'resource': asset.name,
-                    'issue': 'Non-compliant location',
-                    'location': asset.resource.location
+                    'issue': f'Missing required labels: {", ".join(missing_labels)}'
                 })
         
-        # Check resource labels for cost allocation
-        if not hasattr(asset.resource.data, 'labels') or not asset.resource.data.get('labels'):
-            compliance_issues.append({
-                'resource': asset.name,
-                'issue': 'Missing required labels for cost allocation'
-            })
-    
-    if compliance_issues:
-        logging.warning(f"Found {len(compliance_issues)} compliance issues")
-        # Here you would send notifications or take automated remediation actions
-    
-    return compliance_issues
+        if compliance_issues:
+            logging.warning(f"Found {len(compliance_issues)} compliance issues")
+            for issue in compliance_issues:
+                logging.warning(f"Compliance issue: {issue}")
+        else:
+            logging.info("No compliance issues found")
+        
+        return compliance_issues
+        
+    except Exception as e:
+        logging.error(f"Failed to check resource compliance: {str(e)}")
+        return []
 
 def analyze_billing_patterns(client, event_data):
     """Analyze billing patterns for cost optimization opportunities."""
     billing_account = event_data.get('billing_account')
     
     if not billing_account:
+        logging.info("No billing account specified for analysis")
         return
     
-    # List projects associated with billing account
-    request = billing_v1.ListProjectBillingInfoRequest(
-        name=f"billingAccounts/{billing_account}"
-    )
-    
-    projects = client.list_project_billing_info(request=request)
-    
-    for project in projects:
-        if project.billing_enabled:
-            # Analyze project billing data (simplified example)
-            logging.info(f"Analyzing billing for project: {project.project_id}")
-            # Here you would implement cost analysis logic
+    try:
+        # List projects associated with billing account
+        request = billing_v1.ListProjectBillingInfoRequest(
+            name=f"billingAccounts/{billing_account}"
+        )
+        
+        projects = client.list_project_billing_info(request=request)
+        
+        for project in projects:
+            if project.billing_enabled:
+                logging.info(f"Analyzing billing for project: {project.project_id}")
+                # Here you would implement detailed cost analysis logic
+                # For example, checking for unused resources, right-sizing opportunities, etc.
+                
+    except Exception as e:
+        logging.error(f"Failed to analyze billing patterns: {str(e)}")
 
 def simulate_policy_changes(client, event_data):
     """Simulate IAM policy changes before implementation."""
-    project_id = event_data.get('project_id')
+    project_id = event_data.get('project_id', os.environ.get('PROJECT_ID'))
     proposed_policy = event_data.get('proposed_policy')
     
-    if not proposed_policy:
+    if not project_id or not proposed_policy:
+        logging.info("Project ID or proposed policy not provided for simulation")
         return
     
-    # Create simulation request
-    parent = f"projects/{project_id}"
-    
-    # Simulation logic would be implemented here
-    logging.info(f"Simulating policy changes for project: {project_id}")
-    
-    return {"simulation_status": "completed", "violations": []}
+    try:
+        # Create simulation request
+        parent = f"projects/{project_id}"
+        
+        # Note: Actual policy simulation would require more complex setup
+        # This is a simplified example showing the structure
+        logging.info(f"Simulating policy changes for project: {project_id}")
+        
+        # In a real implementation, you would:
+        # 1. Create a simulation request with the proposed policy
+        # 2. Run the simulation using the Policy Simulator API
+        # 3. Analyze the results for potential access violations
+        # 4. Return actionable recommendations
+        
+        return {"simulation_status": "completed", "violations": []}
+        
+    except Exception as e:
+        logging.error(f"Failed to simulate policy changes: {str(e)}")
+        return {"simulation_status": "failed", "error": str(e)}
 
 EOF
 
    cat > requirements.txt << 'EOF'
-google-cloud-asset==3.19.1
-google-cloud-billing==1.12.0
+google-cloud-asset==3.30.1
+google-cloud-billing==1.16.3
 google-cloud-functions==1.16.0
 google-cloud-policy-simulator==1.1.0
 google-cloud-resource-manager==1.12.0
@@ -316,7 +367,9 @@ EOF
        --entry-point=governance_automation \
        --trigger-topic=${TOPIC_NAME} \
        --service-account=policy-simulator-sa@${PROJECT_ID}.iam.gserviceaccount.com \
-       --set-env-vars="PROJECT_ID=${PROJECT_ID},ORGANIZATION_ID=${ORGANIZATION_ID}"
+       --set-env-vars="PROJECT_ID=${PROJECT_ID},ORGANIZATION_ID=${ORGANIZATION_ID}" \
+       --timeout=540s \
+       --memory=512MB
 
    cd ..
    echo "✅ Governance automation function deployed successfully"
@@ -339,37 +392,22 @@ EOF
        --member="serviceAccount:billing-governance-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/billing.viewer"
    
-   # Create billing budget for governance monitoring
-   cat > billing-budget.json << EOF
-{
-  "displayName": "Governance Budget Alert",
-  "budgetFilter": {
-    "projects": ["projects/${PROJECT_ID}"]
-  },
-  "amount": {
-    "specifiedAmount": {
-      "currencyCode": "USD",
-      "units": "100"
-    }
-  },
-  "thresholdRules": [
-    {
-      "thresholdPercent": 0.8,
-      "spendBasis": "CURRENT_SPEND"
-    },
-    {
-      "thresholdPercent": 1.0,
-      "spendBasis": "CURRENT_SPEND"
-    }
-  ],
-  "notificationsRule": {
-    "pubsubTopic": "projects/${PROJECT_ID}/topics/${TOPIC_NAME}",
-    "enableProjectLevelRecipients": true
-  }
-}
-EOF
-
-   echo "✅ Billing governance service account created and budget configuration prepared"
+   # Get the billing account ID for budget creation
+   BILLING_ACCOUNT_ID=$(gcloud billing accounts list \
+       --format="value(name)" \
+       --limit=1 | cut -d'/' -f2)
+   
+   # Create billing budget for governance monitoring using gcloud CLI
+   gcloud billing budgets create \
+       --billing-account=${BILLING_ACCOUNT_ID} \
+       --display-name="Governance Budget Alert" \
+       --budget-amount=100USD \
+       --threshold-rule=percent=80,basis=current-spend \
+       --threshold-rule=percent=100,basis=current-spend \
+       --filter-projects=${PROJECT_ID} \
+       --notifications-rule-pubsub-topic=projects/${PROJECT_ID}/topics/${TOPIC_NAME}
+   
+   echo "✅ Billing governance service account created and budget alert configured"
    ```
 
    The billing integration infrastructure is now configured to monitor costs and send alerts through Pub/Sub when spending thresholds are reached. This enables proactive cost management and automated responses to budget violations.
@@ -379,23 +417,6 @@ EOF
    Resource tagging policies ensure consistent cost allocation and resource organization across your Google Cloud environment. Implementing automated tagging requirements enables granular cost tracking, departmental chargebacks, and efficient resource management at scale.
 
    ```bash
-   # Create organization policy for required resource labels
-   cat > tagging-policy.yaml << EOF
-name: organizations/${ORGANIZATION_ID}/policies/iam.managed.requireResourceLabels
-spec:
-  rules:
-  - enforce: true
-    parameters:
-      requiredLabels:
-        - environment
-        - team
-        - cost-center
-        - project-code
-EOF
-
-   # Apply the tagging policy
-   gcloud org-policies set-policy tagging-policy.yaml
-   
    # Create custom constraint for label validation
    cat > label-constraint.yaml << EOF
 name: organizations/${ORGANIZATION_ID}/customConstraints/custom.validateResourceLabels
@@ -416,7 +437,18 @@ displayName: "Validate Required Resource Labels"
 description: "Ensure all resources have required labels for cost allocation"
 EOF
 
+   # Deploy the label validation constraint
    gcloud org-policies set-custom-constraint label-constraint.yaml
+   
+   # Create and apply organization policy to enforce the constraint
+   cat > enforce-labels-policy.yaml << EOF
+name: organizations/${ORGANIZATION_ID}/policies/custom.validateResourceLabels
+spec:
+  rules:
+  - enforce: true
+EOF
+
+   gcloud org-policies set-policy enforce-labels-policy.yaml
    
    echo "✅ Resource tagging policies implemented for cost allocation"
    ```
@@ -444,7 +476,7 @@ EOF
        --time-zone="America/New_York" \
        --description="Daily cost and budget monitoring"
    
-   # Enable the scheduler jobs
+   # Test the scheduler jobs with manual runs
    gcloud scheduler jobs run governance-audit-job
    gcloud scheduler jobs run cost-monitoring-job
    
@@ -548,6 +580,9 @@ EOF
    gcloud org-policies delete custom.validateResourceLabels \
        --organization=${ORGANIZATION_ID}
    
+   gcloud org-policies delete-custom-constraint custom.validateResourceLabels \
+       --organization=${ORGANIZATION_ID}
+   
    gcloud org-policies delete-custom-constraint custom.restrictComputeLocations \
        --organization=${ORGANIZATION_ID}
    
@@ -587,7 +622,8 @@ The policy simulation capabilities are particularly valuable for large organizat
 
 > **Tip**: Implement governance policies gradually across your organization, starting with non-production environments to validate automation behavior before applying to critical production systems. Use the policy simulation results to fine-tune constraint configurations.
 
-For more information on Google Cloud governance best practices, see:
+For more information on Google Cloud governance best practices, see the following official documentation:
+
 - [Organization Policy Service Documentation](https://cloud.google.com/resource-manager/docs/organization-policy/overview)
 - [Policy Intelligence and Policy Simulator](https://cloud.google.com/policy-intelligence/docs)
 - [Google Cloud Cost Management Best Practices](https://cloud.google.com/billing/docs/best-practices)

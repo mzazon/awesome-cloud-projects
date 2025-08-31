@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Database Center, Cloud Asset Inventory, Cloud Workflows, Cloud Monitoring
 estimated-time: 75 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: 2025-07-17
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database governance, fleet management, compliance, ai-powered insights, automation
 recipe-generator-version: 1.3
@@ -456,14 +456,14 @@ echo "✅ Project configured for database governance: ${PROJECT_ID}"
    EOF
    
    cat > requirements.txt << 'EOF'
-   google-cloud-asset==3.19.1
-   google-cloud-bigquery==3.11.4
-   google-cloud-storage==2.10.0
+   google-cloud-asset==3.24.0
+   google-cloud-bigquery==3.25.0
+   google-cloud-storage==2.18.0
    EOF
    
    # Deploy the compliance reporting function
    gcloud functions deploy compliance-reporter \
-       --runtime=python39 \
+       --runtime=python311 \
        --trigger-http \
        --allow-unauthenticated \
        --entry-point=generate_compliance_report \

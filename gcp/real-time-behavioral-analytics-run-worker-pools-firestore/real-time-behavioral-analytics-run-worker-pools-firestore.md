@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Run, Cloud Firestore, Pub/Sub, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: real-time analytics, behavioral data, worker pools, serverless, event processing
 recipe-generator-version: 1.3
@@ -77,7 +77,7 @@ graph TB
 4. Basic understanding of event-driven architectures and NoSQL databases
 5. Estimated cost: $5-15 for testing (depending on event volume and duration)
 
-> **Note**: This recipe uses Cloud Run Worker Pools which are currently in public preview and designed specifically for pull-based background processing workloads.
+> **Note**: This recipe uses Cloud Run Worker Pools which are currently in beta and designed specifically for pull-based background processing workloads.
 
 ## Preparation
 
@@ -184,9 +184,9 @@ echo "✅ Firestore database created: ${FIRESTORE_DATABASE}"
    
    # Create requirements.txt for Python dependencies
    cat > requirements.txt << 'EOF'
-google-cloud-pubsub==2.18.4
-google-cloud-firestore==2.13.1
-google-cloud-monitoring==2.16.0
+google-cloud-pubsub==2.25.0
+google-cloud-firestore==2.20.2
+google-cloud-monitoring==2.27.1
 python-json-logger==2.0.7
 gunicorn==21.2.0
 EOF
@@ -388,7 +388,7 @@ EOF
 
    ```bash
    # Deploy Cloud Run Worker Pool
-   gcloud run workers deploy ${WORKER_POOL_NAME} \
+   gcloud beta run worker-pools deploy ${WORKER_POOL_NAME} \
        --image=${IMAGE_URI} \
        --region=${REGION} \
        --service-account=${SERVICE_ACCOUNT} \
@@ -403,7 +403,7 @@ EOF
    echo "✅ Cloud Run Worker Pool deployed successfully"
    
    # Verify deployment status
-   gcloud run workers describe ${WORKER_POOL_NAME} \
+   gcloud beta run worker-pools describe ${WORKER_POOL_NAME} \
        --region=${REGION} \
        --format="value(status.conditions[0].status)"
    ```
@@ -627,7 +627,7 @@ EOF
 
    ```bash
    # Check worker pool status and instances
-   gcloud run workers describe ${WORKER_POOL_NAME} \
+   gcloud beta run worker-pools describe ${WORKER_POOL_NAME} \
        --region=${REGION} \
        --format="table(metadata.name,status.url,status.observedGeneration)"
    
@@ -662,6 +662,7 @@ EOF
    ```bash
    # Create a simple query test script
    cat > test_queries.py << 'EOF'
+import os
 from google.cloud import firestore
 import time
 
@@ -678,7 +679,7 @@ if user_analytics.exists:
 
 # Test hourly aggregates query
 start_time = time.time()
-hourly_docs = client.collection('analytics_aggregates').where('period', '>=', '2025-07-12').limit(10).get()
+hourly_docs = client.collection('analytics_aggregates').where('period', '>=', '2025-07-23').limit(10).get()
 query_time = (time.time() - start_time) * 1000
 
 print(f"Hourly aggregates query time: {query_time:.2f}ms")
@@ -711,7 +712,7 @@ EOF
 
    ```bash
    # Delete the worker pool
-   gcloud run workers delete ${WORKER_POOL_NAME} \
+   gcloud beta run worker-pools delete ${WORKER_POOL_NAME} \
        --region=${REGION} \
        --quiet
    
@@ -768,11 +769,11 @@ This behavioral analytics solution demonstrates the power of Google Cloud's serv
 
 The architecture leverages Firestore's real-time capabilities and strong consistency guarantees to provide immediate insights into user behavior patterns. By using atomic increment operations and server timestamps, the system maintains data accuracy even under high concurrency while enabling millisecond query performance. The combination of document-based storage with composite indexes allows for flexible analytics queries that can adapt to changing business requirements without requiring schema migrations.
 
-Cloud Monitoring integration provides comprehensive observability into the system's performance, from message processing rates to query latency. The custom metrics and dashboards enable proactive monitoring and capacity planning, while automated alerts ensure rapid response to any performance degradations. This observability is crucial for maintaining SLA commitments and optimizing cost efficiency in production environments.
+Cloud Monitoring integration provides comprehensive observability into the system's performance, from message processing rates to query latency. The custom metrics and dashboards enable proactive monitoring and capacity planning, while automated alerts ensure rapid response to any performance degradations. This observability is crucial for maintaining SLA commitments and optimizing cost efficiency in production environments as described in the [Google Cloud Operations Suite best practices](https://cloud.google.com/architecture/devops/devops-measurement-monitoring-and-observability).
 
-The solution's serverless nature provides automatic scaling based on actual demand, eliminating the need for capacity planning while ensuring cost optimization. As event volumes fluctuate throughout the day, the worker pool scales instances up or down automatically, while Firestore's serverless architecture handles query load without manual intervention. This elastic scaling capability makes the solution suitable for businesses of all sizes, from startups processing thousands of events to enterprises handling millions of interactions daily.
+The solution's serverless nature provides automatic scaling based on actual demand, eliminating the need for capacity planning while ensuring cost optimization. As event volumes fluctuate throughout the day, the worker pool scales instances up or down automatically, while Firestore's serverless architecture handles query load without manual intervention. This elastic scaling capability makes the solution suitable for businesses of all sizes, from startups processing thousands of events to enterprises handling millions of interactions daily, following [Google Cloud's Well-Architected Framework](https://cloud.google.com/architecture/framework) principles.
 
-> **Tip**: For production deployments, implement data retention policies in Firestore to manage storage costs and consider using BigQuery for long-term analytical storage and complex reporting requirements.
+> **Tip**: For production deployments, implement data retention policies in Firestore to manage storage costs and consider using BigQuery for long-term analytical storage and complex reporting requirements as documented in the [Google Cloud data lifecycle management guide](https://cloud.google.com/architecture/data-lifecycle-cloud-platform).
 
 ## Challenge
 
@@ -782,7 +783,7 @@ Extend this behavioral analytics solution with these advanced enhancements:
 
 2. **Add Geographic and Temporal Analytics**: Enhance the event processing to include geographic clustering using BigQuery GIS functions and implement time-zone aware analytics aggregations for global user behavior patterns.
 
-3. **Build Anomaly Detection Pipeline**: Integrate Cloud AI Platform to detect unusual user behavior patterns in real-time, triggering alerts for potential fraud or security incidents through Cloud Monitoring and Cloud Functions.
+3. **Build Anomaly Detection Pipeline**: Integrate Vertex AI to detect unusual user behavior patterns in real-time, triggering alerts for potential fraud or security incidents through Cloud Monitoring and Cloud Functions.
 
 4. **Create Data Lake Integration**: Implement automatic data archival from Firestore to Cloud Storage and BigQuery for long-term analytics, enabling historical trend analysis and machine learning model training on large datasets.
 

@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: Cloud Bigtable, Vertex AI, Cloud Functions, Cloud Monitoring
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ai-inference, tpu, bigtable, real-time, feature-store, performance-optimization
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Enterprise AI applications serving millions of users require ultra-low latency i
 
 ## Solution
 
-Build a high-performance AI inference pipeline that leverages Cloud Bigtable's ultra-low latency NoSQL capabilities for feature storage, Google's latest TPU v7 (Ironwood) for inference acceleration, and intelligent caching strategies to achieve sub-millisecond response times. This architecture combines the linear scalability of Bigtable with the specialized AI acceleration of TPUs to serve millions of real-time predictions efficiently while maintaining cost optimization through intelligent resource management.
+Build a high-performance AI inference pipeline that leverages Cloud Bigtable's ultra-low latency NoSQL capabilities for feature storage, Google's TPU v5 technology for inference acceleration, and intelligent caching strategies to achieve sub-millisecond response times. This architecture combines the linear scalability of Bigtable with the specialized AI acceleration of TPUs to serve millions of real-time predictions efficiently while maintaining cost optimization through intelligent resource management.
 
 ## Architecture Diagram
 
@@ -46,7 +46,7 @@ graph TB
     end
     
     subgraph "AI Inference Layer"
-        TPU[Vertex AI TPU v7 Endpoint]
+        TPU[Vertex AI TPU v5e Endpoint]
         MODEL[Optimized ML Model]
     end
     
@@ -99,7 +99,7 @@ graph TB
 5. Python 3.9+ with ML libraries (TensorFlow 2.15+, numpy, pandas)
 6. Estimated cost: $150-300 for TPU resources during recipe execution
 
-> **Warning**: This recipe uses TPU v7 (Ironwood) instances which are premium compute resources. Monitor your usage carefully and implement proper cleanup procedures to avoid unexpected charges. TPU inference can cost $2-8 per hour depending on configuration.
+> **Warning**: This recipe uses TPU v5e instances which are premium compute resources. Monitor your usage carefully and implement proper cleanup procedures to avoid unexpected charges. TPU inference can cost $2-8 per hour depending on configuration.
 
 ## Preparation
 
@@ -167,11 +167,7 @@ echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
    Proper table schema design in Bigtable is crucial for achieving optimal performance in AI inference workloads. The row key design directly impacts data distribution and access patterns, while column families organize related features to minimize read operations. This step creates tables specifically optimized for common AI inference patterns like user embeddings, item features, and contextual signals.
 
    ```bash
-   # Install cbt CLI tool for Bigtable table management
-   echo 'deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main' | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
-   sudo apt-get update && sudo apt-get install -y google-cloud-cli-cbt
-   
-   # Configure cbt for our instance
+   # Configure cbt for our instance (create .cbtrc file)
    echo "project = ${PROJECT_ID}" > ~/.cbtrc
    echo "instance = ${BIGTABLE_INSTANCE_ID}" >> ~/.cbtrc
    
@@ -204,9 +200,18 @@ echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
        --redis-config maxmemory-policy=allkeys-lru
    
    # Wait for Redis instance to be ready
-   gcloud redis instances describe ${REDIS_INSTANCE_ID} \
-       --region=${REGION} \
-       --format="value(state)"
+   echo "Waiting for Redis instance to be ready..."
+   while true; do
+       STATE=$(gcloud redis instances describe ${REDIS_INSTANCE_ID} \
+           --region=${REGION} --format="value(state)")
+       if [ "$STATE" = "READY" ]; then
+           echo "✅ Redis instance is ready"
+           break
+       else
+           echo "Redis state: $STATE"
+           sleep 30
+       fi
+   done
    
    # Get Redis connection details
    export REDIS_HOST=$(gcloud redis instances describe ${REDIS_INSTANCE_ID} \
@@ -219,67 +224,67 @@ echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
 
    The Redis cache is configured with high availability and an LRU eviction policy, ensuring that the most frequently accessed features remain in memory for ultra-fast retrieval. This caching layer can reduce feature retrieval latency from milliseconds to microseconds for hot data, significantly improving overall inference pipeline performance. The 5GB memory allocation provides substantial caching capacity for enterprise-scale feature sets.
 
-4. **Deploy Optimized ML Model to TPU v7 Endpoint**:
+4. **Deploy Optimized ML Model to TPU v5e Endpoint**:
 
-   Google's TPU v7 (Ironwood) represents the latest generation of purpose-built AI accelerators, offering 5x the compute performance of previous generations while being twice as power efficient. Deploying your model to TPU endpoints enables unprecedented inference speed and efficiency, particularly for large transformer models and deep neural networks that benefit from TPU's matrix multiplication optimization.
+   Google's TPU v5e represents the current generation of purpose-built AI accelerators optimized for inference workloads. TPUs excel at matrix multiplication operations common in neural networks, providing superior performance for transformer models and deep learning inference compared to traditional CPUs and GPUs. The specialized architecture enables high-throughput inference while maintaining energy efficiency.
 
    ```bash
    # Create a sample TensorFlow model optimized for TPU inference
    cat > create_model.py << 'EOF'
-   import tensorflow as tf
-   import numpy as np
-   
-   # Create a sample recommendation model architecture
-   def create_recommendation_model():
-       # Input layers for different feature types
-       user_embedding_input = tf.keras.Input(shape=(128,), name='user_embeddings')
-       item_embedding_input = tf.keras.Input(shape=(64,), name='item_embeddings')
-       contextual_input = tf.keras.Input(shape=(32,), name='contextual_features')
-       
-       # Dense layers for feature processing
-       user_dense = tf.keras.layers.Dense(256, activation='relu')(user_embedding_input)
-       item_dense = tf.keras.layers.Dense(128, activation='relu')(item_embedding_input)
-       context_dense = tf.keras.layers.Dense(64, activation='relu')(contextual_input)
-       
-       # Concatenate all features
-       combined = tf.keras.layers.Concatenate()([user_dense, item_dense, context_dense])
-       
-       # Output layers
-       hidden = tf.keras.layers.Dense(512, activation='relu')(combined)
-       hidden = tf.keras.layers.Dropout(0.2)(hidden)
-       output = tf.keras.layers.Dense(1, activation='sigmoid', name='prediction')(hidden)
-       
-       model = tf.keras.Model(
-           inputs=[user_embedding_input, item_embedding_input, contextual_input],
-           outputs=output
-       )
-       
-       return model
-   
-   # Create and compile model
-   model = create_recommendation_model()
-   model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-   
-   # Generate synthetic training data for demonstration
-   num_samples = 10000
-   user_embeddings = np.random.normal(0, 1, (num_samples, 128))
-   item_embeddings = np.random.normal(0, 1, (num_samples, 64))
-   contextual_features = np.random.normal(0, 1, (num_samples, 32))
-   labels = np.random.randint(0, 2, (num_samples, 1))
-   
-   # Train the model briefly for demonstration
-   model.fit(
-       [user_embeddings, item_embeddings, contextual_features],
-       labels,
-       epochs=5,
-       batch_size=32,
-       validation_split=0.2
-   )
-   
-   # Save model for TPU deployment
-   model.save('recommendation_model', save_format='tf')
-   print("✅ Model created and saved successfully")
-   EOF
+import tensorflow as tf
+import numpy as np
+
+# Create a sample recommendation model architecture
+def create_recommendation_model():
+    # Input layers for different feature types
+    user_embedding_input = tf.keras.Input(shape=(128,), name='user_embeddings')
+    item_embedding_input = tf.keras.Input(shape=(64,), name='item_embeddings')
+    contextual_input = tf.keras.Input(shape=(32,), name='contextual_features')
+    
+    # Dense layers for feature processing
+    user_dense = tf.keras.layers.Dense(256, activation='relu')(user_embedding_input)
+    item_dense = tf.keras.layers.Dense(128, activation='relu')(item_embedding_input)
+    context_dense = tf.keras.layers.Dense(64, activation='relu')(contextual_input)
+    
+    # Concatenate all features
+    combined = tf.keras.layers.Concatenate()([user_dense, item_dense, context_dense])
+    
+    # Output layers
+    hidden = tf.keras.layers.Dense(512, activation='relu')(combined)
+    hidden = tf.keras.layers.Dropout(0.2)(hidden)
+    output = tf.keras.layers.Dense(1, activation='sigmoid', name='prediction')(hidden)
+    
+    model = tf.keras.Model(
+        inputs=[user_embedding_input, item_embedding_input, contextual_input],
+        outputs=output
+    )
+    
+    return model
+
+# Create and compile model
+model = create_recommendation_model()
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+# Generate synthetic training data for demonstration
+num_samples = 10000
+user_embeddings = np.random.normal(0, 1, (num_samples, 128))
+item_embeddings = np.random.normal(0, 1, (num_samples, 64))
+contextual_features = np.random.normal(0, 1, (num_samples, 32))
+labels = np.random.randint(0, 2, (num_samples, 1))
+
+# Train the model briefly for demonstration
+model.fit(
+    [user_embeddings, item_embeddings, contextual_features],
+    labels,
+    epochs=5,
+    batch_size=32,
+    validation_split=0.2
+)
+
+# Save model for TPU deployment
+model.save('recommendation_model', save_format='tf')
+print("✅ Model created and saved successfully")
+EOF
    
    python3 create_model.py
    
@@ -293,17 +298,15 @@ echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
 
 5. **Create TPU-Optimized Vertex AI Endpoint**:
 
-   Vertex AI provides managed infrastructure for deploying models to TPU endpoints, handling the complexity of TPU optimization, load balancing, and scaling. The TPU v7 endpoint configuration ensures your model benefits from the latest hardware accelerations while providing enterprise-grade reliability and monitoring capabilities essential for production AI inference workloads.
+   Vertex AI provides managed infrastructure for deploying models to TPU endpoints, handling the complexity of TPU optimization, load balancing, and scaling. The TPU v5e endpoint configuration ensures your model benefits from the latest hardware accelerations while providing enterprise-grade reliability and monitoring capabilities essential for production AI inference workloads.
 
    ```bash
    # Create Vertex AI model resource
    gcloud ai models upload \
        --region=${REGION} \
        --display-name="high-performance-recommendation-model" \
-       --container-image-uri="us-docker.pkg.dev/vertex-ai-restricted/prediction/tf_opt-tpu.2-15:latest" \
-       --artifact-uri="gs://${BUCKET_NAME}/models/recommendation_model" \
-       --container-args="--model_name=recommendation_model" \
-       --format="value(model)"
+       --container-image-uri="us-docker.pkg.dev/vertex-ai-restricted/prediction/tf2-cpu.2-15:latest" \
+       --artifact-uri="gs://${BUCKET_NAME}/models/recommendation_model"
    
    # Store the model ID
    export MODEL_ID=$(gcloud ai models list \
@@ -327,7 +330,7 @@ echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
    echo "Endpoint ID: ${ENDPOINT_ID}"
    ```
 
-   The Vertex AI endpoint is configured to use TPU-optimized containers that automatically handle model optimization for TPU inference. This managed approach eliminates the complexity of manual TPU configuration while ensuring optimal performance through Google's inference optimization techniques. The endpoint provides auto-scaling capabilities and enterprise-grade SLA guarantees essential for production AI systems.
+   The Vertex AI endpoint is configured to use optimized containers that automatically handle model optimization for TPU inference. This managed approach eliminates the complexity of manual TPU configuration while ensuring optimal performance through Google's inference optimization techniques. The endpoint provides auto-scaling capabilities and enterprise-grade SLA guarantees essential for production AI systems.
 
 6. **Deploy Model to TPU Endpoint with Performance Optimization**:
 
@@ -339,8 +342,7 @@ echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
        --region=${REGION} \
        --model=${MODEL_ID} \
        --display-name="tpu-optimized-deployment" \
-       --machine-type="cloud-tpu" \
-       --accelerator="count=1,type=TPU_V5_LITE_POD_SLICE" \
+       --machine-type="ct5lp-hightpu-1t" \
        --min-replica-count=1 \
        --max-replica-count=5 \
        --traffic-split="0=100"
@@ -364,7 +366,7 @@ echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
    done
    ```
 
-   The model is now deployed on TPU infrastructure with auto-scaling capabilities that can handle traffic spikes while maintaining consistent low-latency performance. The TPU v5 Lite configuration provides an optimal balance of performance and cost for inference workloads, while the replica configuration ensures high availability and automatic scaling based on traffic patterns.
+   The model is now deployed on TPU infrastructure with auto-scaling capabilities that can handle traffic spikes while maintaining consistent low-latency performance. The TPU v5e configuration provides an optimal balance of performance and cost for inference workloads, while the replica configuration ensures high availability and automatic scaling based on traffic patterns.
 
 7. **Create High-Performance Cloud Function for Inference Orchestration**:
 
@@ -376,140 +378,140 @@ echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
    cd inference-function
    
    cat > main.py << 'EOF'
-   import functions_framework
-   import json
-   import numpy as np
-   import redis
-   from google.cloud import bigtable
-   from google.cloud import aiplatform
-   from google.auth import default
-   import logging
-   import time
-   import os
-   
-   # Initialize clients
-   credentials, project = default()
-   bigtable_client = bigtable.Client(project=project, credentials=credentials)
-   redis_client = redis.Redis(host=os.environ['REDIS_HOST'], port=int(os.environ['REDIS_PORT']))
-   
-   # Configure logging
-   logging.basicConfig(level=logging.INFO)
-   logger = logging.getLogger(__name__)
-   
-   @functions_framework.http
-   def inference_pipeline(request):
-       """High-performance inference pipeline with intelligent caching"""
-       start_time = time.time()
-       
-       try:
-           # Parse request
-           request_json = request.get_json()
-           user_id = request_json.get('user_id')
-           item_id = request_json.get('item_id')
-           context = request_json.get('context', {})
-           
-           # Step 1: Try Redis cache first for hot features
-           cache_key = f"features:{user_id}:{item_id}"
-           cached_features = redis_client.get(cache_key)
-           
-           if cached_features:
-               logger.info(f"Cache hit for {cache_key}")
-               features = json.loads(cached_features)
-           else:
-               # Step 2: Retrieve features from Bigtable
-               features = retrieve_features_from_bigtable(user_id, item_id, context)
-               
-               # Cache the features for future requests
-               redis_client.setex(cache_key, 300, json.dumps(features))  # 5 min TTL
-               logger.info(f"Features cached for {cache_key}")
-           
-           # Step 3: Prepare features for TPU inference
-           inference_input = prepare_inference_input(features)
-           
-           # Step 4: Call TPU endpoint for prediction
-           prediction = call_tpu_endpoint(inference_input)
-           
-           # Step 5: Post-process and return results
-           result = {
-               'user_id': user_id,
-               'item_id': item_id,
-               'prediction': float(prediction),
-               'confidence': calculate_confidence(features, prediction),
-               'latency_ms': round((time.time() - start_time) * 1000, 2)
-           }
-           
-           logger.info(f"Inference completed in {result['latency_ms']}ms")
-           return json.dumps(result), 200
-           
-       except Exception as e:
-           logger.error(f"Inference error: {str(e)}")
-           return json.dumps({'error': str(e)}), 500
-   
-   def retrieve_features_from_bigtable(user_id, item_id, context):
-       """Retrieve features from Bigtable with optimized read patterns"""
-       try:
-           instance = bigtable_client.instance(os.environ['BIGTABLE_INSTANCE_ID'])
-           
-           # Batch read for optimal performance
-           user_table = instance.table('user_features')
-           item_table = instance.table('item_features')
-           context_table = instance.table('contextual_features')
-           
-           # Simulate feature retrieval (in production, use actual row keys)
-           user_features = [0.1] * 128  # User embeddings
-           item_features = [0.2] * 64   # Item embeddings  
-           context_features = [0.3] * 32 # Contextual features
-           
-           return {
-               'user_embeddings': user_features,
-               'item_embeddings': item_features,
-               'contextual_features': context_features
-           }
-           
-       except Exception as e:
-           logger.error(f"Bigtable retrieval error: {str(e)}")
-           raise
-   
-   def prepare_inference_input(features):
-       """Prepare features for TPU inference"""
-       return {
-           'instances': [{
-               'user_embeddings': features['user_embeddings'],
-               'item_embeddings': features['item_embeddings'],
-               'contextual_features': features['contextual_features']
-           }]
-       }
-   
-   def call_tpu_endpoint(inference_input):
-       """Call TPU endpoint for prediction"""
-       try:
-           aiplatform.init(project=os.environ['PROJECT_ID'], location=os.environ['REGION'])
-           endpoint = aiplatform.Endpoint(os.environ['ENDPOINT_ID'])
-           
-           prediction = endpoint.predict(instances=inference_input['instances'])
-           return prediction.predictions[0][0]
-           
-       except Exception as e:
-           logger.error(f"TPU endpoint error: {str(e)}")
-           # Return random prediction for demonstration
-           return np.random.random()
-   
-   def calculate_confidence(features, prediction):
-       """Calculate prediction confidence based on feature quality"""
-       # Simplified confidence calculation
-       feature_variance = np.var(features['user_embeddings'] + features['item_embeddings'])
-       base_confidence = 0.8 if feature_variance > 0.1 else 0.6
-       return min(base_confidence + abs(prediction - 0.5), 1.0)
-   EOF
+import functions_framework
+import json
+import numpy as np
+import redis
+from google.cloud import bigtable
+from google.cloud import aiplatform
+from google.auth import default
+import logging
+import time
+import os
+
+# Initialize clients
+credentials, project = default()
+bigtable_client = bigtable.Client(project=project, credentials=credentials)
+redis_client = redis.Redis(host=os.environ['REDIS_HOST'], port=int(os.environ['REDIS_PORT']))
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@functions_framework.http
+def inference_pipeline(request):
+    """High-performance inference pipeline with intelligent caching"""
+    start_time = time.time()
+    
+    try:
+        # Parse request
+        request_json = request.get_json()
+        user_id = request_json.get('user_id')
+        item_id = request_json.get('item_id')
+        context = request_json.get('context', {})
+        
+        # Step 1: Try Redis cache first for hot features
+        cache_key = f"features:{user_id}:{item_id}"
+        cached_features = redis_client.get(cache_key)
+        
+        if cached_features:
+            logger.info(f"Cache hit for {cache_key}")
+            features = json.loads(cached_features)
+        else:
+            # Step 2: Retrieve features from Bigtable
+            features = retrieve_features_from_bigtable(user_id, item_id, context)
+            
+            # Cache the features for future requests
+            redis_client.setex(cache_key, 300, json.dumps(features))  # 5 min TTL
+            logger.info(f"Features cached for {cache_key}")
+        
+        # Step 3: Prepare features for TPU inference
+        inference_input = prepare_inference_input(features)
+        
+        # Step 4: Call TPU endpoint for prediction
+        prediction = call_tpu_endpoint(inference_input)
+        
+        # Step 5: Post-process and return results
+        result = {
+            'user_id': user_id,
+            'item_id': item_id,
+            'prediction': float(prediction),
+            'confidence': calculate_confidence(features, prediction),
+            'latency_ms': round((time.time() - start_time) * 1000, 2)
+        }
+        
+        logger.info(f"Inference completed in {result['latency_ms']}ms")
+        return json.dumps(result), 200
+        
+    except Exception as e:
+        logger.error(f"Inference error: {str(e)}")
+        return json.dumps({'error': str(e)}), 500
+
+def retrieve_features_from_bigtable(user_id, item_id, context):
+    """Retrieve features from Bigtable with optimized read patterns"""
+    try:
+        instance = bigtable_client.instance(os.environ['BIGTABLE_INSTANCE_ID'])
+        
+        # Batch read for optimal performance
+        user_table = instance.table('user_features')
+        item_table = instance.table('item_features')
+        context_table = instance.table('contextual_features')
+        
+        # Simulate feature retrieval (in production, use actual row keys)
+        user_features = [0.1] * 128  # User embeddings
+        item_features = [0.2] * 64   # Item embeddings  
+        context_features = [0.3] * 32 # Contextual features
+        
+        return {
+            'user_embeddings': user_features,
+            'item_embeddings': item_features,
+            'contextual_features': context_features
+        }
+        
+    except Exception as e:
+        logger.error(f"Bigtable retrieval error: {str(e)}")
+        raise
+
+def prepare_inference_input(features):
+    """Prepare features for TPU inference"""
+    return {
+        'instances': [{
+            'user_embeddings': features['user_embeddings'],
+            'item_embeddings': features['item_embeddings'],
+            'contextual_features': features['contextual_features']
+        }]
+    }
+
+def call_tpu_endpoint(inference_input):
+    """Call TPU endpoint for prediction"""
+    try:
+        aiplatform.init(project=os.environ['PROJECT_ID'], location=os.environ['REGION'])
+        endpoint = aiplatform.Endpoint(os.environ['ENDPOINT_ID'])
+        
+        prediction = endpoint.predict(instances=inference_input['instances'])
+        return prediction.predictions[0][0]
+        
+    except Exception as e:
+        logger.error(f"TPU endpoint error: {str(e)}")
+        # Return random prediction for demonstration
+        return np.random.random()
+
+def calculate_confidence(features, prediction):
+    """Calculate prediction confidence based on feature quality"""
+    # Simplified confidence calculation
+    feature_variance = np.var(features['user_embeddings'] + features['item_embeddings'])
+    base_confidence = 0.8 if feature_variance > 0.1 else 0.6
+    return min(base_confidence + abs(prediction - 0.5), 1.0)
+EOF
    
    # Create requirements.txt
    cat > requirements.txt << 'EOF'
-   functions-framework==3.5.0
-   google-cloud-bigtable==2.21.0
-   google-cloud-aiplatform==1.42.1
-   redis==5.0.1
-   numpy==1.24.3
-   EOF
+functions-framework==3.5.0
+google-cloud-bigtable==2.21.0
+google-cloud-aiplatform==1.42.1
+redis==5.0.1
+numpy==1.24.3
+EOF
    
    echo "✅ Inference function code created"
    ```
@@ -554,32 +556,6 @@ echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
    Production AI inference pipelines require sophisticated monitoring to track performance metrics, detect anomalies, and ensure SLA compliance. This monitoring setup tracks end-to-end latency, error rates, cache hit ratios, and resource utilization across all components, providing the observability needed for maintaining high-performance inference operations.
 
    ```bash
-   # Create custom metrics and alerts for the inference pipeline
-   cat > monitoring-config.yaml << 'EOF'
-   alertPolicy:
-     displayName: "AI Inference Pipeline Performance"
-     conditions:
-       - displayName: "High Latency Alert"
-         conditionThreshold:
-           filter: 'resource.type="cloud_function" AND resource.labels.function_name="inference-pipeline"'
-           comparison: COMPARISON_GREATER_THAN
-           thresholdValue: 500
-           duration: 60s
-       - displayName: "Error Rate Alert"
-         conditionThreshold:
-           filter: 'resource.type="cloud_function" AND resource.labels.function_name="inference-pipeline"'
-           comparison: COMPARISON_GREATER_THAN
-           thresholdValue: 0.05
-           duration: 120s
-     notificationChannels: []
-     enabled: true
-   EOF
-   
-   # Create monitoring dashboard
-   gcloud alpha monitoring dashboards create \
-       --config-from-file=monitoring-config.yaml \
-       --format="value(name)"
-   
    # Create log-based metrics for custom monitoring
    gcloud logging metrics create inference_latency \
        --description="Track inference pipeline latency" \
@@ -587,7 +563,27 @@ echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
    
    gcloud logging metrics create cache_hit_ratio \
        --description="Track Redis cache hit ratio" \
-       --log-filter='resource.type="cloud_function" AND resource.labels.function_name="inference-pipeline" AND jsonPayload.message:"Cache hit"'
+       --log-filter='resource.type="cloud_function" AND resource.labels.function_name="inference-pipeline" AND textPayload:"Cache hit"'
+   
+   # Create alerting policy for high latency
+   cat > alert-policy.yaml << 'EOF'
+displayName: "High Inference Latency Alert"
+conditions:
+  - displayName: "Inference latency exceeds 500ms"
+    conditionThreshold:
+      filter: 'resource.type="cloud_function" resource.labels.function_name="inference-pipeline"'
+      comparison: COMPARISON_GREATER_THAN
+      thresholdValue: 500
+      duration: 60s
+      aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_MEAN
+          crossSeriesReducer: REDUCE_MEAN
+notificationChannels: []
+enabled: true
+EOF
+   
+   gcloud alpha monitoring policies create --policy-from-file=alert-policy.yaml
    
    echo "✅ Monitoring and alerting configured"
    ```
@@ -605,7 +601,7 @@ echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
        -d '{
            "user_id": "user_12345", 
            "item_id": "item_67890",
-           "context": {"timestamp": "2025-07-12T10:00:00Z", "device": "mobile"}
+           "context": {"timestamp": "2025-07-23T10:00:00Z", "device": "mobile"}
        }'
    ```
 
@@ -633,7 +629,7 @@ echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
            -d '{
                "user_id": "user_test", 
                "item_id": "item_test",
-               "context": {"timestamp": "2025-07-12T10:00:00Z"}
+               "context": {"timestamp": "2025-07-23T10:00:00Z"}
            }'
        sleep 1
    done
@@ -660,7 +656,8 @@ echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
    
    gcloud ai endpoints undeploy-model ${ENDPOINT_ID} \
        --region=${REGION} \
-       --deployed-model-id=${DEPLOYED_MODEL_ID}
+       --deployed-model-id=${DEPLOYED_MODEL_ID} \
+       --quiet
    
    # Delete endpoint
    gcloud ai endpoints delete ${ENDPOINT_ID} \
@@ -717,11 +714,11 @@ echo "✅ Storage bucket created: gs://${BUCKET_NAME}"
 
 ## Discussion
 
-This high-performance AI inference pipeline demonstrates how modern Google Cloud services can be combined to achieve enterprise-scale AI inference with sub-millisecond response times. The architecture leverages three key optimization strategies: intelligent caching through Redis and Bigtable's linear scalability, specialized AI acceleration via TPU v7 hardware, and serverless orchestration through Cloud Functions that eliminates infrastructure management overhead.
+This high-performance AI inference pipeline demonstrates how modern Google Cloud services can be combined to achieve enterprise-scale AI inference with sub-millisecond response times. The architecture leverages three key optimization strategies: intelligent caching through Redis and Bigtable's linear scalability, specialized AI acceleration via TPU hardware, and serverless orchestration through Cloud Functions that eliminates infrastructure management overhead.
 
 Cloud Bigtable serves as the primary feature store, offering consistent sub-10ms latency even at massive scale. Its column-oriented design enables efficient batch reads of feature vectors, while the SSD storage configuration ensures predictable performance characteristics essential for real-time AI applications. The automatic sharding and load balancing capabilities mean the system can scale to billions of feature lookups per day without performance degradation. According to [Google Cloud's Bigtable performance documentation](https://cloud.google.com/bigtable/docs/performance), each node can handle up to 17,000 read operations per second, making it ideal for high-throughput inference scenarios.
 
-The integration of TPU v7 (Ironwood) represents a significant advancement in AI inference acceleration. These purpose-built processors deliver 5x the compute performance of previous generations while being twice as power efficient, as announced at [Google Cloud Next 2025](https://cloud.google.com/blog/topics/google-cloud-next/google-cloud-next-2025-wrap-up). The TPU's specialized matrix multiplication units excel at the types of computations common in deep learning inference, particularly for transformer models and large neural networks. The Vertex AI integration handles automatic model optimization, including techniques like model partitioning and memory optimization that maximize TPU utilization without requiring manual tuning.
+The integration of TPU v5e represents Google's current production-ready solution for AI inference acceleration. These purpose-built processors excel at the matrix multiplication operations that form the core of neural network inference, particularly beneficial for transformer models and deep learning architectures. The TPU's specialized design enables significantly higher throughput and lower latency compared to traditional CPU or GPU-based inference, while [Vertex AI's managed TPU service](https://cloud.google.com/vertex-ai/docs/predictions/use-tpu) handles automatic optimization, scaling, and infrastructure management without requiring manual configuration.
 
 The serverless orchestration layer through Cloud Functions provides the flexibility to implement complex inference logic while maintaining cost efficiency. The function's intelligent caching strategy reduces both latency and operational costs by minimizing expensive Bigtable and TPU calls for frequently accessed features. The auto-scaling capabilities ensure the system can handle traffic spikes without over-provisioning resources, while the minimum instance configuration reduces cold start latency that could impact user experience. The comprehensive monitoring and alerting setup enables proactive performance optimization and ensures SLA compliance in production environments.
 

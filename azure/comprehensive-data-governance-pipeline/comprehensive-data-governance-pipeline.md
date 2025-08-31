@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Purview, Azure Data Lake Storage, Azure Synapse Analytics
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-governance, compliance, data-catalog, data-lineage, automation
 recipe-generator-version: 1.3
@@ -74,18 +74,18 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with Owner or Contributor permissions
-2. Azure CLI version 2.37.0 or later installed and configured
+2. Azure CLI version 2.50.0 or later installed and configured
 3. Basic understanding of data governance concepts and Azure storage
 4. Familiarity with Azure Synapse Analytics and data pipeline concepts
 5. Estimated cost: $50-100 USD for testing environment (depends on data volume and scan frequency)
 
-> **Note**: Azure Purview follows consumption-based pricing for data scanning and catalog operations. Review the [Azure Purview pricing guide](https://azure.microsoft.com/pricing/details/azure-purview/) to understand cost implications before proceeding.
+> **Note**: Azure Purview follows consumption-based pricing for data scanning and catalog operations. For existing Azure Purview accounts, this recipe works with classic accounts. New customers should consider upgrading to the [Microsoft Purview Unified Catalog](https://docs.microsoft.com/en-us/purview/unified-catalog) experience. Review the [Azure Purview pricing guide](https://azure.microsoft.com/pricing/details/purview/) to understand cost implications before proceeding.
 
 ## Preparation
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-purview-governance-demo"
+export RESOURCE_GROUP="rg-purview-governance-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
@@ -96,7 +96,6 @@ RANDOM_SUFFIX=$(openssl rand -hex 3)
 export PURVIEW_ACCOUNT="purview-${RANDOM_SUFFIX}"
 export STORAGE_ACCOUNT="datalake${RANDOM_SUFFIX}"
 export SYNAPSE_WORKSPACE="synapse-${RANDOM_SUFFIX}"
-export KEY_VAULT="kv-${RANDOM_SUFFIX}"
 
 # Create resource group
 az group create \
@@ -110,7 +109,6 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 az provider register --namespace Microsoft.Purview
 az provider register --namespace Microsoft.Storage
 az provider register --namespace Microsoft.Synapse
-az provider register --namespace Microsoft.KeyVault
 
 echo "✅ Required resource providers registered"
 ```
@@ -202,7 +200,7 @@ echo "✅ Required resource providers registered"
    Azure Purview serves as the central hub for data governance, providing automated data discovery, cataloging, and classification capabilities. The Purview account creates a unified data map that spans across your entire data estate, enabling comprehensive governance and compliance management.
 
    ```bash
-   # Create Azure Purview account
+   # Create Azure Purview account (Note: For existing tenants with classic accounts)
    az purview account create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${PURVIEW_ACCOUNT} \
@@ -277,6 +275,12 @@ echo "✅ Required resource providers registered"
    Azure Synapse Analytics integrates seamlessly with Azure Purview to provide advanced analytics capabilities while maintaining data lineage tracking. This integration enables end-to-end data governance from ingestion through transformation to consumption, ensuring compliance throughout the analytics lifecycle.
 
    ```bash
+   # Create file system for Synapse workspace
+   az storage fs create \
+       --name synapse \
+       --account-name ${STORAGE_ACCOUNT} \
+       --account-key ${STORAGE_KEY}
+   
    # Create Azure Synapse workspace
    az synapse workspace create \
        --name ${SYNAPSE_WORKSPACE} \
@@ -396,8 +400,8 @@ echo "✅ Required resource providers registered"
    EOF
    
    # Replace placeholders in linked service
-   sed -i "s/STORAGE_ACCOUNT/${STORAGE_ACCOUNT}/g" linked-service.json
-   sed -i "s/STORAGE_KEY/${STORAGE_KEY}/g" linked-service.json
+   sed -i.bak "s/STORAGE_ACCOUNT/${STORAGE_ACCOUNT}/g" linked-service.json
+   sed -i.bak "s/STORAGE_KEY/${STORAGE_KEY}/g" linked-service.json
    
    echo "✅ Data pipeline configuration created"
    echo "Pipeline files ready for Synapse Studio deployment"
@@ -598,7 +602,7 @@ echo "✅ Required resource providers registered"
    # Remove temporary files
    rm -f customers.csv orders.csv data-pipeline.json
    rm -f linked-service.json classification-rules.json
-   rm -f sensitivity-labels.json
+   rm -f sensitivity-labels.json linked-service.json.bak
    
    echo "✅ Local configuration files cleaned up"
    ```
@@ -607,11 +611,11 @@ echo "✅ Required resource providers registered"
 
 Azure Purview provides a comprehensive data governance solution that addresses the critical challenges of managing distributed data assets at enterprise scale. The integration between Azure Purview, Data Lake Storage, and Synapse Analytics creates a unified governance framework that automatically discovers, catalogs, and classifies data while maintaining complete lineage tracking throughout the analytics lifecycle. This approach significantly reduces manual governance overhead while ensuring consistent compliance with regulatory requirements such as GDPR, HIPAA, and industry-specific standards.
 
-The automated data classification capabilities demonstrated in this recipe leverage machine learning algorithms to identify sensitive data patterns and apply appropriate governance policies automatically. This AI-driven approach scales effectively across large data estates and adapts to evolving data patterns without requiring constant manual intervention. For organizations managing petabytes of data across multiple business units, this automation becomes essential for maintaining governance consistency and compliance effectiveness. The [Azure Purview data governance documentation](https://docs.microsoft.com/en-us/azure/purview/concept-data-governance) provides comprehensive guidance on implementing enterprise-scale governance strategies.
+The automated data classification capabilities demonstrated in this recipe leverage machine learning algorithms to identify sensitive data patterns and apply appropriate governance policies automatically. This AI-driven approach scales effectively across large data estates and adapts to evolving data patterns without requiring constant manual intervention. For organizations managing petabytes of data across multiple business units, this automation becomes essential for maintaining governance consistency and compliance effectiveness. The [Azure Purview data governance documentation](https://docs.microsoft.com/en-us/purview/concept-data-governance) provides comprehensive guidance on implementing enterprise-scale governance strategies.
 
 The seamless integration with Azure Synapse Analytics enables organizations to maintain governance controls throughout the entire data processing pipeline, from raw data ingestion through complex transformations to business intelligence reporting. This end-to-end lineage tracking ensures that compliance requirements are met at every stage of the analytics process while providing data engineers and analysts with the visibility needed to understand data origins and transformations. The [Azure Synapse Analytics integration guide](https://docs.microsoft.com/en-us/azure/synapse-analytics/catalog-and-governance/quickstart-connect-azure-purview) details advanced configuration options for production environments.
 
-From a cost optimization perspective, Azure Purview's consumption-based pricing model ensures that organizations only pay for actual scanning and cataloging activities, making it cost-effective for both small-scale implementations and enterprise-wide deployments. The service's ability to schedule scans and focus on specific data sources helps optimize costs while maintaining comprehensive governance coverage. For detailed cost management strategies, review the [Azure Purview pricing and cost optimization guide](https://docs.microsoft.com/en-us/azure/purview/concept-elastic-data-map).
+From a cost optimization perspective, Azure Purview's consumption-based pricing model ensures that organizations only pay for actual scanning and cataloging activities, making it cost-effective for both small-scale implementations and enterprise-wide deployments. For new implementations, Microsoft recommends considering the [Microsoft Purview Unified Catalog](https://docs.microsoft.com/en-us/purview/unified-catalog) experience, which provides enhanced capabilities and simplified billing. The service's ability to schedule scans and focus on specific data sources helps optimize costs while maintaining comprehensive governance coverage.
 
 > **Tip**: Implement incremental scanning strategies to minimize costs and processing time while maintaining current governance information. Use Azure Purview's built-in scheduling capabilities to scan frequently changing data sources more often than static reference data, optimizing both performance and cost effectiveness.
 

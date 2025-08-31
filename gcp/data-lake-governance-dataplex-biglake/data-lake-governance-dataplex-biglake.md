@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Dataplex, BigLake, Cloud Functions, BigQuery
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-governance, data-lake, AI-powered-catalog, metadata-management, policy-enforcement
 recipe-generator-version: 1.3
@@ -323,9 +323,9 @@ echo "✅ Sample data uploaded to Cloud Storage"
    
    # Create requirements.txt for dependencies
    cat > requirements.txt << 'EOF'
-   google-cloud-dataplex==1.9.3
-   google-cloud-bigquery==3.13.0
-   google-cloud-logging==3.8.0
+   google-cloud-dataplex==1.13.1
+   google-cloud-bigquery==3.17.2
+   google-cloud-logging==3.9.0
    functions-framework==3.5.0
    EOF
    
@@ -424,14 +424,8 @@ def governance_monitor(request):
    Dataplex provides comprehensive data lineage tracking and quality profiling that helps understand data flow, dependencies, and quality trends over time. These features are essential for impact analysis, compliance reporting, and maintaining data trust across the organization.
 
    ```bash
-   # Enable data lineage for comprehensive tracking
-   gcloud dataplex tasks create lineage-tracking-task \
-       --location=${REGION} \
-       --lake=${LAKE_NAME} \
-       --trigger-type=ON_DEMAND \
-       --execution-service-account="${CONNECTION_SA}" \
-       --spark-main-class="com.google.cloud.dataplex.templates.hive.HiveDDLExecutor" \
-       --spark-file-uris="gs://dataplex-public-assets/hive-ddl-executor-template.jar"
+   # Wait for connection service account to be fully propagated
+   sleep 30
    
    # Create data profile task for quality assessment
    gcloud dataplex tasks create quality-profile-task \
@@ -440,14 +434,14 @@ def governance_monitor(request):
        --trigger-type=RECURRING \
        --trigger-schedule="0 2 * * *" \
        --execution-service-account="${CONNECTION_SA}" \
-       --spark-main-class="com.google.cloud.dataplex.templates.hive.HiveDDLExecutor" \
+       --spark-main-class="com.google.cloud.dataplex.templates.dataquality.DataQualityMainClass" \
        --spark-file-uris="gs://dataplex-public-assets/data-quality-template.jar"
    
-   echo "✅ Data lineage and quality profiling configured"
+   echo "✅ Data quality profiling configured"
    echo "Tasks will execute automatically based on defined schedules"
    ```
 
-   These automated tasks provide continuous insights into data quality trends, lineage relationships, and governance compliance. The recurring schedule ensures that quality metrics are updated regularly, enabling proactive identification and resolution of data issues.
+   These automated tasks provide continuous insights into data quality trends and governance compliance. The recurring schedule ensures that quality metrics are updated regularly, enabling proactive identification and resolution of data issues.
 
 ## Validation & Testing
 
@@ -510,7 +504,7 @@ def governance_monitor(request):
 
    Expected output: JSON response with quality metrics and governance status for monitored tables.
 
-4. **Verify Data Lineage and Quality Metrics**:
+4. **Verify Data Quality Profile Results**:
 
    ```bash
    # Check task execution status
@@ -519,13 +513,15 @@ def governance_monitor(request):
        --lake=${LAKE_NAME} \
        --format="table(name,state,createTime,updateTime)"
    
-   # View quality profile results (after tasks complete)
-   gcloud dataplex aspects list \
+   # View asset discovery status
+   gcloud dataplex assets describe governance-bucket-asset \
        --location=${REGION} \
-       --entry-group="projects/${PROJECT_ID}/locations/${REGION}/entryGroups/dataplex"
+       --lake=${LAKE_NAME} \
+       --zone=${ZONE_NAME} \
+       --format="table(name,state,discoveryStatus)"
    ```
 
-   Expected output: Completed tasks with quality profiles and lineage information available in Dataplex catalog.
+   Expected output: Completed tasks with asset in ACTIVE state showing successful discovery.
 
 ## Cleanup
 
@@ -547,11 +543,6 @@ def governance_monitor(request):
 
    ```bash
    # Delete Dataplex tasks
-   gcloud dataplex tasks delete lineage-tracking-task \
-       --location=${REGION} \
-       --lake=${LAKE_NAME} \
-       --quiet
-   
    gcloud dataplex tasks delete quality-profile-task \
        --location=${REGION} \
        --lake=${LAKE_NAME} \

@@ -1,22 +1,21 @@
 ---
-title: API Throttling and Rate Limiting
+title: API Throttling and Rate Limiting with API Gateway and Lambda
 id: 30a829f4
 category: serverless
 difficulty: 200
 subject: aws
 services: API Gateway, CloudWatch, Lambda, IAM
 estimated-time: 60 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: api-gateway, rate-limiting, throttling, performance, quotas
 recipe-generator-version: 1.3
 ---
 
-# API Throttling and Rate Limiting
-
+# API Throttling and Rate Limiting with API Gateway and Lambda
 
 ## Problem
 
@@ -166,7 +165,7 @@ echo "✅ Environment prepared with API name: ${API_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.13 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role-${RANDOM_SUFFIX} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda_function.zip \
@@ -441,7 +440,7 @@ echo "✅ Environment prepared with API name: ${API_NAME}"
     aws cloudwatch put-metric-alarm \
         --alarm-name "API-High-Throttling-${RANDOM_SUFFIX}" \
         --alarm-description "Alert when API throttling exceeds threshold" \
-        --metric-name Count \
+        --metric-name ThrottleCount \
         --namespace AWS/ApiGateway \
         --statistic Sum \
         --period 300 \
@@ -505,10 +504,12 @@ echo "✅ Environment prepared with API name: ${API_NAME}"
    # brew install apache-bench (macOS)
    
    # Test Basic tier rate limiting (should throttle after 100 RPS)
-   ab -n 1000 -c 10 -H "X-API-Key: ${BASIC_KEY_VALUE}" ${API_URL}
+   ab -n 1000 -c 10 \
+       -H "X-API-Key: ${BASIC_KEY_VALUE}" ${API_URL}
    
    # Test Premium tier (should handle higher load)
-   ab -n 1000 -c 50 -H "X-API-Key: ${PREMIUM_KEY_VALUE}" ${API_URL}
+   ab -n 1000 -c 50 \
+       -H "X-API-Key: ${PREMIUM_KEY_VALUE}" ${API_URL}
    ```
 
    Expected: Basic tier should show throttling (429 errors), Premium tier should handle load better
@@ -605,15 +606,15 @@ echo "✅ Environment prepared with API name: ${API_NAME}"
 
 This implementation demonstrates a comprehensive approach to API throttling and rate limiting using Amazon API Gateway's native capabilities. The solution provides multiple layers of protection: account-level throttling prevents system overload, stage-level throttling controls API-wide limits, and usage plans with API keys enable customer-specific quotas and rate limits.
 
-The token bucket algorithm used by API Gateway allows for burst traffic while maintaining steady-state limits, making it suitable for real-world usage patterns where traffic naturally fluctuates. The three-tier structure (Basic, Standard, Premium) provides a foundation for monetizing API access while ensuring fair usage policies.
+The token bucket algorithm used by API Gateway allows for burst traffic while maintaining steady-state limits, making it suitable for real-world usage patterns where traffic naturally fluctuates. The three-tier structure (Basic, Standard, Premium) provides a foundation for monetizing API access while ensuring fair usage policies that align with modern SaaS business models.
 
 Usage plans serve as the primary mechanism for implementing differentiated service levels. By associating API keys with specific usage plans, you can provide different customers with varying levels of access based on their subscription tier or business requirements. This approach is commonly used in SaaS platforms to implement freemium models or tiered pricing structures. For detailed guidance on implementing and managing usage plans, see the [API Gateway usage plans documentation](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-api-usage-plans.html).
 
-> **Warning**: Usage plan quotas and throttling are applied on a best-effort basis and should not be relied upon for absolute rate limiting. Consider implementing additional controls using [AWS WAF rate limiting rules](https://docs.aws.amazon.com/waf/latest/developerguide/waf-rule-statement-type-rate-based-request-limiting.html) for stricter enforcement.
+CloudWatch integration provides essential monitoring capabilities, allowing you to track API usage patterns, identify potential abuse, and set up proactive alerts. The metrics help optimize throttling settings based on actual usage patterns and can inform business decisions about pricing and capacity planning. For comprehensive monitoring best practices, reference the [API Gateway monitoring documentation](https://docs.aws.amazon.com/apigateway/latest/developerguide/monitoring-cloudwatch.html).
 
-> **Tip**: Monitor your API usage patterns through CloudWatch metrics to optimize throttling settings and identify opportunities for capacity planning. For comprehensive usage analytics, refer to the [API Gateway usage plans documentation](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-api-usage-plans.html).
+> **Warning**: Usage plan quotas and throttling are applied on a best-effort basis and should not be relied upon for absolute rate limiting. Consider implementing additional controls using [AWS WAF rate limiting rules](https://docs.aws.amazon.com/waf/latest/developerguide/waf-rule-statement-type-rate-based-request-limiting.html) for stricter enforcement in high-security environments.
 
-CloudWatch integration provides essential monitoring capabilities, allowing you to track API usage patterns, identify potential abuse, and set up proactive alerts. The metrics help optimize throttling settings based on actual usage patterns and can inform business decisions about pricing and capacity planning.
+> **Tip**: Monitor your API usage patterns through CloudWatch metrics to optimize throttling settings and identify opportunities for capacity planning. Use the AWS Well-Architected Framework's [Performance Efficiency pillar](https://docs.aws.amazon.com/wellarchitected/latest/performance-efficiency-pillar/welcome.html) to guide optimization decisions.
 
 For production deployments, consider implementing additional security measures such as [AWS WAF rate limiting rules](https://docs.aws.amazon.com/waf/latest/developerguide/waf-rule-statement-type-rate-based-request-limiting.html), custom authorizers, and integration with identity providers like Amazon Cognito. These layers provide defense-in-depth protection against sophisticated attacks and unauthorized access attempts. Additional security controls can be found in the [API Gateway access control documentation](https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-control-access-to-api.html).
 
@@ -621,15 +622,15 @@ For production deployments, consider implementing additional security measures s
 
 Extend this solution by implementing these enhancements:
 
-1. **Custom Authorizer Integration**: Create a Lambda authorizer that validates JWT tokens and dynamically assigns usage plans based on token claims, enabling real-time tier adjustments.
+1. **Custom Authorizer Integration**: Create a Lambda authorizer that validates JWT tokens and dynamically assigns usage plans based on token claims, enabling real-time tier adjustments based on customer subscription changes.
 
-2. **Geographic Rate Limiting**: Implement AWS WAF rules that apply different rate limits based on client geography, with stricter limits for regions with higher abuse rates.
+2. **Geographic Rate Limiting**: Implement AWS WAF rules that apply different rate limits based on client geography, with stricter limits for regions with higher abuse rates or compliance requirements.
 
-3. **Adaptive Throttling**: Build a Lambda function that monitors CloudWatch metrics and automatically adjusts throttling limits based on backend performance and error rates.
+3. **Adaptive Throttling**: Build a Lambda function that monitors CloudWatch metrics and automatically adjusts throttling limits based on backend performance and error rates, creating a self-healing API infrastructure.
 
-4. **Usage Analytics Dashboard**: Create a custom dashboard using QuickSight that visualizes API usage patterns, throttling events, and customer tier utilization across different time periods.
+4. **Usage Analytics Dashboard**: Create a custom dashboard using Amazon QuickSight that visualizes API usage patterns, throttling events, and customer tier utilization across different time periods to support business intelligence decisions.
 
-5. **Multi-API Governance**: Extend the solution to manage throttling across multiple APIs using AWS Config rules and AWS Systems Manager Parameter Store for centralized configuration management.
+5. **Multi-API Governance**: Extend the solution to manage throttling across multiple APIs using AWS Config rules and AWS Systems Manager Parameter Store for centralized configuration management and compliance enforcement.
 
 ## Infrastructure Code
 

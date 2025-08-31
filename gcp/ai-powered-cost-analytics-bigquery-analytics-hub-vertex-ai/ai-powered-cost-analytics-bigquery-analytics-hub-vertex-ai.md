@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: BigQuery, Analytics Hub, Vertex AI, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-optimization, machine-learning, data-analytics, bigquery, vertex-ai
 recipe-generator-version: 1.3
@@ -81,13 +81,13 @@ graph TB
 
 ## Prerequisites
 
-1. Google Cloud project with billing enabled and appropriate IAM permissions
+1. Google Cloud project with billing enabled and appropriate IAM permissions (including Analytics Hub Admin role)
 2. Google Cloud CLI (gcloud) installed and configured (version 400.0.0 or later)
 3. Basic understanding of BigQuery, machine learning concepts, and cost optimization strategies
 4. Cloud Billing Export enabled for your organization
 5. Estimated cost: $50-100 for BigQuery storage and compute, Vertex AI training, and data transfer
 
-> **Note**: This recipe uses BigQuery's built-in data sharing capabilities and Vertex AI's AutoML features to minimize complexity while maximizing analytical power.
+> **Note**: This recipe uses BigQuery's built-in data sharing capabilities and Vertex AI's AutoML features to minimize complexity while maximizing analytical power. Analytics Hub data exchanges are managed through the Google Cloud Console and REST API, not the bq CLI.
 
 ## Preparation
 
@@ -117,6 +117,7 @@ gcloud services enable storage.googleapis.com
 gcloud services enable monitoring.googleapis.com
 gcloud services enable cloudbilling.googleapis.com
 gcloud services enable datacatalog.googleapis.com
+gcloud services enable analyticshub.googleapis.com
 
 # Create Cloud Storage bucket for model artifacts
 gsutil mb -p ${PROJECT_ID} \
@@ -156,26 +157,44 @@ echo "✅ APIs enabled and storage bucket created"
 
 2. **Set Up Analytics Hub Data Exchange**:
 
-   Analytics Hub enables secure data sharing within and across organizations, creating a marketplace for cost-related datasets. By establishing a data exchange, teams can discover and subscribe to relevant cost datasets, benchmarking data, and optimization insights from other departments or external partners.
+   Analytics Hub enables secure data sharing within and across organizations, creating a marketplace for cost-related datasets. By establishing a data exchange, teams can discover and subscribe to relevant cost datasets, benchmarking data, and optimization insights from other departments or external partners. Note that Analytics Hub data exchanges are created through the Google Cloud Console or REST API, not the bq CLI.
 
    ```bash
-   # Create data exchange for cost analytics
-   bq mk --data_exchange \
-       --location=${REGION} \
-       --display_name="Cost Analytics Exchange" \
-       --description="Shared cost data and optimization insights" \
-       ${PROJECT_ID}:${EXCHANGE_ID}
+   # Create data exchange using the REST API
+   # Note: Analytics Hub exchanges cannot be created via bq CLI
+   cat > exchange_request.json << EOF
+   {
+     "displayName": "Cost Analytics Exchange",
+     "description": "Shared cost data and optimization insights",
+     "primaryContact": "admin@${PROJECT_ID}.iam.gserviceaccount.com"
+   }
+   EOF
+   
+   # Create the data exchange using REST API
+   curl -X POST \
+       -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       -H "Content-Type: application/json" \
+       -d @exchange_request.json \
+       "https://analyticshub.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/dataExchanges?dataExchangeId=${EXCHANGE_ID}"
    
    # Create a listing for the billing dataset
-   bq mk --listing \
-       --data_exchange=${EXCHANGE_ID} \
-       --location=${REGION} \
-       --display_name="Billing Data Feed" \
-       --description="Real-time billing and usage data" \
-       --source_dataset=${PROJECT_ID}:${DATASET_ID} \
-       ${PROJECT_ID}:${EXCHANGE_ID}.billing_feed
+   cat > listing_request.json << EOF
+   {
+     "displayName": "Billing Data Feed",
+     "description": "Real-time billing and usage data",
+     "bigqueryDataset": {
+       "dataset": "projects/${PROJECT_ID}/datasets/${DATASET_ID}"
+     }
+   }
+   EOF
    
-   echo "✅ Analytics Hub exchange and listing created"
+   curl -X POST \
+       -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       -H "Content-Type: application/json" \
+       -d @listing_request.json \
+       "https://analyticshub.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/dataExchanges/${EXCHANGE_ID}/listings?listingId=billing_feed"
+   
+   echo "✅ Analytics Hub exchange and listing created via REST API"
    ```
 
    The data exchange creates a centralized hub for cost-related datasets, enabling data-driven collaboration and shared optimization strategies. This foundation supports advanced analytics scenarios where multiple teams contribute and consume cost insights.
@@ -344,13 +363,13 @@ echo "✅ APIs enabled and storage bucket created"
        --display-name=${MODEL_NAME} \
        --description="Cost prediction model for analytics" \
        --artifact-uri=gs://${BUCKET_NAME}/models/cost_prediction \
-       --container-image-uri=gcr.io/cloud-aiplatform/prediction/tf2-cpu.2-8:latest
+       --container-image-uri=gcr.io/cloud-aiplatform/prediction/tf2-cpu.2-11:latest
    
-   # Get the model ID
-   MODEL_ID=$(gcloud ai models list \
+   # Get the model resource name
+   MODEL_RESOURCE_NAME=$(gcloud ai models list \
        --region=${REGION} \
        --filter="displayName:${MODEL_NAME}" \
-       --format="value(name)" | cut -d'/' -f6)
+       --format="value(name)")
    
    # Create prediction endpoint
    gcloud ai endpoints create \
@@ -358,22 +377,22 @@ echo "✅ APIs enabled and storage bucket created"
        --display-name=${ENDPOINT_NAME} \
        --description="Cost prediction endpoint for real-time inference"
    
-   # Get the endpoint ID
-   ENDPOINT_ID=$(gcloud ai endpoints list \
+   # Get the endpoint resource name
+   ENDPOINT_RESOURCE_NAME=$(gcloud ai endpoints list \
        --region=${REGION} \
        --filter="displayName:${ENDPOINT_NAME}" \
-       --format="value(name)" | cut -d'/' -f6)
+       --format="value(name)")
    
    # Deploy model to endpoint
-   gcloud ai endpoints deploy-model ${ENDPOINT_ID} \
+   gcloud ai endpoints deploy-model ${ENDPOINT_RESOURCE_NAME} \
        --region=${REGION} \
-       --model=${MODEL_ID} \
+       --model=${MODEL_RESOURCE_NAME} \
        --display-name="${MODEL_NAME}-deployment" \
        --machine-type=n1-standard-2 \
        --min-replica-count=1 \
        --max-replica-count=3
    
-   echo "✅ Model deployed to Vertex AI endpoint: ${ENDPOINT_ID}"
+   echo "✅ Model deployed to Vertex AI endpoint: ${ENDPOINT_RESOURCE_NAME}"
    ```
 
    The deployed endpoint provides enterprise-grade model serving with automatic scaling, version management, and performance monitoring. This infrastructure supports both batch and real-time predictions for cost optimization applications.
@@ -439,7 +458,7 @@ echo "✅ APIs enabled and storage bucket created"
    Cloud Monitoring integrates with BigQuery to provide real-time alerting on cost metrics and anomalies. Custom metrics and alerting policies enable automated notifications when spending exceeds thresholds or unusual patterns are detected, ensuring proactive cost management.
 
    ```bash
-   # Create alert policy for high cost anomalies
+   # Create alert policy for high cost anomalies using REST API
    cat > cost_alert_policy.json << EOF
    {
      "displayName": "High Cost Anomaly Alert",
@@ -465,9 +484,12 @@ echo "✅ APIs enabled and storage bucket created"
    }
    EOF
    
-   # Create the alert policy
-   gcloud alpha monitoring policies create \
-       --policy-from-file=cost_alert_policy.json
+   # Create the alert policy using REST API
+   curl -X POST \
+       -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       -H "Content-Type: application/json" \
+       -d @cost_alert_policy.json \
+       "https://monitoring.googleapis.com/v1/projects/${PROJECT_ID}/alertPolicies"
    
    # Create custom metric for cost trends
    bq query --use_legacy_sql=false "
@@ -513,17 +535,19 @@ echo "✅ APIs enabled and storage bucket created"
    ```bash
    # Test prediction with sample data
    echo '[{
-     "day_of_week": 2,
-     "hour_of_day": 14,
-     "service_description": "Compute Engine",
-     "project_id": "project-1",
-     "usage_amount": 50.0,
-     "previous_cost": 75.5,
-     "cost_week_ago": 70.0
+     "instances": [{
+       "day_of_week": 2,
+       "hour_of_day": 14,
+       "service_description": "Compute Engine",
+       "project_id": "project-1",
+       "usage_amount": 50.0,
+       "previous_cost": 75.5,
+       "cost_week_ago": 70.0
+     }]
    }]' > prediction_input.json
    
    # Make prediction request
-   gcloud ai endpoints predict ${ENDPOINT_ID} \
+   gcloud ai endpoints predict ${ENDPOINT_RESOURCE_NAME} \
        --region=${REGION} \
        --json-request=prediction_input.json
    ```
@@ -533,12 +557,13 @@ echo "✅ APIs enabled and storage bucket created"
 3. **Validate Analytics Hub Exchange**:
 
    ```bash
-   # List data exchanges
-   bq ls --data_exchange --location=${REGION}
+   # List data exchanges using REST API
+   curl -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       "https://analyticshub.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/dataExchanges"
    
    # Check listing details
-   bq show --location=${REGION} \
-       ${PROJECT_ID}:${EXCHANGE_ID}.billing_feed
+   curl -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       "https://analyticshub.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/dataExchanges/${EXCHANGE_ID}/listings/billing_feed"
    ```
 
    Expected output: Exchange listing with metadata and subscription information.
@@ -562,19 +587,22 @@ echo "✅ APIs enabled and storage bucket created"
 
    ```bash
    # Undeploy model from endpoint
-   gcloud ai endpoints undeploy-model ${ENDPOINT_ID} \
+   DEPLOYED_MODEL_ID=$(gcloud ai endpoints describe ${ENDPOINT_RESOURCE_NAME} \
        --region=${REGION} \
-       --deployed-model-id=$(gcloud ai endpoints describe ${ENDPOINT_ID} \
-           --region=${REGION} \
-           --format="value(deployedModels[0].id)")
+       --format="value(deployedModels[0].id)")
+   
+   gcloud ai endpoints undeploy-model ${ENDPOINT_RESOURCE_NAME} \
+       --region=${REGION} \
+       --deployed-model-id=${DEPLOYED_MODEL_ID} \
+       --quiet
    
    # Delete endpoint
-   gcloud ai endpoints delete ${ENDPOINT_ID} \
+   gcloud ai endpoints delete ${ENDPOINT_RESOURCE_NAME} \
        --region=${REGION} \
        --quiet
    
    # Delete model
-   gcloud ai models delete ${MODEL_ID} \
+   gcloud ai models delete ${MODEL_RESOURCE_NAME} \
        --region=${REGION} \
        --quiet
    
@@ -584,9 +612,14 @@ echo "✅ APIs enabled and storage bucket created"
 2. **Remove BigQuery Resources**:
 
    ```bash
-   # Delete Analytics Hub listing and exchange
-   bq rm --data_exchange --location=${REGION} \
-       ${PROJECT_ID}:${EXCHANGE_ID}
+   # Delete Analytics Hub listing and exchange using REST API
+   curl -X DELETE \
+       -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       "https://analyticshub.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/dataExchanges/${EXCHANGE_ID}/listings/billing_feed"
+   
+   curl -X DELETE \
+       -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       "https://analyticshub.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/dataExchanges/${EXCHANGE_ID}"
    
    # Delete dataset and all tables/views
    bq rm -r -f ${PROJECT_ID}:${DATASET_ID}
@@ -600,14 +633,19 @@ echo "✅ APIs enabled and storage bucket created"
    # Delete Cloud Storage bucket
    gsutil -m rm -r gs://${BUCKET_NAME}
    
-   # Remove alert policies
-   gcloud alpha monitoring policies list \
-       --filter="displayName:'High Cost Anomaly Alert'" \
-       --format="value(name)" | \
-       xargs -I {} gcloud alpha monitoring policies delete {} --quiet
+   # Remove alert policies (list and delete via REST API)
+   POLICY_NAME=$(curl -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+       "https://monitoring.googleapis.com/v1/projects/${PROJECT_ID}/alertPolicies" | \
+       jq -r '.alertPolicies[] | select(.displayName=="High Cost Anomaly Alert") | .name')
+   
+   if [ ! -z "$POLICY_NAME" ]; then
+     curl -X DELETE \
+         -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+         "https://monitoring.googleapis.com/v1/${POLICY_NAME}"
+   fi
    
    # Clean up local files
-   rm -f cost_alert_policy.json prediction_input.json
+   rm -f cost_alert_policy.json prediction_input.json exchange_request.json listing_request.json
    
    echo "✅ Storage and monitoring resources cleaned up"
    ```
@@ -616,7 +654,7 @@ echo "✅ APIs enabled and storage bucket created"
 
 This solution demonstrates the power of Google Cloud's integrated analytics platform for intelligent cost optimization. By combining BigQuery's serverless data warehouse capabilities with Analytics Hub's data sharing features and Vertex AI's machine learning platform, organizations can build sophisticated cost analytics systems that provide both historical insights and predictive capabilities.
 
-The [BigQuery Analytics Hub](https://cloud.google.com/bigquery/docs/analytics-hub-introduction) enables secure data sharing across organizational boundaries, allowing teams to discover and subscribe to relevant cost datasets without complex data movement. This approach supports collaborative cost optimization strategies where multiple departments can contribute usage patterns and share optimization insights.
+The [BigQuery Analytics Hub](https://cloud.google.com/bigquery/docs/analytics-hub-introduction) enables secure data sharing across organizational boundaries, allowing teams to discover and subscribe to relevant cost datasets without complex data movement. This approach supports collaborative cost optimization strategies where multiple departments can contribute usage patterns and share optimization insights. Note that Analytics Hub data exchanges are managed through the Google Cloud Console and REST API, as CLI support is not currently available.
 
 [Vertex AI's AutoML capabilities](https://cloud.google.com/vertex-ai/docs/beginner/beginners-guide) simplify the machine learning workflow, enabling organizations to build accurate cost prediction models without requiring deep ML expertise. The platform's managed infrastructure handles model training, deployment, and scaling, allowing teams to focus on business logic rather than infrastructure management.
 

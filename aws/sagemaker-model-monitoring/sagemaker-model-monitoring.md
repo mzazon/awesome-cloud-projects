@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: sagemaker,cloudwatch,s3,lambda
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: sagemaker,cloudwatch,s3,lambda,monitoring
 recipe-generator-version: 1.3
@@ -312,12 +312,14 @@ echo "✅ Preparation complete"
    aws s3 cp baseline-data.csv \
        s3://${MODEL_MONITOR_BUCKET}/baseline-data/baseline-data.csv
    
-   # Create baseline job
+   # Create baseline job using the built-in model monitor analyzer image
+   MONITOR_IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/sagemaker-model-monitor-analyzer"
+   
    aws sagemaker create-processing-job \
        --processing-job-name ${BASELINE_JOB_NAME} \
        --processing-inputs Source=s3://${MODEL_MONITOR_BUCKET}/baseline-data,Destination=/opt/ml/processing/input,S3DataType=S3Prefix,S3InputMode=File,S3DataDistributionType=FullyReplicated,S3CompressionType=None \
        --processing-output-config Outputs=[{OutputName=statistics,S3Output={S3Uri=s3://${MODEL_MONITOR_BUCKET}/monitoring-results/statistics,LocalPath=/opt/ml/processing/output/statistics,S3UploadMode=EndOfJob}},{OutputName=constraints,S3Output={S3Uri=s3://${MODEL_MONITOR_BUCKET}/monitoring-results/constraints,LocalPath=/opt/ml/processing/output/constraints,S3UploadMode=EndOfJob}}] \
-       --app-specification ImageUri=159807026194.dkr.ecr.${AWS_REGION}.amazonaws.com/sagemaker-model-monitor-analyzer:latest \
+       --app-specification ImageUri=${MONITOR_IMAGE_URI} \
        --role-arn ${MODEL_MONITOR_ROLE_ARN} \
        --processing-resources ClusterConfig={InstanceType=ml.m5.xlarge,InstanceCount=1,VolumeSizeInGB=20}
    
@@ -418,7 +420,7 @@ echo "✅ Preparation complete"
            }
          },
          "MonitoringAppSpecification": {
-           "ImageUri": "159807026194.dkr.ecr.${AWS_REGION}.amazonaws.com/sagemaker-model-monitor-analyzer:latest"
+           "ImageUri": "${MONITOR_IMAGE_URI}"
          },
          "BaselineConfig": {
            "StatisticsResource": {
@@ -589,6 +591,9 @@ echo "✅ Preparation complete"
        --role-name ${LAMBDA_ROLE_NAME} \
        --query Role.Arn --output text)
    
+   # Wait for role propagation
+   sleep 10
+   
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
@@ -613,28 +618,28 @@ echo "✅ Preparation complete"
        --alarm-name "ModelMonitor-ConstraintViolations-${RANDOM_SUFFIX}" \
        --alarm-description "Alert when model monitor detects constraint violations" \
        --metric-name "constraint_violations" \
-       --namespace "AWS/SageMaker/ModelMonitor" \
+       --namespace "AWS/SageMaker/ProcessingJob" \
        --statistic Sum \
        --period 300 \
        --threshold 1 \
        --comparison-operator GreaterThanOrEqualToThreshold \
        --evaluation-periods 1 \
        --alarm-actions ${SNS_TOPIC_ARN} \
-       --dimensions Name=MonitoringSchedule,Value=${MONITORING_SCHEDULE_NAME}
+       --dimensions Name=ProcessingJobName,Value=${MONITORING_SCHEDULE_NAME}
    
    # Create alarm for monitoring job failures
    aws cloudwatch put-metric-alarm \
        --alarm-name "ModelMonitor-JobFailures-${RANDOM_SUFFIX}" \
        --alarm-description "Alert when model monitor jobs fail" \
-       --metric-name "monitoring_job_failures" \
-       --namespace "AWS/SageMaker/ModelMonitor" \
+       --metric-name "Failures" \
+       --namespace "AWS/SageMaker/ProcessingJob" \
        --statistic Sum \
        --period 300 \
        --threshold 1 \
        --comparison-operator GreaterThanOrEqualToThreshold \
        --evaluation-periods 1 \
        --alarm-actions ${SNS_TOPIC_ARN} \
-       --dimensions Name=MonitoringSchedule,Value=${MONITORING_SCHEDULE_NAME}
+       --dimensions Name=ProcessingJobName,Value=${MONITORING_SCHEDULE_NAME}
    
    # Subscribe Lambda to SNS topic
    export LAMBDA_ARN=$(aws lambda get-function \
@@ -658,8 +663,6 @@ echo "✅ Preparation complete"
    ```
 
    The CloudWatch alarms are now actively monitoring for constraint violations and job failures. This creates a robust alerting system that detects both data quality issues and operational problems, ensuring comprehensive monitoring coverage and rapid incident response through automated Lambda function execution.
-
-> **Warning**: CloudWatch alarms may take several minutes to activate after creation. Monitor alarm states in the AWS console to verify proper configuration and metric data availability.
 
 9. **Create Model Quality Monitoring Schedule**:
 
@@ -706,7 +709,7 @@ echo "✅ Preparation complete"
            }
          },
          "MonitoringAppSpecification": {
-           "ImageUri": "159807026194.dkr.ecr.${AWS_REGION}.amazonaws.com/sagemaker-model-monitor-analyzer:latest"
+           "ImageUri": "${MONITOR_IMAGE_URI}"
          },
          "RoleArn": "${MODEL_MONITOR_ROLE_ARN}"
        }
@@ -735,21 +738,20 @@ echo "✅ Preparation complete"
           "type": "metric",
           "properties": {
             "metrics": [
-              [ "AWS/SageMaker/ModelMonitor", "constraint_violations", "MonitoringSchedule", "${MONITORING_SCHEDULE_NAME}" ],
-              [ ".", "monitoring_job_failures", ".", "." ]
+              [ "AWS/SageMaker/ProcessingJob", "Failures", "ProcessingJobName", "${MONITORING_SCHEDULE_NAME}" ]
             ],
             "period": 300,
             "stat": "Sum",
             "region": "${AWS_REGION}",
-            "title": "Model Monitor Metrics"
+            "title": "Model Monitor Job Failures"
           }
         },
         {
           "type": "log",
           "properties": {
-            "query": "SOURCE '/aws/sagemaker/ProcessingJobs' | fields @timestamp, @message | filter @message like /constraint/",
+            "query": "SOURCE '/aws/sagemaker/ProcessingJobs' | fields @timestamp, @message | filter @message like /constraint/ | sort @timestamp desc",
             "region": "${AWS_REGION}",
-            "title": "Model Monitor Logs"
+            "title": "Model Monitor Constraint Violations"
           }
         }
       ]
@@ -771,15 +773,6 @@ echo "✅ Preparation complete"
     System testing validates the complete monitoring pipeline by generating synthetic drift scenarios and verifying automated response mechanisms. Anomalous data injection simulates real-world drift conditions, testing the system's ability to detect distribution changes and trigger appropriate alerts. This end-to-end validation ensures the monitoring infrastructure performs correctly under operational conditions and confirms that alert pathways function as designed for production readiness.
 
     ```bash
-    # Trigger a monitoring job manually to test
-    aws sagemaker start-monitoring-schedule \
-        --monitoring-schedule-name ${MONITORING_SCHEDULE_NAME}
-    
-    # Check monitoring schedule status
-    aws sagemaker describe-monitoring-schedule \
-        --monitoring-schedule-name ${MONITORING_SCHEDULE_NAME} \
-        --query 'MonitoringScheduleStatus' --output text
-    
     # Generate some anomalous data to test drift detection
     python3 -c "
     import json
@@ -798,7 +791,7 @@ echo "✅ Preparation complete"
     "
     
     # Send anomalous requests
-    for i in {1..5}; do
+    for i in {1..10}; do
         aws sagemaker-runtime invoke-endpoint \
             --endpoint-name ${ENDPOINT_NAME} \
             --content-type application/json \
@@ -807,10 +800,83 @@ echo "✅ Preparation complete"
         sleep 1
     done
     
-    echo "✅ Sent anomalous data to test drift detection"
+    # Wait for data capture to process
+    sleep 30
+    
+    # Manually trigger a monitoring job to test the system
+    MANUAL_JOB_NAME="manual-monitor-test-${RANDOM_SUFFIX}"
+    
+    cat > manual-monitor-job.json << EOF
+    {
+      "ProcessingJobName": "${MANUAL_JOB_NAME}",
+      "ProcessingInputs": [
+        {
+          "InputName": "endpoint_input",
+          "S3Input": {
+            "S3Uri": "s3://${MODEL_MONITOR_BUCKET}/captured-data",
+            "LocalPath": "/opt/ml/processing/input/endpoint",
+            "S3DataType": "S3Prefix",
+            "S3InputMode": "File",
+            "S3DataDistributionType": "FullyReplicated"
+          }
+        },
+        {
+          "InputName": "baseline",
+          "S3Input": {
+            "S3Uri": "s3://${MODEL_MONITOR_BUCKET}/monitoring-results/statistics",
+            "LocalPath": "/opt/ml/processing/baseline/stats",
+            "S3DataType": "S3Prefix",
+            "S3InputMode": "File",
+            "S3DataDistributionType": "FullyReplicated"
+          }
+        },
+        {
+          "InputName": "constraints",
+          "S3Input": {
+            "S3Uri": "s3://${MODEL_MONITOR_BUCKET}/monitoring-results/constraints",
+            "LocalPath": "/opt/ml/processing/baseline/constraints",
+            "S3DataType": "S3Prefix",
+            "S3InputMode": "File",
+            "S3DataDistributionType": "FullyReplicated"
+          }
+        }
+      ],
+      "ProcessingOutputConfig": {
+        "Outputs": [
+          {
+            "OutputName": "result",
+            "S3Output": {
+              "S3Uri": "s3://${MODEL_MONITOR_BUCKET}/monitoring-results/manual-test",
+              "LocalPath": "/opt/ml/processing/output",
+              "S3UploadMode": "EndOfJob"
+            }
+          }
+        ]
+      },
+      "ProcessingResources": {
+        "ClusterConfig": {
+          "InstanceType": "ml.m5.xlarge",
+          "InstanceCount": 1,
+          "VolumeSizeInGB": 20
+        }
+      },
+      "AppSpecification": {
+        "ImageUri": "${MONITOR_IMAGE_URI}"
+      },
+      "RoleArn": "${MODEL_MONITOR_ROLE_ARN}"
+    }
+    EOF
+    
+    aws sagemaker create-processing-job \
+        --cli-input-json file://manual-monitor-job.json
+    
+    echo "✅ Sent anomalous data and triggered manual monitoring job"
+    echo "Monitor the processing job status in the AWS console"
     ```
 
     The monitoring system has been tested with artificially generated drift patterns. This validates the complete pipeline from data capture through drift detection to automated alerting, confirming the system is ready for production deployment and will effectively monitor real-world model performance.
+
+> **Warning**: CloudWatch alarms may take several minutes to activate after creation. Monitor alarm states in the AWS console to verify proper configuration and metric data availability.
 
 ## Validation & Testing
 
@@ -965,38 +1031,39 @@ echo "✅ Preparation complete"
    aws s3 rb s3://${MODEL_MONITOR_BUCKET}
    
    # Clean up local files
-   rm -f *.json *.py *.zip *.csv model-artifacts/
+   rm -f *.json *.py *.zip *.csv
+   rm -rf model-artifacts/
    
    echo "✅ Cleanup complete"
    ```
 
 ## Discussion
 
-Amazon SageMaker Model Monitor provides a comprehensive solution for maintaining ML model performance in production environments. This implementation demonstrates several key aspects of production ML monitoring that are critical for successful MLOps practices.
+Amazon SageMaker Model Monitor provides a comprehensive solution for maintaining ML model performance in production environments. This implementation demonstrates several key aspects of production ML monitoring that are critical for successful MLOps practices, following AWS Well-Architected Framework principles for operational excellence, security, and reliability.
 
-The architecture separates concerns between data capture, baseline establishment, monitoring execution, and alerting. Data capture occurs continuously at the endpoint level, ensuring that all inference requests and responses are logged for analysis. The baseline establishment process is crucial as it defines the expected statistical properties of the training data, which serves as the reference point for drift detection. Regular monitoring jobs compare current data distributions against these baselines using statistical tests and constraint checking.
+The architecture separates concerns between data capture, baseline establishment, monitoring execution, and alerting. Data capture occurs continuously at the endpoint level, ensuring that all inference requests and responses are logged for analysis. The baseline establishment process is crucial as it defines the expected statistical properties of the training data, which serves as the reference point for drift detection. Regular monitoring jobs compare current data distributions against these baselines using statistical tests and constraint checking, implementing the [Deequ data quality framework](https://github.com/awslabs/deequ) for robust statistical analysis.
 
-The integration with CloudWatch and Lambda enables automated responses to detected drift, which is essential for maintaining model performance without constant manual intervention. The Lambda function can be extended to trigger automated retraining pipelines, update model configurations, or integrate with existing incident management systems. This automation reduces the time between drift detection and remediation, minimizing the impact on business operations.
+The integration with CloudWatch and Lambda enables automated responses to detected drift, which is essential for maintaining model performance without constant manual intervention. The Lambda function can be extended to trigger automated retraining pipelines, update model configurations, or integrate with existing incident management systems. This automation reduces the time between drift detection and remediation, minimizing the impact on business operations while following AWS security best practices for serverless computing.
 
-Model Monitor supports multiple types of monitoring including data quality, model quality, bias drift, and feature attribution drift. Each type addresses different aspects of model degradation. Data quality monitoring focuses on statistical properties of input features, while model quality monitoring evaluates prediction accuracy when ground truth labels are available. The scheduling flexibility allows organizations to balance monitoring frequency with computational costs, with more critical models receiving more frequent monitoring.
+Model Monitor supports multiple types of monitoring including data quality, model quality, bias drift, and feature attribution drift. Each type addresses different aspects of model degradation. Data quality monitoring focuses on statistical properties of input features, while model quality monitoring evaluates prediction accuracy when ground truth labels are available. The scheduling flexibility allows organizations to balance monitoring frequency with computational costs, with more critical models receiving more frequent monitoring as outlined in the [SageMaker Model Monitor documentation](https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor.html).
 
-> **Tip**: Configure monitoring schedules based on your data velocity and business requirements. High-frequency trading models may need hourly monitoring, while batch processing models might only need daily checks.
+> **Tip**: Configure monitoring schedules based on your data velocity and business requirements. High-frequency trading models may need hourly monitoring, while batch processing models might only need daily checks. Consider using SageMaker's spot instances for cost-effective monitoring job execution.
 
-> **Note**: Model Monitor generates detailed JSON reports for each monitoring job. These reports contain statistical analysis, constraint violations, and drift measurements that can be integrated with external analytics platforms for advanced modeling and trend analysis.
+> **Note**: Model Monitor generates detailed JSON reports for each monitoring job. These reports contain statistical analysis, constraint violations, and drift measurements that can be integrated with external analytics platforms for advanced modeling and trend analysis using tools like Amazon QuickSight or third-party business intelligence solutions.
 
 ## Challenge
 
 Extend this monitoring solution with these advanced capabilities:
 
-1. **Multi-Model Monitoring Dashboard**: Create a centralized dashboard that monitors multiple models simultaneously, comparing their drift patterns and performance metrics across different model versions and endpoints.
+1. **Multi-Model Monitoring Dashboard**: Create a centralized dashboard that monitors multiple models simultaneously, comparing their drift patterns and performance metrics across different model versions and endpoints using CloudWatch custom metrics and QuickSight integration.
 
-2. **Automated Retraining Pipeline**: Implement a Step Functions workflow that automatically triggers model retraining when drift is detected, including data preparation, model training, evaluation, and deployment stages with approval gates.
+2. **Automated Retraining Pipeline**: Implement a AWS Step Functions workflow that automatically triggers model retraining when drift is detected, including data preparation, model training, evaluation, and deployment stages with approval gates using SageMaker Pipelines.
 
-3. **Advanced Drift Detection**: Enhance the monitoring system with custom drift detection algorithms using statistical tests like Kolmogorov-Smirnov or Jensen-Shannon divergence, and implement population stability index (PSI) calculations for more sophisticated drift analysis.
+3. **Advanced Drift Detection**: Enhance the monitoring system with custom drift detection algorithms using statistical tests like Kolmogorov-Smirnov or Jensen-Shannon divergence, and implement population stability index (PSI) calculations for more sophisticated drift analysis using custom SageMaker Processing jobs.
 
-4. **Cross-Account Monitoring**: Configure Model Monitor to work across multiple AWS accounts, centralizing monitoring results and alerts while maintaining security boundaries between development, staging, and production environments.
+4. **Cross-Account Monitoring**: Configure Model Monitor to work across multiple AWS accounts, centralizing monitoring results and alerts while maintaining security boundaries between development, staging, and production environments using AWS Organizations and cross-account IAM roles.
 
-5. **Real-time Drift Detection**: Implement near real-time drift detection using Kinesis Data Streams and Lambda functions to process inference data streams, providing immediate alerts for sudden distribution changes rather than waiting for scheduled monitoring jobs.
+5. **Real-time Drift Detection**: Implement near real-time drift detection using Amazon Kinesis Data Streams and Lambda functions to process inference data streams, providing immediate alerts for sudden distribution changes rather than waiting for scheduled monitoring jobs.
 
 ## Infrastructure Code
 

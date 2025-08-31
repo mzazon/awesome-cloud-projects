@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: transcribe,s3,iam,lambda
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: machine-learning,speech-recognition,transcription,real-time-processing,audio-processing
 recipe-generator-version: 1.3
@@ -81,7 +81,7 @@ graph TB
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of speech recognition concepts and audio formats
 4. Sample audio files in supported formats (MP3, WAV, FLAC, or MP4)
-5. Estimated cost: $0.10-$2.00 per hour of audio transcribed (varies by features)
+5. Estimated cost: $0.0300 per minute for first 250,000 minutes (standard transcription)
 
 > **Note**: Amazon Transcribe supports audio formats including MP3, MP4, WAV, FLAC, AMR, OGG, and WebM. For streaming, supported formats are FLAC, OPUS-encoded audio in OGG containers, and PCM.
 
@@ -573,7 +573,7 @@ echo "✅ S3 bucket created: ${BUCKET_NAME}"
     # Create Lambda function
     aws lambda create-function \
         --function-name transcribe-processor-${RANDOM_SUFFIX} \
-        --runtime python3.9 \
+        --runtime python3.11 \
         --role ${LAMBDA_ROLE_ARN} \
         --handler lambda-function.lambda_handler \
         --zip-file fileb://lambda-function.zip \
@@ -870,25 +870,25 @@ The integration with other AWS services creates powerful end-to-end solutions. S
 
 From a cost optimization perspective, Amazon Transcribe offers a pay-as-you-go pricing model that scales with usage, eliminating the need for upfront investments in speech recognition infrastructure. The service's regional availability ensures low-latency processing, while its integration with AWS security services provides enterprise-grade protection for sensitive audio data. For organizations implementing speech recognition at scale, the combination of high accuracy, flexible deployment options, and comprehensive feature set makes Amazon Transcribe a compelling choice for building speech-enabled applications.
 
-> **Note**: Amazon Transcribe pricing varies by feature usage - standard transcription costs approximately $0.024 per minute, while advanced features like custom language models and PII redaction incur additional charges. See [Amazon Transcribe Pricing](https://aws.amazon.com/transcribe/pricing/) for detailed cost information.
+> **Note**: Amazon Transcribe pricing is tiered with Tier 1 at $0.0300 per minute for the first 250,000 minutes. Custom language models and PII redaction incur additional charges. See [Amazon Transcribe Pricing](https://aws.amazon.com/transcribe/pricing/) for detailed cost information.
 
 > **Warning**: Custom Language Models require significant training time (4-6 hours minimum) and substantial text data (at least 100,000 words) to achieve optimal performance. Plan accordingly for production implementations.
 
-> **Tip**: For production applications, implement proper error handling and retry logic for transcription jobs, as network issues or audio quality problems can cause job failures.
+> **Tip**: For production applications, implement proper error handling and retry logic for transcription jobs, as network issues or audio quality problems can cause job failures. Monitor service quotas and consider setting up CloudWatch alarms for job failure rates.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-language Support**: Modify the transcription pipeline to automatically detect and handle multiple languages within the same audio file, creating separate transcription outputs for each detected language segment.
+1. **Multi-language Support**: Modify the transcription pipeline to automatically detect and handle multiple languages within the same audio file, creating separate transcription outputs for each detected language segment using the `IdentifyMultipleLanguages` parameter.
 
-2. **Real-time Analytics Dashboard**: Build a real-time dashboard using Amazon QuickSight that visualizes transcription metrics, speaker analytics, sentiment analysis, and keyword frequency from live transcription streams.
+2. **Real-time Analytics Dashboard**: Build a real-time dashboard using Amazon QuickSight that visualizes transcription metrics, speaker analytics, sentiment analysis, and keyword frequency from live transcription streams integrated with Amazon Kinesis Data Streams.
 
-3. **Voice Biometric Integration**: Integrate with Amazon Connect Voice ID to add speaker verification and identification capabilities, creating a comprehensive voice analytics platform for call centers.
+3. **Voice Biometric Integration**: Integrate with Amazon Connect Voice ID to add speaker verification and identification capabilities, creating a comprehensive voice analytics platform for call centers with enhanced security features.
 
-4. **Automated Content Moderation**: Implement a machine learning pipeline that automatically categorizes transcribed content, identifies sensitive information beyond PII, and triggers appropriate workflows based on content classification.
+4. **Automated Content Moderation**: Implement a machine learning pipeline using Amazon Comprehend that automatically categorizes transcribed content, identifies sensitive information beyond PII, and triggers appropriate workflows based on content classification using EventBridge rules.
 
-5. **Multi-modal Processing**: Extend the solution to handle video files by extracting audio tracks, performing transcription, and synchronizing transcripts with video timestamps for closed captioning and video search capabilities.
+5. **Multi-modal Processing**: Extend the solution to handle video files by extracting audio tracks using AWS Elemental MediaConvert, performing transcription with timestamp synchronization, and generating closed captions for video content with proper SRT/VTT formatting.
 
 ## Infrastructure Code
 

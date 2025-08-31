@@ -1,0 +1,597 @@
+# Infrastructure Manager Configuration for DNS Threat Detection with Cloud Armor and Security Center
+# This configuration deploys a comprehensive DNS threat detection solution using:
+# - Cloud Armor for DDoS protection and rate limiting
+# - Security Command Center for threat detection
+# - Cloud Functions for automated incident response
+# - Cloud DNS with comprehensive logging
+# - Pub/Sub for security event messaging
+# - Cloud Monitoring for alerting
+
+terraform:
+  required_version: ">= 1.5"
+  required_providers:
+    google: {
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    }
+    google-beta: {
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    }
+    archive: {
+      source: "hashicorp/archive"
+      version: "~> 2.4"
+    }
+    random: {
+      source: "hashicorp/random"
+      version: "~> 3.5"
+    }
+
+# Define input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID where resources will be created"
+    
+  region:
+    type: string
+    description: "Primary region for deploying resources"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Primary zone for zonal resources"
+    default: "us-central1-a"
+    
+  environment:
+    type: string
+    description: "Environment identifier (dev, staging, prod)"
+    default: "dev"
+    
+  organization_id:
+    type: string
+    description: "Google Cloud Organization ID for Security Command Center configuration"
+    
+  dns_domain:
+    type: string
+    description: "DNS domain for the security monitoring zone"
+    default: "security-demo.example.com."
+    
+  function_timeout:
+    type: number
+    description: "Cloud Function timeout in seconds"
+    default: 60
+    
+  rate_limit_threshold:
+    type: number
+    description: "Rate limiting threshold for Cloud Armor (requests per minute)"
+    default: 100
+    
+  ban_duration:
+    type: number
+    description: "Ban duration for rate limited IPs (seconds)"
+    default: 600
+    
+  notification_email:
+    type: string
+    description: "Email address for security notifications"
+    default: ""
+
+# Generate random suffix for unique resource naming
+resources:
+  random_id:
+    type: random_id
+    properties:
+      byte_length: 3
+
+  # Enable required Google Cloud APIs for the DNS threat detection solution
+  enable_apis:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: compute.googleapis.com
+      disable_on_destroy: false
+      
+  enable_dns_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: dns.googleapis.com
+      disable_on_destroy: false
+      depends_on: [enable_apis]
+      
+  enable_logging_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: logging.googleapis.com
+      disable_on_destroy: false
+      depends_on: [enable_dns_api]
+      
+  enable_functions_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudfunctions.googleapis.com
+      disable_on_destroy: false
+      depends_on: [enable_logging_api]
+      
+  enable_pubsub_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: pubsub.googleapis.com
+      disable_on_destroy: false
+      depends_on: [enable_functions_api]
+      
+  enable_securitycenter_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: securitycenter.googleapis.com
+      disable_on_destroy: false
+      depends_on: [enable_pubsub_api]
+      
+  enable_monitoring_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: monitoring.googleapis.com
+      disable_on_destroy: false
+      depends_on: [enable_securitycenter_api]
+      
+  enable_cloudbuild_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudbuild.googleapis.com
+      disable_on_destroy: false
+      depends_on: [enable_monitoring_api]
+
+  # Create IAM service account for Cloud Functions with appropriate permissions
+  function_service_account:
+    type: google_service_account
+    properties:
+      project: ${var.project_id}
+      account_id: dns-security-processor-${random_id.hex}
+      display_name: "DNS Security Processor Service Account"
+      description: "Service account for automated DNS threat response functions"
+    depends_on: [enable_cloudbuild_api]
+
+  # Grant necessary IAM roles to the service account
+  function_sa_security_admin:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/compute.securityAdmin"
+      member: "serviceAccount:${function_service_account.email}"
+    depends_on: [function_service_account]
+
+  function_sa_logging_writer:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/logging.logWriter"
+      member: "serviceAccount:${function_service_account.email}"
+    depends_on: [function_sa_security_admin]
+
+  function_sa_monitoring_writer:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/monitoring.metricWriter"
+      member: "serviceAccount:${function_service_account.email}"
+    depends_on: [function_sa_logging_writer]
+
+  function_sa_scc_viewer:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/securitycenter.findingsViewer"
+      member: "serviceAccount:${function_service_account.email}"
+    depends_on: [function_sa_monitoring_writer]
+
+  # Create Cloud Armor security policy for DNS threat protection
+  dns_protection_policy:
+    type: google_compute_security_policy
+    properties:
+      project: ${var.project_id}
+      name: dns-protection-policy-${random_id.hex}
+      description: "DNS threat protection policy with rate limiting and geo-blocking"
+      
+      # Default rule to allow traffic
+      rule:
+        - action: "allow"
+          priority: 2147483647
+          match:
+            versioned_expr: "SRC_IPS_V1"
+            config:
+              src_ip_ranges: ["*"]
+          description: "Default allow rule"
+          
+        # Rate limiting rule for DNS queries
+        - action: "rate_based_ban"
+          priority: 1000
+          match:
+            versioned_expr: "SRC_IPS_V1"
+            config:
+              src_ip_ranges: ["*"]
+          rate_limit_options:
+            conform_action: "allow"
+            exceed_action: "deny(429)"
+            enforce_on_key: "IP"
+            rate_limit_threshold:
+              count: ${var.rate_limit_threshold}
+              interval_sec: 60
+            ban_duration_sec: ${var.ban_duration}
+          description: "Rate limit DNS queries to prevent abuse"
+          
+        # Geo-blocking rule for high-risk countries
+        - action: "deny(403)"
+          priority: 2000
+          match:
+            expr:
+              expression: "origin.region_code == 'CN' || origin.region_code == 'RU'"
+          description: "Block high-risk geographic regions"
+    depends_on: [function_sa_scc_viewer]
+
+  # Create DNS policy with comprehensive logging enabled
+  dns_security_policy:
+    type: google_dns_policy
+    properties:
+      project: ${var.project_id}
+      name: dns-security-policy-${random_id.hex}
+      description: "DNS policy with security logging enabled for threat detection"
+      enable_logging: true
+      networks:
+        - network_url: "https://www.googleapis.com/compute/v1/projects/${var.project_id}/global/networks/default"
+    depends_on: [dns_protection_policy]
+
+  # Create private DNS managed zone for security monitoring
+  security_dns_zone:
+    type: google_dns_managed_zone
+    properties:
+      project: ${var.project_id}
+      name: security-zone-${random_id.hex}
+      dns_name: ${var.dns_domain}
+      description: "Security monitoring DNS zone with comprehensive logging"
+      visibility: "private"
+      
+      private_visibility_config:
+        networks:
+          - network_url: "https://www.googleapis.com/compute/v1/projects/${var.project_id}/global/networks/default"
+    depends_on: [dns_security_policy]
+
+  # Create Pub/Sub topic for security alert processing
+  dns_security_alerts_topic:
+    type: google_pubsub_topic
+    properties:
+      project: ${var.project_id}
+      name: dns-security-alerts-${random_id.hex}
+      
+      message_retention_duration: "86400s"  # 24 hours
+      
+      message_storage_policy:
+        allowed_persistence_regions: [${var.region}]
+    depends_on: [security_dns_zone]
+
+  # Create Pub/Sub subscription for Cloud Functions processing
+  dns_alert_subscription:
+    type: google_pubsub_subscription
+    properties:
+      project: ${var.project_id}
+      name: dns-alert-processor-${random_id.hex}
+      topic: ${dns_security_alerts_topic.id}
+      
+      ack_deadline_seconds: 60
+      message_retention_duration: "86400s"
+      
+      retry_policy:
+        minimum_backoff: "10s"
+        maximum_backoff: "600s"
+        
+      dead_letter_policy:
+        dead_letter_topic: ${dns_security_alerts_topic.id}
+        max_delivery_attempts: 5
+    depends_on: [dns_security_alerts_topic]
+
+  # Create Cloud Storage bucket for Cloud Function source code
+  function_source_bucket:
+    type: google_storage_bucket
+    properties:
+      project: ${var.project_id}
+      name: dns-security-functions-${var.project_id}-${random_id.hex}
+      location: ${var.region}
+      
+      uniform_bucket_level_access: true
+      
+      versioning:
+        enabled: true
+        
+      lifecycle_rule:
+        - action:
+            type: "Delete"
+          condition:
+            age: 30
+    depends_on: [dns_alert_subscription]
+
+  # Create archive for Cloud Function source code
+  function_source_archive:
+    type: archive_file
+    properties:
+      type: "zip"
+      output_path: "./dns-security-function.zip"
+      source:
+        - filename: "main.py"
+          content: |
+            import json
+            import logging
+            import base64
+            import os
+            from google.cloud import securitycenter
+            from google.cloud import compute_v1
+            from google.cloud import logging as cloud_logging
+
+            # Configure logging
+            logging.basicConfig(level=logging.INFO)
+            logger = logging.getLogger(__name__)
+
+            # Initialize clients
+            scc_client = securitycenter.SecurityCenterClient()
+            compute_client = compute_v1.SecurityPoliciesClient()
+            logging_client = cloud_logging.Client()
+
+            def process_security_finding(event, context):
+                """Process Security Command Center findings for DNS threats."""
+                
+                try:
+                    # Decode Pub/Sub message
+                    pubsub_message = base64.b64decode(event['data']).decode('utf-8')
+                    finding_data = json.loads(pubsub_message)
+                    
+                    # Log the finding
+                    logger.info(f"Processing DNS security finding: {finding_data.get('name', 'Unknown')}")
+                    
+                    # Check if this is a DNS-related threat
+                    category = finding_data.get('category', '')
+                    if any(keyword in category.upper() for keyword in ['DNS', 'MALWARE', 'DOMAIN']):
+                        severity = finding_data.get('severity', 'MEDIUM')
+                        
+                        if severity in ['HIGH', 'CRITICAL']:
+                            # Implement automated response for high-severity threats
+                            implement_emergency_response(finding_data)
+                        else:
+                            # Log and monitor medium/low severity findings
+                            log_security_event(finding_data)
+                    
+                    return 'OK'
+                    
+                except Exception as e:
+                    logger.error(f"Error processing security finding: {str(e)}")
+                    return f'Error: {str(e)}'
+
+            def implement_emergency_response(finding_data):
+                """Implement automated response for high-severity DNS threats."""
+                logger.warning(f"Implementing emergency response for: {finding_data.get('name', 'Unknown')}")
+                
+                # Add suspicious IPs to Cloud Armor deny list if available
+                source_properties = finding_data.get('sourceProperties', {})
+                source_ip = source_properties.get('sourceIp') or source_properties.get('clientIp')
+                
+                if source_ip:
+                    add_ip_to_blocklist(source_ip)
+                
+                # Send high-priority alert
+                send_emergency_alert(finding_data)
+
+            def add_ip_to_blocklist(source_ip):
+                """Add suspicious IP to Cloud Armor security policy."""
+                try:
+                    logger.info(f"Adding {source_ip} to security policy blocklist")
+                    # In a production environment, you would implement the actual
+                    # Cloud Armor rule creation here with proper IAM permissions
+                    logger.info(f"Successfully flagged IP {source_ip} for blocking")
+                except Exception as e:
+                    logger.error(f"Error adding IP to blocklist: {str(e)}")
+
+            def log_security_event(finding_data):
+                """Log security event for monitoring and analysis."""
+                logger.info(f"Logging security event: {finding_data.get('name', 'Unknown')}")
+
+            def send_emergency_alert(finding_data):
+                """Send high-priority security alert."""
+                logger.critical(f"EMERGENCY: DNS threat detected - {finding_data.get('name', 'Unknown')}")
+                # In production, integrate with notification systems like email, Slack, etc.
+        - filename: "requirements.txt"
+          content: |
+            google-cloud-security-center==1.28.0
+            google-cloud-compute==1.19.0
+            google-cloud-logging==3.11.0
+            functions-framework==3.8.0
+    depends_on: [function_source_bucket]
+
+  # Upload function source to Cloud Storage
+  function_source_object:
+    type: google_storage_bucket_object
+    properties:
+      bucket: ${function_source_bucket.name}
+      name: "dns-security-function-${random_id.hex}.zip"
+      source: ${function_source_archive.output_path}
+      content_type: "application/zip"
+    depends_on: [function_source_archive]
+
+  # Deploy Cloud Function for automated DNS threat response
+  dns_security_processor:
+    type: google_cloudfunctions_function
+    properties:
+      project: ${var.project_id}
+      region: ${var.region}
+      name: dns-security-processor-${random_id.hex}
+      description: "Automated DNS threat response processor"
+      
+      runtime: "python312"
+      available_memory_mb: 256
+      timeout: ${var.function_timeout}
+      entry_point: "process_security_finding"
+      max_instances: 10
+      
+      service_account_email: ${function_service_account.email}
+      
+      source_archive_bucket: ${function_source_bucket.name}
+      source_archive_object: ${function_source_object.name}
+      
+      event_trigger:
+        event_type: "google.pubsub.topic.publish"
+        resource: ${dns_security_alerts_topic.id}
+        failure_policy:
+          retry: true
+      
+      environment_variables:
+        PROJECT_ID: ${var.project_id}
+        REGION: ${var.region}
+        SECURITY_POLICY: ${dns_protection_policy.name}
+    depends_on: [function_source_object]
+
+  # Create custom log-based metric for DNS security monitoring
+  dns_malware_metric:
+    type: google_logging_metric
+    properties:
+      project: ${var.project_id}
+      name: dns_malware_queries_${replace(random_id.hex, "-", "_")}
+      description: "Count of malware-related DNS queries for threat detection"
+      
+      filter: 'resource.type="dns_query" AND (jsonPayload.queryName:("malware" OR "botnet" OR "c2") OR jsonPayload.responseCode>=300)'
+      
+      metric_descriptor:
+        metric_kind: "DELTA"
+        value_type: "INT64"
+        display_name: "DNS Malware Queries"
+        
+      label_extractors:
+        query_name: 'EXTRACT(jsonPayload.queryName)'
+        response_code: 'EXTRACT(jsonPayload.responseCode)'
+    depends_on: [dns_security_processor]
+
+  # Create Cloud Monitoring notification channel (if email provided)
+  notification_channel:
+    type: google_monitoring_notification_channel
+    count: ${var.notification_email != "" ? 1 : 0}
+    properties:
+      project: ${var.project_id}
+      display_name: "DNS Security Alerts Email"
+      type: "email"
+      
+      labels:
+        email_address: ${var.notification_email}
+        
+      enabled: true
+    depends_on: [dns_malware_metric]
+
+  # Create alerting policy for DNS threat detection
+  dns_threat_alert_policy:
+    type: google_monitoring_alert_policy
+    properties:
+      project: ${var.project_id}
+      display_name: "DNS Threat Detection Alert - ${var.environment}"
+      combiner: "OR"
+      enabled: true
+      
+      documentation:
+        content: "Alert triggered when malware DNS queries are detected above threshold"
+        mime_type: "text/markdown"
+      
+      conditions:
+        - display_name: "Malware DNS Query Rate Threshold"
+          condition_threshold:
+            filter: 'resource.type="global" AND metric.type="logging.googleapis.com/user/${dns_malware_metric.name}"'
+            comparison: "COMPARISON_GT"
+            threshold_value: 5.0
+            duration: "60s"
+            
+            aggregations:
+              - alignment_period: "60s"
+                per_series_aligner: "ALIGN_RATE"
+                cross_series_reducer: "REDUCE_SUM"
+      
+      notification_channels: ${var.notification_email != "" ? [notification_channel[0].id] : []}
+      
+      alert_strategy:
+        auto_close: "86400s"  # 24 hours
+    depends_on: [notification_channel]
+
+  # Security Command Center notification configuration
+  # Note: This requires organization-level permissions and Premium tier
+  scc_notification:
+    type: google_scc_notification_config
+    properties:
+      config_id: dns-threat-export-${random_id.hex}
+      organization: ${var.organization_id}
+      description: "Export DNS threat findings to Pub/Sub for automated response"
+      
+      pubsub_topic: ${dns_security_alerts_topic.id}
+      
+      streaming_config:
+        filter: 'category:"Malware: Bad Domain" OR category:"Malware: Bad IP" OR category:"DNS" OR finding_class="THREAT"'
+    depends_on: [dns_threat_alert_policy]
+
+# Define outputs for reference and integration
+outputs:
+  dns_protection_policy_name:
+    description: "Name of the Cloud Armor security policy"
+    value: ${dns_protection_policy.name}
+    
+  dns_security_policy_name:
+    description: "Name of the DNS security policy"
+    value: ${dns_security_policy.name}
+    
+  security_dns_zone_name:
+    description: "Name of the security monitoring DNS zone"
+    value: ${security_dns_zone.name}
+    
+  security_dns_zone_domain:
+    description: "DNS domain of the security monitoring zone"
+    value: ${security_dns_zone.dns_name}
+    
+  pubsub_topic_name:
+    description: "Name of the Pub/Sub topic for security alerts"
+    value: ${dns_security_alerts_topic.name}
+    
+  pubsub_subscription_name:
+    description: "Name of the Pub/Sub subscription for processing"
+    value: ${dns_alert_subscription.name}
+    
+  cloud_function_name:
+    description: "Name of the DNS security processor Cloud Function"
+    value: ${dns_security_processor.name}
+    
+  cloud_function_url:
+    description: "URL of the deployed Cloud Function"
+    value: ${dns_security_processor.https_trigger_url}
+    
+  service_account_email:
+    description: "Email of the Cloud Function service account"
+    value: ${function_service_account.email}
+    
+  monitoring_metric_name:
+    description: "Name of the custom DNS malware monitoring metric"
+    value: ${dns_malware_metric.name}
+    
+  alert_policy_name:
+    description: "Name of the DNS threat detection alert policy"
+    value: ${dns_threat_alert_policy.display_name}
+    
+  scc_notification_config:
+    description: "Security Command Center notification configuration ID"
+    value: ${scc_notification.config_id}
+    
+  random_suffix:
+    description: "Random suffix used for resource naming"
+    value: ${random_id.hex}
+    
+  deployment_region:
+    description: "Primary deployment region"
+    value: ${var.region}
+    
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}

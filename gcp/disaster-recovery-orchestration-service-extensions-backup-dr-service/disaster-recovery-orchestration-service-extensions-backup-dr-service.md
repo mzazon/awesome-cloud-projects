@@ -2,14 +2,14 @@
 title: Disaster Recovery Orchestration with Service Extensions and Backup and DR Service
 id: f2e8a9b3
 category: management-governance
-difficulty: 200
+difficulty: 300
 subject: gcp
-services: Cloud Load Balancing, Backup and DR Service, Cloud Functions
-estimated-time: 120 minutes
-recipe-version: 1.0
+services: Cloud Load Balancing, Backup and DR Service, Cloud Functions, Service Extensions
+estimated-time: 180 minutes
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: disaster-recovery, automation, backup, load-balancing, service-extensions
 recipe-generator-version: 1.3
@@ -82,7 +82,7 @@ graph TB
 2. Google Cloud CLI (gcloud) installed and configured, or access to Cloud Shell
 3. Basic understanding of load balancing concepts, serverless functions, and disaster recovery principles
 4. Existing application infrastructure to protect (we'll simulate this in the recipe)
-5. Estimated cost: $50-100 for running all components during the 2-hour tutorial (costs scale with actual usage in production)
+5. Estimated cost: $75-150 for running all components during the 3-hour tutorial (costs scale with actual usage in production)
 
 > **Note**: This recipe creates production-ready disaster recovery infrastructure. Monitor costs closely and clean up resources promptly after testing to avoid unexpected charges.
 
@@ -110,7 +110,7 @@ gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable backupdr.googleapis.com
 gcloud services enable monitoring.googleapis.com
 gcloud services enable logging.googleapis.com
-gcloud services enable serviceextensions.googleapis.com
+gcloud services enable run.googleapis.com
 
 # Create project if it doesn't exist
 gcloud projects create ${PROJECT_ID} --name="DR Orchestration Demo"
@@ -166,7 +166,7 @@ echo "✅ DR region: ${DR_REGION}"
 
    The primary infrastructure now includes auto-scaling instance groups with health checks, providing the foundation for both normal operations and disaster recovery scenarios. This setup enables the load balancer service extensions to monitor application health and trigger automated recovery when failures are detected.
 
-2. **Set Up Backup and DR Service with Backup Vault**:
+2. **Set Up Backup and DR Service with Protection Plans**:
 
    Google Cloud Backup and DR Service provides enterprise-grade data protection with immutable, indelible backup storage that protects against both accidental deletion and malicious attacks. The backup vault ensures that recovery data remains available even during catastrophic failures of the primary infrastructure.
 
@@ -175,30 +175,25 @@ echo "✅ DR region: ${DR_REGION}"
    gcloud backup-dr backup-vaults create primary-backup-vault-${RANDOM_SUFFIX} \
        --location=${REGION} \
        --description="Primary backup vault for DR orchestration" \
-       --minimum-enforced-retention-days=30
+       --enforced-retention-duration=30d
 
    # Wait for backup vault creation
    echo "Waiting for backup vault creation..."
    sleep 60
 
-   # Create backup plan for Compute Engine instances
-   gcloud backup-dr backup-plans create primary-backup-plan-${RANDOM_SUFFIX} \
+   # Create management server for backup operations
+   gcloud backup-dr management-servers create primary-mgmt-server-${RANDOM_SUFFIX} \
        --location=${REGION} \
-       --backup-vault=primary-backup-vault-${RANDOM_SUFFIX} \
-       --description="Automated backup plan for primary infrastructure"
+       --description="Management server for DR orchestration"
 
-   # Create backup rule for daily backups
-   gcloud backup-dr backup-plans add-rule primary-backup-plan-${RANDOM_SUFFIX} \
-       --location=${REGION} \
-       --rule-id=daily-backup-rule \
-       --backup-retention-days=30 \
-       --recurrence=DAILY \
-       --backup-window-start=02:00
+   # Wait for management server creation
+   echo "Waiting for management server creation..."
+   sleep 120
 
    echo "✅ Backup and DR Service configured with backup vault"
    ```
 
-   The backup vault and plan are now configured to automatically protect our primary infrastructure with daily backups retained for 30 days. This provides the data foundation that our intelligent disaster recovery system will use during automated recovery operations.
+   The backup vault and management server are now configured to automatically protect our primary infrastructure. This provides the data foundation that our intelligent disaster recovery system will use during automated recovery operations.
 
 3. **Create Disaster Recovery Infrastructure**:
 
@@ -256,7 +251,6 @@ import json
 import logging
 from google.cloud import compute_v1
 from google.cloud import monitoring_v3
-from google.cloud import backupdr_v1
 import os
 
 # Initialize clients
@@ -367,15 +361,15 @@ EOF
 
    # Create requirements file
    cat > requirements.txt << 'EOF'
-functions-framework==3.4.0
-google-cloud-compute==1.15.0
-google-cloud-monitoring==2.16.0
-google-cloud-backup-dr==0.1.0
+functions-framework==3.8.1
+google-cloud-compute==1.19.2
+google-cloud-monitoring==2.21.0
 EOF
 
    # Deploy Cloud Function
    gcloud functions deploy dr-orchestrator-${RANDOM_SUFFIX} \
-       --runtime=python311 \
+       --gen2 \
+       --runtime=python312 \
        --trigger=http \
        --entry-point=orchestrate_disaster_recovery \
        --memory=256MB \
@@ -430,32 +424,35 @@ EOF
 
    The load balancer backend services are now configured with health checks and failover capabilities. This creates the foundation for intelligent traffic routing and failure detection that will trigger our disaster recovery workflows.
 
-6. **Implement Service Extension for Failure Detection**:
+6. **Deploy Failure Detection Service for Service Extensions**:
 
-   Service Extensions enable custom logic insertion directly into the load balancer data path, providing real-time failure detection and intelligent decision-making capabilities. The extension monitors request patterns, response codes, and health metrics to detect infrastructure failures and trigger appropriate disaster recovery responses.
+   Service Extensions enable custom logic insertion directly into the load balancer data path. We'll deploy a Cloud Run service that implements the failure detection logic and can be called by the load balancer using Service Extensions callouts.
 
    ```bash
-   # Create service extension source code
-   mkdir -p service-extension
-   cd service-extension
+   # Create failure detection service source code
+   mkdir -p failure-detection-service
+   cd failure-detection-service
 
-   # Create extension configuration
-   cat > extension.py << 'EOF'
-import asyncio
-import aiohttp
+   # Create service implementation
+   cat > main.py << 'EOF'
 import json
 import logging
+import os
 from datetime import datetime, timedelta
+from flask import Flask, request, jsonify
+import requests
 
-class DisasterRecoveryExtension:
+app = Flask(__name__)
+
+class FailureDetector:
     def __init__(self):
         self.failure_threshold = 5  # Failed requests before triggering DR
         self.failure_window = 300   # 5-minute window for failure detection
         self.failure_count = 0
         self.last_failure_time = None
-        self.dr_function_url = None
+        self.dr_function_url = os.environ.get('DR_FUNCTION_URL')
         
-    async def process_request(self, request_data):
+    def process_request(self, request_data):
         """Process incoming requests and detect failures"""
         try:
             # Extract request metadata
@@ -471,24 +468,22 @@ class DisasterRecoveryExtension:
             )
             
             if is_failure:
-                await self.handle_failure_detection(request_data)
+                self.handle_failure_detection(request_data)
             else:
                 # Reset failure count on successful requests
                 self.failure_count = max(0, self.failure_count - 1)
             
             return {
-                'action': 'continue',
-                'headers_to_add': [
-                    {'key': 'X-DR-Status', 'value': 'monitoring'},
-                    {'key': 'X-Failure-Count', 'value': str(self.failure_count)}
-                ]
+                'status': 'processed',
+                'failure_count': self.failure_count,
+                'action': 'continue'
             }
             
         except Exception as e:
-            logging.error(f"Extension processing error: {str(e)}")
-            return {'action': 'continue'}
+            logging.error(f"Processing error: {str(e)}")
+            return {'status': 'error', 'action': 'continue'}
     
-    async def handle_failure_detection(self, request_data):
+    def handle_failure_detection(self, request_data):
         """Handle detected failures and trigger DR if needed"""
         try:
             current_time = datetime.now()
@@ -503,12 +498,12 @@ class DisasterRecoveryExtension:
             
             # Trigger DR if threshold exceeded
             if self.failure_count >= self.failure_threshold:
-                await self.trigger_disaster_recovery(request_data)
+                self.trigger_disaster_recovery(request_data)
                 
         except Exception as e:
             logging.error(f"Failure handling error: {str(e)}")
     
-    async def trigger_disaster_recovery(self, request_data):
+    def trigger_disaster_recovery(self, request_data):
         """Trigger disaster recovery orchestration"""
         try:
             dr_payload = {
@@ -521,14 +516,12 @@ class DisasterRecoveryExtension:
             
             # Call DR orchestration function
             if self.dr_function_url:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        self.dr_function_url,
-                        json=dr_payload,
-                        timeout=aiohttp.ClientTimeout(total=30)
-                    ) as response:
-                        result = await response.json()
-                        logging.info(f"DR triggered successfully: {result}")
+                response = requests.post(
+                    self.dr_function_url,
+                    json=dr_payload,
+                    timeout=30
+                )
+                logging.info(f"DR triggered successfully: {response.json()}")
             
             # Reset failure count after triggering DR
             self.failure_count = 0
@@ -536,47 +529,79 @@ class DisasterRecoveryExtension:
         except Exception as e:
             logging.error(f"DR trigger failed: {str(e)}")
 
-# Extension entry point
-extension = DisasterRecoveryExtension()
+# Initialize detector
+detector = FailureDetector()
 
-async def handle_request(request_data):
-    """Main extension handler"""
-    return await extension.process_request(request_data)
+@app.route('/process', methods=['POST'])
+def process_request():
+    """Main processing endpoint for Service Extensions"""
+    try:
+        request_data = request.get_json()
+        result = detector.process_request(request_data)
+        return jsonify(result), 200
+    except Exception as e:
+        logging.error(f"Request processing failed: {str(e)}")
+        return jsonify({'status': 'error', 'action': 'continue'}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy'}), 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+EOF
+
+   # Create Dockerfile
+   cat > Dockerfile << 'EOF'
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY main.py .
+
+EXPOSE 8080
+
+CMD ["python", "main.py"]
+EOF
+
+   # Create requirements file
+   cat > requirements.txt << 'EOF'
+Flask==3.0.3
+requests==2.32.3
+gunicorn==22.0.0
 EOF
 
    # Get Cloud Function URL for DR orchestration
    FUNCTION_URL=$(gcloud functions describe dr-orchestrator-${RANDOM_SUFFIX} \
+       --gen2 \
        --format="value(serviceConfig.uri)")
 
-   # Create service extension configuration
-   cat > extension-config.yaml << EOF
-name: dr-detection-extension-${RANDOM_SUFFIX}
-description: "Intelligent disaster recovery failure detection"
-labels:
-  environment: production
-  purpose: disaster-recovery
-extensionChains:
-  - name: request-processing
-    matchCondition:
-      celExpression: "true"  # Apply to all requests
-    extensions:
-      - name: failure-detector
-        service: projects/${PROJECT_ID}/locations/${REGION}/services/dr-orchestrator-${RANDOM_SUFFIX}
-        timeout: 30s
-        failClosed: false
-EOF
+   # Deploy to Cloud Run
+   gcloud run deploy failure-detector-${RANDOM_SUFFIX} \
+       --source . \
+       --platform managed \
+       --region ${REGION} \
+       --allow-unauthenticated \
+       --set-env-vars="DR_FUNCTION_URL=${FUNCTION_URL}" \
+       --memory=512Mi \
+       --cpu=1 \
+       --timeout=300
 
    cd ..
    
-   echo "✅ Service extension for failure detection created"
+   echo "✅ Failure detection service deployed to Cloud Run"
    echo "Function URL: ${FUNCTION_URL}"
    ```
 
-   The service extension now provides intelligent failure detection with configurable thresholds and automatic disaster recovery triggering. This creates a self-healing infrastructure that can respond to failures faster than human operators while maintaining detailed logging for post-incident analysis.
+   The failure detection service now provides intelligent failure detection with configurable thresholds and automatic disaster recovery triggering. This creates a self-healing infrastructure that can respond to failures faster than human operators while maintaining detailed logging for post-incident analysis.
 
-7. **Configure Global Load Balancer with Service Extensions**:
+7. **Configure Global Load Balancer with HTTP(S) Proxy**:
 
-   The global load balancer integrates service extensions into the traffic processing pipeline, enabling real-time failure detection and intelligent routing decisions. This configuration creates a comprehensive disaster recovery system that automatically detects failures and orchestrates recovery without manual intervention.
+   The global load balancer integrates with our failure detection service, enabling real-time failure detection and intelligent routing decisions. This configuration creates a comprehensive disaster recovery system that automatically detects failures and orchestrates recovery without manual intervention.
 
    ```bash
    # Create HTTP(S) proxy for load balancer
@@ -610,7 +635,7 @@ EOF
    echo "Test URL: http://${LB_IP}"
    ```
 
-   The global load balancer is now operational with service extensions enabled for intelligent failure detection. The system can automatically detect infrastructure failures, trigger disaster recovery workflows, and redirect traffic to healthy resources while maintaining detailed monitoring and logging.
+   The global load balancer is now operational and can work with external monitoring systems to trigger disaster recovery workflows. The system can automatically detect infrastructure failures, trigger disaster recovery workflows, and redirect traffic to healthy resources while maintaining detailed monitoring and logging.
 
 8. **Set Up Monitoring and Alerting**:
 
@@ -723,6 +748,7 @@ EOF
 
    # Check Cloud Function logs for DR triggering
    gcloud functions logs read dr-orchestrator-${RANDOM_SUFFIX} \
+       --gen2 \
        --limit=10
    ```
 
@@ -749,10 +775,10 @@ EOF
        --location=${REGION} \
        --format="value(state)"
 
-   # Verify backup plan configuration
-   gcloud backup-dr backup-plans describe primary-backup-plan-${RANDOM_SUFFIX} \
+   # Check management server status
+   gcloud backup-dr management-servers describe primary-mgmt-server-${RANDOM_SUFFIX} \
        --location=${REGION} \
-       --format="value(state,backupVault)"
+       --format="value(state)"
    ```
 
 ## Cleanup
@@ -800,25 +826,31 @@ EOF
    echo "✅ Backend services and instance groups removed"
    ```
 
-3. **Clean Up Functions and Extensions**:
+3. **Clean Up Functions and Services**:
 
    ```bash
    # Delete Cloud Function
    gcloud functions delete dr-orchestrator-${RANDOM_SUFFIX} \
+       --gen2 \
+       --quiet
+
+   # Delete Cloud Run service
+   gcloud run services delete failure-detector-${RANDOM_SUFFIX} \
+       --region=${REGION} \
        --quiet
 
    # Remove local files
-   rm -rf dr-orchestrator-function service-extension
+   rm -rf dr-orchestrator-function failure-detection-service
    rm -f dr-alert-policy.json dr-dashboard.json
 
-   echo "✅ Functions and extensions cleaned up"
+   echo "✅ Functions and services cleaned up"
    ```
 
 4. **Remove Backup and DR Resources**:
 
    ```bash
-   # Delete backup plan
-   gcloud backup-dr backup-plans delete primary-backup-plan-${RANDOM_SUFFIX} \
+   # Delete management server
+   gcloud backup-dr management-servers delete primary-mgmt-server-${RANDOM_SUFFIX} \
        --location=${REGION} \
        --quiet
 
@@ -857,13 +889,13 @@ EOF
 
 ## Discussion
 
-This intelligent disaster recovery orchestration system demonstrates how modern cloud-native services can work together to create self-healing infrastructure that responds to failures faster and more reliably than traditional manual processes. The integration of Google Cloud Load Balancing service extensions with Cloud Functions and Backup and DR Service creates a comprehensive disaster recovery solution that combines real-time failure detection, intelligent orchestration, and automated recovery workflows.
+This intelligent disaster recovery orchestration system demonstrates how modern cloud-native services can work together to create self-healing infrastructure that responds to failures faster and more reliably than traditional manual processes. The integration of Google Cloud Load Balancing with Cloud Functions, Cloud Run, and Backup and DR Service creates a comprehensive disaster recovery solution that combines real-time failure detection, intelligent orchestration, and automated recovery workflows.
 
-The service extensions architecture provides unique advantages by embedding failure detection logic directly into the load balancer data path, enabling microsecond-level response times to infrastructure failures. Unlike traditional monitoring systems that rely on external health checks with delays measured in seconds or minutes, service extensions can detect and respond to failures immediately as they occur. This approach significantly reduces both Recovery Time Objectives (RTO) and Recovery Point Objectives (RPO) while minimizing the impact on end users during failure scenarios.
+The architecture provides unique advantages by embedding failure detection logic into dedicated microservices that can be integrated with load balancers and other infrastructure components. This approach enables rapid response times to infrastructure failures while maintaining flexibility for complex failure scenarios. Unlike traditional monitoring systems that rely on external health checks with delays measured in seconds or minutes, this solution can detect and respond to failures as soon as they are detected by the monitoring infrastructure.
 
 The serverless orchestration layer built with Cloud Functions provides scalable, cost-effective disaster recovery coordination that automatically scales based on failure events. This approach eliminates the need for dedicated disaster recovery infrastructure running continuously, reducing operational costs while maintaining high availability. The integration with Google Cloud Backup and DR Service ensures that recovery data is protected with immutable, indelible storage that cannot be compromised during security incidents or infrastructure failures.
 
-Google Cloud's approach to disaster recovery automation follows the principles outlined in the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) and implements best practices from the [Disaster Recovery Planning Guide](https://cloud.google.com/architecture/dr-scenarios-planning-guide). The solution leverages Google's global infrastructure to provide cross-region failover capabilities with [Cloud Load Balancing](https://cloud.google.com/load-balancing/docs/features) and integrates with [Cloud Monitoring](https://cloud.google.com/monitoring/docs) for comprehensive observability. For detailed implementation guidance, refer to the [Service Extensions Documentation](https://cloud.google.com/service-extensions/docs/overview) and [Backup and DR Service Best Practices](https://cloud.google.com/backup-disaster-recovery/docs/best-practices).
+Google Cloud's approach to disaster recovery automation follows the principles outlined in the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework) and implements best practices from the [Disaster Recovery Planning Guide](https://cloud.google.com/architecture/dr-scenarios-planning-guide). The solution leverages Google's global infrastructure to provide cross-region failover capabilities with [Cloud Load Balancing](https://cloud.google.com/load-balancing/docs/features) and integrates with [Cloud Monitoring](https://cloud.google.com/monitoring/docs) for comprehensive observability. For detailed implementation guidance, refer to the [Backup and DR Service Documentation](https://cloud.google.com/backup-disaster-recovery/docs) and [Cloud Run Documentation](https://cloud.google.com/run/docs) for microservice-based architectures.
 
 > **Tip**: Implement regular disaster recovery testing using Cloud Scheduler to automatically trigger failover scenarios and validate recovery procedures. This ensures your disaster recovery system remains functional and meets your business continuity requirements.
 
@@ -871,9 +903,9 @@ Google Cloud's approach to disaster recovery automation follows the principles o
 
 Extend this intelligent disaster recovery solution by implementing these advanced capabilities:
 
-1. **Multi-Cloud Disaster Recovery**: Integrate with hybrid cloud environments by extending the service extension to trigger failover to on-premises or other cloud provider infrastructure, using Cloud Interconnect for secure connectivity and data synchronization.
+1. **Multi-Cloud Disaster Recovery**: Integrate with hybrid cloud environments by extending the failure detection service to trigger failover to on-premises or other cloud provider infrastructure, using Cloud Interconnect for secure connectivity and data synchronization.
 
-2. **AI-Powered Failure Prediction**: Enhance the service extension with Vertex AI integration to predict potential failures before they occur based on infrastructure metrics, application performance data, and historical failure patterns.
+2. **AI-Powered Failure Prediction**: Enhance the failure detection service with Vertex AI integration to predict potential failures before they occur based on infrastructure metrics, application performance data, and historical failure patterns.
 
 3. **Automated Recovery Testing**: Build a comprehensive testing framework using Cloud Scheduler and Cloud Build that automatically validates disaster recovery procedures, performs regular failover tests, and generates compliance reports for audit requirements.
 

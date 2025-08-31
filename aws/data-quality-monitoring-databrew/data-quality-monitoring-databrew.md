@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: glue-databrew, s3, cloudwatch, eventbridge
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-quality, profiling, monitoring, etl, analytics, serverless
 recipe-generator-version: 1.3
@@ -44,9 +44,8 @@ graph TB
     end
     
     subgraph "Monitoring & Alerting"
-        CW_EVENTS[CloudWatch Events]
+        EB_EVENTS[EventBridge Events]
         SNS[SNS Topic]
-        LAMBDA[Lambda Function]
         CW_LOGS[CloudWatch Logs]
     end
     
@@ -65,9 +64,8 @@ graph TB
     RULESET --> PROFILE_JOB
     PROFILE_JOB --> VALIDATION
     
-    VALIDATION --> CW_EVENTS
-    CW_EVENTS --> SNS
-    CW_EVENTS --> LAMBDA
+    VALIDATION --> EB_EVENTS
+    EB_EVENTS --> SNS
     
     PROFILE_JOB --> S3_RESULTS
     PROFILE_JOB --> CW_LOGS
@@ -78,7 +76,7 @@ graph TB
     style DATASET fill:#FF9900
     style PROFILE_JOB fill:#FF9900
     style RULESET fill:#FF9900
-    style CW_EVENTS fill:#3F8624
+    style EB_EVENTS fill:#3F8624
     style S3_RESULTS fill:#3F8624
 ```
 
@@ -89,6 +87,8 @@ graph TB
 3. Basic understanding of data quality concepts and AWS services
 4. Sample dataset in S3 (CSV, JSON, or Parquet format)
 5. Estimated cost: $10-20 for profile jobs and storage during this tutorial
+
+> **Note**: Profile jobs consume compute resources based on data volume. Large datasets may require significant processing time and costs.
 
 ## Preparation
 
@@ -114,7 +114,7 @@ export SNS_TOPIC_NAME="data-quality-alerts-${RANDOM_SUFFIX}"
 # Create S3 bucket for results
 aws s3 mb s3://${S3_BUCKET_NAME} --region ${AWS_REGION}
 
-# Create sample customer data file
+# Create sample customer data file with quality issues
 cat > customer_data.csv << 'EOF'
 customer_id,name,email,age,registration_date,account_balance
 1,John Smith,john.smith@example.com,25,2023-01-15,1500.00
@@ -139,7 +139,7 @@ echo "✅ Environment prepared successfully"
 
 1. **Create IAM Role for DataBrew**:
 
-   AWS Glue DataBrew requires specific IAM permissions to access S3 data and write results. The service role enables DataBrew to read source data, write profile results, and publish CloudWatch events. Understanding IAM roles is crucial for maintaining security while enabling service functionality.
+   AWS Glue DataBrew requires specific IAM permissions to access S3 data and write results. The service role enables DataBrew to read source data, write profile results, and publish CloudWatch events following the principle of least privilege security model.
 
    ```bash
    # Create trust policy for DataBrew service
@@ -158,7 +158,7 @@ echo "✅ Environment prepared successfully"
    }
    EOF
    
-   # Create the IAM role
+   # Create the IAM role  
    aws iam create-role \
        --role-name ${DATABREW_ROLE_NAME} \
        --assume-role-policy-document file://databrew-trust-policy.json
@@ -201,11 +201,11 @@ echo "✅ Environment prepared successfully"
    echo "✅ IAM role created: ${DATABREW_ROLE_ARN}"
    ```
 
-   The IAM role is now configured with the necessary permissions to access S3 data and execute profile jobs. This security foundation ensures DataBrew can operate while maintaining the principle of least privilege.
+   The IAM role is now configured with necessary permissions following AWS security best practices. This foundation ensures DataBrew can operate while maintaining proper access controls for your data.
 
 2. **Create DataBrew Dataset**:
 
-   A DataBrew dataset represents the connection to your data source and defines the schema for data profiling. Creating a dataset establishes the foundation for all subsequent data quality monitoring activities and enables DataBrew to understand your data structure.
+   A DataBrew dataset represents the connection to your data source and defines the schema for data profiling. This logical representation enables DataBrew to understand your data structure and perform comprehensive analysis across different file formats.
 
    ```bash
    # Create DataBrew dataset pointing to our sample data
@@ -223,11 +223,11 @@ echo "✅ Environment prepared successfully"
    echo "✅ Dataset created: ${DATASET_NAME}"
    ```
 
-   The dataset now serves as the entry point for data profiling operations. DataBrew can automatically detect schema changes and data patterns, providing the foundation for comprehensive data quality monitoring.
+   The dataset now serves as the entry point for data profiling operations. DataBrew automatically detects schema changes and data patterns, providing the foundation for comprehensive quality monitoring.
 
 3. **Create Data Quality Ruleset**:
 
-   Data quality rules define the criteria that your data must meet to be considered valid. These rules enable automated validation of data quality metrics and provide objective standards for data acceptability across your organization.
+   Data quality rules define objective criteria that your data must meet to be considered valid. These rules enable automated validation of completeness, format, range, and business logic requirements that protect downstream analytics workflows.
 
    ```bash
    # Create comprehensive data quality ruleset
@@ -248,7 +248,7 @@ echo "✅ Environment prepared successfully"
                "Disabled": false
            },
            {
-               "Name": "age_range_valid",
+               "Name": "age_range_valid", 
                "CheckExpression": "COLUMN_MIN(age) >= 0 AND COLUMN_MAX(age) <= 120",
                "SubstitutionMap": {},
                "Disabled": false
@@ -270,11 +270,11 @@ echo "✅ Environment prepared successfully"
    echo "✅ Data quality ruleset created: ${RULESET_NAME}"
    ```
 
-   The ruleset now defines comprehensive quality standards including completeness, format validation, range checks, and data type validation. These rules provide automated quality gates that protect downstream systems from poor-quality data.
+   The ruleset now defines comprehensive quality standards including completeness checks, format validation, range verification, and data type validation. These automated quality gates prevent poor-quality data from impacting downstream systems.
 
 4. **Create SNS Topic for Alerting**:
 
-   Amazon SNS enables automated notifications when data quality issues are detected. This proactive alerting system ensures that data teams can respond quickly to quality problems before they impact business operations.
+   Amazon SNS provides the notification infrastructure for automated alerting when data quality issues are detected. This real-time alerting capability enables immediate response to quality problems before they impact business operations.
 
    ```bash
    # Create SNS topic for data quality alerts
@@ -294,11 +294,11 @@ echo "✅ Environment prepared successfully"
    echo "Please confirm your email subscription to receive alerts"
    ```
 
-   The SNS topic is now configured to deliver real-time notifications about data quality validation results. This enables immediate response to quality issues and helps maintain high data standards across your organization.
+   The SNS topic is now configured to deliver real-time notifications about data quality validation results. This proactive alerting system ensures rapid response to quality issues and maintains high data standards.
 
 5. **Create Profile Job with Data Quality Validation**:
 
-   Profile jobs analyze your data to generate comprehensive quality reports and validate against your defined rules. These jobs provide deep insights into data characteristics while automatically enforcing quality standards through rule validation.
+   Profile jobs perform comprehensive data analysis while simultaneously validating against your defined quality rules. These jobs provide statistical insights into data characteristics and enforce quality standards through automated rule validation.
 
    ```bash
    # Create profile job with data quality validation
@@ -333,14 +333,14 @@ echo "✅ Environment prepared successfully"
    echo "✅ Profile job created: ${PROFILE_JOB_NAME}"
    ```
 
-   The profile job is now configured to perform comprehensive data analysis and quality validation. When executed, it will generate detailed statistics about your data while simultaneously validating against your quality rules.
+   The profile job is now configured to perform comprehensive data analysis and quality validation. This serverless approach provides detailed statistics about your data while enforcing quality standards automatically.
 
 6. **Set Up EventBridge Rule for Automation**:
 
-   EventBridge enables event-driven automation by capturing DataBrew job completion events and triggering downstream actions. This automation ensures that quality validation results are immediately processed and appropriate notifications are sent.
+   Amazon EventBridge captures DataBrew job completion events and triggers automated responses. This event-driven architecture ensures that quality validation results are immediately processed and appropriate notifications are sent when issues occur.
 
    ```bash
-   # Create EventBridge rule for DataBrew events
+   # Create EventBridge rule for DataBrew validation events
    aws events put-rule \
        --name "DataBrewQualityValidation" \
        --description "Trigger actions on DataBrew validation results" \
@@ -355,33 +355,36 @@ echo "✅ Environment prepared successfully"
    # Add SNS topic as target for failed validations
    aws events put-targets \
        --rule "DataBrewQualityValidation" \
-       --targets "Id"="1","Arn"="${SNS_TOPIC_ARN}" \
-       --input-transformer '{
-           "InputPathsMap": {
-               "dataset": "$.detail.datasetName",
-               "ruleset": "$.detail.rulesetName",
-               "state": "$.detail.validationState",
-               "report": "$.detail.validationReportLocation"
-           },
-           "InputTemplate": "Data quality validation FAILED for dataset: <dataset>, ruleset: <ruleset>. Status: <state>. Report: <report>"
-       }'
+       --targets '[{
+           "Id": "1",
+           "Arn": "'${SNS_TOPIC_ARN}'",
+           "InputTransformer": {
+               "InputPathsMap": {
+                   "dataset": "$.detail.datasetName",
+                   "ruleset": "$.detail.rulesetName", 
+                   "state": "$.detail.validationState",
+                   "report": "$.detail.validationReportLocation"
+               },
+               "InputTemplate": "Data quality validation FAILED for dataset: <dataset>, ruleset: <ruleset>. Status: <state>. Report: <report>"
+           }
+       }]'
    
    echo "✅ EventBridge rule configured for data quality monitoring"
    ```
 
    EventBridge is now monitoring DataBrew validation events and will automatically send alerts when quality rules fail. This creates a responsive monitoring system that enables proactive data quality management.
 
-> **Note**: Data quality monitoring requires establishing baseline expectations for your data. Review the [AWS Glue DataBrew Data Quality documentation](https://docs.aws.amazon.com/databrew/latest/dg/profile.data-quality-rules.html) for advanced rule configurations and validation strategies.
+> **Tip**: EventBridge delivers DataBrew events on a best-effort basis. For critical data quality workflows, consider implementing additional monitoring using CloudWatch metrics and alarms.
 
 7. **Execute Profile Job**:
 
-   Running the profile job performs the actual data analysis and quality validation. This process generates comprehensive reports that provide insights into data distribution, quality metrics, and rule validation results.
+   Running the profile job performs comprehensive data analysis and quality validation. This process generates detailed reports that provide insights into data distribution, statistical characteristics, and rule validation results.
 
    ```bash
    # Start the profile job
    aws databrew start-job-run --name ${PROFILE_JOB_NAME}
    
-   # Get the job run ID
+   # Get the job run ID for monitoring
    export JOB_RUN_ID=$(aws databrew list-job-runs \
        --name ${PROFILE_JOB_NAME} \
        --query 'JobRuns[0].RunId' --output text)
@@ -389,8 +392,9 @@ echo "✅ Environment prepared successfully"
    echo "✅ Profile job started with ID: ${JOB_RUN_ID}"
    echo "Job is running... This may take several minutes"
    
-   # Monitor job status
-   while true; do
+   # Monitor job status with timeout
+   timeout_counter=0
+   while [ $timeout_counter -lt 20 ]; do
        JOB_STATUS=$(aws databrew describe-job-run \
            --name ${PROFILE_JOB_NAME} \
            --run-id ${JOB_RUN_ID} \
@@ -403,6 +407,7 @@ echo "✅ Environment prepared successfully"
        fi
        
        sleep 30
+       timeout_counter=$((timeout_counter + 1))
    done
    
    echo "✅ Profile job completed with status: ${JOB_STATUS}"
@@ -419,40 +424,46 @@ echo "✅ Environment prepared successfully"
    aws s3 ls s3://${S3_BUCKET_NAME}/profile-results/ --recursive
    
    # Download and examine profile results
-   aws s3 cp s3://${S3_BUCKET_NAME}/profile-results/ ./results/ --recursive
+   mkdir -p ./results
+   aws s3 cp s3://${S3_BUCKET_NAME}/profile-results/ ./results/ \
+       --recursive --exclude "*" --include "*.json"
    
-   # Display basic statistics from profile report
-   echo "Profile results downloaded to ./results/"
+   echo "✅ Profile results downloaded to ./results/"
    echo "Check the JSON files for detailed data profiling information"
    ```
+
+   Expected output: JSON files containing detailed statistical analysis of your dataset
 
 2. **Check Data Quality Validation Results**:
 
    ```bash
    # List validation reports
-   aws s3 ls s3://${S3_BUCKET_NAME}/profile-results/ --recursive | grep "dq-validation-report"
+   VALIDATION_FILES=$(aws s3 ls s3://${S3_BUCKET_NAME}/profile-results/ \
+       --recursive | grep "dq-validation-report" | head -1)
    
-   # Download validation report
-   VALIDATION_REPORT=$(aws s3 ls s3://${S3_BUCKET_NAME}/profile-results/ --recursive | grep "dq-validation-report" | awk '{print $4}' | head -1)
-   
-   if [ ! -z "$VALIDATION_REPORT" ]; then
-       aws s3 cp s3://${S3_BUCKET_NAME}/${VALIDATION_REPORT} ./validation-report.json
+   if [ ! -z "$VALIDATION_FILES" ]; then
+       VALIDATION_KEY=$(echo "$VALIDATION_FILES" | awk '{print $4}')
+       aws s3 cp s3://${S3_BUCKET_NAME}/${VALIDATION_KEY} \
+           ./validation-report.json
        echo "✅ Validation report downloaded: ./validation-report.json"
    else
-       echo "No validation report found"
+       echo "No validation report found - check job status"
    fi
    ```
 
 3. **Test EventBridge Integration**:
 
    ```bash
-   # Check CloudWatch Events for DataBrew events
-   aws logs filter-log-events \
-       --log-group-name /aws/events/rule/DataBrewQualityValidation \
-       --start-time $(date -d '1 hour ago' +%s)000 \
-       --query 'events[].message' --output text
+   # Check if EventBridge rule exists and is active
+   aws events list-rules --name-prefix "DataBrewQualityValidation" \
+       --query 'Rules[].{Name:Name,State:State}' --output table
    
-   echo "EventBridge rule is active and monitoring DataBrew events"
+   # List rule targets to verify SNS integration
+   aws events list-targets-by-rule \
+       --rule "DataBrewQualityValidation" \
+       --query 'Targets[].{Id:Id,Arn:Arn}' --output table
+   
+   echo "✅ EventBridge rule is active and configured"
    ```
 
 ## Cleanup
@@ -508,37 +519,38 @@ echo "✅ Environment prepared successfully"
    aws s3 rb s3://${S3_BUCKET_NAME}
    
    # Clean up local files
-   rm -f customer_data.csv databrew-trust-policy.json databrew-s3-policy.json
-   rm -rf ./results/ ./validation-report.json
+   rm -f customer_data.csv databrew-trust-policy.json \
+       databrew-s3-policy.json validation-report.json
+   rm -rf ./results/
    
    echo "✅ All resources cleaned up"
    ```
 
 ## Discussion
 
-AWS Glue DataBrew provides a powerful serverless platform for implementing comprehensive data quality monitoring without requiring extensive coding or infrastructure management. The visual interface makes data profiling accessible to business users while the API enables programmatic integration into automated workflows.
+AWS Glue DataBrew provides a powerful serverless platform for implementing comprehensive data quality monitoring without requiring extensive coding or infrastructure management. The visual interface makes data profiling accessible to business users while the API enables programmatic integration into automated workflows following AWS Well-Architected Framework principles of operational excellence and performance efficiency.
 
-The profile job functionality generates detailed statistical analysis of your data including distribution patterns, data types, uniqueness, and completeness metrics. This information is crucial for understanding data characteristics and identifying potential quality issues before they impact downstream systems. The ability to define custom data quality rules enables organizations to codify their specific quality requirements and automate validation processes.
+The profile job functionality generates detailed statistical analysis including distribution patterns, data types, uniqueness, and completeness metrics. This information is crucial for understanding data characteristics and identifying potential quality issues before they impact downstream systems. The ability to define custom data quality rules enables organizations to codify their specific quality requirements and automate validation processes across their data lifecycle.
 
 EventBridge integration creates a reactive monitoring system that can trigger immediate responses to quality issues. This event-driven architecture enables sophisticated workflows such as halting data pipelines when quality thresholds are breached, sending targeted alerts to responsible teams, or automatically initiating data remediation processes. The combination of profiling and real-time alerting provides both historical insights and immediate responsiveness to quality problems.
 
 > **Warning**: Monitor your DataBrew usage carefully as profile jobs consume compute resources based on data volume. Large datasets may require significant processing time and costs. Consider implementing sampling strategies for initial profiling and full validation for production datasets.
 
-The integration with CloudWatch provides comprehensive monitoring of job execution, performance metrics, and operational insights. This observability enables teams to optimize their data quality processes and ensure reliable operation of monitoring workflows. For organizations with complex data landscapes, DataBrew's ability to handle multiple data formats and sources makes it an ideal foundation for enterprise-wide data quality initiatives.
+The integration with CloudWatch provides comprehensive monitoring of job execution, performance metrics, and operational insights as outlined in the [AWS Glue DataBrew monitoring documentation](https://docs.aws.amazon.com/databrew/latest/dg/monitoring.html). This observability enables teams to optimize their data quality processes and ensure reliable operation of monitoring workflows. For organizations with complex data landscapes, DataBrew's ability to handle multiple data formats and sources makes it an ideal foundation for enterprise-wide data quality initiatives.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Advanced Rule Development**: Create custom data quality rules using SQL expressions to validate business-specific logic such as referential integrity, cross-column validation, and temporal consistency checks.
+1. **Advanced Rule Development**: Create custom data quality rules using SQL expressions to validate business-specific logic such as referential integrity, cross-column validation, and temporal consistency checks using DataBrew's advanced rule engine.
 
-2. **Multi-Dataset Monitoring**: Implement a centralized monitoring solution that profiles multiple datasets simultaneously and provides consolidated quality dashboards using Amazon QuickSight for executive reporting.
+2. **Multi-Dataset Monitoring**: Implement a centralized monitoring solution that profiles multiple datasets simultaneously and provides consolidated quality dashboards using Amazon QuickSight for executive reporting and trend analysis.
 
 3. **Automated Remediation**: Build Lambda functions that automatically correct common data quality issues when validation fails, such as standardizing date formats, filling missing values, or flagging suspect records for manual review.
 
-4. **Historical Trending**: Develop a time-series analysis system that tracks data quality metrics over time, identifies degradation patterns, and provides predictive alerts for potential quality issues.
+4. **Historical Trending**: Develop a time-series analysis system that tracks data quality metrics over time using DynamoDB, identifies degradation patterns, and provides predictive alerts for potential quality issues.
 
-5. **Integration with Data Catalog**: Connect DataBrew profiling results with AWS Glue Data Catalog to maintain metadata about data quality scores, lineage information, and automated schema evolution tracking.
+5. **Integration with Data Catalog**: Connect DataBrew profiling results with AWS Glue Data Catalog to maintain metadata about data quality scores, lineage information, and automated schema evolution tracking across your data ecosystem.
 
 ## Infrastructure Code
 

@@ -1,21 +1,21 @@
 ---
-title: Multi-Language Content Optimization with Cloud Translation Advanced and Cloud Run Worker Pools
+title: Multi-Language Content Optimization with Cloud Translation Advanced and Cloud Run Jobs
 id: f7a9b2c5
 category: serverless
 difficulty: 200
 subject: gcp
-services: Cloud Translation Advanced, Cloud Run Worker Pools, Cloud Storage, Pub/Sub
+services: Cloud Translation Advanced, Cloud Run Jobs, Cloud Storage, Pub/Sub
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: translation, serverless, content-optimization, worker-pools, batch-processing
+tags: translation, serverless, content-optimization, jobs, batch-processing
 recipe-generator-version: 1.3
 ---
 
-# Multi-Language Content Optimization with Cloud Translation Advanced and Cloud Run Worker Pools
+# Multi-Language Content Optimization with Cloud Translation Advanced and Cloud Run Jobs
 
 ## Problem
 
@@ -23,7 +23,7 @@ Global content creators and marketing teams struggle with efficiently translatin
 
 ## Solution
 
-Build an intelligent content optimization system using Cloud Translation Advanced for high-quality batch translations with custom models, Cloud Run Worker Pools for continuous background processing of translation jobs, and event-driven architecture to automatically optimize content based on regional engagement metrics and user preferences.
+Build an intelligent content optimization system using Cloud Translation Advanced for high-quality batch translations with custom models, Cloud Run Jobs for continuous background processing of translation tasks, and event-driven architecture to automatically optimize content based on regional engagement metrics and user preferences.
 
 ## Architecture Diagram
 
@@ -46,7 +46,7 @@ graph TB
     end
     
     subgraph "Processing Engine"
-        WORKER[Cloud Run Worker Pool]
+        WORKER[Cloud Run Jobs]
         TRANSLATE[Translation Advanced API]
         OPTIMIZER[Content Optimizer]
     end
@@ -80,7 +80,7 @@ graph TB
 2. Google Cloud CLI installed and configured (or Cloud Shell)
 3. Basic understanding of serverless architectures and event-driven processing
 4. Familiarity with translation workflows and content management
-5. Estimated cost: $50-100 for running this recipe including translation API usage, worker pool instances, and storage
+5. Estimated cost: $50-100 for running this recipe including translation API usage, job instances, and storage
 
 > **Note**: This recipe uses Cloud Translation Advanced features that may have additional charges. Review the [Google Cloud Translation pricing](https://cloud.google.com/translate/pricing) for current rates.
 
@@ -100,7 +100,7 @@ export SOURCE_BUCKET="content-source-${RANDOM_SUFFIX}"
 export TRANSLATED_BUCKET="content-translated-${RANDOM_SUFFIX}"
 export MODELS_BUCKET="translation-models-${RANDOM_SUFFIX}"
 export TOPIC_NAME="content-processing-${RANDOM_SUFFIX}"
-export WORKER_POOL_NAME="translation-workers-${RANDOM_SUFFIX}"
+export JOB_NAME="translation-worker-${RANDOM_SUFFIX}"
 export DATASET_NAME="content_analytics_${RANDOM_SUFFIX}"
 
 # Set default project and region
@@ -163,7 +163,7 @@ echo "✅ Region set to: ${REGION}"
    # Create Pub/Sub topic for content processing events
    gcloud pubsub topics create ${TOPIC_NAME}
    
-   # Create subscription for worker pool consumption
+   # Create subscription for job consumption
    gcloud pubsub subscriptions create ${TOPIC_NAME}-sub \
        --topic=${TOPIC_NAME} \
        --ack-deadline=600 \
@@ -211,7 +211,7 @@ echo "✅ Region set to: ${REGION}"
 
 4. **Create IAM Service Account with Appropriate Permissions**:
 
-   Service accounts provide secure, least-privilege access for our Cloud Run Worker Pool to interact with Translation API, Storage, and BigQuery services. This security configuration follows Google Cloud best practices for workload identity and service-to-service authentication.
+   Service accounts provide secure, least-privilege access for our Cloud Run Jobs to interact with Translation API, Storage, and BigQuery services. This security configuration follows Google Cloud best practices for workload identity and service-to-service authentication.
 
    ```bash
    # Create service account for translation workers
@@ -239,7 +239,7 @@ echo "✅ Region set to: ${REGION}"
    echo "✅ Service account and IAM permissions configured"
    ```
 
-   The security configuration ensures our worker pool has the minimum necessary permissions to perform translation and analytics operations while maintaining security isolation.
+   The security configuration ensures our Cloud Run Jobs have the minimum necessary permissions to perform translation and analytics operations while maintaining security isolation.
 
 5. **Create Worker Application Code**:
 
@@ -255,12 +255,12 @@ echo "✅ Region set to: ${REGION}"
 import json
 import os
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import time
+from datetime import datetime
 from google.cloud import translate_v3
 from google.cloud import storage
 from google.cloud import bigquery
 from google.cloud import pubsub_v1
-import functions_framework
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -279,6 +279,7 @@ class TranslationOptimizer:
         """Process translation request with optimization"""
         try:
             content_info = json.loads(message_data)
+            logger.info(f"Processing translation request: {content_info.get('content_id')}")
             
             # Get engagement metrics for optimization
             engagement_score = self.get_engagement_metrics(
@@ -399,6 +400,8 @@ class TranslationOptimizer:
             table_id = f"{self.project_id}.{os.environ.get('DATASET_NAME')}.translation_performance"
             table = self.bigquery_client.get_table(table_id)
             
+            current_time = datetime.utcnow().isoformat()
+            
             rows = [{
                 'batch_id': content_info.get('batch_id'),
                 'source_language': content_info.get('source_language'),
@@ -406,7 +409,7 @@ class TranslationOptimizer:
                 'content_type': content_info.get('content_type'),
                 'processing_time': 0,  # Will be updated when operation completes
                 'quality_score': 0.95 if results['config_used'].get('use_custom_model') else 0.85,
-                'timestamp': bigquery.QueryJobConfig().timestamp
+                'timestamp': current_time
             } for lang in content_info.get('target_languages', [])]
             
             errors = self.bigquery_client.insert_rows_json(table, rows)
@@ -418,44 +421,72 @@ class TranslationOptimizer:
         except Exception as e:
             logger.error(f"Error logging translation metrics: {str(e)}")
 
-@functions_framework.cloud_event
-def process_pubsub_message(cloud_event):
-    """Cloud Run worker function to process Pub/Sub messages"""
-    import base64
+def main():
+    """Main function for Cloud Run Job"""
+    # Get job configuration from environment variables
+    subscription_name = os.environ.get('SUBSCRIPTION_NAME')
+    max_messages = int(os.environ.get('MAX_MESSAGES', '10'))
+    
+    if not subscription_name:
+        logger.error("SUBSCRIPTION_NAME environment variable not set")
+        return
     
     optimizer = TranslationOptimizer()
+    subscriber = pubsub_v1.SubscriberClient()
     
-    # Decode Pub/Sub message
-    message_data = base64.b64decode(cloud_event.data["message"]["data"]).decode()
+    # Pull messages from subscription
+    subscription_path = subscriber.subscription_path(
+        optimizer.project_id, subscription_name
+    )
     
-    # Process translation request
-    result = optimizer.process_translation_request(message_data)
+    logger.info(f"Pulling messages from {subscription_path}")
     
-    logger.info(f"Translation processing completed: {result}")
+    # Process messages
+    response = subscriber.pull(
+        request={
+            "subscription": subscription_path,
+            "max_messages": max_messages,
+        }
+    )
+    
+    if not response.received_messages:
+        logger.info("No messages to process")
+        return
+    
+    processed_count = 0
+    ack_ids = []
+    
+    for received_message in response.received_messages:
+        try:
+            message_data = received_message.message.data.decode('utf-8')
+            optimizer.process_translation_request(message_data)
+            ack_ids.append(received_message.ack_id)
+            processed_count += 1
+        except Exception as e:
+            logger.error(f"Error processing message: {str(e)}")
+    
+    # Acknowledge processed messages
+    if ack_ids:
+        subscriber.acknowledge(
+            request={
+                "subscription": subscription_path,
+                "ack_ids": ack_ids,
+            }
+        )
+        logger.info(f"Acknowledged {len(ack_ids)} messages")
+    
+    logger.info(f"Processed {processed_count} translation requests")
 
 if __name__ == "__main__":
-    # For local testing
-    optimizer = TranslationOptimizer()
-    test_message = json.dumps({
-        'content_id': 'test-content-001',
-        'batch_id': 'batch-001',
-        'source_language': 'en',
-        'target_languages': ['es', 'fr', 'de'],
-        'source_uri': 'gs://source-bucket/content.txt',
-        'output_uri_prefix': 'gs://translated-bucket/output/',
-        'content_type': 'marketing',
-        'mime_type': 'text/plain'
-    })
-    optimizer.process_translation_request(test_message)
+    main()
 EOF
    
-   # Create requirements file
+   # Create requirements file with latest versions
    cat > requirements.txt << 'EOF'
-google-cloud-translate==3.15.5
-google-cloud-storage==2.10.0
-google-cloud-bigquery==3.13.0
-google-cloud-pubsub==2.18.4
-functions-framework==3.5.0
+google-cloud-translate==3.21.1
+google-cloud-storage==2.18.0
+google-cloud-bigquery==3.25.0
+google-cloud-pubsub==2.23.1
 EOF
    
    # Create Dockerfile for Cloud Run
@@ -469,7 +500,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD exec functions-framework --target=process_pubsub_message --port=${PORT:-8080}
+CMD ["python", "main.py"]
 EOF
    
    cd ..
@@ -479,34 +510,34 @@ EOF
 
    The translation worker application integrates advanced AI capabilities with real-time optimization, enabling intelligent content processing that adapts to user engagement patterns and business requirements.
 
-6. **Deploy Cloud Run Worker Pool**:
+6. **Deploy Cloud Run Job**:
 
-   Cloud Run Worker Pools provide purpose-built infrastructure for continuous background processing without requiring HTTP endpoints. This serverless compute platform scales automatically based on Pub/Sub message volume while maintaining cost efficiency through pay-per-use pricing and intelligent instance management.
+   Cloud Run Jobs provide purpose-built infrastructure for batch processing tasks without requiring HTTP endpoints. This serverless compute platform executes background jobs on-demand while maintaining cost efficiency through pay-per-use pricing and automatic resource management.
 
    ```bash
    # Build container image
    gcloud builds submit translation-worker \
        --tag gcr.io/${PROJECT_ID}/translation-worker
    
-   # Deploy Cloud Run Worker Pool
-   gcloud run worker-pools deploy ${WORKER_POOL_NAME} \
+   # Deploy Cloud Run Job
+   gcloud run jobs create ${JOB_NAME} \
        --image gcr.io/${PROJECT_ID}/translation-worker \
        --region ${REGION} \
        --service-account translation-worker-sa@${PROJECT_ID}.iam.gserviceaccount.com \
        --set-env-vars GOOGLE_CLOUD_PROJECT=${PROJECT_ID} \
        --set-env-vars GOOGLE_CLOUD_REGION=${REGION} \
        --set-env-vars DATASET_NAME=${DATASET_NAME} \
+       --set-env-vars SUBSCRIPTION_NAME=${TOPIC_NAME}-sub \
        --cpu 2 \
        --memory 4Gi \
-       --min-instances 1 \
-       --max-instances 10 \
-       --pubsub-subscription projects/${PROJECT_ID}/subscriptions/${TOPIC_NAME}-sub
+       --max-retries 3 \
+       --task-timeout 3600
    
-   echo "✅ Cloud Run Worker Pool deployed successfully"
-   echo "Worker Pool: ${WORKER_POOL_NAME}"
+   echo "✅ Cloud Run Job deployed successfully"
+   echo "Job Name: ${JOB_NAME}"
    ```
 
-   The worker pool is now running with optimal resource allocation and auto-scaling configuration, ready to process translation requests efficiently based on message queue depth and processing demand.
+   The Cloud Run Job is now configured with optimal resource allocation and retry policies, ready to process translation requests efficiently based on Pub/Sub messages.
 
 7. **Create Sample Content and Trigger Translation**:
 
@@ -545,8 +576,11 @@ EOF
    # Publish message to trigger translation
    echo ${TRANSLATION_REQUEST} | gcloud pubsub topics publish ${TOPIC_NAME} --message=-
    
+   # Execute the job to process the message
+   gcloud run jobs execute ${JOB_NAME} --region ${REGION}
+   
    echo "✅ Sample content uploaded and translation triggered"
-   echo "Monitor worker pool logs for processing status"
+   echo "Monitor job execution logs for processing status"
    ```
 
    The translation workflow is now active, processing sample content through our intelligent optimization system and demonstrating the complete serverless architecture in action.
@@ -597,16 +631,16 @@ EOF
 
 ## Validation & Testing
 
-1. **Verify Cloud Run Worker Pool Status**:
+1. **Verify Cloud Run Job Status**:
 
    ```bash
-   # Check worker pool deployment status
-   gcloud run worker-pools describe ${WORKER_POOL_NAME} \
+   # Check job deployment status and configuration
+   gcloud run jobs describe ${JOB_NAME} \
        --region ${REGION} \
-       --format="table(metadata.name,status.url,status.conditions[0].type:label=STATUS)"
+       --format="table(metadata.name,spec.template.spec.template.spec.serviceAccountName,status.conditions[0].type:label=STATUS)"
    ```
 
-   Expected output: Worker pool should show "Ready" status with active instances processing messages.
+   Expected output: Job should show "Ready" status with the correct service account configured.
 
 2. **Monitor Translation Processing**:
 
@@ -615,10 +649,12 @@ EOF
    gcloud pubsub subscriptions describe ${TOPIC_NAME}-sub \
        --format="yaml(name,numUndeliveredMessages)"
    
-   # View worker pool logs
-   gcloud run worker-pools logs read ${WORKER_POOL_NAME} \
-       --region ${REGION} \
-       --limit 50
+   # View job execution logs
+   gcloud run jobs executions list --job=${JOB_NAME} --region=${REGION}
+   
+   # Get logs from latest execution
+   EXECUTION_NAME=$(gcloud run jobs executions list --job=${JOB_NAME} --region=${REGION} --format="value(metadata.name)" --limit=1)
+   gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=${JOB_NAME} AND resource.labels.execution_name=${EXECUTION_NAME}" --limit=50
    ```
 
 3. **Validate Translation Results**:
@@ -653,20 +689,23 @@ EOF
        echo ${LOAD_TEST_REQUEST} | gcloud pubsub topics publish ${TOPIC_NAME} --message=-
    done
    
-   echo "✅ Load test requests submitted"
+   # Execute job to process all messages
+   gcloud run jobs execute ${JOB_NAME} --region ${REGION}
+   
+   echo "✅ Load test requests submitted and job executed"
    ```
 
 ## Cleanup
 
-1. **Remove Cloud Run Worker Pool**:
+1. **Remove Cloud Run Job**:
 
    ```bash
-   # Delete worker pool
-   gcloud run worker-pools delete ${WORKER_POOL_NAME} \
+   # Delete job
+   gcloud run jobs delete ${JOB_NAME} \
        --region ${REGION} \
        --quiet
    
-   echo "✅ Worker pool deleted"
+   echo "✅ Cloud Run Job deleted"
    ```
 
 2. **Delete Pub/Sub Resources**:
@@ -721,7 +760,7 @@ EOF
 
 ## Discussion
 
-This intelligent content optimization system demonstrates the power of combining Google Cloud's advanced translation capabilities with serverless computing to create adaptive, data-driven workflows. Cloud Translation Advanced provides superior translation quality through custom models and domain-specific optimizations, while Cloud Run Worker Pools enable cost-effective background processing without the complexity of managing server infrastructure.
+This intelligent content optimization system demonstrates the power of combining Google Cloud's advanced translation capabilities with serverless computing to create adaptive, data-driven workflows. Cloud Translation Advanced provides superior translation quality through custom models and domain-specific optimizations, while Cloud Run Jobs enable cost-effective batch processing without the complexity of managing server infrastructure.
 
 The architecture leverages event-driven design patterns to create a responsive system that scales automatically based on content volume and processing demands. By integrating BigQuery analytics, the system continuously learns from user engagement patterns and adjusts translation strategies accordingly. This approach represents a significant advancement over traditional batch translation workflows, offering both technical efficiency and business intelligence capabilities.
 
@@ -729,7 +768,7 @@ The serverless foundation ensures optimal resource utilization and cost manageme
 
 Security and compliance considerations are addressed through IAM service accounts with least-privilege access, encryption at rest and in transit, and audit logging capabilities. The system supports enterprise requirements for data governance while maintaining the agility needed for modern content operations. Performance monitoring and analytics enable continuous optimization of both technical performance and business outcomes.
 
-> **Tip**: Use Cloud Translation's batch processing capabilities to optimize costs for large content volumes. Batch requests provide better pricing than individual API calls and enable more efficient resource utilization in your worker pools.
+> **Tip**: Use Cloud Translation's batch processing capabilities to optimize costs for large content volumes. Batch requests provide better pricing than individual API calls and enable more efficient resource utilization in your Cloud Run Jobs.
 
 ## Challenge
 

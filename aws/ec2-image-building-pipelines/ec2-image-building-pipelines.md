@@ -1,22 +1,21 @@
 ---
-title: EC2 Image Building Pipelines
+title: EC2 Image Building Pipelines with Image Builder
 id: e22f1836
 category: compute
 difficulty: 300
 subject: aws
 services: EC2 Image Builder, EC2, IAM, S3
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ec2-image-builder, ami, automation, compute
 recipe-generator-version: 1.3
 ---
 
-# EC2 Image Building Pipelines
-
+# EC2 Image Building Pipelines with Image Builder
 
 ## Problem
 
@@ -210,7 +209,7 @@ echo "✅ Environment prepared with bucket ${BUCKET_NAME} and IAM roles"
              commands:
                - systemctl status httpd
                - curl -s http://localhost/ | grep -q "Custom Web Server" || exit 1
-               - netstat -tlnp | grep :80 || exit 1
+               - ss -tlnp | grep :80 || exit 1
    EOF
    
    # Upload component to S3
@@ -316,6 +315,13 @@ echo "✅ Environment prepared with bucket ${BUCKET_NAME} and IAM roles"
    BASE_IMAGE_ARN=$(aws imagebuilder list-images \
        --filters "name=name,values=Amazon Linux 2 x86" \
        --query 'imageVersionList[0].arn' --output text)
+   
+   # If the managed image is not found, use Amazon Linux 2023
+   if [[ "$BASE_IMAGE_ARN" == "null" || -z "$BASE_IMAGE_ARN" ]]; then
+       BASE_IMAGE_ARN=$(aws imagebuilder list-images \
+           --filters "name=name,values=Amazon Linux 2023 x86" \
+           --query 'imageVersionList[0].arn' --output text)
+   fi
    
    # Create image recipe
    aws imagebuilder create-image-recipe \
@@ -556,11 +562,11 @@ echo "✅ Environment prepared with bucket ${BUCKET_NAME} and IAM roles"
            --query 'imagePipelineList[0].arn' --output text) \
        --query 'images[0].outputResources.amis[0].image' --output text)
    
-   # Launch test instance
+   # Note: Replace 'your-key-pair' with an existing key pair name
+   # Launch test instance (optional - requires existing key pair)
    INSTANCE_ID=$(aws ec2 run-instances \
        --image-id ${AMI_ID} \
        --instance-type t3.micro \
-       --key-name your-key-pair \
        --subnet-id ${DEFAULT_SUBNET_ID} \
        --security-group-ids ${SECURITY_GROUP_ID} \
        --query 'Instances[0].InstanceId' --output text)
@@ -669,23 +675,25 @@ EC2 Image Builder provides a powerful platform for automating AMI creation and m
 
 The pipeline architecture demonstrated here showcases key capabilities including component-based customization, automated testing, and multi-region distribution. Components are reusable building blocks that can be versioned and shared across different recipes, promoting standardization and reducing duplication. The separation of build and test phases ensures that images are thoroughly validated before distribution, while the automated scheduling capabilities enable regular patching and updates without manual intervention. For advanced component development, refer to the [AWSTOE Component Management Guide](https://docs.aws.amazon.com/imagebuilder/latest/userguide/toe-get-started.html).
 
-Security considerations are paramount in image building. The recipe implements several best practices including least-privilege IAM roles, security group configurations that limit network access, and component-level security hardening. The use of Systems Manager Session Manager for instance access eliminates the need for SSH keys or direct network connectivity, while CloudWatch logging provides comprehensive audit trails for compliance requirements. The [Image Builder Security Best Practices](https://docs.aws.amazon.com/imagebuilder/latest/userguide/security-best-practices.html) documentation provides additional guidance on securing your image building workflows.
+Security considerations are paramount in image building workflows. The recipe implements several best practices including least-privilege IAM roles, security group configurations that limit network access, and component-level security hardening. The use of Systems Manager Session Manager for instance access eliminates the need for SSH keys or direct network connectivity, while CloudWatch logging provides comprehensive audit trails for compliance requirements. Following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles ensures that your image building process is secure, reliable, and cost-effective.
 
-> **Tip**: Use AWS Systems Manager Parameter Store to manage configuration values and secrets in your components, enabling dynamic configuration without hardcoding sensitive information.
+Cost optimization is achieved through automated instance termination, efficient scheduling that prevents unnecessary builds, and the ability to use spot instances for build workloads. The [Image Builder Security Best Practices](https://docs.aws.amazon.com/imagebuilder/latest/userguide/security-best-practices.html) documentation provides additional guidance on securing your image building workflows while maintaining operational efficiency.
+
+> **Tip**: Use AWS Systems Manager Parameter Store to manage configuration values and secrets in your components, enabling dynamic configuration without hardcoding sensitive information in your build components.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Platform Support**: Create components that work across both Linux and Windows base images, implementing platform-specific logic within the same component framework.
+1. **Multi-Platform Support**: Create components that work across both Linux and Windows base images, implementing platform-specific logic within the same component framework using conditional statements and platform detection.
 
-2. **Advanced Testing Integration**: Integrate with AWS Inspector for vulnerability scanning and implement custom test suites using AWS CodeBuild for more comprehensive validation.
+2. **Advanced Testing Integration**: Integrate with AWS Inspector for vulnerability scanning and implement custom test suites using AWS CodeBuild for more comprehensive validation, including security benchmarks and compliance testing.
 
-3. **Cross-Account Distribution**: Configure image sharing across multiple AWS accounts and implement approval workflows for production image promotion.
+3. **Cross-Account Distribution**: Configure image sharing across multiple AWS accounts and implement approval workflows for production image promotion using AWS Organizations and Resource Access Manager (RAM).
 
-4. **Compliance Automation**: Integrate with AWS Config and Security Hub to automatically validate that created images meet organizational compliance standards and security benchmarks.
+4. **Compliance Automation**: Integrate with AWS Config and Security Hub to automatically validate that created images meet organizational compliance standards and security benchmarks such as CIS or NIST frameworks.
 
-5. **Cost Optimization**: Implement lifecycle policies for AMI management, automated cleanup of old images, and integration with AWS Cost Explorer for build cost tracking and optimization.
+5. **Cost Optimization**: Implement lifecycle policies for AMI management, automated cleanup of old images, and integration with AWS Cost Explorer for build cost tracking and optimization using spot instances and scheduled builds.
 
 ## Infrastructure Code
 

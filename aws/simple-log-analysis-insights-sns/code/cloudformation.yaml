@@ -1,0 +1,640 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simple Log Analysis with CloudWatch Insights and SNS - Automated log monitoring solution with real-time alerting'
+
+# Template Parameters
+Parameters:
+  # Naming and Identification
+  ProjectName:
+    Type: String
+    Default: 'simple-log-analysis'
+    Description: 'Project name used for resource naming and tagging'
+    AllowedPattern: '^[a-z0-9-]*$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name (dev, staging, prod)'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    
+  # Notification Configuration
+  NotificationEmail:
+    Type: String
+    Description: 'Email address to receive log analysis alerts'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+    
+  # Lambda Configuration
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    Description: 'Lambda function timeout in seconds'
+    MinValue: 30
+    MaxValue: 900
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: 'Lambda function memory size in MB'
+    AllowedValues:
+      - 128
+      - 256
+      - 512
+      - 1024
+      
+  # Monitoring Configuration
+  AnalysisScheduleRate:
+    Type: String
+    Default: 'rate(5 minutes)'
+    Description: 'How often to run log analysis (EventBridge schedule expression)'
+    AllowedValues:
+      - 'rate(1 minute)'
+      - 'rate(5 minutes)'
+      - 'rate(10 minutes)'
+      - 'rate(15 minutes)'
+      - 'rate(30 minutes)'
+      - 'rate(1 hour)'
+      
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    Description: 'CloudWatch Logs retention period in days'
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      
+  # Log Analysis Configuration
+  ErrorPatterns:
+    Type: String
+    Default: 'ERROR|CRITICAL|FATAL'
+    Description: 'Pipe-separated list of error patterns to detect in logs'
+    
+  MaxErrorsToShow:
+    Type: Number
+    Default: 5
+    Description: 'Maximum number of errors to include in alert notification'
+    MinValue: 1
+    MaxValue: 20
+
+# Template Conditions
+Conditions:
+  # Environment-based conditions for resource configuration
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  IsNonProduction: !Not [!Equals [!Ref Environment, 'prod']]
+  
+  # Schedule frequency conditions
+  IsHighFrequency: !Or
+    - !Equals [!Ref AnalysisScheduleRate, 'rate(1 minute)']
+    - !Equals [!Ref AnalysisScheduleRate, 'rate(5 minutes)']
+
+# Template Resources
+Resources:
+  # ================================================
+  # CloudWatch Logs Resources
+  # ================================================
+  
+  # Main log group for application logs
+  ApplicationLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-demo-app-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Component'
+          Value: 'logging'
+        - Key: 'Purpose'
+          Value: 'application-logs'
+          
+  # ================================================
+  # SNS Resources for Notifications
+  # ================================================
+  
+  # SNS Topic for log analysis alerts
+  LogAnalysisAlertsTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: !Sub '${ProjectName}-log-analysis-alerts-${Environment}'
+      DisplayName: !Sub '${ProjectName} Log Analysis Alerts'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Component'
+          Value: 'notifications'
+        - Key: 'Purpose'
+          Value: 'log-alerts'
+          
+  # Email subscription for alerts
+  EmailSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: 'email'
+      TopicArn: !Ref LogAnalysisAlertsTopic
+      Endpoint: !Ref NotificationEmail
+      
+  # ================================================
+  # IAM Resources
+  # ================================================
+  
+  # IAM Role for Lambda function execution
+  LogAnalyzerLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-log-analyzer-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'CloudWatchLogsInsightsAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:StartQuery'
+                  - 'logs:GetQueryResults'
+                  - 'logs:StopQuery'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: '*'
+                
+        - PolicyName: 'SNSPublishAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref LogAnalysisAlertsTopic
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Component'
+          Value: 'security'
+        - Key: 'Purpose'
+          Value: 'lambda-execution'
+          
+  # ================================================
+  # Lambda Resources
+  # ================================================
+  
+  # Lambda function for log analysis
+  LogAnalyzerFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-log-analyzer-${Environment}'
+      Description: 'Analyzes CloudWatch logs for error patterns and sends SNS alerts'
+      Runtime: 'python3.12'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LogAnalyzerLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          LOG_GROUP_NAME: !Ref ApplicationLogGroup
+          SNS_TOPIC_ARN: !Ref LogAnalysisAlertsTopic
+          ERROR_PATTERNS: !Ref ErrorPatterns
+          MAX_ERRORS_TO_SHOW: !Ref MaxErrorsToShow
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+          import os
+          from datetime import datetime, timedelta
+          
+          def lambda_handler(event, context):
+              """
+              Analyzes CloudWatch logs for error patterns and sends SNS alerts.
+              
+              This function queries CloudWatch Logs Insights for error patterns,
+              processes the results, and sends formatted notifications via SNS
+              when errors are detected.
+              """
+              logs_client = boto3.client('logs')
+              sns_client = boto3.client('sns')
+              
+              # Environment variables
+              log_group = os.environ['LOG_GROUP_NAME']
+              sns_topic = os.environ['SNS_TOPIC_ARN']
+              error_patterns = os.environ.get('ERROR_PATTERNS', 'ERROR|CRITICAL|FATAL')
+              max_errors = int(os.environ.get('MAX_ERRORS_TO_SHOW', '5'))
+              environment = os.environ.get('ENVIRONMENT', 'dev')
+              
+              # Define time range for analysis (last 10 minutes)
+              end_time = datetime.now()
+              start_time = end_time - timedelta(minutes=10)
+              
+              # CloudWatch Logs Insights query for error patterns
+              query = f'''
+              fields @timestamp, @message, @logStream
+              | filter @message like /{error_patterns}/
+              | sort @timestamp desc
+              | limit 50
+              '''
+              
+              try:
+                  print(f"Starting log analysis for log group: {log_group}")
+                  print(f"Time range: {start_time} to {end_time}")
+                  print(f"Error patterns: {error_patterns}")
+                  
+                  # Start the CloudWatch Logs Insights query
+                  response = logs_client.start_query(
+                      logGroupName=log_group,
+                      startTime=int(start_time.timestamp()),
+                      endTime=int(end_time.timestamp()),
+                      queryString=query
+                  )
+                  
+                  query_id = response['queryId']
+                  print(f"Query started with ID: {query_id}")
+                  
+                  # Wait for query completion with timeout
+                  max_wait_time = 30  # seconds
+                  wait_time = 0
+                  
+                  while wait_time < max_wait_time:
+                      time.sleep(2)
+                      wait_time += 2
+                      
+                      result = logs_client.get_query_results(queryId=query_id)
+                      
+                      if result['status'] == 'Complete':
+                          print("Query completed successfully")
+                          break
+                      elif result['status'] == 'Failed':
+                          raise Exception(f"Query failed: {result.get('status', 'Unknown error')}")
+                      elif result['status'] == 'Cancelled':
+                          raise Exception("Query was cancelled")
+                  else:
+                      # Timeout reached
+                      logs_client.stop_query(queryId=query_id)
+                      raise Exception("Query timeout - stopped query execution")
+                  
+                  # Process query results
+                  error_count = len(result['results'])
+                  print(f"Found {error_count} error events")
+                  
+                  if error_count > 0:
+                      # Create detailed alert message
+                      alert_message = f"""🚨 CloudWatch Log Analysis Alert
+          
+          Environment: {environment.upper()}
+          Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+          Log Group: {log_group}
+          
+          📊 Summary:
+          • Total errors detected: {error_count}
+          • Analysis period: Last 10 minutes
+          • Error patterns: {error_patterns}
+          
+          🔍 Recent Error Details:
+          """
+                      
+                      # Add details for the most recent errors
+                      for i, log_entry in enumerate(result['results'][:max_errors]):
+                          try:
+                              timestamp = next((field['value'] for field in log_entry if field['field'] == '@timestamp'), 'Unknown time')
+                              message = next((field['value'] for field in log_entry if field['field'] == '@message'), 'No message')
+                              log_stream = next((field['value'] for field in log_entry if field['field'] == '@logStream'), 'Unknown stream')
+                              
+                              # Format timestamp for readability
+                              try:
+                                  dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                                  formatted_time = dt.strftime('%H:%M:%S')
+                              except:
+                                  formatted_time = timestamp
+                              
+                              alert_message += f"\n{i+1}. [{formatted_time}] {message}"
+                              if i == 0:  # Add stream info for first error
+                                  alert_message += f"\n   Stream: {log_stream}"
+                              
+                          except Exception as e:
+                              print(f"Error processing log entry {i}: {str(e)}")
+                              alert_message += f"\n{i+1}. Error processing log entry"
+                      
+                      if error_count > max_errors:
+                          alert_message += f"\n\n... and {error_count - max_errors} more errors"
+                      
+                      alert_message += f"\n\n📋 Action Items:"
+                      alert_message += f"\n• Review application logs in CloudWatch Console"
+                      alert_message += f"\n• Check application health and dependencies"
+                      alert_message += f"\n• Consider scaling or performance optimization"
+                      
+                      # Send SNS notification
+                      sns_response = sns_client.publish(
+                          TopicArn=sns_topic,
+                          Subject=f'🚨 Log Alert - {environment.upper()} Environment ({error_count} errors)',
+                          Message=alert_message
+                      )
+                      
+                      print(f"Alert notification sent successfully. SNS MessageId: {sns_response['MessageId']}")
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'status': 'success',
+                              'error_count': error_count,
+                              'notification_sent': True,
+                              'message_id': sns_response['MessageId'],
+                              'query_id': query_id
+                          })
+                      }
+                  else:
+                      print("No errors detected in recent logs")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'status': 'success',
+                              'error_count': 0,
+                              'notification_sent': False,
+                              'message': 'No errors detected',
+                              'query_id': query_id
+                          })
+                      }
+                      
+              except Exception as e:
+                  error_message = str(e)
+                  print(f"Error during log analysis: {error_message}")
+                  
+                  # Send error notification to SNS for critical failures
+                  try:
+                      sns_client.publish(
+                          TopicArn=sns_topic,
+                          Subject=f'⚠️ Log Analysis System Error - {environment.upper()}',
+                          Message=f"""Log Analysis System Error
+          
+          Environment: {environment.upper()}
+          Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+          Error: {error_message}
+          
+          The automated log analysis system encountered an error.
+          Please check the Lambda function logs for more details.
+          """
+                      )
+                  except Exception as sns_error:
+                      print(f"Failed to send error notification: {str(sns_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'status': 'error',
+                          'error': error_message,
+                          'error_count': 0,
+                          'notification_sent': False
+                      })
+                  }
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Component'
+          Value: 'processing'
+        - Key: 'Purpose'
+          Value: 'log-analysis'
+          
+  # ================================================
+  # EventBridge Resources for Scheduling
+  # ================================================
+  
+  # EventBridge rule for scheduled log analysis
+  LogAnalysisScheduleRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${ProjectName}-log-analysis-schedule-${Environment}'
+      Description: !Sub 'Triggers log analysis function on schedule (${AnalysisScheduleRate})'
+      ScheduleExpression: !Ref AnalysisScheduleRate
+      State: 'ENABLED'
+      Targets:
+        - Arn: !GetAtt LogAnalyzerFunction.Arn
+          Id: 'LogAnalyzerTarget'
+          Input: !Sub |
+            {
+              "source": "eventbridge-schedule",
+              "environment": "${Environment}",
+              "scheduled_time": "<aws.events.event.ingestion-time>"
+            }
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Component'
+          Value: 'scheduling'
+        - Key: 'Purpose'
+          Value: 'log-analysis-trigger'
+          
+  # Permission for EventBridge to invoke Lambda
+  EventBridgeLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref LogAnalyzerFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt LogAnalysisScheduleRule.Arn
+      
+  # ================================================
+  # CloudWatch Alarms for Monitoring
+  # ================================================
+  
+  # Lambda function error alarm
+  LambdaErrorAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: 'Monitors Lambda function errors for log analyzer'
+      MetricName: 'Errors'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Sum'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      TreatMissingData: 'notBreaching'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref LogAnalyzerFunction
+      AlarmActions:
+        - !Ref LogAnalysisAlertsTopic
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Component'
+          Value: 'monitoring'
+        - Key: 'Purpose'
+          Value: 'lambda-health'
+          
+  # Lambda function duration alarm
+  LambdaDurationAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: 'Monitors Lambda function execution duration'
+      MetricName: 'Duration'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: 'GreaterThanThreshold'
+      TreatMissingData: 'notBreaching'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref LogAnalyzerFunction
+      AlarmActions:
+        - !Ref LogAnalysisAlertsTopic
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Component'
+          Value: 'monitoring'
+        - Key: 'Purpose'
+          Value: 'lambda-performance'
+
+# Template Outputs
+Outputs:
+  # Log Group Information
+  LogGroupName:
+    Description: 'Name of the CloudWatch Log Group for application logs'
+    Value: !Ref ApplicationLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+      
+  LogGroupArn:
+    Description: 'ARN of the CloudWatch Log Group'
+    Value: !GetAtt ApplicationLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupArn'
+      
+  # SNS Topic Information
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for log analysis alerts'
+    Value: !Ref LogAnalysisAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+      
+  SNSTopicName:
+    Description: 'Name of the SNS topic for alerts'
+    Value: !GetAtt LogAnalysisAlertsTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicName'
+      
+  # Lambda Function Information
+  LambdaFunctionName:
+    Description: 'Name of the log analyzer Lambda function'
+    Value: !Ref LogAnalyzerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+      
+  LambdaFunctionArn:
+    Description: 'ARN of the log analyzer Lambda function'
+    Value: !GetAtt LogAnalyzerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+      
+  # IAM Role Information
+  LambdaRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LogAnalyzerLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRoleArn'
+      
+  # EventBridge Rule Information
+  ScheduleRuleName:
+    Description: 'Name of the EventBridge rule for scheduled execution'
+    Value: !Ref LogAnalysisScheduleRule
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleRuleName'
+      
+  ScheduleRuleArn:
+    Description: 'ARN of the EventBridge rule'
+    Value: !GetAtt LogAnalysisScheduleRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleRuleArn'
+      
+  # Configuration Information
+  AnalysisFrequency:
+    Description: 'How often log analysis runs'
+    Value: !Ref AnalysisScheduleRate
+    Export:
+      Name: !Sub '${AWS::StackName}-AnalysisFrequency'
+      
+  ErrorPatterns:
+    Description: 'Error patterns being monitored'
+    Value: !Ref ErrorPatterns
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorPatterns'
+      
+  # CloudWatch Console Links
+  LogGroupConsoleURL:
+    Description: 'Direct link to CloudWatch Log Group console'
+    Value: !Sub 
+      - 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/${EncodedLogGroupName}'
+      - EncodedLogGroupName: !Sub 
+        - '${LogGroupName}'
+        - LogGroupName: !Join
+          - ''
+          - !Split
+            - '/'
+            - !Join
+              - '$252F'
+              - !Split
+                - '/'
+                - !Ref ApplicationLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupConsoleURL'
+      
+  LambdaConsoleURL:
+    Description: 'Direct link to Lambda function console'
+    Value: !Sub 'https://console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${LogAnalyzerFunction}'
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaConsoleURL'
+      
+  # Deployment Information
+  StackName:
+    Description: 'Name of this CloudFormation stack'
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+      
+  DeploymentRegion:
+    Description: 'AWS region where resources are deployed'
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentRegion'
+      
+  Environment:
+    Description: 'Environment name for this deployment'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'

@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: api-gateway, lambda, dynamodb, cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: api-gateway, websocket, real-time, lambda, dynamodb, connection-management, messaging
 recipe-generator-version: 1.3
@@ -113,7 +113,7 @@ graph TB
 4. Knowledge of DynamoDB data modeling and Lambda function patterns
 5. Estimated cost: $15-25 for testing (includes API Gateway WebSocket connections, Lambda executions, DynamoDB operations)
 
-> **Note**: WebSocket APIs have different pricing than REST APIs, with charges based on connection duration and message count. Monitor usage during testing to avoid unexpected costs.
+> **Note**: WebSocket APIs have different pricing than REST APIs, with charges based on connection duration and message count. Monitor usage during testing to avoid unexpected costs. See [API Gateway WebSocket pricing](https://aws.amazon.com/api-gateway/pricing/) for details.
 
 ## Preparation
 
@@ -123,7 +123,7 @@ export AWS_REGION=$(aws configure get region)
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
     --query Account --output text)
 
-# Generate unique identifiers
+# Generate unique identifiers for resource naming
 RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
     --exclude-punctuation --exclude-uppercase \
     --password-length 6 --require-each-included-type \
@@ -174,7 +174,7 @@ aws dynamodb create-table \
     --provisioned-throughput \
         ReadCapacityUnits=5,WriteCapacityUnits=5
 
-# Wait for tables to be created
+# Wait for tables to be created before proceeding
 aws dynamodb wait table-exists --table-name ${CONNECTIONS_TABLE}
 aws dynamodb wait table-exists --table-name ${ROOMS_TABLE}
 aws dynamodb wait table-exists --table-name ${MESSAGES_TABLE}
@@ -186,7 +186,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
 
 1. **Create IAM Roles and Policies for Lambda Functions**:
 
-   IAM roles and policies form the security foundation for WebSocket APIs, enabling Lambda functions to interact with DynamoDB and API Gateway while maintaining least privilege access. These permissions enable connection state management, message persistence, and real-time message delivery through the API Gateway Management API.
+   IAM roles and policies form the security foundation for WebSocket APIs, enabling Lambda functions to interact with DynamoDB and API Gateway while maintaining least privilege access. These permissions enable connection state management, message persistence, and real-time message delivery through the API Gateway Management API, following [AWS security best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html).
 
    ```bash
    # Create IAM role for WebSocket Lambda functions
@@ -257,11 +257,11 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
    echo "✅ Created IAM roles and policies"
    ```
 
-   The IAM role is now established with appropriate permissions for WebSocket operations. This security foundation enables Lambda functions to store connection state in DynamoDB and send messages back to clients through the API Gateway Management API, following AWS security best practices.
+   The IAM role is now established with appropriate permissions for WebSocket operations. This security foundation enables Lambda functions to store connection state in DynamoDB and send messages back to clients through the API Gateway Management API, following AWS security best practices with least privilege access.
 
 2. **Create Connection Handler Lambda Function**:
 
-   The connection handler manages the WebSocket connection lifecycle during the $connect route, which is triggered when clients establish WebSocket connections. This function validates authentication tokens, stores connection metadata in DynamoDB, and sends welcome messages to establish bidirectional communication channels.
+   The connection handler manages the WebSocket connection lifecycle during the $connect route, which is triggered when clients establish WebSocket connections. This function validates authentication tokens, stores connection metadata in DynamoDB, and sends welcome messages to establish bidirectional communication channels, implementing [WebSocket API connection patterns](https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-websocket-api-route-keys-connect-disconnect.html).
 
    ```bash
    # Create connection handler for $connect route
@@ -296,7 +296,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
                        'body': json.dumps({'error': 'Invalid authentication token'})
                    }
            
-           # Store connection information
+           # Store connection information with comprehensive metadata
            connection_data = {
                'connectionId': connection_id,
                'userId': user_id,
@@ -308,13 +308,13 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
                'status': 'connected'
            }
            
-           # Add optional user metadata
+           # Add optional user metadata if provided
            if 'username' in query_params:
                connection_data['username'] = query_params['username']
            
            connections_table.put_item(Item=connection_data)
            
-           # Send welcome message
+           # Send welcome message using API Gateway Management API
            api_gateway = boto3.client('apigatewaymanagementapi',
                endpoint_url=f'https://{domain_name}/{stage}')
            
@@ -355,11 +355,11 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
            }
    EOF
    
-   # Package and deploy connection handler
+   # Package and deploy connection handler with updated runtime
    zip connect_handler.zip connect_handler.py
    aws lambda create-function \
        --function-name websocket-connect-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.13 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler connect_handler.lambda_handler \
        --zip-file fileb://connect_handler.zip \
@@ -377,11 +377,11 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
    echo "✅ Created connection handler Lambda function"
    ```
 
-   The connection handler is now deployed and ready to process incoming WebSocket connections. This function establishes the foundation for real-time communication by validating clients, storing connection state, and initiating the bidirectional messaging protocol essential for interactive applications.
+   The connection handler is now deployed and ready to process incoming WebSocket connections. This function establishes the foundation for real-time communication by validating clients, storing connection state in DynamoDB, and initiating the bidirectional messaging protocol essential for interactive applications.
 
 3. **Create Disconnect Handler Lambda Function**:
 
-   The disconnect handler ensures graceful cleanup when WebSocket connections terminate through the $disconnect route. This function removes connection state from DynamoDB, preventing stale connection accumulation and maintaining accurate user presence information for real-time applications.
+   The disconnect handler ensures graceful cleanup when WebSocket connections terminate through the $disconnect route. This function removes connection state from DynamoDB, preventing stale connection accumulation and maintaining accurate user presence information for real-time applications, following [connection lifecycle management patterns](https://docs.aws.amazon.com/apigateway/latest/developerguide/websocket-api-route-keys-connect-disconnect.html).
 
    ```bash
    # Create disconnect handler for $disconnect route
@@ -398,7 +398,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
        connection_id = event['requestContext']['connectionId']
        
        try:
-           # Get connection information before deletion
+           # Get connection information before deletion for logging
            response = connections_table.get_item(
                Key={'connectionId': connection_id}
            )
@@ -410,7 +410,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
                
                print(f"Disconnecting user {user_id} from room {room_id}")
            
-           # Remove connection from table
+           # Remove connection from table to prevent stale connections
            connections_table.delete_item(
                Key={'connectionId': connection_id}
            )
@@ -440,7 +440,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
    zip disconnect_handler.zip disconnect_handler.py
    aws lambda create-function \
        --function-name websocket-disconnect-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.13 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler disconnect_handler.lambda_handler \
        --zip-file fileb://disconnect_handler.zip \
@@ -462,7 +462,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
 
 4. **Create Message Handler Lambda Function**:
 
-   The message handler processes all real-time communication through the $default route and custom routes, implementing sophisticated message routing logic for different communication patterns. This function handles chat messages, room management, private messaging, and administrative commands while maintaining message persistence and broadcasting capabilities.
+   The message handler processes all real-time communication through the $default route and custom routes, implementing sophisticated message routing logic for different communication patterns. This function handles chat messages, room management, private messaging, and administrative commands while maintaining message persistence and broadcasting capabilities using [route selection expressions](https://docs.aws.amazon.com/apigateway/latest/developerguide/websocket-api-develop-routes.html).
 
    ```bash
    # Create message handler for default and custom routes
@@ -486,13 +486,13 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
        stage = event['requestContext']['stage']
        route_key = event['requestContext']['routeKey']
        
-       # Parse message from client
+       # Parse message from client with error handling
        try:
            message_data = json.loads(event.get('body', '{}'))
        except json.JSONDecodeError:
            return send_error(connection_id, domain_name, stage, 'Invalid JSON format')
        
-       # Get sender connection info
+       # Get sender connection info from DynamoDB
        try:
            sender_response = connections_table.get_item(
                Key={'connectionId': connection_id}
@@ -507,7 +507,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
            print(f"Error getting sender info: {e}")
            return {'statusCode': 500}
        
-       # Route message based on type
+       # Route message based on type with comprehensive message handling
        message_type = message_data.get('type', 'chat')
        
        if message_type == 'chat':
@@ -530,7 +530,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
        if not message_content.strip():
            return send_error(sender_info['connectionId'], domain_name, stage, 'Message cannot be empty')
        
-       # Store message in database
+       # Store message in database with comprehensive metadata
        message_id = str(uuid.uuid4())
        timestamp = int(time.time())
        
@@ -569,7 +569,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
        if not new_room_id:
            return send_error(connection_id, domain_name, stage, 'Room ID required')
        
-       # Update connection's room
+       # Update connection's room using DynamoDB update operations
        connections_table.update_item(
            Key={'connectionId': connection_id},
            UpdateExpression='SET roomId = :room_id, lastActivity = :timestamp',
@@ -602,7 +602,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
            return send_error(sender_info['connectionId'], domain_name, stage, 
                            'Target user ID and message required for private messages')
        
-       # Find target user's connections
+       # Find target user's connections using GSI
        response = connections_table.query(
            IndexName='UserIndex',
            KeyConditionExpression=Key('userId').eq(target_user_id)
@@ -674,7 +674,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
        return {'statusCode': 200}
    
    def broadcast_to_room(room_id, message, domain_name, stage):
-       # Get all connections in the room
+       # Get all connections in the room using room index
        response = connections_table.query(
            IndexName='RoomIndex',
            KeyConditionExpression=Key('roomId').eq(room_id)
@@ -727,7 +727,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
    zip message_handler.zip message_handler.py
    aws lambda create-function \
        --function-name websocket-message-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.13 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler message_handler.lambda_handler \
        --zip-file fileb://message_handler.zip \
@@ -747,14 +747,14 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
    echo "✅ Created message handler Lambda function"
    ```
 
-   The message handler is now deployed with comprehensive routing and broadcasting capabilities. This function enables complex real-time interactions including room-based messaging, private communications, and administrative features, providing the core functionality for interactive applications.
+   The message handler is now deployed with comprehensive routing and broadcasting capabilities. This function enables complex real-time interactions including room-based messaging, private communications, and administrative features, providing the core functionality for interactive applications with automatic stale connection cleanup.
 
 5. **Create WebSocket API Gateway**:
 
-   API Gateway WebSocket APIs provide managed infrastructure for WebSocket connections with automatic scaling, connection management, and integration with AWS services. The route selection expression enables message-based routing to different Lambda handlers, creating a flexible and extensible real-time messaging architecture.
+   API Gateway WebSocket APIs provide managed infrastructure for WebSocket connections with automatic scaling, connection management, and integration with AWS services. The route selection expression enables message-based routing to different Lambda handlers, creating a flexible and extensible real-time messaging architecture following [WebSocket API patterns](https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-websocket-api-overview.html).
 
    ```bash
-   # Create WebSocket API
+   # Create WebSocket API with route selection expression
    export API_ID=$(aws apigatewayv2 create-api \
        --name ${API_NAME} \
        --protocol-type WEBSOCKET \
@@ -762,7 +762,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
        --description "Advanced WebSocket API with route management" \
        --query ApiId --output text)
    
-   # Create $connect integration
+   # Create $connect integration with Lambda proxy
    export CONNECT_INTEGRATION_ID=$(aws apigatewayv2 create-integration \
        --api-id ${API_ID} \
        --integration-type AWS_PROXY \
@@ -776,7 +776,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
        --integration-uri "arn:aws:apigateway:${AWS_REGION}:lambda:path/2015-03-31/functions/${DISCONNECT_FUNCTION_ARN}/invocations" \
        --query IntegrationId --output text)
    
-   # Create $default integration
+   # Create $default integration for message routing
    export MESSAGE_INTEGRATION_ID=$(aws apigatewayv2 create-integration \
        --api-id ${API_ID} \
        --integration-type AWS_PROXY \
@@ -790,22 +790,22 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
 
 6. **Create Routes for WebSocket API**:
 
-   WebSocket routes define how incoming connections and messages are processed, with special routes ($connect, $disconnect, $default) handling connection lifecycle events and custom routes enabling message-type-based routing. This routing mechanism provides flexibility for complex real-time applications with multiple communication patterns.
+   WebSocket routes define how incoming connections and messages are processed, with special routes ($connect, $disconnect, $default) handling connection lifecycle events and custom routes enabling message-type-based routing. This routing mechanism provides flexibility for complex real-time applications with multiple communication patterns as detailed in the [WebSocket routing documentation](https://docs.aws.amazon.com/apigateway/latest/developerguide/websocket-api-develop-routes.html).
 
    ```bash
-   # Create $connect route
+   # Create $connect route for connection establishment
    aws apigatewayv2 create-route \
        --api-id ${API_ID} \
        --route-key '$connect' \
        --target "integrations/${CONNECT_INTEGRATION_ID}"
    
-   # Create $disconnect route
+   # Create $disconnect route for connection cleanup
    aws apigatewayv2 create-route \
        --api-id ${API_ID} \
        --route-key '$disconnect' \
        --target "integrations/${DISCONNECT_INTEGRATION_ID}"
    
-   # Create $default route
+   # Create $default route for unmatched messages
    aws apigatewayv2 create-route \
        --api-id ${API_ID} \
        --route-key '$default' \
@@ -859,14 +859,14 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
        --principal apigateway.amazonaws.com \
        --source-arn "arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${API_ID}/*/*"
    
-   # Deploy API to staging stage
+   # Deploy API to staging stage with comprehensive configuration
    export DEPLOYMENT_ID=$(aws apigatewayv2 create-deployment \
        --api-id ${API_ID} \
        --stage-name staging \
        --description "Initial deployment of WebSocket API" \
        --query DeploymentId --output text)
    
-   # Create staging stage with logging enabled
+   # Create staging stage with monitoring and throttling
    aws apigatewayv2 create-stage \
        --api-id ${API_ID} \
        --stage-name staging \
@@ -893,7 +893,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
    A comprehensive test client demonstrates WebSocket API capabilities and provides interactive testing for all implemented features. This client supports connection management, message routing, room operations, and private messaging, enabling thorough validation of the real-time communication infrastructure.
 
    ```bash
-   # Create Python WebSocket test client
+   # Create Python WebSocket test client with enhanced functionality
    cat > websocket_client.py << 'EOF'
    import asyncio
    import websockets
@@ -1103,7 +1103,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
        --select COUNT \
        --query 'Count'
    
-   # View connection details
+   # View connection details with enhanced output
    aws dynamodb scan \
        --table-name ${CONNECTIONS_TABLE} \
        --max-items 5
@@ -1112,7 +1112,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
 3. **Test Message Storage**:
 
    ```bash
-   # Check if messages are stored
+   # Check if messages are stored in database
    echo "Checking stored messages..."
    aws dynamodb scan \
        --table-name ${MESSAGES_TABLE} \
@@ -1183,7 +1183,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
 2. **Delete Lambda Functions**:
 
    ```bash
-   # Delete Lambda functions
+   # Delete Lambda functions in reverse order of creation
    aws lambda delete-function \
        --function-name websocket-connect-${RANDOM_SUFFIX}
    
@@ -1199,7 +1199,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
 3. **Delete DynamoDB Tables**:
 
    ```bash
-   # Delete DynamoDB tables
+   # Delete DynamoDB tables (data will be permanently lost)
    aws dynamodb delete-table \
        --table-name ${CONNECTIONS_TABLE}
    
@@ -1236,7 +1236,7 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
 5. **Clean up local files**:
 
    ```bash
-   # Remove local files
+   # Remove local files created during deployment
    rm -f *.py *.zip
    
    echo "✅ Cleaned up local files"
@@ -1244,33 +1244,33 @@ echo "✅ Created DynamoDB tables for WebSocket state management"
 
 ## Discussion
 
-This recipe demonstrates a comprehensive WebSocket API implementation that addresses the full lifecycle of real-time application development. The architecture separates concerns between connection management, message routing, and data persistence, enabling scalable and maintainable real-time applications.
+This recipe demonstrates a comprehensive WebSocket API implementation that addresses the full lifecycle of real-time application development using AWS managed services. The architecture separates concerns between connection management, message routing, and data persistence, enabling scalable and maintainable real-time applications that follow [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles.
 
-**Connection Lifecycle Management**: The $connect and $disconnect route handlers provide sophisticated connection state management with authentication, room assignment, and graceful cleanup. The DynamoDB-based connection storage enables horizontal scaling and connection state persistence across Lambda function invocations. The implementation includes connection validation, stale connection cleanup, and comprehensive error handling.
+**Connection Lifecycle Management**: The $connect and $disconnect route handlers provide sophisticated connection state management with authentication, room assignment, and graceful cleanup. The DynamoDB-based connection storage enables horizontal scaling and connection state persistence across Lambda function invocations. The implementation includes connection validation, stale connection cleanup, and comprehensive error handling that follows [WebSocket API best practices](https://docs.aws.amazon.com/apigateway/latest/developerguide/websocket-api-route-keys-connect-disconnect.html).
 
-**Advanced Message Routing**: The route-based message handling enables different processing logic for various message types including chat messages, room management, private messaging, and administrative commands. The route selection expression (`$request.body.type`) provides automatic routing based on message content, reducing complexity in the Lambda handlers while enabling extensible message type support.
+**Advanced Message Routing**: The route-based message handling enables different processing logic for various message types including chat messages, room management, private messaging, and administrative commands. The route selection expression (`$request.body.type`) provides automatic routing based on message content, reducing complexity in the Lambda handlers while enabling extensible message type support as documented in the [WebSocket routing guide](https://docs.aws.amazon.com/apigateway/latest/developerguide/websocket-api-develop-routes.html).
 
-**Real-Time Broadcasting Patterns**: The implementation demonstrates efficient broadcasting mechanisms for room-based messaging, private messaging, and system notifications. The DynamoDB Global Secondary Indexes enable fast queries for room membership and user lookup, while the API Gateway Management API provides reliable message delivery with automatic connection cleanup for disconnected clients.
+**Real-Time Broadcasting Patterns**: The implementation demonstrates efficient broadcasting mechanisms for room-based messaging, private messaging, and system notifications. The DynamoDB Global Secondary Indexes enable fast queries for room membership and user lookup, while the API Gateway Management API provides reliable message delivery with automatic connection cleanup for disconnected clients. This approach follows [DynamoDB access patterns](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/best-practices.html) for optimal performance.
 
-> **Warning**: Be mindful of DynamoDB read/write capacity when scaling to thousands of concurrent connections. Consider using on-demand billing or implementing connection pooling strategies to manage costs effectively.
+> **Warning**: Be mindful of DynamoDB read/write capacity when scaling to thousands of concurrent connections. Consider using on-demand billing or implementing connection pooling strategies to manage costs effectively as outlined in the [DynamoDB cost optimization guide](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/CostOptimization.html).
 
-**Scalability and Performance**: WebSocket APIs on API Gateway automatically scale to handle thousands of concurrent connections without server management. The Lambda-based handlers scale independently based on message volume, while DynamoDB provides consistent performance for connection state and message storage. The architecture supports horizontal scaling patterns for large-scale real-time applications.
+**Scalability and Performance**: WebSocket APIs on API Gateway automatically scale to handle thousands of concurrent connections without server management. The Lambda-based handlers scale independently based on message volume, while DynamoDB provides consistent performance for connection state and message storage. The architecture supports horizontal scaling patterns for large-scale real-time applications following [serverless application patterns](https://docs.aws.amazon.com/lambda/latest/dg/best-practices.html).
 
-> **Tip**: Implement connection heartbeat mechanisms using ping/pong messages to detect and clean up zombie connections that may not trigger the $disconnect route properly.
+> **Tip**: Implement connection heartbeat mechanisms using ping/pong messages to detect and clean up zombie connections that may not trigger the $disconnect route properly. This ensures accurate connection state and prevents resource leaks.
 
 ## Challenge
 
 Extend this WebSocket API by implementing these advanced features:
 
-1. **Authentication and Authorization**: Integrate with Amazon Cognito User Pools for JWT token validation, implement role-based access control for rooms, and add user permissions management for administrative functions.
+1. **Authentication and Authorization**: Integrate with Amazon Cognito User Pools for JWT token validation, implement role-based access control for rooms, and add user permissions management for administrative functions using [Cognito authentication patterns](https://docs.aws.amazon.com/cognito/latest/devguide/authentication.html).
 
-2. **Message Persistence and History**: Implement message history retrieval with pagination, message search functionality, and archival strategies for long-term message storage using S3 and DynamoDB TTL.
+2. **Message Persistence and History**: Implement message history retrieval with pagination, message search functionality, and archival strategies for long-term message storage using S3 and DynamoDB TTL following [data lifecycle patterns](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html).
 
-3. **Advanced Room Management**: Create hierarchical room structures, implement private/public room visibility, add room moderation features, and support for room-based permissions and user roles.
+3. **Advanced Room Management**: Create hierarchical room structures, implement private/public room visibility, add room moderation features, and support for room-based permissions and user roles with comprehensive access control.
 
-4. **Real-Time Presence and Status**: Implement user presence indicators (online/offline/away), typing indicators for chat applications, and user activity tracking with automatic status updates.
+4. **Real-Time Presence and Status**: Implement user presence indicators (online/offline/away), typing indicators for chat applications, and user activity tracking with automatic status updates using event-driven patterns.
 
-5. **Integration with External Services**: Add webhook support for external system integration, implement message queuing with SQS for reliable delivery, and create notification systems using SNS for offline users.
+5. **Integration with External Services**: Add webhook support for external system integration, implement message queuing with SQS for reliable delivery, and create notification systems using SNS for offline users following [event-driven architecture patterns](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-event-patterns.html).
 
 ## Infrastructure Code
 

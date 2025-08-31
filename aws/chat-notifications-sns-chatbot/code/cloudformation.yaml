@@ -1,0 +1,602 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Chat Notifications with SNS and Chatbot - Creates an SNS topic with encryption
+  and a CloudWatch alarm for demonstrating real-time notifications to Slack/Teams
+  channels via AWS Chatbot integration. This template follows AWS Well-Architected
+  Framework principles with least privilege IAM, encryption, and comprehensive monitoring.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: team-notifications
+    Description: Name prefix for all resources (lowercase, hyphens only)
+    AllowedPattern: ^[a-z][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Must start with a letter, contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name for resource tagging and naming
+
+  SNSTopicDisplayName:
+    Type: String
+    Default: Team Notifications Topic
+    Description: Display name for the SNS topic
+    MaxLength: 100
+    MinLength: 1
+
+  EnableSNSEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable server-side encryption for SNS topic using AWS managed KMS key
+
+  CloudWatchAlarmThreshold:
+    Type: Number
+    Default: 1.0
+    MinValue: 0.1
+    MaxValue: 100.0
+    Description: CPU utilization threshold for demo CloudWatch alarm (percent)
+
+  CloudWatchAlarmPeriod:
+    Type: Number
+    Default: 300
+    AllowedValues: [60, 300, 900, 3600]
+    Description: Period in seconds for CloudWatch alarm evaluation
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address for SNS notifications (leave empty to skip)
+    AllowedPattern: ^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address or empty
+
+  CreateCloudWatchDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Create a CloudWatch dashboard for monitoring notifications
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  EnableEncryption: !Equals [!Ref EnableSNSEncryption, 'true']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  IsProdEnvironment: !Equals [!Ref Environment, 'prod']
+  CreateDashboard: !Equals [!Ref CreateCloudWatchDashboard, 'true']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # SNS Topic for team notifications
+  TeamNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}'
+      DisplayName: !Ref SNSTopicDisplayName
+      KmsMasterKeyId: !If
+        - EnableEncryption
+        - alias/aws/sns
+        - !Ref AWS::NoValue
+      # Enable delivery status logging for troubleshooting
+      DeliveryStatusLogging:
+        - Protocol: application
+          SuccessFeedbackRoleArn: !GetAtt SNSDeliveryStatusRole.Arn
+          FailureFeedbackRoleArn: !GetAtt SNSDeliveryStatusRole.Arn
+          SuccessFeedbackSampleRate: 100
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-topic'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ChatNotifications
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Recipe
+          Value: chat-notifications-sns-chatbot
+
+  # SNS Topic Policy for secure access
+  TeamNotificationsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref TeamNotificationsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: TeamNotificationsTopicPolicy
+        Statement:
+          # Allow CloudWatch Alarms to publish to topic
+          - Sid: AllowCloudWatchAlarmsPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref TeamNotificationsTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          
+          # Allow EventBridge to publish event notifications
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref TeamNotificationsTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          
+          # Allow AWS Chatbot to subscribe to topic
+          - Sid: AllowChatbotSubscribe
+            Effect: Allow
+            Principal:
+              Service: chatbot.amazonaws.com
+            Action:
+              - sns:Subscribe
+              - sns:Receive
+            Resource: !Ref TeamNotificationsTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+          # Allow account owner full control
+          - Sid: AllowAccountOwnerFullControl
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'sns:*'
+            Resource: !Ref TeamNotificationsTopic
+
+  # IAM Role for SNS delivery status logging
+  SNSDeliveryStatusRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-sns-delivery-role'
+      Description: !Sub 'IAM role for SNS delivery status logging - ${ProjectName} ${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/SNSLogsDeliveryRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-sns-delivery-role'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SNSDeliveryStatus
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Optional email subscription
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref TeamNotificationsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Demo CloudWatch Alarm for testing notifications
+  DemoCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-demo-cpu-alarm'
+      AlarmDescription: !Sub 'Demo CPU alarm for testing chat notifications - triggers when CPU < ${CloudWatchAlarmThreshold}%'
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: !Ref CloudWatchAlarmPeriod
+      EvaluationPeriods: 1
+      Threshold: !Ref CloudWatchAlarmThreshold
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref TeamNotificationsTopic
+      OKActions:
+        - !Ref TeamNotificationsTopic
+      InsufficientDataActions: []
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-demo-alarm'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: TestingNotifications
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Alarm for SNS topic failures
+  SNSTopicFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-sns-failures'
+      AlarmDescription: Alert when SNS topic has delivery failures
+      MetricName: NumberOfNotificationsFailed
+      Namespace: AWS/SNS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: TopicName
+          Value: !GetAtt TeamNotificationsTopic.TopicName
+      AlarmActions:
+        - !Ref TeamNotificationsTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-sns-failures'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MonitoringSNSFailures
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Log Group for application logs (optional)
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/${ProjectName}/${Environment}/notifications'
+      RetentionInDays: !If
+        - IsProdEnvironment
+        - 30
+        - 7
+      KmsKeyId: !If
+        - EnableEncryption
+        - !GetAtt LogGroupKMSKey.Arn
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-notifications-logs'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ApplicationLogs
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Custom KMS Key for Log Group encryption (if encryption is enabled)
+  LogGroupKMSKey:
+    Type: AWS::KMS::Key
+    Condition: EnableEncryption
+    Properties:
+      Description: !Sub 'KMS key for ${ProjectName} ${Environment} log group encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIAMRootPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/${ProjectName}/${Environment}/notifications'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-logs-key'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: LogGroupEncryption
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # KMS Key Alias for easier reference
+  LogGroupKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: EnableEncryption
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}-logs'
+      TargetKeyId: !Ref LogGroupKMSKey
+
+  # Custom CloudWatch Dashboard for monitoring
+  NotificationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-notifications'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${TeamNotificationsTopic.TopicName}", {"label": "Messages Published"}],
+                  [".", "NumberOfNotificationsFailed", ".", ".", {"label": "Delivery Failures"}],
+                  [".", "NumberOfNotificationsDelivered", ".", ".", {"label": "Successful Deliveries"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "SNS Topic Metrics - ${ProjectName} ${Environment}",
+                "period": 300,
+                "stat": "Sum",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/CloudWatch", "AlarmState", "AlarmName", "${DemoCPUAlarm}", {"label": "Demo CPU Alarm"}],
+                  [".", ".", ".", "${SNSTopicFailureAlarm}", {"label": "SNS Failures Alarm"}]
+                ],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "Alarm States",
+                "period": 300,
+                "stat": "Maximum"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/${ProjectName}/${Environment}/notifications'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Notification Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # SNS Topic Information
+  SNSTopicArn:
+    Description: ARN of the SNS topic for team notifications
+    Value: !Ref TeamNotificationsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  SNSTopicName:
+    Description: Name of the SNS topic
+    Value: !GetAtt TeamNotificationsTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicName'
+
+  # CloudWatch Alarm Information
+  CloudWatchAlarmName:
+    Description: Name of the demo CloudWatch alarm
+    Value: !Ref DemoCPUAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmName'
+
+  CloudWatchAlarmArn:
+    Description: ARN of the demo CloudWatch alarm
+    Value: !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${DemoCPUAlarm}'
+
+  SNSFailureAlarmName:
+    Description: Name of the SNS failure monitoring alarm
+    Value: !Ref SNSTopicFailureAlarm
+
+  # Dashboard Information
+  CloudWatchDashboardURL:
+    Condition: CreateDashboard
+    Description: URL to the CloudWatch dashboard for monitoring notifications
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${NotificationsDashboard}'
+
+  # Log Group Information
+  ApplicationLogGroupName:
+    Description: Name of the CloudWatch log group for application logs
+    Value: !Ref ApplicationLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  ApplicationLogGroupArn:
+    Description: ARN of the CloudWatch log group for application logs
+    Value: !GetAtt ApplicationLogGroup.Arn
+
+  # KMS Key Information (if encryption is enabled)
+  LogGroupKMSKeyId:
+    Condition: EnableEncryption
+    Description: KMS Key ID for log group encryption
+    Value: !Ref LogGroupKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupKMSKeyId'
+
+  LogGroupKMSKeyAlias:
+    Condition: EnableEncryption
+    Description: KMS Key alias for log group encryption
+    Value: !Ref LogGroupKMSKeyAlias
+
+  # Setup Instructions
+  ChatbotSetupURL:
+    Description: AWS Chatbot console URL for manual setup
+    Value: https://console.aws.amazon.com/chatbot/
+
+  NextSteps:
+    Description: Manual configuration steps required after stack deployment
+    Value: !Sub |
+      1. Visit AWS Chatbot Console: https://console.aws.amazon.com/chatbot/
+      2. Configure Slack/Teams workspace integration
+      3. Create channel configuration with SNS topic: ${TeamNotificationsTopic}
+      4. Test notifications using the TestNotificationCommand output
+
+  # Testing Commands
+  TestNotificationCommand:
+    Description: AWS CLI command to test notifications
+    Value: !Sub |
+      aws sns publish --topic-arn ${TeamNotificationsTopic} --subject "Test Alert: ${ProjectName} ${Environment}" --message "Testing chat notifications from CloudFormation stack ${AWS::StackName} - $(date)"
+
+  ManualAlarmTriggerCommand:
+    Description: AWS CLI command to manually trigger the demo alarm state change
+    Value: !Sub |
+      aws cloudwatch set-alarm-state --alarm-name ${DemoCPUAlarm} --state-value ALARM --state-reason "Manual test trigger from CloudFormation deployment"
+
+  # Resource Summary
+  ResourceSummary:
+    Description: Summary of deployed resources
+    Value: !Sub |
+      Stack: ${AWS::StackName}
+      SNS Topic: ${TeamNotificationsTopic.TopicName}
+      Demo Alarm: ${DemoCPUAlarm}
+      Log Group: ${ApplicationLogGroup}
+      Dashboard: ${!If [CreateDashboard, !Ref NotificationsDashboard, "Not Created"]}
+      Environment: ${Environment}
+
+  # Cost Optimization Information
+  CostOptimizationTips:
+    Description: Tips for optimizing costs
+    Value: !Sub |
+      - SNS charges $0.50 per 1M messages (first 1M free)
+      - CloudWatch alarms cost $0.10 per month each
+      - Log retention set to ${!If [IsProdEnvironment, "30", "7"]} days for ${Environment}
+      - Consider using CloudWatch Logs Insights for log analysis
+      - Review alarm thresholds to avoid false positives
+
+# =============================================================================
+# METADATA (Additional)
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Project Configuration
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: SNS Topic Configuration
+        Parameters:
+          - SNSTopicDisplayName
+          - EnableSNSEncryption
+          - NotificationEmail
+      - Label:
+          default: CloudWatch Configuration
+        Parameters:
+          - CloudWatchAlarmThreshold
+          - CloudWatchAlarmPeriod
+          - CreateCloudWatchDashboard
+    ParameterLabels:
+      ProjectName:
+        default: Project Name
+      Environment:
+        default: Environment
+      SNSTopicDisplayName:
+        default: SNS Topic Display Name
+      EnableSNSEncryption:
+        default: Enable SNS Encryption
+      NotificationEmail:
+        default: Notification Email (Optional)
+      CloudWatchAlarmThreshold:
+        default: CPU Alarm Threshold (%)
+      CloudWatchAlarmPeriod:
+        default: Alarm Evaluation Period (seconds)
+      CreateCloudWatchDashboard:
+        default: Create CloudWatch Dashboard
+
+  # Recipe Information
+  Recipe:
+    Title: Chat Notifications with SNS and Chatbot
+    Version: 1.1
+    Difficulty: 100
+    Services: SNS, Chatbot, CloudWatch
+    EstimatedCost: $0.50-$2.00 per month
+    Category: serverless
+    
+  # Template Documentation
+  Documentation:
+    Description: |
+      This CloudFormation template creates the infrastructure for real-time chat 
+      notifications using AWS SNS and AWS Chatbot. It includes an encrypted SNS topic,
+      CloudWatch alarms for testing and monitoring, IAM roles with least privilege access,
+      and a comprehensive monitoring dashboard. Manual configuration of AWS Chatbot is 
+      required after stack deployment.
+    
+    SecurityFeatures: |
+      - SNS topic encryption with AWS managed KMS key
+      - Custom KMS key for CloudWatch Logs encryption
+      - Least privilege IAM policies with account restrictions
+      - Cross-service access controls with source account conditions
+      - Comprehensive resource tagging for governance
+    
+    BestPractices: |
+      - All resources tagged for governance and cost allocation
+      - Parameterized for multi-environment deployment
+      - Conditional logic for optional features and environments
+      - Comprehensive outputs for integration and troubleshooting
+      - CloudWatch dashboard and alarms for operational monitoring
+      - Log retention policies optimized by environment
+      - KMS key aliases for easier key management
+    
+    ManualSteps: |
+      After deploying this stack, you must manually configure AWS Chatbot:
+      1. Open AWS Chatbot Console (URL provided in outputs)
+      2. Configure your chat platform (Slack/Teams) workspace integration
+      3. Create channel configuration and subscribe to the created SNS topic
+      4. Test notifications using the CLI commands provided in outputs
+      5. Optionally customize guardrail policies for enhanced security

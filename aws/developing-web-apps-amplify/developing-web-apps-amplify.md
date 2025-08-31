@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: amplify, lambda, apigateway, cognito
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: lambda,serverless
 recipe-generator-version: 1.3
 ---
 
 # Developing Web Apps with Amplify and Lambda
-
 
 ## Problem
 
@@ -66,7 +65,6 @@ graph TB
     CICD --> HOSTING
     
     style LAMBDA fill:#FF9900
-    style AMPLIFY fill:#FF9900
     style CDN fill:#3F8624
     style APIGW fill:#FF4B4B
 ```
@@ -75,7 +73,7 @@ graph TB
 
 1. AWS account with appropriate permissions for Amplify, Lambda, API Gateway, and Cognito
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
-3. Node.js (v14 or later) and npm installed locally
+3. Node.js (v18 or later) and npm installed locally
 4. Git installed and configured
 5. Basic knowledge of JavaScript, React, and RESTful APIs
 6. Estimated cost: $5-15 per month for development workloads
@@ -115,6 +113,8 @@ cd frontend
 # Install Amplify CLI and libraries
 npm install -g @aws-amplify/cli
 npm install aws-amplify @aws-amplify/ui-react
+
+echo "✅ AWS environment configured"
 ```
 
 ## Steps
@@ -146,12 +146,17 @@ npm install aws-amplify @aws-amplify/ui-react
 
    ```bash
    # Create Lambda function directory
-   mkdir -p amplify/backend/function/${LAMBDA_FUNCTION_NAME}
+   mkdir -p amplify/backend/function/${LAMBDA_FUNCTION_NAME}/src
    
    # Create function source code
    cat > amplify/backend/function/${LAMBDA_FUNCTION_NAME}/src/index.js << 'EOF'
-   const AWS = require('aws-sdk');
-   const dynamodb = new AWS.DynamoDB.DocumentClient();
+   const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+   const { DynamoDBDocumentClient, ScanCommand, PutCommand, \
+       UpdateCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
+   const { randomUUID } = require('crypto');
+   
+   const client = new DynamoDBClient({ region: process.env.AWS_REGION });
+   const dynamodb = DynamoDBDocumentClient.from(client);
    
    exports.handler = async (event) => {
        console.log('Event:', JSON.stringify(event, null, 2));
@@ -159,19 +164,29 @@ npm install aws-amplify @aws-amplify/ui-react
        const { httpMethod, path, body } = event;
        const tableName = process.env.STORAGE_TODOLIST_NAME;
        
+       const headers = {
+           'Content-Type': 'application/json',
+           'Access-Control-Allow-Origin': '*',
+           'Access-Control-Allow-Headers': 'Content-Type',
+           'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+       };
+       
        try {
            switch (httpMethod) {
                case 'GET':
-                   return await getTodos(tableName);
+                   return await getTodos(tableName, headers);
                case 'POST':
-                   return await createTodo(tableName, JSON.parse(body));
+                   return await createTodo(tableName, JSON.parse(body), headers);
                case 'PUT':
-                   return await updateTodo(tableName, JSON.parse(body));
+                   return await updateTodo(tableName, JSON.parse(body), headers);
                case 'DELETE':
-                   return await deleteTodo(tableName, event.pathParameters.id);
+                   return await deleteTodo(tableName, event.pathParameters.id, headers);
+               case 'OPTIONS':
+                   return { statusCode: 200, headers };
                default:
                    return {
                        statusCode: 405,
+                       headers,
                        body: JSON.stringify({ error: 'Method not allowed' })
                    };
            }
@@ -179,50 +194,45 @@ npm install aws-amplify @aws-amplify/ui-react
            console.error('Error:', error);
            return {
                statusCode: 500,
+               headers,
                body: JSON.stringify({ error: 'Internal server error' })
            };
        }
    };
    
-   async function getTodos(tableName) {
-       const result = await dynamodb.scan({
+   async function getTodos(tableName, headers) {
+       const result = await dynamodb.send(new ScanCommand({
            TableName: tableName
-       }).promise();
+       }));
        
        return {
            statusCode: 200,
-           headers: {
-               'Content-Type': 'application/json',
-               'Access-Control-Allow-Origin': '*'
-           },
-           body: JSON.stringify(result.Items)
+           headers,
+           body: JSON.stringify(result.Items || [])
        };
    }
    
-   async function createTodo(tableName, todo) {
+   async function createTodo(tableName, todo, headers) {
        const item = {
-           id: AWS.util.uuid.v4(),
+           id: randomUUID(),
            ...todo,
            createdAt: new Date().toISOString()
        };
        
-       await dynamodb.put({
+       await dynamodb.send(new PutCommand({
            TableName: tableName,
            Item: item
-       }).promise();
+       }));
        
        return {
            statusCode: 201,
-           headers: {
-               'Content-Type': 'application/json',
-               'Access-Control-Allow-Origin': '*'
-           },
+           headers,
            body: JSON.stringify(item)
        };
    }
    
-   async function updateTodo(tableName, todo) {
-       await dynamodb.update({
+   async function updateTodo(tableName, todo, headers) {
+       await dynamodb.send(new UpdateCommand({
            TableName: tableName,
            Key: { id: todo.id },
            UpdateExpression: 'SET #title = :title, #completed = :completed',
@@ -234,29 +244,24 @@ npm install aws-amplify @aws-amplify/ui-react
                ':title': todo.title,
                ':completed': todo.completed
            }
-       }).promise();
+       }));
        
        return {
            statusCode: 200,
-           headers: {
-               'Content-Type': 'application/json',
-               'Access-Control-Allow-Origin': '*'
-           },
+           headers,
            body: JSON.stringify(todo)
        };
    }
    
-   async function deleteTodo(tableName, id) {
-       await dynamodb.delete({
+   async function deleteTodo(tableName, id, headers) {
+       await dynamodb.send(new DeleteCommand({
            TableName: tableName,
            Key: { id }
-       }).promise();
+       }));
        
        return {
            statusCode: 204,
-           headers: {
-               'Access-Control-Allow-Origin': '*'
-           }
+           headers
        };
    }
    EOF
@@ -264,51 +269,39 @@ npm install aws-amplify @aws-amplify/ui-react
    echo "✅ Lambda function code created"
    ```
 
-   The Lambda function implements a complete CRUD API using the AWS SDK for DynamoDB operations. The function handles HTTP method routing, implements proper error handling, and includes CORS headers for browser compatibility. This serverless approach eliminates the need for server provisioning, load balancing, or capacity planning while providing automatic scaling and fault tolerance.
+   The Lambda function implements a complete CRUD API using AWS SDK v3 for DynamoDB operations. The function handles HTTP method routing, implements proper error handling, and includes CORS headers for browser compatibility. This serverless approach eliminates the need for server provisioning, load balancing, or capacity planning while providing automatic scaling and fault tolerance.
 
-3. **Configure API Gateway Integration**:
-
-   Amazon API Gateway provides a fully managed service for creating, deploying, and managing REST APIs at scale. It handles request routing, authentication, authorization, throttling, and monitoring while integrating seamlessly with Lambda functions. API Gateway also provides features like request/response transformation, caching, and SDK generation for client applications.
+3. **Create Lambda Function Configuration**:
 
    ```bash
-   # Add API Gateway configuration
-   amplify add api
-   
-   # Configure REST API with Lambda integration
-   cat > amplify/backend/api/${APP_NAME}/template.json << EOF
+   # Create Lambda function configuration
+   cat > amplify/backend/function/${LAMBDA_FUNCTION_NAME}/function-parameters.json << EOF
    {
-       "AWSTemplateFormatVersion": "2010-09-09",
-       "Parameters": {
-           "AppSyncApiName": {
-               "Type": "String"
-           },
-           "DynamoDBBillingMode": {
-               "Type": "String",
-               "Default": "PAY_PER_REQUEST"
-           },
-           "env": {
-               "Type": "String"
+       "permissions": {
+           "storage": {
+               "todolist": ["read", "write"]
            }
        },
-       "Resources": {
-           "TodoApi": {
-               "Type": "AWS::ApiGateway::RestApi",
-               "Properties": {
-                   "Name": "${APP_NAME}-api",
-                   "Description": "REST API for Todo application",
-                   "EndpointConfiguration": {
-                       "Types": ["REGIONAL"]
-                   }
-               }
-           }
+       "runtime": "nodejs20.x"
+   }
+   EOF
+   
+   # Create package.json for Lambda function
+   cat > amplify/backend/function/${LAMBDA_FUNCTION_NAME}/src/package.json << 'EOF'
+   {
+       "name": "todo-api",
+       "version": "1.0.0",
+       "description": "Todo API Lambda function",
+       "main": "index.js",
+       "dependencies": {
+           "@aws-sdk/client-dynamodb": "^3.0.0",
+           "@aws-sdk/lib-dynamodb": "^3.0.0"
        }
    }
    EOF
    
-   echo "✅ API Gateway configuration created"
+   echo "✅ Lambda function configuration created"
    ```
-
-   This CloudFormation template defines the API Gateway REST API that will serve as the HTTP interface for our Lambda functions. The regional endpoint configuration optimizes for lower latency within the AWS region while the API Gateway handles all the complexity of HTTP request processing, routing, and Lambda function invocation.
 
 4. **Create React Frontend Components**:
 
@@ -321,6 +314,7 @@ npm install aws-amplify @aws-amplify/ui-react
    import { Amplify } from 'aws-amplify';
    import { withAuthenticator } from '@aws-amplify/ui-react';
    import '@aws-amplify/ui-react/styles.css';
+   import { fetchAuthSession } from 'aws-amplify/auth';
    import awsExports from './aws-exports';
    import TodoList from './components/TodoList';
    import './App.css';
@@ -337,16 +331,34 @@ npm install aws-amplify @aws-amplify/ui-react
    function App({ signOut, user }: any) {
        const [todos, setTodos] = useState<Todo[]>([]);
        const [loading, setLoading] = useState(true);
+       const [apiEndpoint, setApiEndpoint] = useState('');
    
        useEffect(() => {
+           const getApiEndpoint = () => {
+               const config = Amplify.getConfig();
+               return config.API?.REST?.api?.endpoint || '';
+           };
+           
+           setApiEndpoint(getApiEndpoint());
            fetchTodos();
        }, []);
    
        const fetchTodos = async () => {
            try {
-               const response = await fetch('/api/todos');
-               const data = await response.json();
-               setTodos(data);
+               const session = await fetchAuthSession();
+               const token = session.tokens?.idToken?.toString();
+               
+               const response = await fetch(`${apiEndpoint}/todos`, {
+                   headers: {
+                       'Authorization': `Bearer ${token}`,
+                       'Content-Type': 'application/json'
+                   }
+               });
+               
+               if (response.ok) {
+                   const data = await response.json();
+                   setTodos(data);
+               }
            } catch (error) {
                console.error('Error fetching todos:', error);
            } finally {
@@ -356,15 +368,22 @@ npm install aws-amplify @aws-amplify/ui-react
    
        const createTodo = async (title: string) => {
            try {
-               const response = await fetch('/api/todos', {
+               const session = await fetchAuthSession();
+               const token = session.tokens?.idToken?.toString();
+               
+               const response = await fetch(`${apiEndpoint}/todos`, {
                    method: 'POST',
                    headers: {
+                       'Authorization': `Bearer ${token}`,
                        'Content-Type': 'application/json',
                    },
                    body: JSON.stringify({ title, completed: false }),
                });
-               const newTodo = await response.json();
-               setTodos([...todos, newTodo]);
+               
+               if (response.ok) {
+                   const newTodo = await response.json();
+                   setTodos([...todos, newTodo]);
+               }
            } catch (error) {
                console.error('Error creating todo:', error);
            }
@@ -372,18 +391,24 @@ npm install aws-amplify @aws-amplify/ui-react
    
        const updateTodo = async (id: string, updates: Partial<Todo>) => {
            try {
+               const session = await fetchAuthSession();
+               const token = session.tokens?.idToken?.toString();
                const todo = todos.find(t => t.id === id);
                if (!todo) return;
    
-               const response = await fetch(`/api/todos/${id}`, {
+               const response = await fetch(`${apiEndpoint}/todos/${id}`, {
                    method: 'PUT',
                    headers: {
+                       'Authorization': `Bearer ${token}`,
                        'Content-Type': 'application/json',
                    },
                    body: JSON.stringify({ ...todo, ...updates }),
                });
-               const updatedTodo = await response.json();
-               setTodos(todos.map(t => t.id === id ? updatedTodo : t));
+               
+               if (response.ok) {
+                   const updatedTodo = await response.json();
+                   setTodos(todos.map(t => t.id === id ? updatedTodo : t));
+               }
            } catch (error) {
                console.error('Error updating todo:', error);
            }
@@ -391,10 +416,19 @@ npm install aws-amplify @aws-amplify/ui-react
    
        const deleteTodo = async (id: string) => {
            try {
-               await fetch(`/api/todos/${id}`, {
+               const session = await fetchAuthSession();
+               const token = session.tokens?.idToken?.toString();
+               
+               const response = await fetch(`${apiEndpoint}/todos/${id}`, {
                    method: 'DELETE',
+                   headers: {
+                       'Authorization': `Bearer ${token}`,
+                   },
                });
-               setTodos(todos.filter(t => t.id !== id));
+               
+               if (response.ok) {
+                   setTodos(todos.filter(t => t.id !== id));
+               }
            } catch (error) {
                console.error('Error deleting todo:', error);
            }
@@ -733,66 +767,27 @@ npm install aws-amplify @aws-amplify/ui-react
 
    The React application is now globally distributed through CloudFront CDN, providing low-latency access for users worldwide. Amplify hosting automatically handles build optimization, asset compression, and cache invalidation, ensuring optimal performance without manual configuration.
 
-9. **Configure Environment Variables and API Integration**:
+9. **Configure Lambda Function Environment Variables**:
+
+   Environment variables enable Lambda functions to access configuration data and resource identifiers without hardcoding values in source code. This approach follows security best practices by keeping resource names and configuration separate from application logic while enabling the same function code to work across different environments (development, staging, production).
 
    ```bash
-   # Get API Gateway endpoint
-   API_ENDPOINT=$(aws apigateway get-rest-apis \
-       --query "items[?name=='${APP_NAME}-api'].id" \
+   # Get DynamoDB table name
+   TABLE_NAME=$(aws dynamodb list-tables \
+       --query "TableNames[?contains(@, '${APP_NAME}')]" \
        --output text)
    
-   # Update environment configuration
-   cat > src/config.ts << EOF
-   export const API_CONFIG = {
-       endpoint: 'https://${API_ENDPOINT}.execute-api.${AWS_REGION}.amazonaws.com/dev',
-       region: '${AWS_REGION}'
-   };
-   EOF
+   # Update Lambda function environment variables
+   aws lambda update-function-configuration \
+       --function-name ${LAMBDA_FUNCTION_NAME} \
+       --environment Variables="{STORAGE_TODOLIST_NAME=${TABLE_NAME}}"
    
-   # Update package.json proxy for development
-   npm pkg set proxy="https://${API_ENDPOINT}.execute-api.${AWS_REGION}.amazonaws.com/dev"
-   
-   echo "✅ API integration configured"
+   echo "✅ Lambda environment variables configured"
    ```
 
-10. **Set up CI/CD Pipeline**:
+   The Lambda function can now dynamically discover and connect to the DynamoDB table created by Amplify. This configuration pattern enables environment-specific deployments while maintaining security and flexibility in resource management.
 
-    ```bash
-    # Create GitHub repository (if using GitHub)
-    # git init
-    # git add .
-    # git commit -m "Initial commit"
-    # git remote add origin <your-repo-url>
-    # git push -u origin main
-    
-    # Configure automatic deployments from Git
-    amplify console
-    
-    # Note: This opens the Amplify console for manual configuration
-    echo "✅ CI/CD pipeline configured"
-    ```
-
-11. **Configure Lambda Function Environment Variables**:
-
-    Environment variables enable Lambda functions to access configuration data and resource identifiers without hardcoding values in source code. This approach follows security best practices by keeping resource names and configuration separate from application logic while enabling the same function code to work across different environments (development, staging, production).
-
-    ```bash
-    # Get DynamoDB table name
-    TABLE_NAME=$(aws dynamodb list-tables \
-        --query "TableNames[?contains(@, '${APP_NAME}')]" \
-        --output text)
-    
-    # Update Lambda function environment variables
-    aws lambda update-function-configuration \
-        --function-name ${LAMBDA_FUNCTION_NAME} \
-        --environment Variables="{STORAGE_TODOLIST_NAME=${TABLE_NAME}}"
-    
-    echo "✅ Lambda environment variables configured"
-    ```
-
-    The Lambda function can now dynamically discover and connect to the DynamoDB table created by Amplify. This configuration pattern enables environment-specific deployments while maintaining security and flexibility in resource management.
-
-12. **Add Monitoring and Logging**:
+10. **Add Monitoring and Logging**:
 
     CloudWatch provides comprehensive monitoring and logging for serverless applications, enabling observability into function performance, error rates, and operational metrics. Setting up proper monitoring is essential for production applications to quickly identify and resolve issues, optimize performance, and maintain service level agreements.
 
@@ -860,11 +855,16 @@ npm install aws-amplify @aws-amplify/ui-react
 3. **Test API Gateway Endpoints**:
 
    ```bash
+   # Get API Gateway endpoint
+   API_ENDPOINT=$(aws apigateway get-rest-apis \
+       --query "items[?name=='${APP_NAME}-api'].id" \
+       --output text)
+   
    # Test GET endpoint
-   curl -X GET "${API_ENDPOINT}/todos"
+   curl -X GET "https://${API_ENDPOINT}.execute-api.${AWS_REGION}.amazonaws.com/dev/todos"
    
    # Test POST endpoint
-   curl -X POST "${API_ENDPOINT}/todos" \
+   curl -X POST "https://${API_ENDPOINT}.execute-api.${AWS_REGION}.amazonaws.com/dev/todos" \
        -H "Content-Type: application/json" \
        -d '{"title":"Test Todo","completed":false}'
    ```
@@ -888,7 +888,7 @@ npm install aws-amplify @aws-amplify/ui-react
    ```bash
    # Test concurrent requests
    for i in {1..10}; do
-       curl -X GET "${API_ENDPOINT}/todos" &
+       curl -X GET "https://${API_ENDPOINT}.execute-api.${AWS_REGION}.amazonaws.com/dev/todos" &
    done
    wait
    
@@ -960,7 +960,9 @@ The architecture follows serverless best practices by implementing event-driven 
 
 Cost optimization is inherent in this serverless approach, as you only pay for actual usage rather than provisioned capacity. Lambda functions scale automatically from zero to thousands of concurrent executions, making this architecture ideal for applications with unpredictable or intermittent traffic patterns. The Amplify hosting service provides global content delivery through CloudFront, ensuring low latency for users worldwide while maintaining cost-effectiveness through automatic optimization.
 
-One of the key advantages of this architecture is the developer experience and deployment velocity it enables. The Amplify CLI streamlines the development workflow by automating resource provisioning, environment management, and deployment processes. Developers can focus on application logic rather than infrastructure concerns, significantly reducing time-to-market for new features and applications.
+One of the key advantages of this architecture is the developer experience and deployment velocity it enables. The Amplify CLI streamlines the development workflow by automating resource provisioning, environment management, and deployment processes. Developers can focus on application logic rather than infrastructure concerns, significantly reducing time-to-market for new features and applications. For comprehensive guidance on serverless best practices, see the [AWS Well-Architected Serverless Applications Lens](https://docs.aws.amazon.com/wellarchitected/latest/serverless-applications-lens/welcome.html).
+
+> **Note**: This architecture aligns with the AWS Well-Architected Framework principles, particularly focusing on operational excellence, security, reliability, performance efficiency, and cost optimization for serverless applications.
 
 ## Challenge
 

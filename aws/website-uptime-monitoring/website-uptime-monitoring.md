@@ -6,10 +6,10 @@ difficulty: 100
 subject: aws
 services: Route 53, CloudWatch, SNS
 estimated-time: 60 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: monitoring, uptime, health-checks, alerting, availability
 recipe-generator-version: 1.3
@@ -240,7 +240,6 @@ echo "✅ Notifications will be sent to: ${MONITOR_EMAIL}"
                            "min": 0,
                            "max": 1
                        }
-                   }
                    }
                }
            },

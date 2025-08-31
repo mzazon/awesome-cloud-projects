@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: CloudFormation Guard, CloudFormation, S3, IAM
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: policy-as-code, compliance, governance, infrastructure-validation, security
 recipe-generator-version: 1.3
@@ -70,7 +70,7 @@ graph TB
 
 1. AWS account with administrative permissions for CloudFormation, S3, and IAM
 2. AWS CLI v2 installed and configured
-3. CloudFormation Guard CLI installed locally ([Installation Guide](https://docs.aws.amazon.com/cfn-guard/latest/ug/setting-up-guard.html))
+3. CloudFormation Guard CLI v3.0+ installed locally ([Installation Guide](https://docs.aws.amazon.com/cfn-guard/latest/ug/setting-up.html))
 4. Basic understanding of CloudFormation templates and policy writing
 5. `jq` command-line JSON processor for report analysis
 6. Estimated cost: $5-10 per month for S3 storage and CloudFormation operations
@@ -522,7 +522,7 @@ echo "✅ AWS environment configured with bucket: ${BUCKET_NAME}"
        Type: AWS::Lambda::Function
        Properties:
          FunctionName: !Sub 'data-processing-${AWS::Region}'
-         Runtime: python3.9
+         Runtime: python3.11
          Handler: index.handler
          Role: !GetAtt LambdaExecutionRole.Arn
          Code:
@@ -588,7 +588,7 @@ echo "✅ AWS environment configured with bucket: ${BUCKET_NAME}"
        Type: AWS::Lambda::Function
        Properties:
          FunctionName: 'unsafe-lambda'
-         Runtime: python3.9
+         Runtime: python3.11
          Handler: index.handler
          Role: !GetAtt UnsafeRole.Arn
          Code:
@@ -670,7 +670,7 @@ echo "✅ AWS environment configured with bucket: ${BUCKET_NAME}"
    
    for rule_file in $(find $RULES_DIR -name "*.guard"); do
        echo "Checking against: $(basename $rule_file)"
-       if ! cfn-guard validate --data $TEMPLATE_FILE --rules $rule_file --show-summary; then
+       if ! cfn-guard validate --data $TEMPLATE_FILE --rules $rule_file --show-summary all; then
            VALIDATION_FAILED=true
        fi
        echo ""
@@ -714,7 +714,7 @@ echo "✅ AWS environment configured with bucket: ${BUCKET_NAME}"
    cfn-guard validate \
        --data compliant-template.yaml \
        --rules local-validation/rules/security/s3-security.guard \
-       --output-format json --show-summary > validation-report.json
+       --output-format json --show-summary all > validation-report.json
    
    # Display summary of validation results
    echo "Validation Summary:"
@@ -766,7 +766,7 @@ echo "✅ AWS environment configured with bucket: ${BUCKET_NAME}"
    for rule_file in $(find /tmp/guard-rules -name "*.guard"); do
        echo "Validating against: $(basename $rule_file)"
        
-       if cfn-guard validate --data $TEMPLATE_FILE --rules $rule_file --show-summary; then
+       if cfn-guard validate --data $TEMPLATE_FILE --rules $rule_file --show-summary all; then
            echo "✅ Validation passed for: $(basename $rule_file)"
            VALIDATION_RESULTS="${VALIDATION_RESULTS}✅ $(basename $rule_file): PASS\n"
        else
@@ -781,7 +781,7 @@ echo "✅ AWS environment configured with bucket: ${BUCKET_NAME}"
    cfn-guard validate \
        --data $TEMPLATE_FILE \
        --rules /tmp/guard-rules/security/s3-security.guard \
-       --output-format json --show-summary > compliance-report.json
+       --output-format json --show-summary all > compliance-report.json
    
    # Upload report to S3 with timestamp
    TIMESTAMP=$(date +%Y%m%d-%H%M%S)
@@ -849,7 +849,7 @@ echo "✅ AWS environment configured with bucket: ${BUCKET_NAME}"
    # Test individual rule files
    cfn-guard validate --data compliant-template.yaml \
        --rules local-validation/rules/security/s3-security.guard \
-       --show-summary
+       --show-summary all
    ```
 
    Expected output: Compliant template passes all rules, non-compliant template fails with specific policy violations identified.
@@ -953,9 +953,9 @@ The integration of Guard rules with S3 storage creates a scalable governance mod
 
 The shift-left approach implemented through local validation and CI/CD integration significantly reduces the cost of compliance by catching violations early in the development cycle. This approach transforms compliance from a reactive audit process into a proactive development practice that guides teams toward secure and compliant infrastructure patterns. The automated validation pipeline ensures that governance policies are consistently enforced without manual intervention, reducing the risk of human error and improving overall security posture.
 
-Performance considerations include the minimal overhead of Guard validation compared to the significant cost of post-deployment remediation. Guard rules execute quickly and can be parallelized across multiple rule files, making them suitable for integration into fast-paced CI/CD pipelines. The JSON reporting format enables integration with existing monitoring and alerting systems, providing comprehensive visibility into compliance status across the organization.
+CloudFormation Guard v3.0+ provides enhanced performance and reliability compared to earlier versions, with improved parsing capabilities and expanded rule syntax that enables more sophisticated policy definitions. The JSON reporting format enables integration with existing monitoring and alerting systems, providing comprehensive visibility into compliance status across the organization. Additionally, the built-in test framework ensures that policy rules remain accurate and effective as infrastructure patterns evolve.
 
-> **Tip**: Use CloudFormation Guard's built-in testing framework to validate rule changes before deployment. This ensures that policy updates don't introduce unintended consequences or break existing validation workflows.
+> **Warning**: Ensure CloudFormation Guard CLI version 3.0+ is installed for compatibility with the latest rule syntax and features. Older versions may not support all validation options used in this recipe.
 
 For comprehensive implementation guidance, refer to the [CloudFormation Guard User Guide](https://docs.aws.amazon.com/cfn-guard/latest/ug/what-is-guard.html), [AWS CloudFormation Best Practices](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/best-practices.html), and the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html). Additional examples and community-contributed rules are available in the [CloudFormation Guard GitHub repository](https://github.com/aws-cloudformation/cloudformation-guard), and practical CI/CD integration patterns are demonstrated in the [AWS DevOps Blog](https://aws.amazon.com/blogs/devops/).
 

@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure AI Vision, Azure AI Search, Azure Storage, Azure Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ai-vision, cognitive-search, image-analysis, vector-search, content-discovery, semantic-search
 recipe-generator-version: 1.3
@@ -66,9 +66,9 @@ graph TB
 
 ## Prerequisites
 
-1. Azure subscription with Cognitive Services and Search service permissions
-2. Azure CLI v2.0 or later installed and configured
-3. Basic understanding of Azure AI services and search concepts
+1. Azure subscription with Azure AI Vision and Azure AI Search service permissions
+2. Azure CLI version 2.51.0 or later installed and configured
+3. Basic understanding of Azure AI services and vector search concepts
 4. Familiarity with REST APIs and JSON processing
 5. Estimated cost: $30-50 for running this tutorial (delete resources after completion)
 
@@ -77,23 +77,23 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for resource management
-export RESOURCE_GROUP="rg-image-discovery-demo"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-recipe-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
-# Generate unique identifiers for resource names
+# Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
 export STORAGE_ACCOUNT="stgimgdiscov${RANDOM_SUFFIX}"
 export VISION_SERVICE="aivision-imgdiscov-${RANDOM_SUFFIX}"
 export SEARCH_SERVICE="aisearch-imgdiscov-${RANDOM_SUFFIX}"
 export FUNCTION_APP="func-imgdiscov-${RANDOM_SUFFIX}"
 
-# Create resource group for all components
+# Create resource group
 az group create \
     --name ${RESOURCE_GROUP} \
     --location ${LOCATION} \
-    --tags purpose=image-discovery environment=demo
+    --tags purpose=recipe environment=demo
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
 echo "✅ Environment variables configured"
@@ -203,7 +203,7 @@ echo "✅ Environment variables configured"
        --storage-account ${STORAGE_ACCOUNT} \
        --consumption-plan-location ${LOCATION} \
        --runtime python \
-       --runtime-version 3.11 \
+       --runtime-version 3.12 \
        --functions-version 4 \
        --os-type Linux
    
@@ -232,7 +232,7 @@ echo "✅ Environment variables configured"
    curl -X POST "${SEARCH_ENDPOINT}/indexes" \
        -H "Content-Type: application/json" \
        -H "api-key: ${SEARCH_KEY}" \
-       -H "api-version: 2024-05-01-preview" \
+       -H "api-version: 2024-07-01" \
        -d '{
      "name": "image-content-index",
      "fields": [
@@ -360,7 +360,7 @@ echo "✅ Environment variables configured"
        # Analyze image with AI Vision
        image_data = myBlob.read()
        
-       # Call AI Vision API
+       # Call AI Vision API (using latest stable version)
        vision_url = f"{vision_endpoint}/vision/v3.2/analyze"
        headers = {
            'Ocp-Apim-Subscription-Key': vision_key,
@@ -465,7 +465,7 @@ echo "✅ Environment variables configured"
        <script>
            async function searchImages() {
                const query = document.getElementById('searchQuery').value;
-               const searchUrl = `${SEARCH_ENDPOINT}/indexes/image-content-index/docs/search?api-version=2024-05-01-preview`;
+               const searchUrl = `${SEARCH_ENDPOINT}/indexes/image-content-index/docs/search?api-version=2024-07-01`;
                
                const response = await fetch(searchUrl, {
                    method: 'POST',
@@ -535,11 +535,11 @@ echo "✅ Environment variables configured"
 
    ```bash
    # Check if documents were indexed
-   curl -X GET "${SEARCH_ENDPOINT}/indexes/image-content-index/docs/count?api-version=2024-05-01-preview" \
+   curl -X GET "${SEARCH_ENDPOINT}/indexes/image-content-index/docs/count?api-version=2024-07-01" \
        -H "api-key: ${SEARCH_KEY}"
    
    # Search for test content
-   curl -X POST "${SEARCH_ENDPOINT}/indexes/image-content-index/docs/search?api-version=2024-05-01-preview" \
+   curl -X POST "${SEARCH_ENDPOINT}/indexes/image-content-index/docs/search?api-version=2024-07-01" \
        -H "Content-Type: application/json" \
        -H "api-key: ${SEARCH_KEY}" \
        -d '{
@@ -552,7 +552,7 @@ echo "✅ Environment variables configured"
 
    ```bash
    # Test semantic search with natural language
-   curl -X POST "${SEARCH_ENDPOINT}/indexes/image-content-index/docs/search?api-version=2024-05-01-preview" \
+   curl -X POST "${SEARCH_ENDPOINT}/indexes/image-content-index/docs/search?api-version=2024-07-01" \
        -H "Content-Type: application/json" \
        -H "api-key: ${SEARCH_KEY}" \
        -d '{
@@ -602,26 +602,30 @@ echo "✅ Environment variables configured"
        --resource-group ${RESOURCE_GROUP} \
        --yes
    
-   # Delete resource group
+   # Delete resource group and all contained resources
    az group delete \
        --name ${RESOURCE_GROUP} \
        --yes \
        --no-wait
    
-   echo "✅ All resources deleted"
+   echo "✅ Resource group deletion initiated: ${RESOURCE_GROUP}"
+   echo "Note: Deletion may take several minutes to complete"
+   
+   # Verify deletion (optional)
+   az group exists --name ${RESOURCE_GROUP}
    ```
 
 ## Discussion
 
-The intelligent image content discovery system demonstrates the powerful combination of Azure AI Vision and Azure AI Search for creating sophisticated content management solutions. Azure AI Vision's advanced image analysis capabilities extract rich metadata including object detection, scene understanding, and OCR text recognition, while Azure AI Search provides enterprise-grade indexing and semantic search capabilities. This integration enables organizations to move beyond traditional file-based search to content-aware discovery systems that understand visual context and meaning. For comprehensive implementation guidance, see the [Azure AI Vision documentation](https://docs.microsoft.com/en-us/azure/cognitive-services/computer-vision/) and [Azure AI Search vector search guide](https://docs.microsoft.com/en-us/azure/search/vector-search-overview).
+The intelligent image content discovery system demonstrates the powerful combination of Azure AI Vision and Azure AI Search for creating sophisticated content management solutions. Azure AI Vision's advanced image analysis capabilities extract rich metadata including object detection, scene understanding, and OCR text recognition, while Azure AI Search provides enterprise-grade indexing and semantic search capabilities. This integration enables organizations to move beyond traditional file-based search to content-aware discovery systems that understand visual context and meaning. For comprehensive implementation guidance, see the [Azure AI Vision documentation](https://learn.microsoft.com/en-us/azure/ai-services/computer-vision/) and [Azure AI Search vector search guide](https://learn.microsoft.com/en-us/azure/search/vector-search-overview).
 
-The event-driven architecture using Azure Functions provides automatic, scalable image processing that responds to storage events in real-time. This serverless approach eliminates infrastructure management while providing cost-effective processing that scales with demand. The combination of blob triggers and cognitive services creates a robust pipeline for continuous content analysis and indexing. Azure Functions' integration with storage and AI services follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of reliability and operational excellence.
+The event-driven architecture using Azure Functions provides automatic, scalable image processing that responds to storage events in real-time. This serverless approach eliminates infrastructure management while providing cost-effective processing that scales with demand. The combination of blob triggers and cognitive services creates a robust pipeline for continuous content analysis and indexing. Azure Functions' integration with storage and AI services follows the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) principles of reliability and operational excellence.
 
 Vector search capabilities in Azure AI Search enable semantic similarity matching that goes beyond keyword-based search. By generating embeddings from image descriptions and metadata, the system can find visually similar or contextually related images even when they don't share exact keywords. This semantic search approach provides more intuitive and effective content discovery, particularly valuable for creative workflows, digital asset management, and content marketing applications. The hybrid search functionality combines traditional text search with vector search for comprehensive query capabilities.
 
-From a business perspective, this solution addresses critical challenges in digital asset management and content discovery. Organizations can dramatically improve content reuse, reduce duplicate asset creation, and enable more effective content marketing strategies. The system's ability to automatically tag and categorize images reduces manual curation efforts while improving search accuracy. For detailed cost optimization strategies and performance tuning, review the [Azure AI Search performance guide](https://docs.microsoft.com/en-us/azure/search/search-performance-optimization) and [Azure AI Vision best practices](https://docs.microsoft.com/en-us/azure/cognitive-services/computer-vision/concept-recognizing-text).
+From a business perspective, this solution addresses critical challenges in digital asset management and content discovery. Organizations can dramatically improve content reuse, reduce duplicate asset creation, and enable more effective content marketing strategies. The system's ability to automatically tag and categorize images reduces manual curation efforts while improving search accuracy. For detailed cost optimization strategies and performance tuning, review the [Azure AI Search performance guide](https://learn.microsoft.com/en-us/azure/search/search-performance-optimization) and [Azure AI Vision best practices](https://learn.microsoft.com/en-us/azure/ai-services/computer-vision/concept-recognizing-text).
 
-> **Tip**: Implement custom skills in Azure AI Search to extend processing capabilities with domain-specific image analysis. The [Azure AI Search custom skills documentation](https://docs.microsoft.com/en-us/azure/search/cognitive-search-custom-skill-interface) provides guidance on creating specialized processing pipelines for specific industries or use cases.
+> **Tip**: Implement custom skills in Azure AI Search to extend processing capabilities with domain-specific image analysis. The [Azure AI Search custom skills documentation](https://learn.microsoft.com/en-us/azure/search/cognitive-search-custom-skill-interface) provides guidance on creating specialized processing pipelines for specific industries or use cases. Consider using Azure AI Vision 4.0 for improved image analysis capabilities and better performance.
 
 ## Challenge
 

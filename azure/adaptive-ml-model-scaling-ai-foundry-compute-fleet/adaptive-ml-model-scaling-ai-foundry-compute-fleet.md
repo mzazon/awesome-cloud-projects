@@ -6,10 +6,10 @@ difficulty: 400
 subject: azure
 services: Azure AI Foundry, Azure Compute Fleet, Azure Machine Learning, Azure Monitor
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: machine-learning, scaling, compute-fleet, ai-foundry, agents, orchestration, cost-optimization
 recipe-generator-version: 1.3
@@ -23,16 +23,16 @@ Organizations running ML workloads face significant challenges in dynamically sc
 
 ## Solution
 
-Azure AI Foundry Agent Service provides intelligent orchestration capabilities that automatically scale ML compute resources using Azure Compute Fleet based on real-time demand patterns. This solution creates adaptive agents that monitor workload metrics, analyze capacity requirements, and dynamically provision or deprovision compute resources across multiple VM series and availability zones, ensuring optimal cost-performance balance while maintaining high availability.
+Azure AI Foundry provides a comprehensive platform for building intelligent applications with agent capabilities that can monitor ML workload patterns and make scaling decisions. Combined with Azure Compute Fleet's dynamic resource management across multiple VM series and availability zones, this solution creates an adaptive scaling system that automatically provisions or deprovisions compute resources based on real-time demand, ensuring optimal cost-performance balance while maintaining high availability.
 
 ## Architecture Diagram
 
 ```mermaid
 graph TB
     subgraph "AI Foundry Platform"
-        AIF[Azure AI Foundry]
-        AS[Agent Service]
-        CO[Connected Agents]
+        AIF[Azure AI Foundry Hub]
+        PROJ[AI Foundry Project]
+        AGENT[Agent Applications]
     end
     
     subgraph "Compute Management"
@@ -43,9 +43,10 @@ graph TB
     end
     
     subgraph "ML Services"
-        AML[Azure ML Studio]
+        AML[Azure ML Workspace]
         MODELS[Model Registry]
         ENDPOINTS[Inference Endpoints]
+        COMPUTE[Compute Clusters]
     end
     
     subgraph "Monitoring & Control"
@@ -57,29 +58,30 @@ graph TB
     
     subgraph "Storage & Data"
         BLOB[Blob Storage]
-        ADLS[Data Lake Storage]
-        COSMOS[Cosmos DB]
+        KV[Key Vault]
+        APPINS[Application Insights]
     end
     
-    AIF --> AS
-    AS --> CO
-    CO --> ACF
+    AIF --> PROJ
+    PROJ --> AGENT
+    AGENT --> ACF
     ACF --> VMSS
     ACF --> SPOT
     ACF --> STD
     
-    AS --> AML
+    AGENT --> AML
     AML --> MODELS
     AML --> ENDPOINTS
+    AML --> COMPUTE
     
     AM --> LAW
     AM --> ALERTS
     AM --> DASH
-    ALERTS --> AS
+    ALERTS --> AGENT
     
     AML --> BLOB
-    AML --> ADLS
-    AS --> COSMOS
+    AML --> KV
+    AGENT --> APPINS
     
     style AIF fill:#FF6B6B
     style ACF fill:#4ECDC4
@@ -90,10 +92,10 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with appropriate permissions for AI Foundry, Compute Fleet, and Machine Learning
-2. Azure CLI v2.60.0 or later installed and configured
+2. Azure CLI v2.60.0 or later installed and configured with ML extension
 3. Understanding of machine learning workflows and Azure compute services
-4. Familiarity with Azure AI Foundry and agent orchestration concepts
-5. Estimated cost: $50-150 for testing resources (varies by region and compute usage)
+4. Familiarity with Azure AI Foundry and intelligent application development
+5. Estimated cost: $75-200 for testing resources (varies by region and compute usage)
 
 > **Note**: This recipe requires preview features. Ensure your subscription has access to Azure AI Foundry and Compute Fleet preview services before proceeding.
 
@@ -101,14 +103,15 @@ graph TB
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-ml-adaptive-scaling"
+export RESOURCE_GROUP="rg-ml-adaptive-scaling-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 export TENANT_ID=$(az account show --query tenantId --output tsv)
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
-export AI_FOUNDRY_NAME="aif-adaptive-${RANDOM_SUFFIX}"
+export AI_FOUNDRY_HUB_NAME="aifhub-adaptive-${RANDOM_SUFFIX}"
+export AI_FOUNDRY_PROJECT_NAME="aifproj-adaptive-${RANDOM_SUFFIX}"
 export COMPUTE_FLEET_NAME="cf-ml-scaling-${RANDOM_SUFFIX}"
 export ML_WORKSPACE_NAME="mlw-scaling-${RANDOM_SUFFIX}"
 export STORAGE_ACCOUNT_NAME="stmlscaling${RANDOM_SUFFIX}"
@@ -125,175 +128,222 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
 # Register required resource providers
 az provider register --namespace Microsoft.MachineLearningServices
-az provider register --namespace Microsoft.Compute
+az provider register --namespace Microsoft.AzureFleet
 az provider register --namespace Microsoft.CognitiveServices
 az provider register --namespace Microsoft.OperationalInsights
+az provider register --namespace Microsoft.Storage
+az provider register --namespace Microsoft.KeyVault
 
 echo "✅ Resource providers registered"
 ```
 
 ## Steps
 
-1. **Create Azure AI Foundry Hub and Project**:
+1. **Create foundational Azure resources**:
 
-   Azure AI Foundry serves as the central orchestration platform for intelligent agent management. The Agent Service provides production-ready infrastructure for deploying ML scaling agents that can make autonomous decisions about compute resource allocation. This foundational step establishes the secure, governed environment needed for enterprise-scale ML operations.
+   Azure AI Foundry requires several foundational Azure resources including storage, key vault, and application insights. These resources provide the secure foundation for ML workloads and enable comprehensive monitoring and governance across the adaptive scaling system.
+
+   ```bash
+   # Create storage account for ML workspace
+   az storage account create \
+       --name ${STORAGE_ACCOUNT_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
+       --sku Standard_LRS \
+       --kind StorageV2 \
+       --hierarchical-namespace true \
+       --tags purpose=ml-scaling
+   
+   # Create key vault for secrets management
+   az keyvault create \
+       --name ${KEY_VAULT_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
+       --sku standard \
+       --tags purpose=ml-scaling
+   
+   # Create Application Insights for monitoring
+   az monitor app-insights component create \
+       --app ai-${ML_WORKSPACE_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
+       --kind web \
+       --tags purpose=ml-scaling
+   
+   echo "✅ Foundational resources created"
+   ```
+
+   The foundational resources now provide secure storage, secrets management, and comprehensive monitoring capabilities. These services form the backbone of the adaptive scaling system and ensure enterprise-grade security and observability.
+
+2. **Create Azure AI Foundry Hub and Project**:
+
+   Azure AI Foundry Hub serves as the central governance and resource management platform for AI applications. The hub provides shared resources, security policies, and collaborative spaces for building intelligent applications. Creating a project within the hub enables isolated development environments while inheriting enterprise governance policies.
 
    ```bash
    # Create AI Foundry hub
    az ml workspace create \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${AI_FOUNDRY_NAME} \
+       --name ${AI_FOUNDRY_HUB_NAME} \
        --location ${LOCATION} \
-       --kind Hub \
-       --description "AI Foundry Hub for ML Scaling"
+       --kind hub \
+       --description "AI Foundry Hub for ML Scaling" \
+       --storage-account "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT_NAME}" \
+       --key-vault "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.KeyVault/vaults/${KEY_VAULT_NAME}" \
+       --application-insights "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/components/ai-${ML_WORKSPACE_NAME}"
    
    # Create project within the hub
    az ml workspace create \
        --resource-group ${RESOURCE_GROUP} \
-       --name "project-${AI_FOUNDRY_NAME}" \
+       --name ${AI_FOUNDRY_PROJECT_NAME} \
        --location ${LOCATION} \
-       --kind Project \
-       --hub-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.MachineLearningServices/workspaces/${AI_FOUNDRY_NAME}"
+       --kind project \
+       --hub-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.MachineLearningServices/workspaces/${AI_FOUNDRY_HUB_NAME}" \
+       --description "AI Foundry Project for Adaptive ML Scaling"
    
    echo "✅ AI Foundry hub and project created"
    ```
 
-   The AI Foundry hub now provides centralized governance and security for all ML agents. The project workspace enables isolated development and deployment of scaling agents while maintaining enterprise compliance and observability standards.
+   The AI Foundry infrastructure now provides centralized governance and security for intelligent applications. The project workspace enables isolated development of scaling agents while maintaining enterprise compliance and shared resource access through the hub.
 
-2. **Create Machine Learning Workspace with Compute Fleet Integration**:
+3. **Create Machine Learning Workspace with monitoring integration**:
 
-   Azure Machine Learning workspace provides the foundation for ML model development and deployment. Integrating with Compute Fleet enables dynamic scaling capabilities that automatically adjust compute resources based on training and inference demands. This integration supports both spot and standard VM allocation strategies for cost optimization.
+   Azure Machine Learning workspace provides the foundation for ML model development, training, and deployment. Integrating comprehensive monitoring enables the collection of performance metrics essential for intelligent scaling decisions. This workspace will host the ML models and compute resources that the adaptive scaling system will manage.
 
    ```bash
-   # Create ML workspace
+   # Create ML workspace with monitoring integration
    az ml workspace create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${ML_WORKSPACE_NAME} \
        --location ${LOCATION} \
        --storage-account "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT_NAME}" \
-       --key-vault "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.KeyVault/vaults/${KEY_VAULT_NAME}"
+       --key-vault "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.KeyVault/vaults/${KEY_VAULT_NAME}" \
+       --application-insights "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/components/ai-${ML_WORKSPACE_NAME}" \
+       --description "ML Workspace for adaptive compute scaling"
+   
+   # Create Log Analytics workspace for comprehensive monitoring
+   az monitor log-analytics workspace create \
+       --resource-group ${RESOURCE_GROUP} \
+       --workspace-name ${LOG_ANALYTICS_NAME} \
+       --location ${LOCATION} \
+       --sku pergb2018 \
+       --tags purpose=ml-scaling
+   
+   echo "✅ ML workspace and monitoring configured"
+   ```
+
+   The ML workspace is now configured with comprehensive monitoring capabilities that will feed performance data to the adaptive scaling system. The integrated monitoring provides the telemetry foundation needed for intelligent scaling decisions.
+
+4. **Create Azure Compute Fleet for dynamic scaling**:
+
+   Azure Compute Fleet enables sophisticated compute resource management that spans multiple VM series, pricing models, and availability zones. The fleet configuration supports both spot and standard VM allocation strategies, maximizing resource utilization while minimizing costs through intelligent allocation policies.
+
+   ```bash
+   # Create compute profile for ML workloads
+   cat > compute-profile.json << 'EOF'
+   {
+     "baseVirtualMachineProfile": {
+       "osProfile": {
+         "computerNamePrefix": "mlscale",
+         "adminUsername": "azureuser",
+         "linuxConfiguration": {
+           "disablePasswordAuthentication": true,
+           "ssh": {
+             "publicKeys": [
+               {
+                 "path": "/home/azureuser/.ssh/authorized_keys",
+                 "keyData": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC..."
+               }
+             ]
+           }
+         }
+       },
+       "storageProfile": {
+         "imageReference": {
+           "publisher": "microsoft-dsvm",
+           "offer": "ubuntu-2004",
+           "sku": "2004-gen2",
+           "version": "latest"
+         },
+         "osDisk": {
+           "createOption": "FromImage",
+           "managedDisk": {
+             "storageAccountType": "Standard_LRS"
+           }
+         }
+       },
+       "networkProfile": {
+         "networkInterfaceConfigurations": [
+           {
+             "name": "mlscale-nic",
+             "properties": {
+               "primary": true,
+               "ipConfigurations": [
+                 {
+                   "name": "internal",
+                   "properties": {
+                     "subnet": {
+                       "id": "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/vnet-ml-scaling/subnets/default"
+                     }
+                   }
+                 }
+               ]
+             }
+           }
+         ]
+       }
+     }
+   }
+   EOF
+   
+   # Create virtual network for compute fleet
+   az network vnet create \
+       --resource-group ${RESOURCE_GROUP} \
+       --name vnet-ml-scaling \
+       --address-prefix 10.0.0.0/16 \
+       --subnet-name default \
+       --subnet-prefix 10.0.0.0/24 \
+       --location ${LOCATION}
    
    # Create compute fleet for dynamic scaling
-   az vm fleet create \
+   az compute-fleet create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${COMPUTE_FLEET_NAME} \
        --location ${LOCATION} \
-       --vm-sizes-profile '[
-         {
-           "name": "Standard_D4s_v3",
-           "rank": 1
-         },
-         {
-           "name": "Standard_D8s_v3", 
-           "rank": 2
-         },
-         {
-           "name": "Standard_E4s_v3",
-           "rank": 3
-         }
-       ]' \
        --spot-priority-profile '{
          "capacity": 20,
-         "minCapacity": 5,
+         "minCapacity": 2,
          "maxPricePerVM": 0.10,
          "evictionPolicy": "Deallocate",
          "allocationStrategy": "PriceCapacityOptimized"
        }' \
        --regular-priority-profile '{
          "capacity": 10,
-         "minCapacity": 2,
+         "minCapacity": 1,
          "allocationStrategy": "LowestPrice"
-       }'
+       }' \
+       --vm-sizes-profile '[
+         {
+           "name": "Standard_D4s_v5"
+         },
+         {
+           "name": "Standard_D8s_v5"
+         },
+         {
+           "name": "Standard_E4s_v5"
+         }
+       ]' \
+       --compute-profile @compute-profile.json
    
-   echo "✅ ML workspace and compute fleet configured"
+   echo "✅ Compute fleet configured with intelligent allocation"
    ```
 
    The compute fleet is now configured with intelligent allocation strategies that prioritize cost-effective spot instances while maintaining guaranteed capacity through regular VMs. This hybrid approach ensures consistent performance while optimizing costs for ML workloads.
 
-3. **Deploy AI Foundry Agent Service for Scaling Orchestration**:
+5. **Configure Azure Monitor for workload intelligence**:
 
-   The Agent Service orchestrates complex multi-agent workflows that monitor ML workload patterns and make intelligent scaling decisions. These agents leverage Azure Monitor metrics to assess compute demand and automatically adjust Compute Fleet capacity to maintain optimal performance while minimizing costs.
-
-   ```bash
-   # Create agent service configuration
-   cat > agent-config.json << 'EOF'
-   {
-     "name": "ml-scaling-agent",
-     "description": "Intelligent ML compute scaling orchestrator",
-     "model": {
-       "type": "gpt-4",
-       "version": "2024-02-01",
-       "parameters": {
-         "temperature": 0.3,
-         "maxTokens": 2000
-       }
-     },
-     "instructions": "You are an expert ML infrastructure agent responsible for optimizing compute resource allocation. Monitor workload metrics, analyze capacity requirements, and make scaling decisions to maintain performance while minimizing costs. Always consider spot instance availability and pricing trends.",
-     "tools": [
-       {
-         "type": "azure_monitor",
-         "name": "workload_monitor",
-         "configuration": {
-           "workspace_id": "${LOG_ANALYTICS_NAME}",
-           "metrics": ["cpu_utilization", "memory_usage", "queue_depth", "inference_latency"]
-         }
-       },
-       {
-         "type": "compute_fleet",
-         "name": "fleet_manager",
-         "configuration": {
-           "fleet_id": "${COMPUTE_FLEET_NAME}",
-           "scaling_policies": {
-             "scale_up_threshold": 0.75,
-             "scale_down_threshold": 0.25,
-             "cooldown_period": 300
-           }
-         }
-       }
-     ],
-     "connectedAgents": [
-       {
-         "name": "cost-optimizer",
-         "role": "Analyze cost patterns and recommend optimal VM mix"
-       },
-       {
-         "name": "performance-monitor", 
-         "role": "Track ML model performance and SLA compliance"
-       }
-     ]
-   }
-   EOF
-   
-   # Deploy agent service
-   az ml agent create \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME} \
-       --name ml-scaling-agent \
-       --file agent-config.json
-   
-   echo "✅ AI Foundry Agent Service deployed"
-   ```
-
-   The Agent Service is now active with intelligent orchestration capabilities. The connected agents work collaboratively to optimize compute allocation, monitor performance metrics, and ensure cost-effective scaling decisions across your ML infrastructure.
-
-4. **Configure Azure Monitor for Workload Intelligence**:
-
-   Azure Monitor provides comprehensive observability for ML workloads, enabling agents to make data-driven scaling decisions. Log Analytics workspaces collect performance metrics, while custom queries identify scaling triggers and optimization opportunities. This monitoring foundation is essential for autonomous scaling operations.
+   Azure Monitor provides comprehensive observability for ML workloads, enabling data-driven scaling decisions. Custom workbooks and alert rules create the monitoring foundation needed for autonomous scaling operations. This monitoring infrastructure will feed real-time metrics to the intelligent scaling system.
 
    ```bash
-   # Create Log Analytics workspace
-   az monitor log-analytics workspace create \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${LOG_ANALYTICS_NAME} \
-       --location ${LOCATION} \
-       --sku pergb2018
-   
-   # Configure monitoring for ML workspace
-   az ml workspace update \
-       --resource-group ${RESOURCE_GROUP} \
-       --name ${ML_WORKSPACE_NAME} \
-       --application-insights "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/components/ai-${ML_WORKSPACE_NAME}"
-   
    # Create custom workbook for scaling metrics
    cat > scaling-workbook.json << 'EOF'
    {
@@ -327,6 +377,18 @@ echo "✅ Resource providers registered"
              "durationMs": 3600000
            }
          }
+       },
+       {
+         "type": 3,
+         "content": {
+           "version": "KqlItem/1.0",
+           "query": "AzureActivity\n| where ResourceProvider == \"Microsoft.AzureFleet\"\n| where OperationNameValue contains \"scale\"\n| summarize count() by bin(TimeGenerated, 15m)\n| render columnchart",
+           "size": 0,
+           "title": "Fleet Scaling Operations",
+           "timeContext": {
+             "durationMs": 3600000
+           }
+         }
        }
      ]
    }
@@ -338,85 +400,37 @@ echo "✅ Resource providers registered"
        --name "ML-Scaling-Dashboard" \
        --display-name "ML Adaptive Scaling Dashboard" \
        --description "Comprehensive monitoring for ML compute scaling" \
-       --template-data @scaling-workbook.json
+       --template-data @scaling-workbook.json \
+       --location ${LOCATION}
    
-   echo "✅ Azure Monitor configured with scaling intelligence"
-   ```
-
-   The monitoring infrastructure now provides real-time visibility into ML workload patterns. The custom workbook enables operators to visualize scaling decisions and optimize agent configurations based on historical performance data.
-
-5. **Create Intelligent Scaling Policies and Alert Rules**:
-
-   Intelligent scaling policies define the automated responses to changing ML workload demands. These policies integrate with Azure Monitor alerts to trigger agent actions when performance thresholds are exceeded or cost optimization opportunities are identified. This automation ensures consistent, policy-driven scaling behavior.
-
-   ```bash
-   # Create scaling policy for training workloads
-   cat > training-scaling-policy.json << 'EOF'
-   {
-     "name": "training-workload-scaling",
-     "description": "Dynamic scaling for ML training jobs",
-     "triggers": [
-       {
-         "type": "metric",
-         "metric": "queue_depth",
-         "threshold": 5,
-         "operator": "GreaterThan",
-         "action": "scale_up",
-         "parameters": {
-           "increment": 3,
-           "maxCapacity": 50
-         }
-       },
-       {
-         "type": "metric", 
-         "metric": "cpu_utilization",
-         "threshold": 20,
-         "operator": "LessThan",
-         "duration": "10m",
-         "action": "scale_down",
-         "parameters": {
-           "decrement": 2,
-           "minCapacity": 2
-         }
-       }
-     ],
-     "constraints": {
-       "maxCostPerHour": 100,
-       "preferredVMSizes": ["Standard_D4s_v3", "Standard_E4s_v3"],
-       "spotInstanceRatio": 0.7
-     }
-   }
-   EOF
+   # Create action group for scaling alerts
+   az monitor action-group create \
+       --resource-group ${RESOURCE_GROUP} \
+       --name "ml-scaling-actions" \
+       --short-name "mlscale"
    
    # Create alert rule for scaling triggers
    az monitor metrics alert create \
        --resource-group ${RESOURCE_GROUP} \
        --name "ml-scaling-trigger" \
-       --description "Triggers agent scaling actions" \
+       --description "Triggers scaling actions based on ML workload metrics" \
        --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.MachineLearningServices/workspaces/${ML_WORKSPACE_NAME}" \
-       --condition "avg compute_utilization > 75" \
+       --condition "avg Percentage CPU > 75" \
        --window-size 5m \
        --evaluation-frequency 1m \
-       --action-group "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/actionGroups/ml-scaling-actions"
+       --action "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/actionGroups/ml-scaling-actions"
    
-   # Deploy scaling policy to agent service
-   az ml agent update \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME} \
-       --name ml-scaling-agent \
-       --add-policy @training-scaling-policy.json
-   
-   echo "✅ Intelligent scaling policies configured"
+   echo "✅ Azure Monitor configured with scaling intelligence"
    ```
 
-   The scaling policies are now active and will automatically trigger agent actions based on real-time workload metrics. These policies ensure consistent scaling behavior while maintaining cost controls and performance guarantees across your ML infrastructure.
+   The monitoring infrastructure now provides real-time visibility into ML workload patterns and fleet scaling operations. The custom workbook enables operators to visualize scaling decisions and optimize configurations based on historical performance data.
 
-6. **Deploy Sample ML Models for Scaling Testing**:
+6. **Deploy sample ML models for scaling validation**:
 
-   Sample ML models provide realistic workloads for testing the adaptive scaling system. These models simulate real-world training and inference patterns, enabling validation of agent decision-making and scaling performance. The models also generate the telemetry data needed for continuous optimization.
+   Sample ML models provide realistic workloads for testing the adaptive scaling system. These models simulate real-world training and inference patterns, generating the telemetry data needed for validating scaling performance and optimization strategies.
 
    ```bash
-   # Create sample training script
+   # Create sample training script with comprehensive logging
    cat > train_model.py << 'EOF'
    import mlflow
    import numpy as np
@@ -425,14 +439,24 @@ echo "✅ Resource providers registered"
    from sklearn.model_selection import train_test_split
    import time
    import argparse
+   import logging
+   import json
+   from datetime import datetime
    
-   def train_model(n_samples=10000, n_features=20):
+   # Configure logging for monitoring
+   logging.basicConfig(level=logging.INFO)
+   logger = logging.getLogger(__name__)
+   
+   def train_model(n_samples=10000, n_features=20, complexity_factor=1):
+       """Train ML model with configurable complexity for testing scaling"""
+       start_time = datetime.utcnow()
+       
        # Generate synthetic dataset
        X, y = make_classification(
            n_samples=n_samples, 
            n_features=n_features, 
-           n_informative=10, 
-           n_redundant=10,
+           n_informative=max(2, n_features//2), 
+           n_redundant=max(1, n_features//4),
            random_state=42
        )
        
@@ -440,359 +464,474 @@ echo "✅ Resource providers registered"
            X, y, test_size=0.2, random_state=42
        )
        
-       # Simulate compute-intensive training
+       logger.info(f"Training model with {n_samples} samples and {n_features} features")
+       
+       # Simulate variable compute intensity based on complexity factor
        with mlflow.start_run():
            model = RandomForestClassifier(
-               n_estimators=100, 
-               max_depth=10, 
-               random_state=42
+               n_estimators=50 * complexity_factor, 
+               max_depth=5 + complexity_factor, 
+               random_state=42,
+               n_jobs=-1
            )
            
            # Add artificial delay to simulate compute load
-           time.sleep(30)
+           compute_delay = 15 * complexity_factor
+           logger.info(f"Simulating compute load for {compute_delay} seconds")
+           time.sleep(compute_delay)
            
            model.fit(X_train, y_train)
            accuracy = model.score(X_test, y_test)
            
+           # Log comprehensive metrics for monitoring
            mlflow.log_metric("accuracy", accuracy)
-           mlflow.log_param("n_samples", n_samples)
-           mlflow.log_param("n_features", n_features)
+           mlflow.log_metric("training_samples", n_samples)
+           mlflow.log_metric("feature_count", n_features)
+           mlflow.log_metric("complexity_factor", complexity_factor)
+           mlflow.log_metric("compute_duration", compute_delay)
+           
+           training_duration = (datetime.utcnow() - start_time).total_seconds()
+           mlflow.log_metric("total_training_time", training_duration)
            
            mlflow.sklearn.log_model(model, "model")
            
-       return model, accuracy
+           # Log metrics for scaling system
+           metrics = {
+               "timestamp": start_time.isoformat(),
+               "accuracy": accuracy,
+               "samples": n_samples,
+               "features": n_features,
+               "complexity": complexity_factor,
+               "duration": training_duration
+           }
+           logger.info(f"Training completed: {json.dumps(metrics)}")
+           
+       return model, accuracy, metrics
    
    if __name__ == "__main__":
        parser = argparse.ArgumentParser()
        parser.add_argument("--samples", type=int, default=10000)
        parser.add_argument("--features", type=int, default=20)
+       parser.add_argument("--complexity", type=int, default=1)
        args = parser.parse_args()
        
-       model, accuracy = train_model(args.samples, args.features)
+       model, accuracy, metrics = train_model(
+           args.samples, args.features, args.complexity
+       )
        print(f"Model trained with accuracy: {accuracy:.3f}")
+       print(f"Training metrics: {json.dumps(metrics, indent=2)}")
    EOF
    
-   # Create ML job for testing scaling
+   # Create compute cluster for ML workloads
+   az ml compute create \
+       --resource-group ${RESOURCE_GROUP} \
+       --workspace-name ${ML_WORKSPACE_NAME} \
+       --name compute-cluster \
+       --type amlcompute \
+       --min-instances 0 \
+       --max-instances 10 \
+       --size Standard_D4s_v3
+   
+   # Submit test job to generate workload
+   cat > job.yml << 'EOF'
+   $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+   command: python train_model.py --samples 50000 --features 100 --complexity 2
+   code: .
+   environment: azureml:AzureML-sklearn-1.0-ubuntu20.04-py38-cpu@latest
+   compute: compute-cluster
+   display_name: scaling-test-job
+   experiment_name: adaptive-scaling-test
+   description: Test job for validating adaptive scaling system
+   EOF
+   
    az ml job create \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${ML_WORKSPACE_NAME} \
-       --name "scaling-test-job" \
-       --type command \
-       --code . \
-       --command "python train_model.py --samples 50000 --features 100" \
-       --environment "AzureML-sklearn-1.0-ubuntu20.04-py38-cpu" \
-       --compute "compute-cluster"
-   
-   # Create inference endpoint for testing
-   az ml online-endpoint create \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${ML_WORKSPACE_NAME} \
-       --name "scaling-test-endpoint" \
-       --auth-mode key
+       --file job.yml
    
    echo "✅ Sample ML models deployed for scaling testing"
    ```
 
-   The sample models are now generating realistic ML workloads that will trigger the adaptive scaling system. These models provide the foundation for testing agent decision-making and validating scaling performance under various load conditions.
+   The sample models are now generating realistic ML workloads with comprehensive logging and metrics. These models provide the foundation for testing the adaptive scaling system under various load conditions and complexity scenarios.
 
-7. **Configure Connected Agents for Multi-Agent Orchestration**:
+7. **Create intelligent scaling automation with Azure Logic Apps**:
 
-   Connected agents enable sophisticated multi-agent workflows where specialized agents collaborate to optimize different aspects of ML infrastructure. The cost optimizer agent focuses on economic efficiency, while the performance monitor ensures SLA compliance. This orchestration creates a comprehensive adaptive scaling system.
-
-   ```bash
-   # Create cost optimizer agent
-   cat > cost-optimizer-agent.json << 'EOF'
-   {
-     "name": "cost-optimizer",
-     "description": "Specialized agent for ML cost optimization",
-     "model": {
-       "type": "gpt-4",
-       "version": "2024-02-01"
-     },
-     "instructions": "You are a cost optimization specialist for ML infrastructure. Analyze pricing patterns, spot instance availability, and resource utilization to recommend the most cost-effective compute configurations. Always balance cost savings with performance requirements.",
-     "tools": [
-       {
-         "type": "azure_pricing",
-         "name": "pricing_analyzer"
-       },
-       {
-         "type": "azure_advisor",
-         "name": "cost_recommendations"
-       }
-     ]
-   }
-   EOF
-   
-   # Create performance monitor agent
-   cat > performance-monitor-agent.json << 'EOF'
-   {
-     "name": "performance-monitor",
-     "description": "Specialized agent for ML performance monitoring",
-     "model": {
-       "type": "gpt-4",
-       "version": "2024-02-01"
-     },
-     "instructions": "You are a performance monitoring specialist for ML workloads. Track model training times, inference latency, and resource utilization to ensure SLA compliance. Identify performance bottlenecks and recommend optimization strategies.",
-     "tools": [
-       {
-         "type": "azure_monitor",
-         "name": "performance_metrics"
-       },
-       {
-         "type": "application_insights",
-         "name": "ml_telemetry"
-       }
-     ]
-   }
-   EOF
-   
-   # Deploy connected agents
-   az ml agent create \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME} \
-       --name cost-optimizer \
-       --file cost-optimizer-agent.json
-   
-   az ml agent create \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME} \
-       --name performance-monitor \
-       --file performance-monitor-agent.json
-   
-   # Configure agent connections
-   az ml agent connection create \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME} \
-       --source-agent ml-scaling-agent \
-       --target-agent cost-optimizer \
-       --connection-type bidirectional
-   
-   az ml agent connection create \
-       --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME} \
-       --source-agent ml-scaling-agent \
-       --target-agent performance-monitor \
-       --connection-type bidirectional
-   
-   echo "✅ Connected agents configured for multi-agent orchestration"
-   ```
-
-   The connected agents are now operating as a collaborative network, with the main scaling agent coordinating with specialized agents for cost optimization and performance monitoring. This multi-agent approach ensures comprehensive decision-making for adaptive ML scaling.
-
-8. **Implement Automated Scaling Workflows**:
-
-   Automated workflows orchestrate the complete scaling lifecycle from demand detection to resource provisioning. These workflows integrate agent intelligence with Azure Compute Fleet capabilities to create seamless scaling operations. The workflows also include safety mechanisms to prevent resource sprawl and cost overruns.
+   Azure Logic Apps provides workflow orchestration capabilities that can integrate with Azure Monitor alerts to create intelligent scaling responses. This automation creates the decision-making layer that processes monitoring data and triggers appropriate scaling actions on the Compute Fleet.
 
    ```bash
-   # Create scaling workflow definition
-   cat > scaling-workflow.json << 'EOF'
+   # Create scaling logic app for workflow orchestration
+   cat > scaling-logic-app.json << 'EOF'
    {
-     "name": "adaptive-ml-scaling",
-     "description": "Automated ML compute scaling workflow",
-     "version": "1.0",
-     "triggers": [
-       {
-         "type": "schedule",
-         "schedule": "0 */5 * * * *",
-         "description": "Check scaling needs every 5 minutes"
+     "definition": {
+       "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+       "contentVersion": "1.0.0.0",
+       "parameters": {},
+       "triggers": {
+         "When_a_metric_alert_is_fired": {
+           "type": "Request",
+           "kind": "Http",
+           "inputs": {
+             "schema": {
+               "properties": {
+                 "data": {
+                   "properties": {
+                     "context": {
+                       "properties": {
+                         "condition": {
+                           "properties": {
+                             "metricName": {
+                               "type": "string"
+                             },
+                             "metricValue": {
+                               "type": "number"
+                             }
+                           },
+                           "type": "object"
+                         }
+                       },
+                       "type": "object"
+                     }
+                   },
+                   "type": "object"
+                 }
+               },
+               "type": "object"
+             }
+           }
+         }
        },
-       {
-         "type": "metric_alert",
-         "source": "azure_monitor",
-         "description": "Respond to immediate scaling alerts"
-       }
-     ],
-     "workflow": {
-       "steps": [
-         {
-           "name": "assess_demand",
-           "type": "agent_action",
-           "agent": "ml-scaling-agent",
-           "action": "analyze_workload_demand",
-           "parameters": {
-             "lookback_minutes": 15,
-             "prediction_horizon": 30
+       "actions": {
+         "Analyze_Scaling_Need": {
+           "type": "Compose",
+           "inputs": {
+             "currentUtilization": "@triggerBody()['data']['context']['condition']['metricValue']",
+             "timestamp": "@utcNow()",
+             "action": "@if(greater(triggerBody()['data']['context']['condition']['metricValue'], 75), 'scale_up', 'monitor')"
            }
          },
-         {
-           "name": "cost_analysis",
-           "type": "agent_action",
-           "agent": "cost-optimizer",
-           "action": "analyze_cost_options",
-           "depends_on": ["assess_demand"]
-         },
-         {
-           "name": "performance_check",
-           "type": "agent_action",
-           "agent": "performance-monitor",
-           "action": "validate_performance_requirements",
-           "depends_on": ["assess_demand"]
-         },
-         {
-           "name": "scaling_decision",
-           "type": "agent_collaboration",
-           "agents": ["ml-scaling-agent", "cost-optimizer", "performance-monitor"],
-           "action": "collaborative_scaling_decision",
-           "depends_on": ["cost_analysis", "performance_check"]
-         },
-         {
-           "name": "execute_scaling",
-           "type": "compute_fleet_action",
-           "action": "update_fleet_capacity",
-           "depends_on": ["scaling_decision"]
+         "Execute_Scaling_Decision": {
+           "type": "Switch",
+           "expression": "@outputs('Analyze_Scaling_Need')['action']",
+           "cases": {
+             "scale_up": {
+               "case": "scale_up",
+               "actions": {
+                 "Scale_Up_Compute_Fleet": {
+                   "type": "Http",
+                   "inputs": {
+                     "method": "POST",
+                     "uri": "https://management.azure.com/subscriptions/@{subscription_id}/resourceGroups/@{resource_group}/providers/Microsoft.AzureFleet/fleets/@{fleet_name}/scale",
+                     "headers": {
+                       "Authorization": "Bearer @{accessToken}",
+                       "Content-Type": "application/json"
+                     },
+                     "body": {
+                       "capacity": {
+                         "spotPriority": {
+                           "capacity": "@add(variables('currentSpotCapacity'), 5)"
+                         }
+                       }
+                     }
+                   }
+                 }
+               }
+             }
+           },
+           "default": {
+             "actions": {
+               "Log_Monitoring_Event": {
+                 "type": "Compose",
+                 "inputs": {
+                   "message": "Monitoring - no scaling action needed",
+                   "utilization": "@triggerBody()['data']['context']['condition']['metricValue']"
+                 }
+               }
+             }
+           }
          }
-       ]
+       }
      }
    }
    EOF
    
-   # Deploy scaling workflow
-   az ml workflow create \
+   # Create Logic App for scaling automation
+   az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME} \
-       --name adaptive-ml-scaling \
-       --file scaling-workflow.json
+       --name "ml-adaptive-scaling-workflow" \
+       --location ${LOCATION} \
+       --definition @scaling-logic-app.json \
+       --tags purpose=ml-scaling
    
-   # Enable workflow automation
-   az ml workflow enable \
+   # Update alert action group to trigger Logic App
+   LOGIC_APP_TRIGGER_URL=$(az logic workflow show \
        --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME} \
-       --name adaptive-ml-scaling
+       --name ml-adaptive-scaling-workflow \
+       --query "accessEndpoint" -o tsv)
    
-   echo "✅ Automated scaling workflows implemented"
+   az monitor action-group update \
+       --resource-group ${RESOURCE_GROUP} \
+       --name "ml-scaling-actions" \
+       --add-logic-app "ml-scaling-webhook" "${LOGIC_APP_TRIGGER_URL}"
+   
+   echo "✅ Intelligent scaling automation configured"
    ```
 
-   The automated scaling workflows are now active and will continuously monitor ML workload demands, collaborate across agents to make optimal scaling decisions, and execute changes to the Compute Fleet. This creates a fully autonomous adaptive scaling system for your ML infrastructure.
+   The intelligent scaling automation is now active with workflow orchestration that analyzes monitoring alerts and executes appropriate scaling actions. This creates an automated adaptive scaling system that responds to ML workload demands while maintaining cost optimization principles.
+
+8. **Implement advanced monitoring and optimization**:
+
+   Advanced monitoring capabilities provide comprehensive visibility into the adaptive scaling system's performance and decision-making processes. Custom metrics and dashboards enable continuous optimization of scaling policies and help identify opportunities for further efficiency improvements.
+
+   ```bash
+   # Create advanced monitoring queries
+   cat > advanced-queries.kql << 'EOF'
+   // Query: ML Workload Scaling Efficiency
+   AzureMetrics
+   | where ResourceProvider == "MICROSOFT.MACHINELEARNINGSERVICES" 
+   | where MetricName in ("CpuUtilization", "MemoryUtilization")
+   | join kind=inner (
+       AzureActivity
+       | where ResourceProvider == "Microsoft.AzureFleet"
+       | where OperationNameValue contains "scale"
+   ) on $left.ResourceId == $right.ResourceId
+   | summarize 
+       AvgUtilization = avg(Average),
+       ScalingEvents = count()
+   by bin(TimeGenerated, 1h)
+   | render timechart
+   
+   // Query: Cost Optimization Analysis
+   AzureMetrics
+   | where ResourceProvider == "Microsoft.AzureFleet"
+   | where MetricName == "SpotInstanceUtilization"
+   | summarize 
+       SpotUtilization = avg(Average),
+       CostSavings = avg(Average) * 0.7  // Approximate spot savings
+   by bin(TimeGenerated, 1d)
+   | render columnchart
+   EOF
+   
+   # Create cost optimization dashboard
+   cat > cost-dashboard.json << 'EOF'
+   {
+     "version": "Notebook/1.0",
+     "items": [
+       {
+         "type": 1,
+         "content": {
+           "json": "# Adaptive ML Scaling - Cost Optimization Dashboard\nThis dashboard provides insights into cost optimization effectiveness and scaling performance."
+         }
+       },
+       {
+         "type": 3,
+         "content": {
+           "version": "KqlItem/1.0",
+           "query": "AzureMetrics | where ResourceProvider == \"Microsoft.AzureFleet\" | where MetricName == \"TotalCost\" | summarize TotalCost = sum(Average) by bin(TimeGenerated, 1d) | render areachart",
+           "size": 0,
+           "title": "Daily Compute Costs",
+           "timeContext": {
+             "durationMs": 604800000
+           }
+         }
+       },
+       {
+         "type": 3,
+         "content": {
+           "version": "KqlItem/1.0",
+           "query": "AzureActivity | where ResourceProvider == \"Microsoft.AzureFleet\" | where OperationNameValue contains \"scale\" | summarize ScalingEvents = count() by bin(TimeGenerated, 1h) | render columnchart",
+           "size": 0,
+           "title": "Scaling Event Frequency",
+           "timeContext": {
+             "durationMs": 86400000
+           }
+         }
+       }
+     ]
+   }
+   EOF
+   
+   # Deploy cost optimization dashboard
+   az monitor workbook create \
+       --resource-group ${RESOURCE_GROUP} \
+       --name "ML-Cost-Optimization" \
+       --display-name "ML Cost Optimization Dashboard" \
+       --description "Advanced cost optimization monitoring for adaptive ML scaling" \
+       --template-data @cost-dashboard.json \
+       --location ${LOCATION}
+   
+   # Create custom metric for scaling efficiency
+   az monitor metrics alert create \
+       --resource-group ${RESOURCE_GROUP} \
+       --name "scaling-efficiency-alert" \
+       --description "Monitors scaling efficiency and cost optimization" \
+       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.AzureFleet/fleets/${COMPUTE_FLEET_NAME}" \
+       --condition "avg SpotInstanceUtilization < 40" \
+       --window-size 15m \
+       --evaluation-frequency 5m \
+       --action "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Insights/actionGroups/ml-scaling-actions"
+   
+   echo "✅ Advanced monitoring and optimization implemented"
+   ```
+
+   The advanced monitoring infrastructure now provides comprehensive visibility into scaling efficiency, cost optimization, and system performance. These dashboards and metrics enable continuous improvement of the adaptive scaling system's decision-making processes.
 
 ## Validation & Testing
 
-1. **Verify AI Foundry Agent Service deployment**:
+1. **Verify AI Foundry infrastructure deployment**:
 
    ```bash
-   # Check agent service status
-   az ml agent show \
+   # Check AI Foundry hub status
+   az ml workspace show \
        --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME} \
-       --name ml-scaling-agent
+       --name ${AI_FOUNDRY_HUB_NAME} \
+       --query '{name:name, kind:kind, provisioningState:provisioningState}'
    
-   # Verify connected agents
-   az ml agent connection list \
+   # Verify project workspace
+   az ml workspace show \
        --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME}
+       --name ${AI_FOUNDRY_PROJECT_NAME} \
+       --query '{name:name, kind:kind, hubId:hubId}'
    ```
 
-   Expected output: Active agent service with connected cost-optimizer and performance-monitor agents.
+   Expected output: Active AI Foundry hub with kind "Hub" and project with reference to hub.
 
 2. **Test Compute Fleet scaling capabilities**:
 
    ```bash
-   # Check fleet capacity and utilization
-   az vm fleet show \
+   # Check fleet capacity and configuration
+   az compute-fleet show \
        --resource-group ${RESOURCE_GROUP} \
        --name ${COMPUTE_FLEET_NAME} \
-       --query '{name:name, capacity:capacity, utilization:utilization}'
+       --query '{name:name, spotPriorityProfile:spotPriorityProfile, regularPriorityProfile:regularPriorityProfile}'
    
-   # Validate scaling policies
-   az ml agent policy list \
+   # Test manual scaling to validate fleet responsiveness
+   az compute-fleet update \
        --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME} \
-       --agent ml-scaling-agent
+       --name ${COMPUTE_FLEET_NAME} \
+       --spot-priority-profile '{
+         "capacity": 15,
+         "minCapacity": 2
+       }'
    ```
 
-   Expected output: Fleet showing configured capacity with active scaling policies.
+   Expected output: Fleet showing updated capacity with spot and regular VM configurations.
 
-3. **Validate monitoring and alerting**:
+3. **Validate monitoring and alerting system**:
 
    ```bash
-   # Check monitoring workbook
+   # Check monitoring workbook deployment
    az monitor workbook show \
        --resource-group ${RESOURCE_GROUP} \
-       --name "ML-Scaling-Dashboard"
+       --name "ML-Scaling-Dashboard" \
+       --query '{name:name, location:location}'
    
-   # Verify alert rules
+   # Verify alert rules are active
    az monitor metrics alert list \
        --resource-group ${RESOURCE_GROUP} \
-       --query '[].{name:name, enabled:enabled, condition:condition}'
+       --query '[].{name:name, enabled:enabled, targetResourceId:scopes[0]}'
+   
+   # Test alert system with sample data
+   az monitor metrics alert test-notifications \
+       --resource-group ${RESOURCE_GROUP} \
+       --rule-name "ml-scaling-trigger"
    ```
 
-   Expected output: Active workbook and alert rules for ML scaling monitoring.
+   Expected output: Active workbooks and alert rules with successful test notifications.
 
-4. **Test agent collaboration and decision-making**:
+4. **Test ML workload and scaling integration**:
 
    ```bash
-   # Submit test ML job to trigger scaling
-   az ml job submit \
+   # Submit scaling test job to generate workload
+   cat > scaling-test-job.yml << 'EOF'
+   $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+   command: python train_model.py --samples 100000 --features 200 --complexity 3
+   code: .
+   environment: azureml:AzureML-sklearn-1.0-ubuntu20.04-py38-cpu@latest
+   compute: compute-cluster
+   display_name: scaling-validation-job
+   experiment_name: adaptive-scaling-validation
+   EOF
+   
+   az ml job create \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name ${ML_WORKSPACE_NAME} \
-       --name "scaling-validation-job" \
-       --compute "compute-cluster" \
-       --command "python train_model.py --samples 100000 --features 200"
+       --file scaling-test-job.yml
    
-   # Monitor agent actions
-   az ml agent logs \
+   # Monitor job execution and scaling events
+   az ml job show \
        --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME} \
-       --name ml-scaling-agent \
-       --tail 50
+       --workspace-name ${ML_WORKSPACE_NAME} \
+       --name scaling-validation-job \
+       --query '{status:status, startTime:startTime}'
    ```
 
-   Expected output: Agent logs showing scaling decisions and fleet capacity adjustments.
+   Expected output: Running ML job that triggers monitoring alerts and scaling actions.
 
 ## Cleanup
 
-1. **Stop automated workflows**:
+1. **Stop Logic App workflows**:
 
    ```bash
-   # Disable scaling workflow
-   az ml workflow disable \
+   # Disable scaling automation workflow
+   az logic workflow update \
        --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME} \
-       --name adaptive-ml-scaling
+       --name "ml-adaptive-scaling-workflow" \
+       --state "Disabled"
    
-   echo "✅ Automated workflows stopped"
+   echo "✅ Scaling automation workflows stopped"
    ```
 
-2. **Remove agent connections and services**:
+2. **Remove ML workloads and compute resources**:
 
    ```bash
-   # Delete agent connections
-   az ml agent connection delete \
+   # Cancel any running jobs
+   az ml job list \
        --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME} \
-       --source-agent ml-scaling-agent \
-       --target-agent cost-optimizer
+       --workspace-name ${ML_WORKSPACE_NAME} \
+       --query '[?status==`Running`].name' -o tsv | \
+   while read job_name; do
+       az ml job cancel \
+           --resource-group ${RESOURCE_GROUP} \
+           --workspace-name ${ML_WORKSPACE_NAME} \
+           --name "$job_name"
+   done
    
-   # Delete agents
-   az ml agent delete \
+   # Delete compute resources
+   az ml compute delete \
        --resource-group ${RESOURCE_GROUP} \
-       --workspace-name ${AI_FOUNDRY_NAME} \
-       --name ml-scaling-agent
+       --workspace-name ${ML_WORKSPACE_NAME} \
+       --name compute-cluster \
+       --yes
    
-   echo "✅ Agent services removed"
+   echo "✅ ML workloads and compute resources removed"
    ```
 
-3. **Clean up compute resources**:
+3. **Clean up Compute Fleet and monitoring**:
 
    ```bash
-   # Delete compute fleet
-   az vm fleet delete \
+   # Delete Compute Fleet
+   az compute-fleet delete \
        --resource-group ${RESOURCE_GROUP} \
        --name ${COMPUTE_FLEET_NAME} \
-       --yes
+       --yes \
+       --no-wait
    
-   # Delete ML workspace
-   az ml workspace delete \
+   # Remove monitoring resources
+   az monitor workbook delete \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${ML_WORKSPACE_NAME} \
-       --yes
+       --name "ML-Scaling-Dashboard"
    
-   echo "✅ Compute resources cleaned up"
+   az monitor workbook delete \
+       --resource-group ${RESOURCE_GROUP} \
+       --name "ML-Cost-Optimization"
+   
+   echo "✅ Compute Fleet and monitoring resources cleaned up"
    ```
 
-4. **Remove resource group and all resources**:
+4. **Remove resource group and all remaining resources**:
 
    ```bash
-   # Delete resource group
+   # Delete resource group and all contained resources
    az group delete \
        --name ${RESOURCE_GROUP} \
        --yes \
@@ -800,33 +939,37 @@ echo "✅ Resource providers registered"
    
    echo "✅ Resource group deletion initiated: ${RESOURCE_GROUP}"
    echo "Note: Deletion may take several minutes to complete"
+   
+   # Verify deletion (optional)
+   sleep 30
+   az group exists --name ${RESOURCE_GROUP}
    ```
 
 ## Discussion
 
-Azure AI Foundry Agent Service represents a paradigm shift in ML infrastructure management by enabling autonomous, intelligent scaling decisions. Unlike traditional rule-based auto-scaling, these agents leverage large language models to understand complex workload patterns and make contextual decisions that balance performance, cost, and resource availability. The agent-based approach provides unprecedented flexibility in handling diverse ML workloads while maintaining operational efficiency. For comprehensive guidance on agent development, see the [Azure AI Foundry Agent Service documentation](https://learn.microsoft.com/en-us/azure/ai-foundry/agents/overview).
+Azure AI Foundry represents a comprehensive platform for building intelligent applications that can make autonomous decisions about infrastructure management. Unlike traditional rule-based auto-scaling systems, AI Foundry enables the development of sophisticated applications that can understand complex patterns in ML workload data and make contextual scaling decisions. The platform provides enterprise-grade governance, security, and collaboration capabilities essential for production AI applications. For comprehensive guidance on building intelligent applications, see the [Azure AI Foundry documentation](https://learn.microsoft.com/en-us/azure/ai-foundry/).
 
-The integration with Azure Compute Fleet enables sophisticated compute resource management that spans multiple VM series, pricing models, and availability zones. This approach maximizes resource utilization while minimizing costs through intelligent mixing of spot and standard instances. The fleet's ability to scale up to 10,000 VMs in a single API call provides the elasticity needed for large-scale ML workloads, while the agent service ensures optimal resource allocation strategies. For detailed fleet configuration guidance, see the [Azure Compute Fleet documentation](https://learn.microsoft.com/en-us/azure/azure-compute-fleet/overview).
+The integration with Azure Compute Fleet enables sophisticated compute resource management that spans multiple VM series, pricing models, and availability zones. This approach maximizes resource utilization while minimizing costs through intelligent mixing of spot and standard instances. The fleet's ability to scale across different VM types provides the elasticity needed for diverse ML workloads, from small experimentation to large-scale production training. For detailed fleet configuration guidance, see the [Azure Compute Fleet documentation](https://learn.microsoft.com/en-us/azure/azure-compute-fleet/overview).
 
-Connected agents create a collaborative intelligence network where specialized agents contribute domain expertise to scaling decisions. This multi-agent orchestration ensures that cost optimization, performance monitoring, and capacity planning are all considered in scaling actions. The agent collaboration patterns demonstrated in this recipe can be extended to include additional specialists such as security compliance agents, data governance agents, or workload scheduling agents. For multi-agent orchestration patterns, refer to the [Azure AI Foundry multi-agent documentation](https://learn.microsoft.com/en-us/azure/ai-foundry/agents/how-to/connected-agents).
+Azure Logic Apps provides the workflow orchestration capabilities that bridge monitoring data with scaling actions. This integration creates a responsive system that can process complex decision trees, implement safety mechanisms, and coordinate across multiple Azure services. The workflow-based approach enables sophisticated scaling strategies that consider multiple factors including cost constraints, performance requirements, and resource availability. For workflow orchestration patterns, refer to the [Azure Logic Apps documentation](https://learn.microsoft.com/en-us/azure/logic-apps/).
 
-The monitoring and observability infrastructure provides the foundation for continuous optimization of scaling decisions. Azure Monitor workbooks and custom queries enable operators to understand agent behavior and fine-tune scaling policies based on historical performance data. This feedback loop ensures that the adaptive scaling system continuously improves its decision-making accuracy over time. For comprehensive monitoring strategies, see the [Azure Monitor documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/) and [Azure Machine Learning monitoring guide](https://learn.microsoft.com/en-us/azure/machine-learning/monitor-azure-machine-learning).
+The monitoring and observability infrastructure built on Azure Monitor provides the foundation for continuous optimization of scaling decisions. Custom workbooks, KQL queries, and alert rules enable operators to understand system behavior and fine-tune scaling policies based on historical performance data. This comprehensive observability ensures that the adaptive scaling system continuously improves its decision-making accuracy and cost optimization effectiveness over time. For advanced monitoring strategies, see the [Azure Monitor documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/) and [Azure Machine Learning monitoring guide](https://learn.microsoft.com/en-us/azure/machine-learning/monitor-azure-machine-learning).
 
-> **Tip**: Use Azure Cost Management and Billing APIs to create custom cost tracking dashboards that complement the agent-based scaling decisions. This provides additional visibility into cost optimization effectiveness and helps identify opportunities for further savings.
+> **Tip**: Use Azure Cost Management APIs to create custom cost tracking that integrates with the scaling decisions. This provides additional visibility into cost optimization effectiveness and helps identify opportunities for Reserved Instance utilization and Azure Hybrid Benefit optimization.
 
 ## Challenge
 
 Extend this adaptive scaling solution by implementing these advanced capabilities:
 
-1. **Multi-Region Scaling Intelligence**: Deploy agents across multiple Azure regions with cross-region workload balancing based on capacity, latency, and cost considerations.
+1. **Multi-Region Intelligent Scaling**: Deploy scaling intelligence across multiple Azure regions with cross-region workload balancing based on latency, capacity, and cost considerations using Azure Traffic Manager.
 
-2. **Predictive Scaling with Time Series Forecasting**: Integrate Azure Machine Learning time series forecasting models to predict future compute demands and proactively scale resources.
+2. **Predictive Scaling with Azure Machine Learning**: Integrate Azure Machine Learning AutoML time series forecasting to predict future compute demands and proactively scale resources before demand spikes occur.
 
-3. **GPU Compute Fleet Integration**: Extend the solution to include GPU-optimized compute fleets for deep learning workloads with specialized agents for GPU resource optimization.
+3. **GPU Compute Fleet Integration**: Extend the solution to include GPU-optimized compute fleets for deep learning workloads with specialized cost optimization strategies for high-performance computing scenarios.
 
-4. **Advanced Cost Optimization**: Implement sophisticated cost models that consider Reserved Instances, Savings Plans, and Azure Hybrid Benefit in scaling decisions.
+4. **Advanced Cost Optimization Engine**: Implement sophisticated cost models that consider Reserved Instances, Savings Plans, Azure Hybrid Benefit, and spot instance market dynamics in scaling decisions.
 
-5. **MLOps Integration**: Connect the scaling system with Azure DevOps and MLOps pipelines to automatically scale compute resources based on deployment schedules and model training requirements.
+5. **MLOps Pipeline Integration**: Connect the scaling system with Azure DevOps MLOps pipelines to automatically scale compute resources based on deployment schedules, model training requirements, and CI/CD pipeline demands.
 
 ## Infrastructure Code
 

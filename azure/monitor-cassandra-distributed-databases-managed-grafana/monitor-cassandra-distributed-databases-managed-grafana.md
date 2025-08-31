@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Managed Instance for Apache Cassandra, Azure Managed Grafana, Azure Monitor, Azure Virtual Network
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: nosql, cassandra, monitoring, grafana, observability
 recipe-generator-version: 1.3
@@ -39,6 +39,7 @@ graph TB
         
         subgraph "Monitoring Layer"
             MON[Azure Monitor]
+            LAW[Log Analytics Workspace]
             AMG[Azure Managed Grafana]
         end
     end
@@ -56,13 +57,15 @@ graph TB
     CASS2 --> MON
     CASS3 --> MON
     
-    MON --> AMG
+    MON --> LAW
+    LAW --> AMG
     DEV --> AMG
     OPS --> AMG
     
     style CASS fill:#FF9900
     style AMG fill:#3F8624
     style MON fill:#0078D4
+    style LAW fill:#0078D4
 ```
 
 ## Prerequisites
@@ -78,8 +81,8 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for resource deployment
-export RESOURCE_GROUP="rg-cassandra-monitoring"
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-cassandra-monitoring-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
@@ -93,7 +96,7 @@ export VNET_NAME="vnet-cassandra-${RANDOM_SUFFIX}"
 az group create \
     --name ${RESOURCE_GROUP} \
     --location ${LOCATION} \
-    --tags purpose=monitoring environment=demo
+    --tags purpose=recipe environment=demo
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
@@ -171,6 +174,8 @@ echo "✅ Virtual network configured: ${VNET_NAME}"
    echo "✅ Data center operational"
    ```
 
+   The data center configuration provides distributed storage and compute resources optimized for Cassandra workloads. This setup ensures automatic load balancing across nodes and provides the foundation for horizontal scaling as your data requirements grow.
+
 3. **Configure Azure Monitor Diagnostic Settings**:
 
    Azure Monitor diagnostic settings enable comprehensive logging and metrics collection for your Cassandra cluster. These settings capture critical operational data including query performance, audit logs, and system metrics. By configuring diagnostic settings, you establish the data pipeline that feeds into your monitoring dashboards and alerting systems.
@@ -188,16 +193,25 @@ echo "✅ Virtual network configured: ${VNET_NAME}"
        --resource-group ${RESOURCE_GROUP} \
        --query id --output tsv)
    
+   # Get Cassandra cluster resource ID
+   CASSANDRA_RESOURCE_ID=$(az managed-cassandra cluster show \
+       --cluster-name ${CASSANDRA_CLUSTER_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query id --output tsv)
+   
    # Configure diagnostic settings for Cassandra cluster
    az monitor diagnostic-settings create \
        --name "cassandra-diagnostics" \
-       --resource "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DocumentDB/cassandraClusters/${CASSANDRA_CLUSTER_NAME}" \
+       --resource ${CASSANDRA_RESOURCE_ID} \
        --workspace ${WORKSPACE_ID} \
        --logs '[{"category":"CassandraLogs","enabled":true},{"category":"CassandraAudit","enabled":true}]' \
-       --metrics '[{"category":"AllMetrics","enabled":true}]'
+       --metrics '[{"category":"AllMetrics","enabled":true}]' \
+       --export-to-resource-specific true
    
    echo "✅ Diagnostic settings configured"
    ```
+
+   These diagnostic settings enable resource-specific table storage in Log Analytics, providing optimized query performance and cost-effective data retention. The configuration captures both operational logs and performance metrics essential for comprehensive cluster monitoring.
 
 4. **Deploy Azure Managed Grafana**:
 
@@ -209,7 +223,7 @@ echo "✅ Virtual network configured: ${VNET_NAME}"
        --name ${GRAFANA_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --sku-name "Standard"
+       --sku "Standard"
    
    echo "✅ Azure Managed Grafana deployment initiated"
    
@@ -224,6 +238,8 @@ echo "✅ Virtual network configured: ${VNET_NAME}"
    
    echo "✅ Grafana available at: ${GRAFANA_ENDPOINT}"
    ```
+
+   Azure Managed Grafana automatically provisions with system-assigned managed identity, enabling secure authentication to Azure Monitor without managing service principals. This integration simplifies the connection process while maintaining security best practices.
 
 5. **Configure Grafana Data Source**:
 
@@ -245,20 +261,23 @@ echo "✅ Virtual network configured: ${VNET_NAME}"
    echo "✅ Grafana permissions configured"
    
    # Create data source configuration
-   cat > datasource-config.json << EOF
-   {
-     "name": "Azure Monitor - Cassandra",
-     "type": "grafana-azure-monitor-datasource",
-     "access": "proxy",
-     "jsonData": {
-       "azureAuthType": "msi",
-       "subscriptionId": "${SUBSCRIPTION_ID}"
-     }
-   }
-   EOF
+   az grafana data-source create \
+       --name ${GRAFANA_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --definition '{
+         "name": "Azure Monitor - Cassandra",
+         "type": "grafana-azure-monitor-datasource",
+         "access": "proxy",
+         "jsonData": {
+           "azureAuthType": "msi",
+           "subscriptionId": "'${SUBSCRIPTION_ID}'"
+         }
+       }'
    
-   echo "✅ Data source configuration prepared"
+   echo "✅ Data source configuration created"
    ```
+
+   The managed identity authentication approach provides secure, credential-free access to Azure Monitor data while automatically handling token renewal. This configuration enables Grafana to query metrics and logs without storing sensitive credentials.
 
 6. **Create Monitoring Dashboard**:
 
@@ -270,14 +289,18 @@ echo "✅ Virtual network configured: ${VNET_NAME}"
    {
      "dashboard": {
        "title": "Cassandra Cluster Monitoring",
+       "tags": ["cassandra", "monitoring"],
        "panels": [
          {
            "title": "Node CPU Usage",
+           "type": "graph",
            "targets": [
              {
                "azureMonitor": {
                  "resourceGroup": "${RESOURCE_GROUP}",
-                 "metricName": "CPUUsage",
+                 "resourceName": "${CASSANDRA_CLUSTER_NAME}",
+                 "metricDefinition": "Microsoft.DocumentDB/cassandraClusters",
+                 "metricName": "CpuUsage",
                  "aggregation": "Average",
                  "timeGrain": "PT1M"
                }
@@ -286,18 +309,38 @@ echo "✅ Virtual network configured: ${VNET_NAME}"
            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
          },
          {
-           "title": "Read/Write Latency",
+           "title": "Request Latency",
+           "type": "graph",
            "targets": [
              {
                "azureMonitor": {
                  "resourceGroup": "${RESOURCE_GROUP}",
-                 "metricName": "ReadLatency",
+                 "resourceName": "${CASSANDRA_CLUSTER_NAME}",
+                 "metricDefinition": "Microsoft.DocumentDB/cassandraClusters",
+                 "metricName": "TotalRequestUnits",
                  "aggregation": "Average",
                  "timeGrain": "PT1M"
                }
              }
            ],
            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+         },
+         {
+           "title": "Storage Usage",
+           "type": "graph",
+           "targets": [
+             {
+               "azureMonitor": {
+                 "resourceGroup": "${RESOURCE_GROUP}",
+                 "resourceName": "${CASSANDRA_CLUSTER_NAME}",
+                 "metricDefinition": "Microsoft.DocumentDB/cassandraClusters",
+                 "metricName": "DataUsage",
+                 "aggregation": "Average",
+                 "timeGrain": "PT5M"
+               }
+             }
+           ],
+           "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
          }
        ],
        "time": {"from": "now-6h", "to": "now"},
@@ -307,11 +350,14 @@ echo "✅ Virtual network configured: ${VNET_NAME}"
    EOF
    
    echo "✅ Dashboard configuration created"
+   echo "Import this dashboard manually via Grafana UI at: ${GRAFANA_ENDPOINT}"
    ```
+
+   This dashboard configuration provides comprehensive visibility into cluster performance, including CPU utilization, request patterns, and storage consumption. The multi-panel layout enables quick identification of performance bottlenecks and resource constraints.
 
 7. **Configure Alerting Rules**:
 
-   Proactive alerting ensures rapid response to performance degradation or system issues. Azure Managed Grafana's alerting capabilities integrate with Azure Monitor to provide threshold-based notifications for critical metrics. By establishing alerting rules for key performance indicators, you create an early warning system that prevents minor issues from escalating into major outages.
+   Proactive alerting ensures rapid response to performance degradation or system issues. Azure Monitor's alerting capabilities integrate with Azure Managed Grafana to provide threshold-based notifications for critical metrics. By establishing alerting rules for key performance indicators, you create an early warning system that prevents minor issues from escalating into major outages.
 
    ```bash
    # Create action group for alerts
@@ -325,15 +371,28 @@ echo "✅ Virtual network configured: ${VNET_NAME}"
    az monitor metrics alert create \
        --name "cassandra-high-cpu" \
        --resource-group ${RESOURCE_GROUP} \
-       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DocumentDB/cassandraClusters/${CASSANDRA_CLUSTER_NAME}" \
-       --condition "avg CPUUsage > 80" \
+       --scopes ${CASSANDRA_RESOURCE_ID} \
+       --condition "avg CpuUsage > 80" \
        --window-size 5m \
        --evaluation-frequency 1m \
        --action "cassandra-alerts" \
        --description "Alert when Cassandra CPU usage exceeds 80%"
    
+   # Create alert for storage capacity
+   az monitor metrics alert create \
+       --name "cassandra-high-storage" \
+       --resource-group ${RESOURCE_GROUP} \
+       --scopes ${CASSANDRA_RESOURCE_ID} \
+       --condition "avg DataUsage > 85" \
+       --window-size 15m \
+       --evaluation-frequency 5m \
+       --action "cassandra-alerts" \
+       --description "Alert when storage usage exceeds 85%"
+   
    echo "✅ Alerting rules configured"
    ```
+
+   These alerting rules provide automated monitoring for critical performance thresholds, enabling proactive response to resource constraints. The multi-layered alert configuration ensures appropriate escalation timing for different types of issues.
 
 > **Tip**: Use Azure Monitor Workbooks alongside Grafana for advanced analytics and reporting capabilities. Workbooks provide interactive reports that complement real-time Grafana dashboards.
 
@@ -358,7 +417,12 @@ echo "✅ Virtual network configured: ${VNET_NAME}"
    # Verify Grafana is accessible
    curl -I ${GRAFANA_ENDPOINT}
    
-   # Check data source connectivity via API
+   # List configured data sources
+   az grafana data-source list \
+       --name ${GRAFANA_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --output table
+   
    echo "Access Grafana at: ${GRAFANA_ENDPOINT}"
    echo "Use your Azure AD credentials to log in"
    ```
@@ -368,8 +432,8 @@ echo "✅ Virtual network configured: ${VNET_NAME}"
    ```bash
    # Query recent metrics from Azure Monitor
    az monitor metrics list \
-       --resource "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DocumentDB/cassandraClusters/${CASSANDRA_CLUSTER_NAME}" \
-       --metric "CPUUsage" \
+       --resource ${CASSANDRA_RESOURCE_ID} \
+       --metric "CpuUsage" \
        --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ) \
        --interval PT1M \
        --output table
@@ -378,11 +442,11 @@ echo "✅ Virtual network configured: ${VNET_NAME}"
 4. Test alert functionality:
 
    ```bash
-   # Generate test alert
+   # Check alert rule status
    az monitor metrics alert show \
        --name "cassandra-high-cpu" \
        --resource-group ${RESOURCE_GROUP} \
-       --query "{State:state,LastUpdated:lastUpdatedTime}" \
+       --query "{State:isEnabled,LastUpdated:lastUpdatedTime}" \
        --output table
    ```
 
@@ -444,19 +508,21 @@ Azure Managed Instance for Apache Cassandra combined with Azure Managed Grafana 
 
 The integration between Azure Monitor and Grafana enables comprehensive observability across your Cassandra deployment. Metrics flow automatically from each node through Azure Monitor's collection pipeline, providing real-time insights into performance, resource utilization, and query patterns. This approach aligns with the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of operational excellence and reliability. The managed nature of both services ensures automatic updates, security patches, and high availability without manual intervention.
 
-From a cost optimization perspective, the solution scales efficiently with your workload demands. Azure Managed Grafana's Standard tier provides enterprise features including alerting and reporting, while the consumption-based pricing of Azure Monitor ensures you only pay for the metrics and logs you collect. For comprehensive monitoring strategies, review the [Azure Monitor best practices](https://docs.microsoft.com/en-us/azure/azure-monitor/best-practices) and [Grafana visualization guide](https://docs.microsoft.com/en-us/azure/managed-grafana/how-to-create-dashboard).
+From a cost optimization perspective, the solution scales efficiently with your workload demands. Azure Managed Grafana's Standard tier provides enterprise features including alerting and reporting, while the consumption-based pricing of Azure Monitor ensures you only pay for the metrics and logs you collect. The resource-specific logging configuration optimizes both performance and costs by providing efficient data storage and querying capabilities. For comprehensive monitoring strategies, review the [Azure Monitor best practices](https://docs.microsoft.com/en-us/azure/azure-monitor/best-practices) and [Grafana visualization guide](https://docs.microsoft.com/en-us/azure/managed-grafana/how-to-create-dashboard).
 
-> **Warning**: Monitor your Log Analytics workspace retention and ingestion rates to control costs. High-volume Cassandra deployments can generate significant log data, potentially impacting your monitoring budget.
+The solution implements Azure security best practices through managed identities, eliminating the need for stored credentials while providing seamless authentication between services. Role-based access control ensures that monitoring components have appropriate permissions without excessive privileges, following the principle of least privilege access.
+
+> **Warning**: Monitor your Log Analytics workspace retention and ingestion rates to control costs. High-volume Cassandra deployments can generate significant log data, potentially impacting your monitoring budget. Consider implementing log sampling or filtering for non-critical log categories.
 
 ## Challenge
 
 Extend this monitoring solution with advanced capabilities:
 
-1. Implement custom Grafana panels that visualize Cassandra-specific metrics like compaction statistics, repair progress, and tombstone ratios using Azure Monitor's custom metrics API
-2. Create automated remediation workflows using Azure Logic Apps that respond to specific alert conditions, such as automatically scaling nodes when performance thresholds are exceeded
-3. Integrate Azure Data Explorer for long-term metric retention and advanced analytics, enabling historical trend analysis and capacity planning across multiple Cassandra clusters
-4. Develop a multi-cluster monitoring dashboard that aggregates metrics from Cassandra deployments across different regions, providing a global view of your distributed database infrastructure
-5. Implement machine learning-based anomaly detection using Azure Monitor's built-in capabilities to identify unusual patterns in query performance or resource utilization
+1. Implement custom Grafana panels that visualize Cassandra-specific metrics like compaction statistics, repair progress, and tombstone ratios using Azure Monitor's custom metrics API and Kusto queries
+2. Create automated remediation workflows using Azure Logic Apps that respond to specific alert conditions, such as automatically scaling nodes when performance thresholds are exceeded or triggering maintenance tasks
+3. Integrate Azure Data Explorer for long-term metric retention and advanced analytics, enabling historical trend analysis and capacity planning across multiple Cassandra clusters with machine learning insights
+4. Develop a multi-cluster monitoring dashboard that aggregates metrics from Cassandra deployments across different regions, providing a global view of your distributed database infrastructure with geo-distributed alerting
+5. Implement machine learning-based anomaly detection using Azure Monitor's built-in capabilities to identify unusual patterns in query performance or resource utilization, with automated baseline adjustment over time
 
 ## Infrastructure Code
 

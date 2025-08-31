@@ -6,10 +6,10 @@ difficulty: 400
 subject: azure
 services: Azure Kubernetes Service, Azure DNS Private Zones, Azure Application Gateway, Azure Monitor
 estimated-time: 150 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: network-segmentation, service-mesh, istio, dns, microservices, security, aks, kubernetes
 recipe-generator-version: 1.3
@@ -145,7 +145,7 @@ export STORAGE_ACCOUNT_NAME="stadvnet${RANDOM_SUFFIX}"
 az group create \
     --name ${RESOURCE_GROUP} \
     --location ${LOCATION} \
-    --tags purpose=advanced-networking environment=production
+    --tags purpose=advanced-networking environment=demo
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
@@ -230,7 +230,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
        --enable-cluster-autoscaler \
        --min-count 2 \
        --max-count 10 \
-       --kubernetes-version 1.28.0
+       --kubernetes-version 1.30.0
 
    # Enable Istio service mesh addon
    az aks mesh enable \
@@ -516,7 +516,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
      rules:
      - from:
        - source:
-           namespaces: ["istio-system"]
+           namespaces: ["aks-istio-system"]
      - to:
        - operation:
            methods: ["GET", "POST"]
@@ -602,13 +602,6 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
    Azure Application Gateway provides enterprise-grade ingress capabilities with integrated Web Application Firewall (WAF) protection. This component controls external access to the service mesh while maintaining security boundaries and enabling advanced traffic management at the edge.
 
    ```bash
-   # Get subnet ID for Application Gateway
-   APPGW_SUBNET_ID=$(az network vnet subnet show \
-       --resource-group ${RESOURCE_GROUP} \
-       --vnet-name ${VNET_NAME} \
-       --name appgw-subnet \
-       --query id --output tsv)
-
    # Create public IP for Application Gateway
    az network public-ip create \
        --resource-group ${RESOURCE_GROUP} \
@@ -628,6 +621,11 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
        --sku WAF_v2 \
        --public-ip-address appgw-public-ip \
        --priority 1000
+
+   # Wait for Istio ingress gateway service to be ready
+   echo "Waiting for Istio ingress gateway to be ready..."
+   kubectl wait --for=condition=available --timeout=300s \
+       deployment/istio-ingressgateway -n aks-istio-system
 
    # Get Istio ingress gateway service IP
    ISTIO_INGRESS_IP=$(kubectl get service istio-ingressgateway \
@@ -764,7 +762,7 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
     Comprehensive monitoring provides visibility into service mesh operations, network traffic patterns, and security policy enforcement. This observability foundation enables proactive management of the advanced network segmentation solution and supports compliance reporting requirements.
 
     ```bash
-    # Enable Istio telemetry and monitoring
+    # Enable Istio telemetry and monitoring addons
     kubectl apply -f https://raw.githubusercontent.com/istio/istio/release-1.20/samples/addons/prometheus.yaml
     kubectl apply -f https://raw.githubusercontent.com/istio/istio/release-1.20/samples/addons/grafana.yaml
     kubectl apply -f https://raw.githubusercontent.com/istio/istio/release-1.20/samples/addons/jaeger.yaml
@@ -796,16 +794,18 @@ echo "✅ Log Analytics workspace created: ${LOG_ANALYTICS_NAME}"
         [prometheus_data_collection_settings.cluster]
           interval = "1m"
           monitor_kubernetes_pods = true
-          monitor_kubernetes_pods_namespaces = ["istio-system", "frontend", "backend", "database"]
+          monitor_kubernetes_pods_namespaces = ["aks-istio-system", "frontend", "backend", "database"]
     EOF
 
-    # Create Azure Monitor alerts for service mesh
+    # Create metric alert for high latency
     az monitor metrics alert create \
         --name "High Service Mesh Latency" \
         --resource-group ${RESOURCE_GROUP} \
         --scopes ${LOG_ANALYTICS_ID} \
-        --condition "avg log_analytics_workspace_latency > 1000" \
-        --description "Alert when service mesh latency exceeds 1 second"
+        --condition "avg ContainerInsights_CL_latency_average_d > 1000" \
+        --description "Alert when service mesh latency exceeds 1 second" \
+        --evaluation-frequency 5m \
+        --window-size 10m
 
     echo "✅ Comprehensive monitoring and observability configured"
     ```

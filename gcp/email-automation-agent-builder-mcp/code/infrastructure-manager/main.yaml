@@ -1,0 +1,518 @@
+# Infrastructure Manager Configuration for Email Automation with Agent Builder and MCP
+# This configuration deploys a complete email automation system using:
+# - Vertex AI Agent Builder for intelligent email processing
+# - Gmail API integration with Pub/Sub for real-time notifications
+# - Cloud Functions for serverless processing workflow
+# - Model Context Protocol (MCP) for enterprise data integration
+
+imports:
+- path: templates/cloud-functions.jinja
+- path: templates/pubsub.jinja
+- path: templates/iam.jinja
+
+resources:
+  # Enable required Google Cloud APIs
+  - name: aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/aiplatform.googleapis.com
+      
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/cloudfunctions.googleapis.com
+      
+  - name: gmail-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/gmail.googleapis.com
+      
+  - name: secretmanager-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/secretmanager.googleapis.com
+      
+  - name: pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/pubsub.googleapis.com
+
+  # Service Account for Email Automation System
+  - name: email-automation-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: email-automation-sa
+      serviceAccount:
+        displayName: Email Automation Service Account
+        description: Service account for email automation with Agent Builder and MCP integration
+    metadata:
+      dependsOn:
+        - aiplatform-api
+        - cloudfunctions-api
+
+  # IAM Bindings for Service Account
+  - name: email-automation-sa-aiplatform-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/{{ env["project"] }}
+      role: roles/aiplatform.user
+      member: serviceAccount:email-automation-sa@{{ env["project"] }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - email-automation-service-account
+
+  - name: email-automation-sa-secretmanager-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/{{ env["project"] }}
+      role: roles/secretmanager.secretAccessor
+      member: serviceAccount:email-automation-sa@{{ env["project"] }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - email-automation-service-account
+
+  - name: email-automation-sa-pubsub-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/{{ env["project"] }}
+      role: roles/pubsub.subscriber
+      member: serviceAccount:email-automation-sa@{{ env["project"] }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - email-automation-service-account
+
+  - name: email-automation-sa-logging-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/{{ env["project"] }}
+      role: roles/logging.logWriter
+      member: serviceAccount:email-automation-sa@{{ env["project"] }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - email-automation-service-account
+
+  # Pub/Sub Topic for Gmail Notifications
+  - name: gmail-notifications-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/{{ env["project"] }}/topics/gmail-notifications
+      labels:
+        purpose: email-automation
+        component: notification-system
+    metadata:
+      dependsOn:
+        - pubsub-api
+
+  # Cloud Storage Bucket for Function Source Code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: {{ env["project"] }}-email-automation-functions-{{ properties["random_suffix"] }}
+      location: {{ properties["region"] }}
+      storageClass: REGIONAL
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        purpose: function-source
+        component: email-automation
+
+  # Cloud Function: Gmail Webhook Handler
+  - name: gmail-webhook-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/functions/gmail-webhook
+      sourceArchiveUrl: gs://{{ env["project"] }}-email-automation-functions-{{ properties["random_suffix"] }}/gmail-webhook.zip
+      entryPoint: gmail_webhook
+      runtime: python311
+      timeout: 60s
+      availableMemoryMb: 512
+      httpsTrigger: {}
+      serviceAccountEmail: email-automation-sa@{{ env["project"] }}.iam.gserviceaccount.com
+      environmentVariables:
+        PROJECT_ID: {{ env["project"] }}
+        REGION: {{ properties["region"] }}
+        PUBSUB_TOPIC: projects/{{ env["project"] }}/topics/gmail-notifications
+      labels:
+        purpose: webhook-handler
+        component: email-processing
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - email-automation-service-account
+        - function-source-bucket
+        - gmail-notifications-topic
+
+  # Pub/Sub Subscription for Gmail Webhook
+  - name: gmail-webhook-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/{{ env["project"] }}/subscriptions/gmail-webhook-sub
+      topic: projects/{{ env["project"] }}/topics/gmail-notifications
+      pushConfig:
+        pushEndpoint: https://{{ properties["region"] }}-{{ env["project"] }}.cloudfunctions.net/gmail-webhook
+        attributes:
+          x-goog-version: v1
+      deadLetterPolicy:
+        maxDeliveryAttempts: 5
+      messageRetentionDuration: 604800s  # 7 days
+      ackDeadlineSeconds: 600  # 10 minutes
+      labels:
+        purpose: webhook-subscription
+        component: notification-system
+    metadata:
+      dependsOn:
+        - gmail-notifications-topic
+        - gmail-webhook-function
+
+  # Cloud Function: MCP Integration
+  - name: mcp-integration-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/functions/mcp-integration
+      sourceArchiveUrl: gs://{{ env["project"] }}-email-automation-functions-{{ properties["random_suffix"] }}/mcp-integration.zip
+      entryPoint: mcp_handler
+      runtime: python311
+      timeout: 30s
+      availableMemoryMb: 512
+      httpsTrigger: {}
+      serviceAccountEmail: email-automation-sa@{{ env["project"] }}.iam.gserviceaccount.com
+      environmentVariables:
+        PROJECT_ID: {{ env["project"] }}
+        REGION: {{ properties["region"] }}
+      labels:
+        purpose: mcp-integration
+        component: context-retrieval
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - email-automation-service-account
+        - function-source-bucket
+
+  # Cloud Function: Response Generator
+  - name: response-generator-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/functions/response-generator
+      sourceArchiveUrl: gs://{{ env["project"] }}-email-automation-functions-{{ properties["random_suffix"] }}/response-generator.zip
+      entryPoint: generate_response
+      runtime: python311
+      timeout: 60s
+      availableMemoryMb: 512
+      httpsTrigger: {}
+      serviceAccountEmail: email-automation-sa@{{ env["project"] }}.iam.gserviceaccount.com
+      environmentVariables:
+        PROJECT_ID: {{ env["project"] }}
+        REGION: {{ properties["region"] }}
+      labels:
+        purpose: response-generation
+        component: ai-processing
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - email-automation-service-account
+        - function-source-bucket
+
+  # Cloud Function: Email Workflow Orchestrator
+  - name: email-workflow-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/functions/email-workflow
+      sourceArchiveUrl: gs://{{ env["project"] }}-email-automation-functions-{{ properties["random_suffix"] }}/email-workflow.zip
+      entryPoint: email_workflow
+      runtime: python311
+      timeout: 120s
+      availableMemoryMb: 1024
+      httpsTrigger: {}
+      serviceAccountEmail: email-automation-sa@{{ env["project"] }}.iam.gserviceaccount.com
+      environmentVariables:
+        PROJECT_ID: {{ env["project"] }}
+        REGION: {{ properties["region"] }}
+        MCP_FUNCTION_URL: https://{{ properties["region"] }}-{{ env["project"] }}.cloudfunctions.net/mcp-integration
+        RESPONSE_FUNCTION_URL: https://{{ properties["region"] }}-{{ env["project"] }}.cloudfunctions.net/response-generator
+      labels:
+        purpose: workflow-orchestration
+        component: email-processing
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - email-automation-service-account
+        - function-source-bucket
+        - mcp-integration-function
+        - response-generator-function
+
+  # Cloud Logging Sink for Email Automation Monitoring
+  - name: email-automation-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      name: email-automation-sink
+      destination: bigquery.googleapis.com/projects/{{ env["project"] }}/datasets/email_automation_logs
+      filter: |
+        resource.type="cloud_function"
+        resource.labels.function_name=~"gmail-webhook|mcp-integration|response-generator|email-workflow"
+        OR jsonPayload.workflow="email_processing"
+      description: Log sink for email automation system monitoring and analytics
+    metadata:
+      dependsOn:
+        - gmail-webhook-function
+        - mcp-integration-function
+        - response-generator-function
+        - email-workflow-function
+
+  # BigQuery Dataset for Log Analytics
+  - name: email-automation-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: email_automation_logs
+      friendlyName: Email Automation System Logs
+      description: Dataset for storing and analyzing email automation system logs
+      location: {{ properties["region"] }}
+      defaultTableExpirationMs: 2592000000  # 30 days
+      labels:
+        purpose: log-analytics
+        component: monitoring
+    metadata:
+      dependsOn:
+        - email-automation-log-sink
+
+  # Cloud Monitoring Alert Policy for Failed Email Processing
+  - name: email-processing-failure-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: Email Processing Failure Alert
+      documentation:
+        content: Alert triggered when email processing workflow fails
+        mimeType: text/markdown
+      conditions:
+        - displayName: Function execution failures
+          conditionThreshold:
+            filter: |
+              resource.type="cloud_function"
+              resource.labels.function_name=~"gmail-webhook|email-workflow"
+              metric.type="cloudfunctions.googleapis.com/function/execution_count"
+              metric.labels.status="error"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 5
+            duration: 300s  # 5 minutes
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      combiner: OR
+      enabled: true
+      notificationChannels: []  # Add notification channels as needed
+    metadata:
+      dependsOn:
+        - gmail-webhook-function
+        - email-workflow-function
+
+  # Secret for Gmail API Credentials (placeholder)
+  - name: gmail-api-credentials-secret
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      secretId: gmail-api-credentials
+      secret:
+        labels:
+          purpose: gmail-integration
+          component: authentication
+        replication:
+          automatic: {}
+    metadata:
+      dependsOn:
+        - secretmanager-api
+
+  # Secret Version for Gmail API Credentials (placeholder)
+  - name: gmail-api-credentials-version
+    type: gcp-types/secretmanager-v1:projects.secrets.versions
+    properties:
+      parent: projects/{{ env["project"] }}/secrets/gmail-api-credentials
+      secretVersion:
+        payload:
+          data: eyJwbGFjZWhvbGRlciI6ICJBZGQgYWN0dWFsIEdtYWlsIEFQSSBjcmVkZW50aWFscyBoZXJlIn0=  # Base64: {"placeholder": "Add actual Gmail API credentials here"}
+    metadata:
+      dependsOn:
+        - gmail-api-credentials-secret
+
+  # Cloud Scheduler Job for Periodic Health Checks (Optional)
+  - name: email-automation-health-check
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/jobs/email-automation-health-check
+      description: Periodic health check for email automation system
+      schedule: "0 */6 * * *"  # Every 6 hours
+      timeZone: "UTC"
+      httpTarget:
+        uri: https://{{ properties["region"] }}-{{ env["project"] }}.cloudfunctions.net/email-workflow
+        httpMethod: POST
+        body: eyJ0ZXN0IjogdHJ1ZX0=  # Base64: {"test": true}
+        headers:
+          Content-Type: application/json
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 1s
+        maxBackoffDuration: 10s
+    metadata:
+      dependsOn:
+        - email-workflow-function
+
+# Properties (variables) for customization
+properties:
+  - project:
+      type: string
+      description: Google Cloud Project ID
+      default: "{{ env['project'] }}"
+  
+  - region:
+      type: string
+      description: Google Cloud region for resource deployment
+      default: "us-central1"
+      enum:
+        - us-central1
+        - us-east1
+        - us-east4
+        - us-west1
+        - us-west2
+        - us-west3
+        - us-west4
+        - europe-west1
+        - europe-west2
+        - europe-west3
+        - europe-west4
+        - asia-east1
+        - asia-northeast1
+        - asia-southeast1
+  
+  - random_suffix:
+      type: string
+      description: Random suffix for unique resource naming
+      default: "$(openssl rand -hex 3)"
+  
+  - enable_monitoring:
+      type: boolean
+      description: Enable Cloud Monitoring and alerting
+      default: true
+  
+  - enable_health_checks:
+      type: boolean
+      description: Enable periodic health check scheduling
+      default: true
+  
+  - log_retention_days:
+      type: integer
+      description: Number of days to retain logs in BigQuery
+      default: 30
+      minimum: 1
+      maximum: 365
+
+# Outputs for integration and verification
+outputs:
+  - name: gmail_webhook_url
+    description: Gmail webhook URL for Pub/Sub push configuration
+    value: https://{{ properties["region"] }}-{{ env["project"] }}.cloudfunctions.net/gmail-webhook
+  
+  - name: mcp_integration_url
+    description: MCP integration function URL
+    value: https://{{ properties["region"] }}-{{ env["project"] }}.cloudfunctions.net/mcp-integration
+  
+  - name: response_generator_url
+    description: Response generator function URL
+    value: https://{{ properties["region"] }}-{{ env["project"] }}.cloudfunctions.net/response-generator
+  
+  - name: email_workflow_url
+    description: Email workflow orchestrator URL
+    value: https://{{ properties["region"] }}-{{ env["project"] }}.cloudfunctions.net/email-workflow
+  
+  - name: pubsub_topic_name
+    description: Pub/Sub topic name for Gmail notifications
+    value: projects/{{ env["project"] }}/topics/gmail-notifications
+  
+  - name: service_account_email
+    description: Email automation service account
+    value: email-automation-sa@{{ env["project"] }}.iam.gserviceaccount.com
+  
+  - name: function_source_bucket
+    description: Cloud Storage bucket for function source code
+    value: {{ env["project"] }}-email-automation-functions-{{ properties["random_suffix"] }}
+  
+  - name: bigquery_dataset
+    description: BigQuery dataset for log analytics
+    value: {{ env["project"] }}:email_automation_logs
+  
+  - name: gmail_api_secret_name
+    description: Secret Manager secret name for Gmail API credentials
+    value: projects/{{ env["project"] }}/secrets/gmail-api-credentials
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: 1.0.0
+  description: Infrastructure Manager configuration for Email Automation with Vertex AI Agent Builder and MCP integration
+  author: Google Cloud Recipe Generator
+  created: 2025-07-23
+  tags:
+    - email-automation
+    - vertex-ai
+    - agent-builder
+    - mcp
+    - serverless
+    - pubsub
+    - cloud-functions
+  
+  # Deployment requirements
+  requirements:
+    apis:
+      - aiplatform.googleapis.com
+      - cloudfunctions.googleapis.com
+      - gmail.googleapis.com
+      - secretmanager.googleapis.com
+      - pubsub.googleapis.com
+      - cloudscheduler.googleapis.com
+      - monitoring.googleapis.com
+      - logging.googleapis.com
+      - bigquery.googleapis.com
+    
+    permissions:
+      - roles/resourcemanager.projectIamAdmin
+      - roles/iam.serviceAccountAdmin
+      - roles/cloudfunctions.admin
+      - roles/pubsub.admin
+      - roles/secretmanager.admin
+      - roles/storage.admin
+      - roles/bigquery.admin
+      - roles/monitoring.admin
+      - roles/logging.admin
+    
+    estimated_cost:
+      monthly_usd: "20-35"
+      components:
+        - "Cloud Functions: $5-10 (based on execution volume)"
+        - "Vertex AI Agent Builder: $10-15 (based on API calls)"
+        - "Pub/Sub: $1-2 (based on message volume)"
+        - "Cloud Storage: $1-2 (for function source)"
+        - "BigQuery: $1-3 (for log storage)"
+        - "Cloud Monitoring: $1-3 (for alerting)"
+
+# Configuration validation schema
+schema:
+  required:
+    - project
+    - region
+  properties:
+    project:
+      type: string
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+      description: Must be a valid Google Cloud project ID
+    region:
+      type: string
+      description: Must be a valid Google Cloud region
+    random_suffix:
+      type: string
+      pattern: "^[a-f0-9]{6}$"
+      description: Must be a 6-character hexadecimal string
+    enable_monitoring:
+      type: boolean
+    enable_health_checks:
+      type: boolean
+    log_retention_days:
+      type: integer
+      minimum: 1
+      maximum: 365

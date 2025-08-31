@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: Vertex AI, Google Kubernetes Engine, Cloud Storage, TPU
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: tpu, llm, inference, kubernetes, volume-populator, performance-optimization
 recipe-generator-version: 1.3
@@ -76,7 +76,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with billing enabled and TPU quota allocation
-2. Google Cloud CLI (gcloud) version 456.0.0 or later with kubectl configured
+2. Google Cloud CLI (gcloud) version 458.0.0 or later with kubectl configured
 3. Advanced knowledge of Kubernetes, TPU architecture, and machine learning inference pipelines
 4. Existing LLM model artifacts (weights, tokenizer) stored in Cloud Storage
 5. Estimated cost: $1,200-2,500 per hour for TPU Ironwood pods during active inference
@@ -97,6 +97,7 @@ RANDOM_SUFFIX=$(openssl rand -hex 3)
 export BUCKET_NAME="llm-models-${RANDOM_SUFFIX}"
 export PARALLELSTORE_NAME="model-storage-${RANDOM_SUFFIX}"
 export SERVICE_ACCOUNT="tpu-inference-sa-${RANDOM_SUFFIX}"
+export NETWORK_NAME="tpu-network-${RANDOM_SUFFIX}"
 
 # Configure gcloud CLI for the project
 gcloud config set project ${PROJECT_ID}
@@ -111,6 +112,29 @@ gcloud services enable parallelstore.googleapis.com
 gcloud services enable compute.googleapis.com
 gcloud services enable monitoring.googleapis.com
 gcloud services enable logging.googleapis.com
+gcloud services enable servicenetworking.googleapis.com
+
+# Create VPC network for Parallelstore
+gcloud compute networks create ${NETWORK_NAME} \
+    --subnet-mode=auto \
+    --mtu=8896 \
+    --project=${PROJECT_ID}
+
+# Create IP range for private services access
+gcloud compute addresses create parallelstore-ip-range \
+    --global \
+    --purpose=VPC_PEERING \
+    --prefix-length=24 \
+    --description="Parallelstore VPC Peering" \
+    --network=${NETWORK_NAME} \
+    --project=${PROJECT_ID}
+
+# Connect VPC peering for Parallelstore
+gcloud services vpc-peerings connect \
+    --network=${NETWORK_NAME} \
+    --ranges=parallelstore-ip-range \
+    --project=${PROJECT_ID} \
+    --service=servicenetworking.googleapis.com
 
 # Create Cloud Storage bucket for model artifacts
 gsutil mb -p ${PROJECT_ID} \
@@ -122,6 +146,7 @@ gsutil mb -p ${PROJECT_ID} \
 gsutil versioning set on gs://${BUCKET_NAME}
 
 echo "✅ Project ${PROJECT_ID} configured with required APIs enabled"
+echo "✅ VPC network and private services access configured"
 echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
 ```
 
@@ -129,12 +154,14 @@ echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
 
 1. **Create TPU Ironwood-enabled GKE Cluster**:
 
-   Google Kubernetes Engine provides the orchestration platform for TPU Ironwood workloads, offering automated scaling, health monitoring, and resource management. TPU Ironwood represents Google's seventh-generation TPU architecture, specifically engineered for large-scale inference with 5x compute performance and 6x high-bandwidth memory capacity compared to previous generations. This cluster configuration enables dynamic TPU pod allocation and integrates with Google Cloud's AI Hypercomputer architecture for optimal performance.
+   Google Kubernetes Engine provides the orchestration platform for TPU Ironwood workloads, offering automated scaling, health monitoring, and resource management. TPU Ironwood represents Google's seventh-generation TPU architecture, specifically engineered for large-scale inference with 5x compute performance and 6x high-bandwidth memory capacity (192 GB HBM per chip) compared to previous generations. This cluster configuration enables dynamic TPU pod allocation and integrates with Google Cloud's AI Hypercomputer architecture for optimal performance.
 
    ```bash
-   # Create GKE cluster with TPU Ironwood support
+   # Create GKE cluster with TPU Ironwood support and custom network
    gcloud container clusters create ${CLUSTER_NAME} \
        --zone=${ZONE} \
+       --network=${NETWORK_NAME} \
+       --subnetwork=default \
        --machine-type=e2-standard-4 \
        --num-nodes=2 \
        --enable-autoscaling \
@@ -145,7 +172,8 @@ echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
        --addons=HorizontalPodAutoscaling,HttpLoadBalancing \
        --enable-network-policy \
        --enable-ip-alias \
-       --enable-workload-identity
+       --enable-workload-identity \
+       --cluster-version=1.31.1-gke.1729000
 
    # Get cluster credentials
    gcloud container clusters get-credentials ${CLUSTER_NAME} \
@@ -154,7 +182,7 @@ echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
    echo "✅ GKE cluster created with TPU Ironwood compatibility"
    ```
 
-   The cluster is now operational with workload identity enabled, providing secure access to Google Cloud services and TPU resources. This foundation supports both training and inference workloads while maintaining enterprise-grade security and compliance standards.
+   The cluster is now operational with workload identity enabled and Volume Populator support, providing secure access to Google Cloud services and TPU resources. This foundation supports both training and inference workloads while maintaining enterprise-grade security and compliance standards.
 
 2. **Create Service Account and Configure Workload Identity**:
 
@@ -179,11 +207,20 @@ echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
        --member="serviceAccount:${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/parallelstore.admin"
 
+   # Create Kubernetes service account
+   kubectl create serviceaccount tpu-inference-pod \
+       --namespace=default
+
    # Configure Workload Identity binding
    gcloud iam service-accounts add-iam-policy-binding \
        --role="roles/iam.workloadIdentityUser" \
        --member="serviceAccount:${PROJECT_ID}.svc.id.goog[default/tpu-inference-pod]" \
        ${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com
+
+   # Annotate Kubernetes service account
+   kubectl annotate serviceaccount tpu-inference-pod \
+       --namespace=default \
+       iam.gke.io/gcp-service-account=${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com
 
    echo "✅ Service account configured with Workload Identity"
    ```
@@ -198,15 +235,18 @@ echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
    # Create Parallelstore instance for model weights
    gcloud parallelstore instances create ${PARALLELSTORE_NAME} \
        --location=${ZONE} \
-       --capacity-gib=1024 \
+       --capacity-gib=12000 \
        --performance-tier=SSD \
-       --network="projects/${PROJECT_ID}/global/networks/default" \
+       --network="projects/${PROJECT_ID}/global/networks/${NETWORK_NAME}" \
        --description="High-performance storage for LLM model weights"
 
    # Wait for instance to become ready
-   gcloud parallelstore instances describe ${PARALLELSTORE_NAME} \
+   while [[ $(gcloud parallelstore instances describe ${PARALLELSTORE_NAME} \
        --location=${ZONE} \
-       --format="value(state)"
+       --format="value(state)") != "READY" ]]; do
+     echo "Waiting for Parallelstore instance to be ready..."
+     sleep 30
+   done
 
    echo "✅ Parallelstore instance created for model storage"
    ```
@@ -269,7 +309,7 @@ echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
    parameters:
      instance-name: ${PARALLELSTORE_NAME}
      location: ${ZONE}
-     capacity-gib: "1024"
+     capacity-gib: "12000"
    volumeBindingMode: WaitForFirstConsumer
    allowVolumeExpansion: true
    EOF
@@ -281,7 +321,7 @@ echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
 
 6. **Deploy TPU Ironwood Inference Workload**:
 
-   This deployment creates a Kubernetes workload optimized for TPU Ironwood inference, including the Volume Populator integration for automatic model loading. The configuration specifies TPU resource requirements, model serving parameters, and health checks. TPU Ironwood's architecture provides significant improvements in memory bandwidth and compute efficiency specifically designed for transformer-based model inference.
+   This deployment creates a Kubernetes workload optimized for TPU Ironwood inference, including the Volume Populator integration for automatic model loading. The configuration specifies TPU resource requirements, model serving parameters, and health checks. TPU Ironwood's architecture provides significant improvements in memory bandwidth (1.2 TBps bidirectional ICI bandwidth) and compute efficiency specifically designed for transformer-based model inference.
 
    ```bash
    # Create PersistentVolumeClaim with Volume Populator
@@ -293,10 +333,10 @@ echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
      namespace: default
    spec:
      accessModes:
-       - ReadOnlyMany
+       - ReadWriteMany
      resources:
        requests:
-         storage: 1024Gi
+         storage: 12000Gi
      storageClassName: parallelstore-csi-volume-populator
      dataSource:
        apiVersion: parallelstore.csi.storage.gke.io/v1
@@ -322,6 +362,7 @@ echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
            app: tpu-ironwood-inference
          annotations:
            iam.gke.io/gcp-service-account: ${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com
+           gke-parallelstore/volumes: "true"
        spec:
          serviceAccountName: tpu-inference-pod
          containers:
@@ -369,22 +410,7 @@ echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
 
    The TPU inference workload is deployed with automatic model loading through Volume Populator, providing enterprise-grade reliability and performance monitoring for production LLM serving.
 
-7. **Create Kubernetes Service Account for Workload Identity**:
-
-   ```bash
-   # Create Kubernetes service account
-   kubectl create serviceaccount tpu-inference-pod \
-       --namespace=default
-
-   # Annotate with Google Service Account
-   kubectl annotate serviceaccount tpu-inference-pod \
-       --namespace=default \
-       iam.gke.io/gcp-service-account=${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com
-
-   echo "✅ Kubernetes service account configured"
-   ```
-
-8. **Expose Inference Service with Load Balancer**:
+7. **Expose Inference Service with Load Balancer**:
 
    The load balancer provides high-availability access to the TPU Ironwood inference endpoints, distributing traffic across multiple TPU pods and enabling horizontal scaling based on demand. This configuration includes health checks, session affinity, and traffic routing optimized for LLM inference patterns.
 
@@ -411,21 +437,29 @@ echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
    EOF
 
    # Wait for external IP assignment
-   kubectl get service tpu-inference-service \
-       --output jsonpath='{.status.loadBalancer.ingress[0].ip}'
+   echo "Waiting for external IP assignment..."
+   while [[ $(kubectl get service tpu-inference-service \
+       --output jsonpath='{.status.loadBalancer.ingress[0].ip}') == "" ]]; do
+     echo "Waiting for load balancer IP..."
+     sleep 15
+   done
+
+   EXTERNAL_IP=$(kubectl get service tpu-inference-service \
+       --output jsonpath='{.status.loadBalancer.ingress[0].ip}')
 
    echo "✅ Load balancer service created for inference endpoints"
+   echo "External IP: ${EXTERNAL_IP}"
    ```
 
    The inference service is now accessible through a highly available endpoint, ready to serve LLM requests with optimal performance powered by TPU Ironwood acceleration.
 
-9. **Configure Cloud Monitoring for Performance Tracking**:
+8. **Configure Cloud Monitoring for Performance Tracking**:
 
    Cloud Monitoring provides comprehensive observability for TPU Ironwood inference workloads, tracking key performance indicators including token generation rate, latency percentiles, memory utilization, and TPU compute efficiency. This monitoring foundation enables performance optimization and capacity planning for production LLM deployments.
 
    ```bash
-   # Create custom metrics for LLM inference monitoring
-   gcloud alpha monitoring dashboards create \
+   # Create custom monitoring dashboard for TPU metrics
+   gcloud monitoring dashboards create \
        --config-from-file=- <<EOF
    {
      "displayName": "TPU Ironwood LLM Inference Dashboard",
@@ -441,7 +475,30 @@ echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
                  {
                    "timeSeriesQuery": {
                      "timeSeriesFilter": {
-                       "filter": "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/cpu/utilization\"",
+                       "filter": "resource.type=\"k8s_container\" AND metric.type=\"kubernetes.io/container/cpu/core_usage_time\"",
+                       "aggregation": {
+                         "alignmentPeriod": "60s",
+                         "perSeriesAligner": "ALIGN_RATE",
+                         "crossSeriesReducer": "REDUCE_MEAN"
+                       }
+                     }
+                   }
+                 }
+               ]
+             }
+           }
+         },
+         {
+           "width": 6,
+           "height": 4,
+           "widget": {
+             "title": "Model Loading Performance",  
+             "xyChart": {
+               "dataSets": [
+                 {
+                   "timeSeriesQuery": {
+                     "timeSeriesFilter": {
+                       "filter": "resource.type=\"k8s_container\" AND metric.type=\"kubernetes.io/container/memory/used_bytes\"",
                        "aggregation": {
                          "alignmentPeriod": "60s",
                          "perSeriesAligner": "ALIGN_MEAN"
@@ -529,8 +586,9 @@ echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
    kubectl delete pvc model-storage-pvc
    kubectl delete gcpdatasource llm-model-source
 
-   # Delete storage class
+   # Delete storage class and service account
    kubectl delete storageclass parallelstore-csi-volume-populator
+   kubectl delete serviceaccount tpu-inference-pod
 
    echo "✅ Kubernetes resources removed"
    ```
@@ -562,12 +620,24 @@ echo "✅ Model storage bucket created: gs://${BUCKET_NAME}"
        ${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com \
        --quiet
 
-   echo "✅ Storage resources and service account cleaned up"
+   # Delete VPC network peering and network
+   gcloud services vpc-peerings delete \
+       --network=${NETWORK_NAME} \
+       --project=${PROJECT_ID} \
+       --service=servicenetworking.googleapis.com \
+       --quiet
+
+   gcloud compute addresses delete parallelstore-ip-range \
+       --global --quiet
+
+   gcloud compute networks delete ${NETWORK_NAME} --quiet
+
+   echo "✅ Storage resources and network cleaned up"
    ```
 
 ## Discussion
 
-This recipe demonstrates the integration of Google Cloud's most advanced AI infrastructure components to achieve optimal large language model inference performance. TPU Ironwood represents a significant advancement in AI accelerator technology, specifically engineered for the inference phase of large transformer models with substantial improvements in memory bandwidth and compute efficiency compared to previous TPU generations.
+This recipe demonstrates the integration of Google Cloud's most advanced AI infrastructure components to achieve optimal large language model inference performance. TPU Ironwood represents a significant advancement in AI accelerator technology, specifically engineered for the inference phase of large transformer models with substantial improvements in memory bandwidth (192 GB HBM per chip, 6x that of Trillium) and compute efficiency compared to previous TPU generations.
 
 The combination of TPU Ironwood and GKE Volume Populator addresses two critical bottlenecks in LLM deployment: compute efficiency and data loading performance. Traditional inference deployments often suffer from prolonged cold start times as model weights are loaded from object storage, and suboptimal memory utilization during inference operations. This architecture eliminates these bottlenecks through parallel file system integration and purpose-built inference accelerators.
 
@@ -579,7 +649,7 @@ The monitoring and observability framework established through Cloud Monitoring 
 
 The architectural pattern demonstrated in this recipe can be adapted for various LLM architectures and scales, from smaller fine-tuned models to large foundation models requiring distributed inference across multiple TPU pods. The combination of Google Cloud's managed services reduces operational complexity while providing the performance characteristics required for enterprise-scale AI applications.
 
-For comprehensive technical details on TPU Ironwood architecture, refer to the [Google Cloud TPU documentation](https://cloud.google.com/tpu/docs/intro-to-tpu) and [AI Hypercomputer architecture guide](https://cloud.google.com/blog/products/ai-machine-learning/introducing-ai-hypercomputer-architecture). Additional performance optimization guidance is available in the [Vertex AI best practices documentation](https://cloud.google.com/vertex-ai/docs/general/best-practices) and [GKE optimization guide](https://cloud.google.com/kubernetes-engine/docs/best-practices/performance).
+For comprehensive technical details on TPU Ironwood architecture, refer to the [Google Cloud TPU documentation](https://cloud.google.com/tpu/docs/intro-to-tpu) and [AI Hypercomputer architecture guide](https://cloud.google.com/blog/products/ai-machine-learning/introducing-ai-hypercomputer-architecture). Additional performance optimization guidance is available in the [Vertex AI best practices documentation](https://cloud.google.com/vertex-ai/docs/general/best-practices) and [GKE optimization guide](https://cloud.google.com/kubernetes-engine/docs/best-practices/performance). For Volume Populator specific documentation, see the [GKE Volume Populator guide](https://cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/volume-populator) and [Parallelstore CSI driver overview](https://cloud.google.com/parallelstore/docs/csi-driver-overview).
 
 ## Challenge
 

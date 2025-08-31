@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: amazon-ses, amazon-sns, amazon-s3, amazon-cloudwatch
 estimated-time: 60 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: email-marketing, amazon-ses, sns-notifications, campaign-automation
 recipe-generator-version: 1.3
@@ -169,11 +169,29 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
        --sending-options SendingEnabled=true \
        --suppression-options SuppressedReasons=BOUNCE,COMPLAINT
    
-   # Enable event publishing to SNS
+   # Enable event publishing to SNS and CloudWatch
    aws sesv2 create-configuration-set-event-destination \
        --configuration-set-name ${CONFIG_SET_NAME} \
        --event-destination-name "email-events" \
-       --event-destination Enabled=true,MatchingEventTypes=bounce,complaint,delivery,send,reject,open,click,renderingFailure,deliveryDelay,subscription,CloudWatchDestination='{DefaultDimensionValue=default,DimensionConfigurations=[{DimensionName=MessageTag,DimensionValueSource=messageTag,DefaultDimensionValue=campaign}]}',SnsDestination='{TopicArn='${SNS_TOPIC_ARN}'}'
+       --event-destination '{
+           "Enabled": true,
+           "MatchingEventTypes": [
+               "bounce", "complaint", "delivery", "send", 
+               "reject", "open", "click", "renderingFailure"
+           ],
+           "CloudWatchDestination": {
+               "DimensionConfigurations": [
+                   {
+                       "DimensionName": "MessageTag",
+                       "DimensionValueSource": "messageTag",
+                       "DefaultDimensionValue": "campaign"
+                   }
+               ]
+           },
+           "SnsDestination": {
+               "TopicArn": "'${SNS_TOPIC_ARN}'"
+           }
+       }'
    
    echo "✅ Configuration set created: ${CONFIG_SET_NAME}"
    ```
@@ -255,8 +273,8 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    The bulk email API in Amazon SES enables high-throughput campaign delivery with individual personalization for each recipient, supporting up to 14 messages per second in most regions. This approach maximizes engagement by delivering relevant content while maintaining cost efficiency through batch processing that can handle millions of emails with consistent performance. The template system ensures consistent branding while the replacement data enables unique messaging that can increase click-through rates by up to 100% compared to generic campaigns.
 
    ```bash
-   # Create bulk email destinations file
-   cat > /tmp/destinations.json << EOF
+   # Create bulk email entries for send-bulk-email command
+   cat > /tmp/bulk-entries.json << 'EOF'
    [
        {
            "Destination": {
@@ -273,12 +291,16 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    ]
    EOF
    
-   # Send bulk personalized emails
+   # Send bulk personalized emails using template
    aws sesv2 send-bulk-email \
        --from-email-address ${SENDER_EMAIL} \
-       --destinations file:///tmp/destinations.json \
-       --template-name "product-promotion" \
-       --default-template-data '{"name":"Valued Customer","discount":"10","product_name":"Our Products","product_url":"https://example.com","expiry_date":"2024-12-31","unsubscribe_url":"https://example.com/unsubscribe"}' \
+       --default-content '{
+           "Template": {
+               "TemplateName": "product-promotion",
+               "TemplateData": "{\"name\":\"Valued Customer\",\"discount\":\"10\",\"product_name\":\"Our Products\",\"product_url\":\"https://example.com\",\"expiry_date\":\"2024-12-31\",\"unsubscribe_url\":\"https://example.com/unsubscribe\"}"
+           }
+       }' \
+       --bulk-email-entries file:///tmp/bulk-entries.json \
        --configuration-set-name ${CONFIG_SET_NAME}
    
    echo "✅ Bulk email campaign sent with personalization"
@@ -316,7 +338,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    
    # Create CloudWatch alarms for bounce rate monitoring
    aws cloudwatch put-metric-alarm \
-       --alarm-name "HighBounceRate" \
+       --alarm-name "HighBounceRate-${RANDOM_SUFFIX}" \
        --alarm-description "Alert when bounce rate exceeds 5%" \
        --metric-name Bounce \
        --namespace AWS/SES \
@@ -403,7 +425,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
     ```bash
     # Create EventBridge rule for weekly campaign automation
     aws events put-rule \
-        --name "WeeklyEmailCampaign" \
+        --name "WeeklyEmailCampaign-${RANDOM_SUFFIX}" \
         --schedule-expression "rate(7 days)" \
         --description "Trigger weekly email campaigns"
     
@@ -464,11 +486,9 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
        --configuration-set-name ${CONFIG_SET_NAME} \
        --query 'ConfigurationSetName' --output text
    
-   # View recent sending statistics
-   aws logs filter-log-events \
-       --log-group-name /aws/ses/sending-stats \
-       --start-time $(date -d '1 hour ago' +%s)000 \
-       --query 'events[].message' --output table
+   # Check sending quota and sending rate
+   aws sesv2 get-send-quota
+   aws sesv2 get-send-statistics
    ```
 
 4. **Test bounce handling**:
@@ -477,8 +497,8 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    # Send test email to SES bounce simulator
    aws sesv2 send-email \
        --from-email-address ${SENDER_EMAIL} \
-       --to-addresses "bounce@simulator.amazonses.com" \
-       --simple-message Subject="Test Bounce",Body='Text={Data="Testing bounce handling"}'
+       --destination ToAddresses=bounce@simulator.amazonses.com \
+       --content 'Simple={Subject={Data="Test Bounce"},Body={Text={Data="Testing bounce handling"}}}'
    
    echo "Check SNS notifications for bounce events"
    ```
@@ -538,10 +558,14 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    
    # Delete CloudWatch alarms
    aws cloudwatch delete-alarms \
-       --alarm-names "HighBounceRate"
+       --alarm-names "HighBounceRate-${RANDOM_SUFFIX}"
+   
+   # Delete EventBridge rule
+   aws events delete-rule \
+       --name "WeeklyEmailCampaign-${RANDOM_SUFFIX}"
    
    # Clean up temporary files
-   rm -f /tmp/subscribers.json /tmp/destinations.json
+   rm -f /tmp/subscribers.json /tmp/bulk-entries.json
    rm -f /tmp/bounce-handler.py /tmp/campaign-role-policy.json
    
    echo "✅ CloudWatch resources and temporary files deleted"
@@ -549,29 +573,29 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 
 ## Discussion
 
-Amazon SES provides a robust foundation for building scalable email marketing campaigns with fine-grained control over delivery, tracking, and cost management. The template-based approach enables personalization at scale while maintaining consistent branding across campaigns. Configuration sets serve as the central hub for tracking email events, allowing businesses to monitor engagement metrics, handle bounces and complaints automatically, and optimize campaign performance.
+Amazon SES provides a robust foundation for building scalable email marketing campaigns with fine-grained control over delivery, tracking, and cost management. The template-based approach enables personalization at scale while maintaining consistent branding across campaigns. Configuration sets serve as the central hub for tracking email events, allowing businesses to monitor engagement metrics, handle bounces and complaints automatically, and optimize campaign performance based on real-time data.
 
-The integration with other AWS services creates a powerful ecosystem for email marketing automation. S3 stores subscriber lists and templates, SNS handles real-time notifications for email events, and CloudWatch provides comprehensive analytics. This architecture supports advanced features like A/B testing, segmentation, and automated drip campaigns while maintaining compliance with email best practices and regulations.
+The integration with other AWS services creates a powerful ecosystem for email marketing automation. S3 stores subscriber lists and templates with 99.999999999% durability, SNS handles real-time notifications for email events enabling immediate response to deliverability issues, and CloudWatch provides comprehensive analytics with customizable dashboards and automated alerting. This architecture supports advanced features like A/B testing, behavioral segmentation, and automated drip campaigns while maintaining compliance with email best practices and regulations like CAN-SPAM and GDPR.
 
-Cost optimization is a key advantage of this solution, with Amazon SES charging $0.10 per 1,000 emails sent, significantly lower than traditional email service providers. The pay-as-you-go model scales with business growth, and the ability to leverage AWS's global infrastructure ensures reliable delivery worldwide. For businesses sending millions of emails monthly, this approach can reduce email marketing costs by 60-80% compared to third-party services.
+Cost optimization is a key advantage of this solution, with Amazon SES charging $0.10 per 1,000 emails sent, significantly lower than traditional email service providers that often charge $20-50 per month for similar volumes. The pay-as-you-go model scales with business growth, and the ability to leverage AWS's global infrastructure ensures reliable delivery worldwide with 99.9% uptime SLA. For businesses sending millions of emails monthly, this approach can reduce email marketing costs by 60-80% compared to third-party services while providing superior control and customization capabilities. The [AWS SES pricing page](https://aws.amazon.com/ses/pricing/) provides detailed cost breakdowns for different usage scenarios.
 
-> **Warning**: Always implement proper suppression list management and honor unsubscribe requests immediately to maintain compliance with CAN-SPAM, GDPR, and other email marketing regulations.
+> **Warning**: Always implement proper suppression list management and honor unsubscribe requests immediately to maintain compliance with CAN-SPAM, GDPR, and other email marketing regulations. Failure to comply can result in significant fines and reputation damage.
 
-> **Tip**: Enable dedicated IP addresses for high-volume sending to improve deliverability and maintain sender reputation independently of other AWS SES users.
+> **Tip**: Enable dedicated IP addresses for high-volume sending (10,000+ emails per day) to improve deliverability and maintain sender reputation independently of other AWS SES users. This feature costs $24.95 per month per IP but provides better control over your sending reputation.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Advanced Segmentation**: Create Lambda functions to automatically segment subscribers based on engagement patterns, purchase history, or demographic data stored in DynamoDB.
+1. **Advanced Segmentation**: Create Lambda functions to automatically segment subscribers based on engagement patterns, purchase history, or demographic data stored in DynamoDB, enabling more targeted campaigns that can increase conversion rates by 200-300%.
 
-2. **A/B Testing Framework**: Implement automated A/B testing for subject lines, content, and send times using Step Functions to orchestrate test campaigns and analyze results.
+2. **A/B Testing Framework**: Implement automated A/B testing for subject lines, content, and send times using Step Functions to orchestrate test campaigns and analyze results, providing data-driven insights for campaign optimization.
 
-3. **Behavioral Triggers**: Set up EventBridge rules to trigger personalized emails based on user actions like abandoned cart, product views, or subscription renewals.
+3. **Behavioral Triggers**: Set up EventBridge rules to trigger personalized emails based on user actions like abandoned cart, product views, or subscription renewals, creating responsive marketing automation that drives higher engagement.
 
-4. **Machine Learning Personalization**: Integrate Amazon Personalize to generate product recommendations and content suggestions for each subscriber based on their behavior and preferences.
+4. **Machine Learning Personalization**: Integrate Amazon Personalize to generate product recommendations and content suggestions for each subscriber based on their behavior and preferences, creating truly personalized experiences.
 
-5. **Multi-channel Integration**: Extend the platform to include SMS campaigns using Amazon SNS and push notifications using Amazon Pinpoint for comprehensive customer engagement.
+5. **Multi-channel Integration**: Extend the platform to include SMS campaigns using Amazon SNS and push notifications using Amazon Pinpoint for comprehensive customer engagement across all digital touchpoints.
 
 ## Infrastructure Code
 

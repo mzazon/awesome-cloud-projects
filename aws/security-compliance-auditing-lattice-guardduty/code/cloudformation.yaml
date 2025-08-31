@@ -1,0 +1,1080 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Security Compliance Auditing with VPC Lattice and GuardDuty - Automated security monitoring, threat detection, and compliance reporting'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableGuardDuty
+          - GuardDutyFindingFreq
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - LogRetentionDays
+          - MetricRetentionDays
+          - DashboardEnabled
+      - Label:
+          default: "VPC Lattice Configuration"
+        Parameters:
+          - CreateDemoServiceNetwork
+          - ServiceNetworkName
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      NotificationEmail:
+        default: "Security Alert Email"
+      EnableGuardDuty:
+        default: "Enable GuardDuty"
+      GuardDutyFindingFreq:
+        default: "GuardDuty Finding Frequency"
+      LogRetentionDays:
+        default: "Log Retention (Days)"
+      MetricRetentionDays:
+        default: "Metric Retention (Days)"
+      DashboardEnabled:
+        default: "Create CloudWatch Dashboard"
+      CreateDemoServiceNetwork:
+        default: "Create Demo Service Network"
+      ServiceNetworkName:
+        default: "Service Network Name"
+
+# Input Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'security-compliance-audit'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment type for resource tagging and configuration'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for security alerts and notifications'
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  EnableGuardDuty:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable Amazon GuardDuty for threat detection'
+
+  GuardDutyFindingFreq:
+    Type: String
+    Default: 'FIFTEEN_MINUTES'
+    AllowedValues:
+      - 'FIFTEEN_MINUTES'
+      - 'ONE_HOUR'
+      - 'SIX_HOURS'
+    Description: 'GuardDuty finding publishing frequency'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 3653
+    Description: 'CloudWatch log retention period in days'
+
+  MetricRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 455
+    Description: 'CloudWatch metric retention period in days'
+
+  DashboardEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Create CloudWatch dashboard for monitoring'
+
+  CreateDemoServiceNetwork:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Create demo VPC Lattice service network for testing'
+
+  ServiceNetworkName:
+    Type: String
+    Default: 'security-demo-network'
+    Description: 'Name for the demo VPC Lattice service network'
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens'
+
+# Conditions
+Conditions:
+  EnableGuardDutyCondition: !Equals [!Ref EnableGuardDuty, 'true']
+  CreateDashboardCondition: !Equals [!Ref DashboardEnabled, 'true']
+  CreateServiceNetworkCondition: !Equals [!Ref CreateDemoServiceNetwork, 'true']
+  IsProdEnvironment: !Equals [!Ref Environment, 'prod']
+
+# Resources
+Resources:
+  # S3 Bucket for Security Logs and Compliance Reports
+  SecurityLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-security-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ComplianceReportsTransition
+            Status: Enabled
+            Prefix: 'compliance-reports/'
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: AccessLogsTransition
+            Status: Enabled
+            Prefix: 'access-logs/'
+            Transitions:
+              - TransitionInDays: 7
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 30
+                StorageClass: GLACIER
+            ExpirationInDays: !If [IsProdEnvironment, 2555, 365] # 7 years for prod, 1 year for dev/staging
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref SecurityLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-security-logs-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Security compliance auditing and log storage'
+
+  # S3 Bucket Policy
+  SecurityLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SecurityLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${SecurityLogsBucket}/*'
+              - !Ref SecurityLogsBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowVPCLatticeLogging
+            Effect: Allow
+            Principal:
+              Service: vpc-lattice.amazonaws.com
+            Action:
+              - 's3:PutObject'
+              - 's3:GetBucketAcl'
+            Resource:
+              - !Sub '${SecurityLogsBucket}/vpc-lattice-logs/*'
+              - !Ref SecurityLogsBucket
+
+  # CloudWatch Log Group for VPC Lattice Access Logs
+  SecurityLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vpclattice/${ProjectName}'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !Ref LogEncryptionKey
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc-lattice-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'VPC Lattice access logs for security monitoring'
+
+  # KMS Key for Log Encryption
+  LogEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for encrypting security compliance logs'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vpclattice/${ProjectName}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-log-encryption-key'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # KMS Key Alias
+  LogEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-log-encryption'
+      TargetKeyId: !Ref LogEncryptionKey
+
+  # GuardDuty Detector
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Condition: EnableGuardDutyCondition
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: !Ref GuardDutyFindingFreq
+      DataSources:
+        S3Logs:
+          Enable: true
+        MalwareProtection:
+          ScanEc2InstanceWithFindings:
+            EbsVolumes: true
+        Kubernetes:
+          AuditLogs:
+            Enable: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-guardduty-detector'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Threat detection for security compliance'
+
+  # SNS Topic for Security Alerts
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-security-alerts'
+      DisplayName: 'Security Compliance Alerts'
+      KmsMasterKeyId: !Ref SNSEncryptionKey
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-security-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Security incident notifications'
+
+  # KMS Key for SNS Encryption
+  SNSEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for encrypting SNS security alerts'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow SNS Service
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-sns-encryption-key'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic Policy
+  SecurityAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SecurityAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt SecurityProcessorRole.Arn
+            Action:
+              - 'sns:Publish'
+            Resource: !Ref SecurityAlertsTopic
+
+  # Email Subscription for Security Alerts
+  SecurityAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SecurityAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda Security Processor
+  SecurityProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-security-processor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: SecurityProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogStreams'
+                  - 'logs:FilterLogEvents'
+                Resource: 
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+                  - !GetAtt SecurityLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - 'guardduty:GetDetector'
+                  - 'guardduty:GetFindings'
+                  - 'guardduty:ListFindings'
+                Resource: 
+                  - !If 
+                    - EnableGuardDutyCondition
+                    - !Sub 'arn:aws:guardduty:${AWS::Region}:${AWS::AccountId}:detector/${GuardDutyDetector}'
+                    - !Ref 'AWS::NoValue'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt SecurityLogsBucket.Arn
+                  - !Sub '${SecurityLogsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref SecurityAlertsTopic
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'kms:Encrypt'
+                  - 'kms:Decrypt'
+                  - 'kms:ReEncrypt*'
+                  - 'kms:GenerateDataKey*'
+                  - 'kms:DescribeKey'
+                Resource:
+                  - !GetAtt LogEncryptionKey.Arn
+                  - !GetAtt SNSEncryptionKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-security-processor-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Security Log Processing
+  SecurityProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-security-processor'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityProcessorRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrencyLimit: 10
+      Environment:
+        Variables:
+          GUARDDUTY_DETECTOR_ID: !If 
+            - EnableGuardDutyCondition
+            - !Ref GuardDutyDetector
+            - ''
+          BUCKET_NAME: !Ref SecurityLogsBucket
+          SNS_TOPIC_ARN: !Ref SecurityAlertsTopic
+          LOG_LEVEL: !If [IsProdEnvironment, 'WARNING', 'INFO']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime, timedelta
+          import gzip
+          import base64
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+          
+          # Initialize AWS clients
+          guardduty = boto3.client('guardduty')
+          cloudwatch = boto3.client('cloudwatch')
+          sns = boto3.client('sns')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Processing event: {json.dumps(event, default=str)}")
+                  
+                  # Process CloudWatch Logs events
+                  cw_data = event['awslogs']['data']
+                  compressed_payload = base64.b64decode(cw_data)
+                  uncompressed_payload = gzip.decompress(compressed_payload)
+                  log_data = json.loads(uncompressed_payload)
+                  
+                  suspicious_activities = []
+                  metrics_data = []
+                  
+                  # Process each log event
+                  for log_event in log_data['logEvents']:
+                      try:
+                          log_entry = json.loads(log_event['message'])
+                          
+                          # Analyze access patterns
+                          analysis_result = analyze_access_log(log_entry)
+                          
+                          if analysis_result['is_suspicious']:
+                              suspicious_activities.append(analysis_result)
+                          
+                          # Collect metrics
+                          metrics_data.append(extract_metrics(log_entry))
+                          
+                      except json.JSONDecodeError as e:
+                          logger.warning(f"Failed to parse log entry: {log_event['message']}, error: {str(e)}")
+                          continue
+                      except Exception as e:
+                          logger.error(f"Error processing log event: {str(e)}")
+                          continue
+                  
+                  # Correlate with GuardDuty findings
+                  recent_findings = get_recent_guardduty_findings()
+                  
+                  # Generate compliance report
+                  compliance_report = generate_compliance_report(
+                      suspicious_activities, metrics_data, recent_findings
+                  )
+                  
+                  # Store report in S3
+                  store_compliance_report(compliance_report)
+                  
+                  # Send alerts if necessary
+                  if suspicious_activities or recent_findings:
+                      send_security_alert(suspicious_activities, recent_findings)
+                  
+                  # Publish metrics to CloudWatch
+                  publish_metrics(metrics_data, suspicious_activities)
+                  
+                  logger.info(f"Successfully processed {len(log_data['logEvents'])} log events")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Processed {len(log_data["logEvents"])} log events')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing logs: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+          
+          def analyze_access_log(log_entry):
+              """Analyze VPC Lattice access log for suspicious patterns"""
+              is_suspicious = False
+              risk_score = 0
+              reasons = []
+              
+              # Check for high error rates
+              response_code = log_entry.get('responseCode', 0)
+              if response_code >= 400:
+                  risk_score += 20
+                  reasons.append(f'HTTP error response: {response_code}')
+              
+              # Check for unusual request patterns
+              method = log_entry.get('requestMethod', '')
+              if method in ['PUT', 'DELETE', 'PATCH']:
+                  risk_score += 10
+                  reasons.append(f'Potentially sensitive operation: {method}')
+              
+              # Check for authentication failures
+              auth_denied = log_entry.get('authDeniedReason')
+              if auth_denied:
+                  risk_score += 30
+                  reasons.append(f'Authentication failure: {auth_denied}')
+              
+              # Check for unusual response times
+              duration = log_entry.get('duration', 0)
+              if duration > 10000:  # More than 10 seconds
+                  risk_score += 15
+                  reasons.append(f'Unusually long response time: {duration}ms')
+              
+              # Check for large response sizes
+              bytes_sent = log_entry.get('bytesSent', 0)
+              if bytes_sent > 10485760:  # More than 10MB
+                  risk_score += 10
+                  reasons.append(f'Large response size: {bytes_sent} bytes')
+              
+              # Mark as suspicious if risk score exceeds threshold
+              if risk_score >= 25:
+                  is_suspicious = True
+              
+              return {
+                  'is_suspicious': is_suspicious,
+                  'risk_score': risk_score,
+                  'reasons': reasons,
+                  'log_entry': log_entry,
+                  'timestamp': log_entry.get('startTime', datetime.utcnow().isoformat())
+              }
+          
+          def get_recent_guardduty_findings():
+              """Retrieve recent GuardDuty findings"""
+              detector_id = os.environ.get('GUARDDUTY_DETECTOR_ID')
+              if not detector_id:
+                  logger.info("No GuardDuty detector ID configured")
+                  return []
+              
+              try:
+                  # Get findings from the last hour
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(hours=1)
+                  
+                  response = guardduty.list_findings(
+                      DetectorId=detector_id,
+                      FindingCriteria={
+                          'Criterion': {
+                              'updatedAt': {
+                                  'Gte': int(start_time.timestamp() * 1000),
+                                  'Lte': int(end_time.timestamp() * 1000)
+                              }
+                          }
+                      }
+                  )
+                  
+                  if response['FindingIds']:
+                      findings_response = guardduty.get_findings(
+                          DetectorId=detector_id,
+                          FindingIds=response['FindingIds']
+                      )
+                      return findings_response['Findings']
+                  
+                  return []
+                  
+              except Exception as e:
+                  logger.error(f"Error retrieving GuardDuty findings: {str(e)}")
+                  return []
+          
+          def generate_compliance_report(suspicious_activities, metrics_data, guardduty_findings):
+              """Generate comprehensive compliance report"""
+              report = {
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'summary': {
+                      'total_requests': len(metrics_data),
+                      'suspicious_activities': len(suspicious_activities),
+                      'guardduty_findings': len(guardduty_findings),
+                      'compliance_status': 'COMPLIANT' if len(suspicious_activities) == 0 and len(guardduty_findings) == 0 else 'NON_COMPLIANT'
+                  },
+                  'suspicious_activities': suspicious_activities,
+                  'guardduty_findings': [
+                      {
+                          'title': finding.get('Title', 'Unknown'),
+                          'type': finding.get('Type', 'Unknown'),
+                          'severity': finding.get('Severity', 0),
+                          'description': finding.get('Description', '')
+                      } for finding in guardduty_findings
+                  ],
+                  'metrics': calculate_summary_metrics(metrics_data)
+              }
+              
+              return report
+          
+          def store_compliance_report(report):
+              """Store compliance report in S3"""
+              bucket_name = os.environ.get('BUCKET_NAME')
+              if not bucket_name:
+                  logger.warning("No S3 bucket configured for compliance reports")
+                  return
+              
+              timestamp = datetime.utcnow().strftime('%Y/%m/%d/%H')
+              key = f"compliance-reports/{timestamp}/report-{int(datetime.utcnow().timestamp())}.json"
+              
+              try:
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=key,
+                      Body=json.dumps(report, indent=2, default=str),
+                      ContentType='application/json',
+                      ServerSideEncryption='AES256'
+                  )
+                  logger.info(f"Compliance report stored: s3://{bucket_name}/{key}")
+              except Exception as e:
+                  logger.error(f"Error storing compliance report: {str(e)}")
+          
+          def send_security_alert(suspicious_activities, guardduty_findings):
+              """Send security alert via SNS"""
+              topic_arn = os.environ.get('SNS_TOPIC_ARN')
+              if not topic_arn:
+                  logger.warning("No SNS topic configured for alerts")
+                  return
+              
+              alert_message = {
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'alert_type': 'SECURITY_VIOLATION',
+                  'suspicious_count': len(suspicious_activities),
+                  'guardduty_count': len(guardduty_findings),
+                  'details': {
+                      'suspicious_activities': suspicious_activities[:5],  # Limit to first 5
+                      'recent_guardduty_findings': [f['Title'] for f in guardduty_findings[:3]]
+                  }
+              }
+              
+              try:
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Subject='🚨 Security Compliance Alert - Suspicious Activity Detected',
+                      Message=json.dumps(alert_message, indent=2, default=str)
+                  )
+                  logger.info("Security alert sent successfully")
+              except Exception as e:
+                  logger.error(f"Error sending security alert: {str(e)}")
+          
+          def extract_metrics(log_entry):
+              """Extract metrics from log entry"""
+              return {
+                  'response_code': log_entry.get('responseCode', 0),
+                  'duration': log_entry.get('duration', 0),
+                  'bytes_sent': log_entry.get('bytesSent', 0),
+                  'bytes_received': log_entry.get('bytesReceived', 0),
+                  'method': log_entry.get('requestMethod', 'UNKNOWN')
+              }
+          
+          def calculate_summary_metrics(metrics_data):
+              """Calculate summary metrics"""
+              if not metrics_data:
+                  return {}
+              
+              total_requests = len(metrics_data)
+              error_count = sum(1 for m in metrics_data if m['response_code'] >= 400)
+              avg_duration = sum(m['duration'] for m in metrics_data) / total_requests if total_requests > 0 else 0
+              total_bytes = sum(m['bytes_sent'] + m['bytes_received'] for m in metrics_data)
+              
+              return {
+                  'total_requests': total_requests,
+                  'error_rate': (error_count / total_requests) * 100 if total_requests > 0 else 0,
+                  'average_duration_ms': round(avg_duration, 2),
+                  'total_bytes_transferred': total_bytes
+              }
+          
+          def publish_metrics(metrics_data, suspicious_activities):
+              """Publish custom metrics to CloudWatch"""
+              if not metrics_data:
+                  return
+              
+              try:
+                  # Calculate and publish key metrics
+                  error_count = sum(1 for m in metrics_data if m['response_code'] >= 400)
+                  avg_duration = sum(m['duration'] for m in metrics_data) / len(metrics_data)
+                  
+                  metric_data = [
+                      {
+                          'MetricName': 'RequestCount',
+                          'Value': len(metrics_data),
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {
+                                  'Name': 'Environment',
+                                  'Value': os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'unknown').split('-')[-2] if '-' in os.environ.get('AWS_LAMBDA_FUNCTION_NAME', '') else 'unknown'
+                              }
+                          ]
+                      },
+                      {
+                          'MetricName': 'ErrorCount',
+                          'Value': error_count,
+                          'Unit': 'Count'
+                      },
+                      {
+                          'MetricName': 'AverageResponseTime',
+                          'Value': avg_duration,
+                          'Unit': 'Milliseconds'
+                      },
+                      {
+                          'MetricName': 'SuspiciousActivityCount',
+                          'Value': len(suspicious_activities),
+                          'Unit': 'Count'
+                      }
+                  ]
+                  
+                  cloudwatch.put_metric_data(
+                      Namespace='Security/VPCLattice',
+                      MetricData=metric_data
+                  )
+                  logger.info("Metrics published to CloudWatch")
+              except Exception as e:
+                  logger.error(f"Error publishing metrics: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-security-processor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Security log processing and threat detection'
+
+  # CloudWatch Log Group for Lambda Function
+  SecurityProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-security-processor'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !Ref LogEncryptionKey
+
+  # Log Subscription Filter
+  SecurityLogSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      LogGroupName: !Ref SecurityLogGroup
+      FilterName: SecurityComplianceFilter
+      FilterPattern: ''
+      DestinationArn: !GetAtt SecurityProcessorFunction.Arn
+
+  # Lambda Permission for CloudWatch Logs
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub '${SecurityLogGroup.Arn}:*'
+
+  # VPC Lattice Service Network (Demo)
+  DemoServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Condition: CreateServiceNetworkCondition
+    Properties:
+      Name: !Sub '${ServiceNetworkName}-${AWS::AccountId}'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceNetworkName}-demo'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Demo service network for security testing'
+
+  # VPC Lattice Access Log Subscription
+  ServiceNetworkAccessLogSubscription:
+    Type: AWS::VpcLattice::AccessLogSubscription
+    Condition: CreateServiceNetworkCondition
+    Properties:
+      ResourceIdentifier: !Ref DemoServiceNetwork
+      DestinationArn: !GetAtt SecurityLogGroup.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-access-log-subscription'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard
+  SecurityComplianceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboardCondition
+    Properties:
+      DashboardName: !Sub '${ProjectName}-SecurityCompliance'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Security/VPCLattice", "RequestCount" ],
+                  [ ".", "ErrorCount" ],
+                  [ ".", "SuspiciousActivityCount" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Security Metrics Overview",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Security/VPCLattice", "AverageResponseTime" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Average Response Time",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ProjectName}-security-processor' | fields @timestamp, @message\n| filter @message like /SECURITY_VIOLATION/ or @message like /suspicious/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Security Alerts",
+                "view": "table"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-security-processor" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Performance"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${ProjectName}-security-alerts" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Security Alert Notifications"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  HighSuspiciousActivityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-HighSuspiciousActivity'
+      AlarmDescription: 'Alarm when suspicious activity count exceeds threshold'
+      MetricName: SuspiciousActivityCount
+      Namespace: Security/VPCLattice
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-high-suspicious-activity'
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-LambdaErrors'
+      AlarmDescription: 'Alarm when Lambda function encounters errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SecurityProcessorFunction
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-errors'
+        - Key: Environment
+          Value: !Ref Environment
+
+# Outputs
+Outputs:
+  SecurityLogsBucketName:
+    Description: 'S3 bucket for security logs and compliance reports'
+    Value: !Ref SecurityLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityLogsBucket'
+
+  SecurityLogsBucketArn:
+    Description: 'ARN of the S3 bucket for security logs'
+    Value: !GetAtt SecurityLogsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityLogsBucketArn'
+
+  SecurityLogGroupName:
+    Description: 'CloudWatch log group for VPC Lattice access logs'
+    Value: !Ref SecurityLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityLogGroup'
+
+  SecurityLogGroupArn:
+    Description: 'ARN of the CloudWatch log group'
+    Value: !GetAtt SecurityLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityLogGroupArn'
+
+  GuardDutyDetectorId:
+    Condition: EnableGuardDutyCondition
+    Description: 'GuardDuty detector ID for threat detection'
+    Value: !Ref GuardDutyDetector
+    Export:
+      Name: !Sub '${AWS::StackName}-GuardDutyDetector'
+
+  SecurityAlertsTopicArn:
+    Description: 'SNS topic ARN for security alerts'
+    Value: !Ref SecurityAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAlertsTopic'
+
+  SecurityProcessorFunctionArn:
+    Description: 'Lambda function ARN for security processing'
+    Value: !GetAtt SecurityProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityProcessorFunction'
+
+  SecurityProcessorFunctionName:
+    Description: 'Lambda function name for security processing'
+    Value: !Ref SecurityProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityProcessorFunctionName'
+
+  DemoServiceNetworkId:
+    Condition: CreateServiceNetworkCondition
+    Description: 'VPC Lattice service network ID for demo'
+    Value: !Ref DemoServiceNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-DemoServiceNetwork'
+
+  DemoServiceNetworkArn:
+    Condition: CreateServiceNetworkCondition
+    Description: 'VPC Lattice service network ARN for demo'
+    Value: !GetAtt DemoServiceNetwork.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DemoServiceNetworkArn'
+
+  DashboardUrl:
+    Condition: CreateDashboardCondition
+    Description: 'CloudWatch dashboard URL for security monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-SecurityCompliance'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardUrl'
+
+  EncryptionKeyId:
+    Description: 'KMS key ID for log encryption'
+    Value: !Ref LogEncryptionKey
+    Export:
+      Name: !Sub '${AWS::StackName}-LogEncryptionKey'
+
+  EncryptionKeyArn:
+    Description: 'KMS key ARN for log encryption'
+    Value: !GetAtt LogEncryptionKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LogEncryptionKeyArn'
+
+  ComplianceReportsPath:
+    Description: 'S3 path for compliance reports'
+    Value: !Sub 's3://${SecurityLogsBucket}/compliance-reports/'
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceReportsPath'

@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: iot-core, kinesis, s3, quicksight
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: aws
 recipe-generator-version: 1.3
 ---
 
 # IoT Dashboard Visualization with QuickSight
-
 
 ## Problem
 
@@ -101,7 +100,6 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
 
 export IOT_POLICY_NAME="iot-device-policy-${RANDOM_SUFFIX}"
 export IOT_THING_NAME="iot-sensor-${RANDOM_SUFFIX}"
-export IOT_CERT_ARN=""
 export KINESIS_STREAM_NAME="iot-data-stream-${RANDOM_SUFFIX}"
 export S3_BUCKET_NAME="iot-analytics-bucket-${RANDOM_SUFFIX}"
 export FIREHOSE_DELIVERY_STREAM="iot-firehose-${RANDOM_SUFFIX}"
@@ -136,8 +134,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    
    # Create IoT thing representing our sensor device
    aws iot create-thing \
-       --thing-name ${IOT_THING_NAME} \
-       --thing-type-name "SensorDevice"
+       --thing-name ${IOT_THING_NAME}
    
    echo "✅ IoT Core resources created"
    ```
@@ -163,33 +160,7 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
 
    The Kinesis stream is now active and ready to receive high-throughput IoT messages. With one shard, it can handle up to 1,000 records per second or 1 MB per second of incoming data. This stream will serve as the reliable backbone for routing IoT sensor data to multiple downstream consumers including storage, analytics, and alerting systems.
 
-3. **Create IoT Rules Engine rule to route data to Kinesis**:
-
-   The AWS IoT Rules Engine provides powerful SQL-based message routing and transformation capabilities. It evaluates incoming messages against SQL-like rules and can route data to multiple AWS services simultaneously. This serverless processing layer eliminates the need for custom message routing infrastructure while providing advanced filtering, transformation, and enrichment capabilities for IoT data streams.
-
-   ```bash
-   # Create IoT rule to forward messages to Kinesis
-   aws iot create-topic-rule \
-       --rule-name "RouteToKinesis" \
-       --topic-rule-payload '{
-           "sql": "SELECT *, timestamp() as event_time FROM \"topic/sensor/data\"",
-           "description": "Route IoT sensor data to Kinesis Data Streams",
-           "actions": [
-               {
-                   "kinesis": {
-                       "roleArn": "arn:aws:iam::'${AWS_ACCOUNT_ID}':role/IoTKinesisRole",
-                       "streamName": "'${KINESIS_STREAM_NAME}'"
-                   }
-               }
-           ]
-       }'
-   
-   echo "✅ IoT Rules Engine rule created"
-   ```
-
-   The rule is now actively monitoring the "topic/sensor/data" MQTT topic and will automatically forward matching messages to Kinesis. The SQL statement adds a server-side timestamp to each message, ensuring consistent time tracking regardless of device clock accuracy. This automated routing eliminates message processing latency and provides reliable delivery guarantees.
-
-4. **Create IAM role for IoT Rules Engine**:
+3. **Create IAM role for IoT Rules Engine**:
 
    IAM roles enable secure, temporary credential delegation without hardcoding secrets in configurations. For IoT Rules Engine, the role follows the principle of least privilege by granting only the specific Kinesis permissions needed for message forwarding. This approach ensures that IoT message routing operates securely while maintaining the flexibility to add additional downstream targets in the future.
 
@@ -209,11 +180,6 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
                }
            ]
        }'
-   
-   # Attach policy to allow Kinesis access
-   aws iam attach-role-policy \
-       --role-name IoTKinesisRole \
-       --policy-arn arn:aws:iam::aws:policy/service-role/IoTThingsRegistration
    
    # Create custom policy for Kinesis access
    aws iam create-policy \
@@ -241,6 +207,32 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    ```
 
    The IAM role is now configured with precise permissions for Kinesis access, enabling the IoT Rules Engine to securely forward messages. This security foundation supports audit compliance by providing clear permission boundaries and enables easy permission management as your IoT architecture scales to include additional services.
+
+4. **Create IoT Rules Engine rule to route data to Kinesis**:
+
+   The AWS IoT Rules Engine provides powerful SQL-based message routing and transformation capabilities. It evaluates incoming messages against SQL-like rules and can route data to multiple AWS services simultaneously. This serverless processing layer eliminates the need for custom message routing infrastructure while providing advanced filtering, transformation, and enrichment capabilities for IoT data streams.
+
+   ```bash
+   # Create IoT rule to forward messages to Kinesis
+   aws iot create-topic-rule \
+       --rule-name "RouteToKinesis" \
+       --topic-rule-payload '{
+           "sql": "SELECT *, timestamp() as event_time FROM \"topic/sensor/data\"",
+           "description": "Route IoT sensor data to Kinesis Data Streams",
+           "actions": [
+               {
+                   "kinesis": {
+                       "roleArn": "arn:aws:iam::'${AWS_ACCOUNT_ID}':role/IoTKinesisRole",
+                       "streamName": "'${KINESIS_STREAM_NAME}'"
+                   }
+               }
+           ]
+       }'
+   
+   echo "✅ IoT Rules Engine rule created"
+   ```
+
+   The rule is now actively monitoring the "topic/sensor/data" MQTT topic and will automatically forward matching messages to Kinesis. The SQL statement adds a server-side timestamp to each message, ensuring consistent time tracking regardless of device clock accuracy. This automated routing eliminates message processing latency and provides reliable delivery guarantees.
 
 5. **Set up Kinesis Data Firehose to deliver data to S3**:
 
@@ -301,20 +293,11 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
    # Create Firehose delivery stream
    aws firehose create-delivery-stream \
        --delivery-stream-name ${FIREHOSE_DELIVERY_STREAM} \
-       --kinesis-stream-source-configuration '{
-           "KinesisStreamARN": "arn:aws:kinesis:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':stream/'${KINESIS_STREAM_NAME}'",
-           "RoleARN": "arn:aws:iam::'${AWS_ACCOUNT_ID}':role/FirehoseDeliveryRole"
-       }' \
-       --s3-destination-configuration '{
-           "RoleARN": "arn:aws:iam::'${AWS_ACCOUNT_ID}':role/FirehoseDeliveryRole",
-           "BucketARN": "arn:aws:s3:::'${S3_BUCKET_NAME}'",
-           "Prefix": "iot-data/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/",
-           "BufferingHints": {
-               "SizeInMBs": 1,
-               "IntervalInSeconds": 60
-           },
-           "CompressionFormat": "GZIP"
-       }'
+       --delivery-stream-type KinesisStreamAsSource \
+       --kinesis-stream-source-configuration \
+           KinesisStreamARN=arn:aws:kinesis:${AWS_REGION}:${AWS_ACCOUNT_ID}:stream/${KINESIS_STREAM_NAME},RoleARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/FirehoseDeliveryRole \
+       --extended-s3-destination-configuration \
+           RoleARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/FirehoseDeliveryRole,BucketARN=arn:aws:s3:::${S3_BUCKET_NAME},Prefix=iot-data/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/,BufferingHints='{SizeInMBs=1,IntervalInSeconds=60}',CompressionFormat=GZIP
    
    echo "✅ Firehose delivery stream created"
    ```
@@ -664,13 +647,13 @@ echo "✅ S3 bucket created: ${S3_BUCKET_NAME}"
 
 ## Discussion
 
-This solution demonstrates the power of combining AWS IoT services with QuickSight for comprehensive IoT data visualization. The architecture leverages AWS IoT Core for device connectivity, Kinesis for real-time data streaming, and S3 for cost-effective data storage, while QuickSight provides powerful business intelligence capabilities.
+This solution demonstrates the power of combining AWS IoT services with QuickSight for comprehensive IoT data visualization. The architecture leverages AWS IoT Core for device connectivity, Kinesis for real-time data streaming, and S3 for cost-effective data storage, while QuickSight provides powerful business intelligence capabilities following AWS Well-Architected Framework principles.
 
 The key architectural decision to use Kinesis Data Streams with Firehose ensures both real-time processing capabilities and efficient batch loading into S3. This approach enables both immediate alerting and historical trend analysis. The AWS Glue Data Catalog acts as a crucial bridge, automatically cataloging the data schema and making it queryable through Athena, which QuickSight can then use as a data source.
 
-QuickSight's integration with the AWS ecosystem makes it particularly well-suited for IoT analytics. Its ability to connect directly to Athena and query data stored in S3 through the Glue Data Catalog eliminates the need for complex ETL processes. The service also supports real-time dashboards through direct database connections, scheduled data refreshes, and can scale to support thousands of concurrent users accessing IoT dashboards.
+QuickSight's integration with the AWS ecosystem makes it particularly well-suited for IoT analytics. Its ability to connect directly to Athena and query data stored in S3 through the Glue Data Catalog eliminates the need for complex ETL processes. The service also supports real-time dashboards through direct database connections, scheduled data refreshes, and can scale to support thousands of concurrent users accessing IoT dashboards. This architecture follows the [AWS Well-Architected IoT Lens](https://docs.aws.amazon.com/wellarchitected/latest/iot-lens/welcome.html) principles for building reliable, secure, and efficient IoT solutions.
 
-For production deployments, consider implementing data partitioning strategies in S3 based on device type, location, or time periods to optimize query performance and costs. Additionally, QuickSight's machine learning insights can automatically detect anomalies in IoT sensor data and provide forecasting capabilities without requiring specialized ML expertise.
+For production deployments, consider implementing data partitioning strategies in S3 based on device type, location, or time periods to optimize query performance and costs. Additionally, QuickSight's machine learning insights can automatically detect anomalies in IoT sensor data and provide forecasting capabilities without requiring specialized ML expertise. The solution also aligns with [AWS IoT Core best practices](https://docs.aws.amazon.com/iot/latest/developerguide/iot-best-practices.html) for secure device connectivity and message routing.
 
 > **Tip**: Use QuickSight's parameter-driven dashboards to create dynamic filters that allow users to drill down into specific devices, time ranges, or sensor types. This approach enables role-based data access and creates more targeted analytics experiences for different stakeholder groups like operations teams, facility managers, and executives.
 

@@ -4,12 +4,12 @@ id: a7b8c9d0
 category: containers
 difficulty: 200
 subject: azure
-services: Azure Container Apps Jobs, Azure Redis Enterprise, Azure Monitor, Azure Storage
+services: Container Apps Jobs, Cache for Redis Enterprise, Monitor, Storage
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: containers, cache, redis, workflow, distributed, monitoring, serverless
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Modern applications often experience performance degradation during cold starts 
 
 ## Solution
 
-This solution implements an automated distributed cache warm-up system using Azure Container Apps Jobs to orchestrate parallel cache population workflows for Azure Redis Enterprise. The system triggers containerized jobs that efficiently populate cache with frequently accessed data, includes comprehensive monitoring through Azure Monitor, and provides failover capabilities to ensure cache availability across different scenarios.
+This solution implements an automated distributed cache warm-up system using Azure Container Apps Jobs to orchestrate parallel cache population workflows for Azure Cache for Redis Enterprise. The system triggers containerized jobs that efficiently populate cache with frequently accessed data, includes comprehensive monitoring through Azure Monitor, and provides failover capabilities to ensure cache availability across different scenarios.
 
 ## Architecture Diagram
 
@@ -38,7 +38,7 @@ graph TB
     end
     
     subgraph "Cache Layer"
-        REDIS[Azure Redis Enterprise]
+        REDIS[Azure Cache for Redis Enterprise]
         BACKUP[Backup Redis Instance]
     end
     
@@ -93,13 +93,13 @@ graph TB
 
 ## Prerequisites
 
-1. Azure subscription with Container Apps and Redis Enterprise permissions
+1. Azure subscription with Container Apps and Cache for Redis Enterprise permissions
 2. Azure CLI v2.50.0 or later installed and configured
 3. Basic knowledge of containerization and Redis caching concepts
 4. Docker installed for local container image building
-5. Estimated cost: $150-300/month for Redis Enterprise cluster and Container Apps environment
+5. Estimated cost: $200-400/month for Redis Enterprise cluster and Container Apps environment
 
-> **Note**: This recipe uses Azure Redis Enterprise tier which provides advanced features like active geo-replication and Redis modules. Consider using Standard tier for development environments to reduce costs.
+> **Note**: This recipe uses Azure Cache for Redis Enterprise tier which provides advanced features like active geo-replication and Redis modules. Consider using Standard tier for development environments to reduce costs.
 
 ## Preparation
 
@@ -171,9 +171,9 @@ echo "✅ Log Analytics workspace ID retrieved: ${LOG_ANALYTICS_ID}"
 
    The Container Apps environment is now ready to host cache warm-up jobs with integrated monitoring and logging. This managed environment automatically handles container orchestration, scaling, and health monitoring while providing secure networking boundaries for the cache population workloads.
 
-2. **Create Azure Redis Enterprise Cluster**:
+2. **Create Azure Cache for Redis Enterprise Cluster**:
 
-   Azure Redis Enterprise provides enterprise-grade caching with advanced features including active geo-replication, Redis modules support, and enhanced security. The Enterprise tier delivers superior performance compared to Standard Redis, with built-in high availability and automatic failover capabilities essential for production cache workloads.
+   Azure Cache for Redis Enterprise provides enterprise-grade caching with advanced features including active geo-replication, Redis modules support, and enhanced security. The Enterprise tier delivers superior performance compared to Standard Redis, with built-in high availability and automatic failover capabilities essential for production cache workloads.
 
    ```bash
    # Create Redis Enterprise cluster
@@ -254,7 +254,7 @@ echo "✅ Log Analytics workspace ID retrieved: ${LOG_ANALYTICS_ID}"
    az keyvault secret set \
        --vault-name ${KEY_VAULT_NAME} \
        --name redis-connection-string \
-       --value "Server=${REDIS_NAME}.redis.cache.windows.net:6380;Password=${REDIS_CONNECTION_STRING};Database=0;Ssl=True"
+       --value "${REDIS_NAME}.redis.cache.windows.net:6380,password=${REDIS_CONNECTION_STRING},ssl=True,abortConnect=False"
 
    echo "✅ Redis connection string stored in Key Vault"
    ```
@@ -356,7 +356,7 @@ foreach (var partition in workPartitions)
 logger.LogInformation("Cache warm-up coordinator completed successfully");
 EOF
 
-   # Build and push coordinator image
+   # Build coordinator image
    COORDINATOR_IMAGE="coordinator:latest"
    docker build -f Dockerfile.coordinator -t ${COORDINATOR_IMAGE} .
    
@@ -477,7 +477,7 @@ public class WorkPartition
 }
 EOF
 
-   # Build and push worker image
+   # Build worker image
    WORKER_IMAGE="worker:latest"
    docker build -f Dockerfile.worker -t ${WORKER_IMAGE} .
    
@@ -503,7 +503,7 @@ EOF
        --memory 1.0Gi \
        --replica-timeout 1800 \
        --parallelism 1 \
-       --completions 1 \
+       --replica-completion-count 1 \
        --env-vars \
            RESOURCE_GROUP=${RESOURCE_GROUP} \
            SUBSCRIPTION_ID=${SUBSCRIPTION_ID} \
@@ -532,7 +532,7 @@ EOF
        --memory 0.5Gi \
        --replica-timeout 3600 \
        --parallelism 4 \
-       --completions 4 \
+       --replica-completion-count 4 \
        --env-vars \
            STORAGE_ACCOUNT_NAME=${STORAGE_ACCOUNT_NAME} \
            KEY_VAULT_NAME=${KEY_VAULT_NAME}
@@ -558,7 +558,7 @@ EOF
    az monitor metrics alert create \
        --name "Cache Warmup Job Failures" \
        --resource-group ${RESOURCE_GROUP} \
-       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/containerapps/${COORDINATOR_JOB_NAME}" \
+       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/jobs/${COORDINATOR_JOB_NAME}" \
        --condition "count static GreaterThan 0 PT5M" \
        --description "Alert when cache warm-up job fails" \
        --evaluation-frequency PT1M \
@@ -586,7 +586,7 @@ EOF
    # List all jobs in the environment
    az containerapp job list \
        --resource-group ${RESOURCE_GROUP} \
-       --query "[].{name:name,triggerType:configuration.triggerType,provisioningState:provisioningState}" \
+       --query "[].{name:name,triggerType:properties.configuration.triggerType,provisioningState:properties.provisioningState}" \
        --output table
    ```
 
@@ -604,7 +604,7 @@ EOF
    az containerapp job execution list \
        --name ${COORDINATOR_JOB_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query "[0].{name:name,status:status,startTime:startTime}" \
+       --query "[0].{name:name,status:properties.status,startTime:properties.startTime}" \
        --output table
    ```
 
@@ -645,7 +645,7 @@ EOF
    
    # Check job execution metrics
    az monitor metrics list \
-       --resource "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/containerapps/${COORDINATOR_JOB_NAME}" \
+       --resource "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/jobs/${COORDINATOR_JOB_NAME}" \
        --metrics "Executions" \
        --output table
    ```
@@ -657,15 +657,21 @@ EOF
 1. **Stop Running Jobs**:
 
    ```bash
-   # Stop any running job executions
-   az containerapp job stop \
+   # Get running job execution name if any exists
+   RUNNING_EXECUTION=$(az containerapp job execution list \
        --name ${COORDINATOR_JOB_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --job-execution-name $(az containerapp job execution list \
+       --query "[?properties.status=='Running'].name" \
+       --output tsv)
+   
+   # Stop running execution if it exists
+   if [ ! -z "$RUNNING_EXECUTION" ]; then
+       az containerapp job stop \
            --name ${COORDINATOR_JOB_NAME} \
            --resource-group ${RESOURCE_GROUP} \
-           --query "[0].name" --output tsv) \
-       --no-wait
+           --job-execution-name ${RUNNING_EXECUTION} \
+           --no-wait
+   fi
    
    echo "✅ Job executions stopped"
    ```
@@ -728,7 +734,7 @@ EOF
 
 ## Discussion
 
-Azure Container Apps Jobs provide an ideal serverless platform for implementing distributed cache warm-up workflows, offering automatic scaling, integrated monitoring, and cost-effective execution for finite-duration workloads. The combination with Azure Redis Enterprise creates a powerful architecture that addresses common cache performance challenges while maintaining enterprise-grade security and reliability. For comprehensive guidance on Container Apps Jobs, see the [Azure Container Apps Jobs documentation](https://learn.microsoft.com/en-us/azure/container-apps/jobs) and [Redis Enterprise best practices](https://learn.microsoft.com/en-us/azure/azure-cache-for-redis/cache-best-practices).
+Azure Container Apps Jobs provide an ideal serverless platform for implementing distributed cache warm-up workflows, offering automatic scaling, integrated monitoring, and cost-effective execution for finite-duration workloads. The combination with Azure Cache for Redis Enterprise creates a powerful architecture that addresses common cache performance challenges while maintaining enterprise-grade security and reliability. For comprehensive guidance on Container Apps Jobs, see the [Azure Container Apps Jobs documentation](https://learn.microsoft.com/en-us/azure/container-apps/jobs) and [Redis Enterprise best practices](https://learn.microsoft.com/en-us/azure/azure-cache-for-redis/cache-best-practices).
 
 The distributed architecture pattern enables efficient cache population across multiple data sources simultaneously, significantly reducing warm-up time compared to sequential approaches. Container Apps Jobs automatically handle container orchestration, failure recovery, and resource management, eliminating operational overhead while ensuring consistent cache population. This approach follows the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/well-architected/) principles of reliability, performance efficiency, and cost optimization.
 
@@ -744,7 +750,7 @@ Extend this solution by implementing these enhancements:
 
 1. **Implement intelligent cache prioritization** by analyzing application access patterns and dynamically adjusting warm-up priorities based on cache hit rates and business impact metrics.
 
-2. **Add multi-region cache warm-up** using Azure Redis Enterprise's active geo-replication features to ensure consistent cache population across multiple geographic regions.
+2. **Add multi-region cache warm-up** using Azure Cache for Redis Enterprise's active geo-replication features to ensure consistent cache population across multiple geographic regions.
 
 3. **Create adaptive scheduling** that adjusts warm-up frequency based on cache expiration patterns, application load, and business hours using Azure Logic Apps or Azure Functions.
 

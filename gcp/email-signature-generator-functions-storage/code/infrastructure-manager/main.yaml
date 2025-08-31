@@ -1,0 +1,330 @@
+# Google Cloud Infrastructure Manager Configuration
+# Email Signature Generator with Cloud Functions and Storage
+# 
+# This Infrastructure Manager configuration deploys:
+# - Cloud Storage bucket for storing generated email signatures
+# - Cloud Function (Gen 2) for signature generation API
+# - IAM bindings for proper service account permissions
+# - Required APIs and services
+#
+# Prerequisites:
+# - Google Cloud Project with billing enabled
+# - Infrastructure Manager API enabled
+# - Deployment Manager API enabled (for some resources)
+#
+# Deployment:
+# gcloud infra-manager deployments apply projects/$PROJECT_ID/locations/$REGION/deployments/email-signature-generator \
+#   --service-account=$SERVICE_ACCOUNT \
+#   --local-source=. \
+#   --input-values=project_id=$PROJECT_ID,region=$REGION
+
+# Infrastructure Manager blueprint metadata
+blueprint:
+  name: email-signature-generator
+  displayName: "Email Signature Generator with Cloud Functions and Storage"
+  description: "Serverless email signature generator using Cloud Functions and Cloud Storage"
+
+# Input variables for customization
+variables:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    varType: string
+    required: true
+    
+  - name: region
+    description: "Google Cloud region for deployment"
+    varType: string
+    defaultValue: "us-central1"
+    
+  - name: function_name
+    description: "Name of the Cloud Function"
+    varType: string
+    defaultValue: "generate-signature"
+    
+  - name: bucket_name_suffix
+    description: "Suffix for the Cloud Storage bucket name (bucket will be named email-signatures-{suffix})"
+    varType: string
+    defaultValue: "generator"
+    
+  - name: function_memory
+    description: "Memory allocation for Cloud Function (e.g., 256Mi, 512Mi)"
+    varType: string
+    defaultValue: "256Mi"
+    
+  - name: function_timeout
+    description: "Timeout for Cloud Function in seconds"
+    varType: string
+    defaultValue: "60s"
+
+# Resources to be deployed
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/cloudfunctions.googleapis.com
+      
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/storage.googleapis.com
+      
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/cloudbuild.googleapis.com
+      
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/run.googleapis.com
+
+  # Cloud Storage bucket for storing generated email signatures
+  - name: email-signatures-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: email-signatures-${bucket_name_suffix}
+      project: ${project_id}
+      location: ${region}
+      storageClass: STANDARD
+      # Enable uniform bucket-level access for simplified IAM
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Configure lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Delete signatures older than 1 year
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90   # Move to coldline storage after 90 days
+      # Enable versioning for signature history
+      versioning:
+        enabled: true
+      # Configure CORS for web browser access
+      cors:
+        - origin: ["*"]
+          method: ["GET", "HEAD"]
+          responseHeader: ["Content-Type"]
+          maxAgeSeconds: 3600
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # IAM binding to make bucket objects publicly readable
+  - name: bucket-public-read-binding
+    type: gcp-types/storage-v1:buckets.iam
+    properties:
+      bucket: $(ref.email-signatures-bucket.name)
+      bindings:
+        - role: roles/storage.objectViewer
+          members:
+            - allUsers
+    metadata:
+      dependsOn:
+        - email-signatures-bucket
+
+  # Service account for Cloud Function
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: email-signature-function-sa
+      serviceAccount:
+        displayName: "Email Signature Generator Function Service Account"
+        description: "Service account for the email signature generator Cloud Function"
+      project: ${project_id}
+
+  # IAM binding for function service account to access storage
+  - name: function-storage-access
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/storage.objectCreator
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+        - email-signatures-bucket
+
+  # Cloud Function source code archive
+  - name: function-source-archive
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.email-signatures-bucket.name)
+      name: function-source.zip
+      # Base64 encoded ZIP file containing the function source
+      # In a real deployment, this would be generated from the source files
+      contentType: application/zip
+      # This is a placeholder - in practice, you would upload the actual ZIP file
+      # containing main.py and requirements.txt
+    metadata:
+      dependsOn:
+        - email-signatures-bucket
+
+  # Cloud Function (Generation 2)
+  - name: signature-generator-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      functionId: ${function_name}
+      function:
+        displayName: "Email Signature Generator"
+        description: "HTTP Cloud Function to generate professional HTML email signatures"
+        
+        # Build configuration
+        buildConfig:
+          runtime: python312
+          entryPoint: generate_signature
+          source:
+            storageSource:
+              bucket: $(ref.email-signatures-bucket.name)
+              object: $(ref.function-source-archive.name)
+          environmentVariables:
+            BUCKET_NAME: $(ref.email-signatures-bucket.name)
+        
+        # Service configuration
+        serviceConfig:
+          maxInstanceCount: 100
+          minInstanceCount: 0
+          availableMemory: ${function_memory}
+          timeoutSeconds: 60
+          environmentVariables:
+            BUCKET_NAME: $(ref.email-signatures-bucket.name)
+          serviceAccountEmail: $(ref.function-service-account.email)
+          
+          # Configure ingress settings
+          ingressSettings: ALLOW_ALL
+          
+          # Configure VPC access if needed (commented out for public access)
+          # vpcConnector: projects/${project_id}/locations/${region}/connectors/connector-name
+          # vpcConnectorEgressSettings: ALL_TRAFFIC
+        
+        # Configure HTTP trigger
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - enable-run-api
+        - function-service-account
+        - function-source-archive
+        - function-storage-access
+
+  # IAM policy to allow unauthenticated invocation of the function
+  - name: function-public-access
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions.iamMemberBinding
+    properties:
+      resource: $(ref.signature-generator-function.name)
+      role: roles/cloudfunctions.invoker
+      member: allUsers
+    metadata:
+      dependsOn:
+        - signature-generator-function
+
+  # Cloud Monitoring alert policy for function errors (optional)
+  - name: function-error-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${project_id}
+      alertPolicy:
+        displayName: "Email Signature Function Errors"
+        documentation:
+          content: "Alert when the email signature generator function experiences errors"
+        conditions:
+          - displayName: "Function error rate"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.labels.function_name="${function_name}"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0.1
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        enabled: true
+        combiner: OR
+    metadata:
+      dependsOn:
+        - signature-generator-function
+
+# Output values for reference and integration
+outputs:
+  - name: storage_bucket_name
+    description: "Name of the Cloud Storage bucket for email signatures"
+    value: $(ref.email-signatures-bucket.name)
+    
+  - name: storage_bucket_url
+    description: "URL of the Cloud Storage bucket"
+    value: https://storage.googleapis.com/$(ref.email-signatures-bucket.name)
+    
+  - name: function_name
+    description: "Name of the deployed Cloud Function"
+    value: $(ref.signature-generator-function.name)
+    
+  - name: function_url
+    description: "HTTP trigger URL for the Cloud Function"
+    value: $(ref.signature-generator-function.serviceConfig.uri)
+    
+  - name: function_service_account
+    description: "Email of the function service account"
+    value: $(ref.function-service-account.email)
+    
+  - name: project_id
+    description: "Google Cloud Project ID used for deployment"
+    value: ${project_id}
+    
+  - name: deployment_region
+    description: "Google Cloud region where resources are deployed"
+    value: ${region}
+
+# Metadata for the deployment
+metadata:
+  version: "1.0"
+  author: "Cloud Recipe Generator"
+  documentation: "https://cloud.google.com/functions/docs"
+  
+  # Resource dependencies visualization
+  dependencyGraph:
+    description: |
+      This deployment creates the following resource dependencies:
+      1. APIs are enabled first
+      2. Storage bucket is created
+      3. Service account is created
+      4. IAM bindings are applied
+      5. Function source is uploaded
+      6. Cloud Function is deployed
+      7. Public access is configured
+      8. Monitoring is set up
+      
+  # Cost estimation notes
+  costEstimation:
+    description: |
+      Estimated monthly costs (based on typical usage):
+      - Cloud Functions: $0.40 per million requests (free tier: 2M requests/month)
+      - Cloud Storage: $0.020 per GB/month (free tier: 5GB/month)
+      - Data Transfer: $0.12 per GB (free tier: 1GB/month)
+      
+      This solution is designed to fit within Google Cloud's free tier limits
+      for small to medium usage patterns.
+      
+  # Security considerations
+  securityNotes:
+    description: |
+      Security features implemented:
+      - Service account with minimal required permissions
+      - HTTPS-only function access
+      - Uniform bucket-level access control
+      - Public read-only access to generated signatures
+      - No hardcoded credentials in function code
+      
+      Additional security recommendations:
+      - Implement authentication for production environments
+      - Add input validation and sanitization
+      - Configure VPC connector for private network access
+      - Enable audit logging for compliance requirements
+      - Implement rate limiting to prevent abuse

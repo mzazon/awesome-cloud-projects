@@ -4,12 +4,12 @@ id: 7a8b9c2d
 category: analytics
 difficulty: 200
 subject: gcp
-services: Cloud Carbon Footprint, Analytics Hub, Cloud Scheduler, Cloud Functions
+services: BigQuery, Analytics Hub, Cloud Scheduler, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: sustainability, carbon-footprint, energy-optimization, analytics, multi-region, green-computing
 recipe-generator-version: 1.3
@@ -116,6 +116,7 @@ gcloud services enable cloudscheduler.googleapis.com
 gcloud services enable bigquery.googleapis.com
 gcloud services enable monitoring.googleapis.com
 gcloud services enable cloudbuild.googleapis.com
+gcloud services enable analyticshub.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled for carbon optimization system"
@@ -188,6 +189,7 @@ echo "✅ APIs enabled for carbon optimization system"
    cat > main.py << 'EOF'
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 import requests
 from google.cloud import bigquery
@@ -233,7 +235,7 @@ def get_carbon_footprint_data():
     for region in regions:
         # In production, this would call the actual Carbon Footprint API
         data = {
-            'timestamp': datetime.utcnow(),
+            'timestamp': datetime.utcnow().isoformat(),
             'region': region,
             'service': 'compute',
             'carbon_emissions_kg': 2.5 + (hash(region) % 10) / 10,
@@ -270,7 +272,7 @@ def process_optimization_data(carbon_data, grid_data):
     for data in carbon_data[1:]:  # Skip the best region
         if data['carbon_intensity'] > sorted_regions[0]['carbon_intensity'] * 1.2:
             recommendations.append({
-                'timestamp': datetime.utcnow(),
+                'timestamp': datetime.utcnow().isoformat(),
                 'workload_id': f"workload-{hash(data['region']) % 1000}",
                 'source_region': data['region'],
                 'target_region': best_region,
@@ -282,25 +284,20 @@ def process_optimization_data(carbon_data, grid_data):
 
 def store_results(carbon_data, recommendations):
     """Store carbon data and recommendations in BigQuery."""
-    dataset_id = 'carbon_analytics_${RANDOM_SUFFIX}'
+    project_id = os.environ.get('PROJECT_ID')
+    dataset_name = os.environ.get('DATASET_NAME')
     
     # Store carbon footprint data
-    table_id = f'{dataset_id}.carbon_footprint'
-    errors = bq_client.insert_rows_json(
-        f'${PROJECT_ID}.{table_id}',
-        carbon_data
-    )
+    table_id = f'{project_id}.{dataset_name}.carbon_footprint'
+    errors = bq_client.insert_rows_json(table_id, carbon_data)
     
     if errors:
         raise Exception(f"BigQuery insert errors: {errors}")
     
     # Store optimization recommendations
     if recommendations:
-        table_id = f'{dataset_id}.workload_schedules'
-        errors = bq_client.insert_rows_json(
-            f'${PROJECT_ID}.{table_id}',
-            recommendations
-        )
+        table_id = f'{project_id}.{dataset_name}.workload_schedules'
+        errors = bq_client.insert_rows_json(table_id, recommendations)
         
         if errors:
             raise Exception(f"BigQuery insert errors: {errors}")
@@ -309,15 +306,15 @@ EOF
    
    # Create requirements.txt
    cat > requirements.txt << 'EOF'
-google-cloud-bigquery==3.11.4
-google-cloud-monitoring==2.15.1
-requests==2.31.0
-functions-framework==3.4.0
+google-cloud-bigquery==3.35.0
+google-cloud-monitoring==2.21.0
+requests==2.32.3
+functions-framework==3.8.1
 EOF
    
    # Deploy the Cloud Function
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-http \
        --allow-unauthenticated \
        --source . \
@@ -459,6 +456,8 @@ EOF
    cat > main.py << 'EOF'
 import json
 import logging
+import os
+from datetime import datetime
 from google.cloud import compute_v1
 from google.cloud import bigquery
 import functions_framework
@@ -491,10 +490,12 @@ def migrate_workloads(cloud_event):
 def get_optimization_recommendations():
     """Retrieve latest workload optimization recommendations."""
     client = bigquery.Client()
+    project_id = os.environ.get('PROJECT_ID')
+    dataset_name = os.environ.get('DATASET_NAME')
     
     query = f"""
     SELECT *
-    FROM \`${PROJECT_ID}.${DATASET_NAME}.workload_schedules\`
+    FROM \`{project_id}.{dataset_name}.workload_schedules\`
     WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 HOUR)
     AND carbon_savings_kg > 0.1
     ORDER BY carbon_savings_kg DESC
@@ -518,14 +519,16 @@ def process_workload_migration(recommendation):
 def log_migration_results(results):
     """Log migration results for audit and monitoring."""
     client = bigquery.Client()
+    project_id = os.environ.get('PROJECT_ID')
+    dataset_name = os.environ.get('DATASET_NAME')
     
     # Store migration results in BigQuery for tracking
-    table_id = f'${PROJECT_ID}.${DATASET_NAME}.migration_log'
+    table_id = f'{project_id}.{dataset_name}.migration_log'
     
     migration_records = []
     for result in results:
         migration_records.append({
-            'timestamp': datetime.utcnow(),
+            'timestamp': datetime.utcnow().isoformat(),
             'workload_id': result['workload_id'],
             'migration_status': result['status'],
             'estimated_carbon_savings': result['estimated_savings']
@@ -539,19 +542,23 @@ def log_migration_results(results):
 EOF
    
    cat > requirements.txt << 'EOF'
-google-cloud-compute==1.14.1
-google-cloud-bigquery==3.11.4
-functions-framework==3.4.0
+google-cloud-compute==1.19.2
+google-cloud-bigquery==3.35.0
+functions-framework==3.8.1
 EOF
+   
+   # Create Pub/Sub topic for triggering migrations
+   gcloud pubsub topics create carbon-optimization-trigger
    
    # Deploy migration function
    gcloud functions deploy workload-migration-${RANDOM_SUFFIX} \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-topic carbon-optimization-trigger \
        --source . \
        --entry-point migrate_workloads \
        --memory 512MB \
-       --timeout 540s
+       --timeout 540s \
+       --set-env-vars PROJECT_ID=${PROJECT_ID},DATASET_NAME=${DATASET_NAME}
    
    cd ..
    echo "✅ Workload migration automation deployed"
@@ -671,6 +678,9 @@ EOF
    # Delete scheduler jobs
    gcloud scheduler jobs delete ${SCHEDULER_JOB} --location=${REGION} --quiet
    gcloud scheduler jobs delete "${SCHEDULER_JOB}-renewable" --location=${REGION} --quiet
+   
+   # Delete Pub/Sub topic
+   gcloud pubsub topics delete carbon-optimization-trigger
    
    echo "✅ Cloud Functions and scheduler jobs deleted"
    ```

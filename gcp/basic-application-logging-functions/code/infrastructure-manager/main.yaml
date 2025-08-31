@@ -1,0 +1,302 @@
+# Infrastructure Manager Configuration for Basic Application Logging with Cloud Functions
+# This configuration deploys a Cloud Function with structured logging capabilities
+# using Google Cloud Logging client library integration
+
+# Import required schemas for resource definitions
+imports:
+  - path: https://www.googleapis.com/compute/v1/
+  - path: https://www.googleapis.com/storage/v1/
+  - path: https://www.googleapis.com/cloudfunctions/v1/
+  - path: https://www.googleapis.com/logging/v2/
+
+# Template configuration and metadata
+info:
+  title: Basic Application Logging with Cloud Functions
+  author: Infrastructure Manager
+  description: |
+    Deploys a Cloud Function demonstrating structured logging best practices
+    with Google Cloud Logging integration for comprehensive observability.
+  version: "1.0"
+
+# Define template parameters for customization
+properties:
+  project_id:
+    type: string
+    description: Google Cloud project ID where resources will be deployed
+    default: logging-demo-project
+
+  region:
+    type: string
+    description: Google Cloud region for resource deployment
+    default: us-central1
+    enum:
+      - us-central1
+      - us-east1
+      - us-west1
+      - europe-west1
+      - asia-east1
+
+  function_name:
+    type: string
+    description: Name for the Cloud Function
+    default: logging-demo-function
+    pattern: "^[a-z][a-z0-9-]{0,61}[a-z0-9]$"
+
+  runtime:
+    type: string
+    description: Python runtime version for Cloud Function
+    default: python312
+    enum:
+      - python39
+      - python310
+      - python311
+      - python312
+
+  memory_mb:
+    type: integer
+    description: Memory allocation for Cloud Function in MB
+    default: 256
+    minimum: 128
+    maximum: 8192
+
+  timeout_seconds:
+    type: integer
+    description: Function execution timeout in seconds
+    default: 60
+    minimum: 1
+    maximum: 540
+
+  source_archive_url:
+    type: string
+    description: Cloud Storage URL containing function source code
+    default: ""
+
+# Define the cloud resources to be created
+resources:
+
+  # Cloud Storage bucket for function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      project: $(ref.project_id.value)
+      name: $(ref.project_id.value)-function-source-$(ref.random_suffix.value)
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      # Enable versioning for source code management
+      versioning:
+        enabled: true
+      # Configure lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              numNewerVersions: 5
+      # Apply security labels for governance
+      labels:
+        component: cloud-function
+        environment: demo
+        purpose: logging-demonstration
+
+  # Generate random suffix for unique resource naming
+  - name: random_suffix
+    type: gcp-types/random-v1:id
+    properties:
+      byte_length: 3
+
+  # IAM Service Account for Cloud Function execution
+  - name: function-service-account
+    type: gcp-types/iam-v1:serviceAccount
+    properties:
+      projectId: $(ref.project_id.value)
+      accountId: $(ref.function_name.value)-sa
+      serviceAccount:
+        displayName: "Cloud Function Service Account for Logging Demo"
+        description: "Service account for executing Cloud Function with logging permissions"
+
+  # IAM binding to grant logging permissions to service account
+  - name: logging-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # IAM binding for Cloud Functions invoker role (allows HTTP access)
+  - name: function-invoker-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/cloudfunctions.invoker
+      member: allUsers
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # Cloud Function with structured logging configuration
+  - name: logging-demo-function
+    type: gcp-types/cloudfunctions-v1:function
+    properties:
+      location: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      function: $(ref.function_name.value)
+      # Function source code configuration
+      sourceArchiveUrl: $(ref.source_archive_url.value)
+      # HTTP trigger configuration for web access
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      # Runtime and execution environment
+      runtime: $(ref.runtime.value)
+      entryPoint: log_demo
+      timeout: $(ref.timeout_seconds.value)s
+      availableMemoryMb: $(ref.memory_mb.value)
+      # Service account for secure execution
+      serviceAccountEmail: $(ref.function-service-account.email)
+      # Environment variables for function configuration
+      environmentVariables:
+        LOG_LEVEL: INFO
+        FUNCTION_NAME: $(ref.function_name.value)
+        PROJECT_ID: $(ref.project_id.value)
+      # Labels for resource management and cost tracking
+      labels:
+        component: logging-demo
+        environment: development
+        runtime: $(ref.runtime.value)
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - function-service-account
+        - logging-writer-binding
+        - function-invoker-binding
+
+  # Log sink for structured log routing (optional enhancement)
+  - name: function-log-sink
+    type: gcp-types/logging-v2:sink
+    properties:
+      name: $(ref.function_name.value)-structured-logs
+      parent: projects/$(ref.project_id.value)
+      # Filter for function-specific logs with structured data
+      filter: |
+        resource.type="cloud_function"
+        resource.labels.function_name="$(ref.function_name.value)"
+        jsonPayload.component="log-demo-function"
+      # Destination for log aggregation (Cloud Logging by default)
+      destination: logging.googleapis.com/projects/$(ref.project_id.value)/logs/structured-function-logs
+      # Include metadata for log analysis
+      includeChildren: true
+    metadata:
+      dependsOn:
+        - logging-demo-function
+
+  # Cloud Monitoring notification channel for log-based alerts (optional)
+  - name: log-alert-channel
+    type: gcp-types/monitoring-v1:notificationChannel
+    properties:
+      name: projects/$(ref.project_id.value)/notificationChannels/function-logs
+      type: email
+      displayName: "Function Logging Alerts"
+      description: "Email notification channel for function logging alerts"
+      labels:
+        email_address: admin@example.com
+      enabled: false  # Disabled by default, enable with valid email
+    metadata:
+      dependsOn:
+        - logging-demo-function
+
+# Define outputs for integration and verification
+outputs:
+  # Function deployment information
+  function_name:
+    description: "Name of the deployed Cloud Function"
+    value: $(ref.logging-demo-function.name)
+
+  function_url:
+    description: "HTTPS URL for invoking the Cloud Function"
+    value: $(ref.logging-demo-function.httpsTrigger.url)
+
+  function_status:
+    description: "Current status of the Cloud Function"
+    value: $(ref.logging-demo-function.status)
+
+  # Service account information
+  service_account_email:
+    description: "Email address of the function's service account"
+    value: $(ref.function-service-account.email)
+
+  # Storage bucket information
+  source_bucket_name:
+    description: "Name of the Cloud Storage bucket for function source"
+    value: $(ref.function-source-bucket.name)
+
+  source_bucket_url:
+    description: "Cloud Storage URL for the source bucket"
+    value: gs://$(ref.function-source-bucket.name)
+
+  # Logging configuration
+  log_sink_name:
+    description: "Name of the structured log sink"
+    value: $(ref.function-log-sink.name)
+
+  # Project and region information
+  project_id:
+    description: "Google Cloud project ID"
+    value: $(ref.project_id.value)
+
+  deployment_region:
+    description: "Google Cloud region for deployment"
+    value: $(ref.region.value)
+
+  # Function configuration details
+  function_runtime:
+    description: "Python runtime version used by the function"
+    value: $(ref.runtime.value)
+
+  function_memory:
+    description: "Memory allocation for the function in MB"
+    value: $(ref.memory_mb.value)
+
+  function_timeout:
+    description: "Function execution timeout in seconds"
+    value: $(ref.timeout_seconds.value)
+
+# Documentation and usage notes
+documentation:
+  description: |
+    This Infrastructure Manager configuration deploys a complete Cloud Function
+    logging demonstration environment following Google Cloud best practices.
+
+  usage: |
+    1. Set project_id parameter to your Google Cloud project
+    2. Upload function source code to Cloud Storage
+    3. Set source_archive_url parameter to the uploaded archive
+    4. Deploy using: gcloud infra-manager deployments apply
+    5. Test the function using the provided HTTPS URL
+    6. View structured logs in Cloud Logging console
+
+  prerequisites: |
+    - Google Cloud project with billing enabled
+    - Cloud Functions API enabled
+    - Cloud Logging API enabled
+    - Cloud Build API enabled (for deployment)
+    - Appropriate IAM permissions for resource creation
+
+  security_considerations: |
+    - Function allows unauthenticated access for demonstration purposes
+    - Service account follows least privilege principle
+    - Logs may contain sensitive information - review before production use
+    - Consider enabling VPC connector for network security in production
+
+  cost_optimization: |
+    - Function uses minimal memory allocation (256MB)
+    - Source bucket includes lifecycle management
+    - Free tier covers typical development and testing usage
+    - Monitor function invocations to optimize costs
+
+  monitoring_and_alerting: |
+    - Structured logs enable powerful querying and analysis
+    - Log sink provides centralized log management
+    - Notification channel ready for custom alerting rules
+    - Use Cloud Monitoring to create dashboards based on log data

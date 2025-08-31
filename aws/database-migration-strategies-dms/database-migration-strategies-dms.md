@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: dms,rds,vpc,s3
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database-migration,dms,replication,cdc,heterogeneous
 recipe-generator-version: 1.3
@@ -125,7 +125,7 @@ echo "✅ Environment variables configured successfully"
 
 1. **Create DMS Subnet Group**:
 
-   A DMS subnet group defines the subnets where your replication instance will be deployed, ensuring proper network isolation and availability zone distribution. This foundational component enables the replication instance to communicate with both source and target databases while maintaining security boundaries. The subnet group must contain at least one subnet in each availability zone for Multi-AZ deployments, providing high availability and automatic failover capabilities.
+   A DMS subnet group defines the subnets where your replication instance will be deployed, ensuring proper network isolation and availability zone distribution. This foundational component enables the replication instance to communicate with both source and target databases while maintaining security boundaries. The subnet group must contain at least one subnet in each availability zone for Multi-AZ deployments, providing high availability and automatic failover capabilities according to AWS Well-Architected reliability principles.
 
    ```bash
    # Create DMS subnet group for replication instance
@@ -146,13 +146,13 @@ echo "✅ Environment variables configured successfully"
    The replication instance is the core compute resource that performs the actual data migration work, including reading from source databases, applying transformations, and writing to target databases. This managed compute instance handles all the complex operations of data replication, change data capture (CDC), and data validation. The Multi-AZ configuration provides automatic failover and high availability, essential for production migrations that cannot tolerate service interruptions.
 
    ```bash
-   # Create Multi-AZ DMS replication instance
+   # Create Multi-AZ DMS replication instance with latest engine version
    aws dms create-replication-instance \
        --replication-instance-identifier ${DMS_REPLICATION_INSTANCE_ID} \
        --replication-instance-class dms.t3.medium \
        --allocated-storage 100 \
        --multi-az \
-       --engine-version 3.5.2 \
+       --engine-version 3.6.1 \
        --replication-subnet-group-identifier ${DMS_SUBNET_GROUP_ID} \
        --publicly-accessible \
        --tags Key=Name,Value=dms-migration-instance \
@@ -175,6 +175,7 @@ echo "✅ Environment variables configured successfully"
 
    ```bash
    # Create source endpoint (MySQL example)
+   # Replace placeholder values with your actual database connection details
    aws dms create-endpoint \
        --endpoint-identifier ${SOURCE_ENDPOINT_ID} \
        --endpoint-type source \
@@ -199,6 +200,7 @@ echo "✅ Environment variables configured successfully"
 
    ```bash
    # Create target endpoint (RDS MySQL example)
+   # Replace placeholder values with your actual RDS connection details
    aws dms create-endpoint \
        --endpoint-identifier ${TARGET_ENDPOINT_ID} \
        --endpoint-type target \
@@ -226,7 +228,8 @@ echo "✅ Environment variables configured successfully"
    aws dms test-connection \
        --replication-instance-arn $(aws dms describe-replication-instances \
            --replication-instance-identifier ${DMS_REPLICATION_INSTANCE_ID} \
-           --query 'ReplicationInstances[0].ReplicationInstanceArn' --output text) \
+           --query 'ReplicationInstances[0].ReplicationInstanceArn' \
+           --output text) \
        --endpoint-arn $(aws dms describe-endpoints \
            --endpoint-identifier ${SOURCE_ENDPOINT_ID} \
            --query 'Endpoints[0].EndpointArn' --output text)
@@ -235,7 +238,8 @@ echo "✅ Environment variables configured successfully"
    aws dms test-connection \
        --replication-instance-arn $(aws dms describe-replication-instances \
            --replication-instance-identifier ${DMS_REPLICATION_INSTANCE_ID} \
-           --query 'ReplicationInstances[0].ReplicationInstanceArn' --output text) \
+           --query 'ReplicationInstances[0].ReplicationInstanceArn' \
+           --output text) \
        --endpoint-arn $(aws dms describe-endpoints \
            --endpoint-identifier ${TARGET_ENDPOINT_ID} \
            --query 'Endpoints[0].EndpointArn' --output text)
@@ -437,7 +441,8 @@ echo "✅ Environment variables configured successfully"
            --query 'Endpoints[0].EndpointArn' --output text) \
        --replication-instance-arn $(aws dms describe-replication-instances \
            --replication-instance-identifier ${DMS_REPLICATION_INSTANCE_ID} \
-           --query 'ReplicationInstances[0].ReplicationInstanceArn' --output text) \
+           --query 'ReplicationInstances[0].ReplicationInstanceArn' \
+           --output text) \
        --migration-type full-load-and-cdc \
        --table-mappings file://table-mapping.json \
        --replication-task-settings file://task-settings.json \
@@ -481,18 +486,21 @@ echo "✅ Environment variables configured successfully"
         --log-group-name "dms-tasks-${DMS_REPLICATION_INSTANCE_ID}" \
         --retention-in-days 30
     
+    # Create SNS topic for alerts (optional)
+    aws sns create-topic --name dms-alerts \
+        --query 'TopicArn' --output text > dms-topic-arn.txt
+    
     # Create CloudWatch alarm for task failures
     aws cloudwatch put-metric-alarm \
         --alarm-name "DMS-Task-Failure-${MIGRATION_TASK_ID}" \
         --alarm-description "Monitor DMS task failures" \
-        --metric-name "ReplicationTasksState" \
+        --metric-name "ReplicationTaskState" \
         --namespace "AWS/DMS" \
         --statistic "Average" \
         --period 300 \
         --threshold 1 \
         --comparison-operator "GreaterThanOrEqualToThreshold" \
         --evaluation-periods 1 \
-        --alarm-actions "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:dms-alerts" \
         --dimensions Name=ReplicationTaskIdentifier,Value=${MIGRATION_TASK_ID}
     
     echo "✅ CloudWatch monitoring configured"
@@ -518,7 +526,8 @@ echo "✅ Environment variables configured successfully"
             --query 'Endpoints[0].EndpointArn' --output text) \
         --replication-instance-arn $(aws dms describe-replication-instances \
             --replication-instance-identifier ${DMS_REPLICATION_INSTANCE_ID} \
-            --query 'ReplicationInstances[0].ReplicationInstanceArn' --output text) \
+            --query 'ReplicationInstances[0].ReplicationInstanceArn' \
+            --output text) \
         --migration-type cdc \
         --table-mappings file://table-mapping.json \
         --replication-task-settings file://task-settings.json \
@@ -641,6 +650,13 @@ echo "✅ Environment variables configured successfully"
 2. **Delete Migration Tasks**:
 
    ```bash
+   # Wait for tasks to stop before deletion
+   aws dms wait replication-task-stopped \
+       --replication-task-identifier ${MIGRATION_TASK_ID}
+   
+   aws dms wait replication-task-stopped \
+       --replication-task-identifier ${CDC_TASK_ID}
+   
    # Delete migration tasks
    aws dms delete-replication-task \
        --replication-task-arn $(aws dms describe-replication-tasks \
@@ -702,6 +718,7 @@ echo "✅ Environment variables configured successfully"
    
    # Clean up local files
    rm -f table-mapping.json task-settings.json validation-settings.json
+   rm -f dms-topic-arn.txt
    
    echo "✅ All resources cleaned up"
    ```
@@ -710,11 +727,11 @@ echo "✅ Environment variables configured successfully"
 
 AWS Database Migration Service provides a robust platform for enterprise database migrations, supporting both homogeneous and heterogeneous migrations with minimal downtime requirements. The service's architecture separates concerns through dedicated components: [replication instances](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_ReplicationInstance.html) handle the processing workload, endpoints manage connection configurations, and [migration tasks](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Tasks.html) define the replication behavior and data transformation rules.
 
-The full-load-and-cdc migration type represents the most comprehensive approach, initially copying all existing data through a full load operation, then seamlessly transitioning to [change data capture (CDC)](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Task.CDC.html) mode to replicate ongoing transactions. This approach ensures data consistency while minimizing downtime windows, as the CDC component can capture changes that occur during the full load phase. For production migrations, the Multi-AZ deployment option provides high availability and automatic failover capabilities, essential for mission-critical database migrations.
+The full-load-and-cdc migration type represents the most comprehensive approach, initially copying all existing data through a full load operation, then seamlessly transitioning to [change data capture (CDC)](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Task.CDC.html) mode to replicate ongoing transactions. This approach ensures data consistency while minimizing downtime windows, as the CDC component can capture changes that occur during the full load phase. For production migrations, the Multi-AZ deployment option provides high availability and automatic failover capabilities, essential for mission-critical database migrations according to the reliability pillar of the AWS Well-Architected Framework.
 
-[Data validation](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Validating.html) capabilities within DMS perform row-level comparisons between source and target databases, identifying inconsistencies and providing detailed reports for troubleshooting. The validation process runs in parallel with the migration, enabling real-time monitoring of data integrity without impacting migration performance. Advanced features like table mapping rules allow for schema transformations during migration, supporting scenarios where database consolidation or restructuring is required alongside the migration process.
+[Data validation](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Validating.html) capabilities within DMS perform row-level comparisons between source and target databases, identifying inconsistencies and providing detailed reports for troubleshooting. The validation process runs in parallel with the migration, enabling real-time monitoring of data integrity without impacting migration performance. Advanced features like table mapping rules allow for schema transformations during migration, supporting scenarios where database consolidation or restructuring is required alongside the migration process. The latest DMS version 3.6.1 includes enhanced data resync capabilities that automatically fix data inconsistencies identified through validation.
 
-Performance optimization is critical for large-scale migrations, with DMS providing multiple tuning options including parallel processing, memory allocation, and batch sizing parameters. The service integrates with [CloudWatch monitoring](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Monitoring.html) to provide comprehensive visibility into migration performance, error rates, and system health metrics. This monitoring capability enables proactive identification of bottlenecks and optimization opportunities throughout the migration lifecycle.
+Performance optimization is critical for large-scale migrations, with DMS providing multiple tuning options including parallel processing, memory allocation, and batch sizing parameters. The service integrates with [CloudWatch monitoring](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Monitoring.html) to provide comprehensive visibility into migration performance, error rates, and system health metrics. This monitoring capability enables proactive identification of bottlenecks and optimization opportunities throughout the migration lifecycle, supporting both operational excellence and performance efficiency principles of the Well-Architected Framework.
 
 > **Warning**: Always perform comprehensive testing in non-production environments before executing production migrations. Database migrations can impact application performance and data availability. Review [AWS DMS Best Practices](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_BestPractices.html) for detailed guidance on migration planning and execution.
 
@@ -722,15 +739,15 @@ Performance optimization is critical for large-scale migrations, with DMS provid
 
 Extend this database migration solution by implementing these enhancements:
 
-1. **Multi-Source Consolidation**: Configure multiple source endpoints to consolidate data from different database systems into a single target database, implementing custom transformation rules for schema normalization.
+1. **Multi-Source Consolidation**: Configure multiple source endpoints to consolidate data from different database systems into a single target database, implementing custom transformation rules for schema normalization and data type conversions.
 
-2. **Cross-Region Migration with Encryption**: Implement cross-region migration with encryption in transit and at rest, using AWS KMS for key management and VPC endpoints for secure connectivity.
+2. **Cross-Region Migration with Encryption**: Implement cross-region migration with encryption in transit and at rest, using AWS KMS for key management and VPC endpoints for secure connectivity while maintaining compliance requirements.
 
-3. **Automated Cutover Orchestration**: Build a Step Functions workflow that orchestrates the complete cutover process, including application traffic redirection, DNS updates, and rollback procedures.
+3. **Automated Cutover Orchestration**: Build a Step Functions workflow that orchestrates the complete cutover process, including application traffic redirection, DNS updates, and rollback procedures with automated health checks.
 
-4. **Performance Optimization Pipeline**: Develop monitoring and optimization scripts that automatically adjust replication instance sizes based on migration throughput metrics and implement parallel processing for large table migrations.
+4. **Performance Optimization Pipeline**: Develop monitoring and optimization scripts that automatically adjust replication instance sizes based on migration throughput metrics and implement parallel processing for large table migrations using DMS task settings.
 
-5. **Hybrid Cloud Migration**: Design a hybrid migration strategy that maintains on-premises database replicas while gradually migrating application workloads to AWS, implementing bidirectional replication for staged migration approaches.
+5. **Hybrid Cloud Migration with IAM Integration**: Design a hybrid migration strategy leveraging the new IAM database authentication features in DMS 3.6.1 for PostgreSQL and MySQL sources, maintaining on-premises database replicas while gradually migrating application workloads to AWS.
 
 ## Infrastructure Code
 

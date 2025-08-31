@@ -4,12 +4,12 @@ id: a7c4e8f3
 category: compute
 difficulty: 200
 subject: azure
-services: Azure Virtual Machine Scale Sets, Azure Load Balancer, Azure Monitor
+services: Virtual Machine Scale Sets, Load Balancer, Monitor, Application Insights
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: auto-scaling, load-balancing, high-availability, web-applications, monitoring
 recipe-generator-version: 1.3
@@ -50,6 +50,7 @@ graph TB
         METRICS[Performance Metrics]
         ALERTS[Auto-Scale Rules]
         LOGS[Application Logs]
+        INSIGHTS[Application Insights]
     end
     
     USER --> LB
@@ -66,15 +67,20 @@ graph TB
     VM2 --> LOGS
     VM3 --> LOGS
     
+    VM1 --> INSIGHTS
+    VM2 --> INSIGHTS
+    VM3 --> INSIGHTS
+    
     style LB fill:#0078D4
     style VMSS fill:#00BCF2
     style METRICS fill:#FF6B35
+    style INSIGHTS fill:#32CD32
 ```
 
 ## Prerequisites
 
 1. Azure account with appropriate permissions to create Virtual Machine Scale Sets, Load Balancers, and Monitor resources
-2. Azure CLI v2.0.80 or later installed and configured (or Azure Cloud Shell)
+2. Azure CLI version 2.35.0 or later installed and configured (or Azure Cloud Shell)
 3. Basic understanding of Azure networking concepts (Virtual Networks, subnets, security groups)
 4. Familiarity with web server configuration and monitoring principles
 5. Estimated cost: $50-150/month for development/testing environment (varies by instance size and scaling configuration)
@@ -85,8 +91,8 @@ graph TB
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-autoscale-web-app"
-export LOCATION="East US"
+export RESOURCE_GROUP="rg-recipe-${RANDOM_SUFFIX}"
+export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
@@ -101,7 +107,7 @@ export PUBLIC_IP_NAME="pip-webapp-${RANDOM_SUFFIX}"
 # Create resource group
 az group create \
     --name ${RESOURCE_GROUP} \
-    --location "${LOCATION}" \
+    --location ${LOCATION} \
     --tags purpose=recipe environment=demo
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
@@ -113,7 +119,7 @@ az network vnet create \
     --address-prefix 10.0.0.0/16 \
     --subnet-name ${SUBNET_NAME} \
     --subnet-prefix 10.0.1.0/24 \
-    --location "${LOCATION}"
+    --location ${LOCATION}
 
 echo "✅ Virtual Network created: ${VNET_NAME}"
 
@@ -121,7 +127,7 @@ echo "✅ Virtual Network created: ${VNET_NAME}"
 az network nsg create \
     --resource-group ${RESOURCE_GROUP} \
     --name ${NSG_NAME} \
-    --location "${LOCATION}"
+    --location ${LOCATION}
 
 # Allow HTTP traffic
 az network nsg rule create \
@@ -159,7 +165,7 @@ echo "✅ Network Security Group configured: ${NSG_NAME}"
        --name ${PUBLIC_IP_NAME} \
        --allocation-method Static \
        --sku Standard \
-       --location "${LOCATION}"
+       --location ${LOCATION}
    
    # Get the public IP address for reference
    PUBLIC_IP_ADDRESS=$(az network public-ip show \
@@ -186,7 +192,7 @@ echo "✅ Network Security Group configured: ${NSG_NAME}"
        --public-ip-address ${PUBLIC_IP_NAME} \
        --frontend-ip-name frontend-ip \
        --backend-pool-name backend-pool \
-       --location "${LOCATION}"
+       --location ${LOCATION}
    
    # Create health probe for HTTP traffic
    az network lb probe create \
@@ -217,7 +223,7 @@ echo "✅ Network Security Group configured: ${NSG_NAME}"
 
 3. **Create Virtual Machine Scale Set**:
 
-   Virtual Machine Scale Sets provide the elastic compute foundation for your web application, allowing automatic scaling based on demand. This configuration deploys Ubuntu VMs with nginx web server pre-installed, creating a horizontally scalable web tier. The scale set integrates with the Load Balancer backend pool and applies the network security group for proper traffic filtering.
+   Virtual Machine Scale Sets provide the elastic compute foundation for your web application, allowing automatic scaling based on demand. This configuration deploys Ubuntu 22.04 LTS VMs with nginx web server pre-installed, creating a horizontally scalable web tier. The scale set integrates with the Load Balancer backend pool and applies the network security group for proper traffic filtering.
 
    ```bash
    # Create cloud-init script for web server setup
@@ -229,7 +235,7 @@ echo "✅ Network Security Group configured: ${NSG_NAME}"
    runcmd:
      - systemctl start nginx
      - systemctl enable nginx
-     - echo "<h1>Web Server $(hostname)</h1><p>Server Time: $(date)</p>" > /var/www/html/index.html
+     - echo "<h1>Web Server $(hostname)</h1><p>Server Time: $(date)</p><p>Instance ID: $(curl -s -H Metadata:true --noproxy '*' 'http://169.254.169.254/metadata/instance/compute/vmId?api-version=2021-02-01&format=text')</p>" > /var/www/html/index.html
      - systemctl restart nginx
    EOF
    
@@ -237,7 +243,7 @@ echo "✅ Network Security Group configured: ${NSG_NAME}"
    az vmss create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${VMSS_NAME} \
-       --image UbuntuLTS \
+       --image Ubuntu2204 \
        --instance-count 2 \
        --admin-username azureuser \
        --generate-ssh-keys \
@@ -249,7 +255,7 @@ echo "✅ Network Security Group configured: ${NSG_NAME}"
        --backend-pool-name backend-pool \
        --custom-data cloud-init.txt \
        --vm-sku Standard_B2s \
-       --location "${LOCATION}"
+       --location ${LOCATION}
    
    # Clean up cloud-init file
    rm cloud-init.txt
@@ -257,7 +263,7 @@ echo "✅ Network Security Group configured: ${NSG_NAME}"
    echo "✅ Virtual Machine Scale Set created: ${VMSS_NAME}"
    ```
 
-   The Virtual Machine Scale Set is deployed with two initial instances running nginx web servers. Each instance automatically displays its hostname and current time, enabling you to verify load balancing functionality and monitor traffic distribution across instances.
+   The Virtual Machine Scale Set is deployed with two initial instances running nginx web servers. Each instance automatically displays its hostname, current time, and unique instance ID, enabling you to verify load balancing functionality and monitor traffic distribution across instances.
 
 4. **Configure Auto-Scaling Rules**:
 
@@ -304,7 +310,7 @@ echo "✅ Network Security Group configured: ${NSG_NAME}"
    az monitor app-insights component create \
        --resource-group ${RESOURCE_GROUP} \
        --app webapp-insights-${RANDOM_SUFFIX} \
-       --location "${LOCATION}" \
+       --location ${LOCATION} \
        --kind web \
        --application-type web
    
@@ -335,7 +341,7 @@ echo "✅ Network Security Group configured: ${NSG_NAME}"
 
 6. **Configure Load Balancer Health Probes and Backend Pool**:
 
-   Load Balancer health probes continuously monitor the health of your web application instances, ensuring traffic is only routed to healthy VMs. This configuration creates custom health endpoints and implements advanced probe settings for optimal availability and performance monitoring. Proper health probe configuration is essential for maintaining high availability during scaling operations.
+   Load Balancer health probes continuously monitor the health of your web application instances, ensuring traffic is only routed to healthy VMs. This configuration optimizes health probe settings for better availability and performance monitoring. Proper health probe configuration is essential for maintaining high availability during scaling operations.
 
    ```bash
    # Update health probe with custom settings
@@ -376,7 +382,7 @@ echo "✅ Network Security Group configured: ${NSG_NAME}"
    # Test initial load balancing
    echo "Testing load balancing with public IP: ${PUBLIC_IP_ADDRESS}"
    for i in {1..5}; do
-       curl -s http://${PUBLIC_IP_ADDRESS} | grep "Server" || echo "Request $i failed"
+       curl -s http://${PUBLIC_IP_ADDRESS} | grep "Instance ID" || echo "Request $i failed"
        sleep 2
    done
    
@@ -432,11 +438,11 @@ echo "✅ Network Security Group configured: ${NSG_NAME}"
    
    # Test load distribution across instances
    for i in {1..10}; do
-       curl -s http://${PUBLIC_IP_ADDRESS} | grep "Web Server" | cut -d' ' -f3
+       curl -s http://${PUBLIC_IP_ADDRESS} | grep "Instance ID" | cut -d' ' -f4
    done | sort | uniq -c
    ```
 
-   Expected output: HTML response from nginx and distribution showing requests across different hostnames.
+   Expected output: HTML response from nginx and distribution showing requests across different instance IDs.
 
 3. **Verify auto-scaling configuration**:
 

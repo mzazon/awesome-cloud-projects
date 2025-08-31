@@ -1,0 +1,754 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Persistent Customer Support Agent with Amazon Bedrock AgentCore Memory - Infrastructure as Code template for intelligent customer support with context retention across sessions'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Memory Configuration"
+        Parameters:
+          - MemoryName
+          - EventExpiryDuration
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaFunctionName
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "DynamoDB Configuration"
+        Parameters:
+          - DynamoDBTableName
+          - ReadCapacityUnits
+          - WriteCapacityUnits
+      - Label:
+          default: "API Gateway Configuration"
+        Parameters:
+          - APIGatewayName
+          - APIGatewayStageName
+      - Label:
+          default: "Bedrock Configuration"
+        Parameters:
+          - BedrockModelId
+      - Label:
+          default: "Tagging"
+        Parameters:
+          - Environment
+          - Project
+    ParameterLabels:
+      MemoryName:
+        default: "AgentCore Memory Name"
+      EventExpiryDuration:
+        default: "Memory Event Expiry Duration"
+      LambdaFunctionName:
+        default: "Lambda Function Name"
+      DynamoDBTableName:
+        default: "DynamoDB Table Name"
+      APIGatewayName:
+        default: "API Gateway Name"
+
+Parameters:
+  MemoryName:
+    Type: String
+    Default: customer-support-memory
+    Description: Name for the Bedrock AgentCore Memory instance
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: ^[a-zA-Z0-9-_]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+
+  EventExpiryDuration:
+    Type: String
+    Default: P30D
+    Description: ISO 8601 duration for memory event expiry (e.g., P30D for 30 days)
+    AllowedPattern: ^P(\d+Y)?(\d+M)?(\d+D)?(T(\d+H)?(\d+M)?(\d+S)?)?$
+    ConstraintDescription: Must be a valid ISO 8601 duration format
+
+  LambdaFunctionName:
+    Type: String
+    Default: support-agent
+    Description: Name for the Lambda function handling support interactions
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: ^[a-zA-Z0-9-_]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: Lambda function memory size in MB
+
+  DynamoDBTableName:
+    Type: String
+    Default: customer-data
+    Description: Name for the DynamoDB table storing customer metadata
+    MinLength: 3
+    MaxLength: 255
+    AllowedPattern: ^[a-zA-Z0-9-_]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+
+  ReadCapacityUnits:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: DynamoDB read capacity units
+
+  WriteCapacityUnits:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: DynamoDB write capacity units
+
+  APIGatewayName:
+    Type: String
+    Default: support-api
+    Description: Name for the API Gateway REST API
+    MinLength: 1
+    MaxLength: 1024
+    AllowedPattern: ^[a-zA-Z0-9-_\s]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, underscores, and spaces
+
+  APIGatewayStageName:
+    Type: String
+    Default: prod
+    Description: API Gateway deployment stage name
+    AllowedValues: [dev, test, staging, prod]
+
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-3-haiku-20240307-v1:0
+    Description: Bedrock foundation model ID for AI responses
+    AllowedValues:
+      - anthropic.claude-3-haiku-20240307-v1:0
+      - anthropic.claude-3-sonnet-20240229-v1:0
+      - anthropic.claude-3-opus-20240229-v1:0
+      - anthropic.claude-instant-v1
+
+  Environment:
+    Type: String
+    Default: production
+    Description: Environment tag for resource organization
+    AllowedValues: [development, testing, staging, production]
+
+  Project:
+    Type: String
+    Default: customer-support-ai
+    Description: Project name for resource tagging
+    MinLength: 1
+    MaxLength: 128
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
+  EnablePointInTimeRecovery: !Equals [!Ref Environment, production]
+
+Resources:
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${LambdaFunctionName}-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAgentCoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:CreateEvent
+                  - bedrock-agentcore:ListSessions
+                  - bedrock-agentcore:ListEvents
+                  - bedrock-agentcore:GetEvent
+                  - bedrock-agentcore:RetrieveMemoryRecords
+                Resource: '*'
+        - PolicyName: BedrockModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: !GetAtt CustomerDataTable.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: CustomerSupportAI
+
+  # DynamoDB Table for Customer Metadata
+  CustomerDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${DynamoDBTableName}-${AWS::StackName}
+      AttributeDefinitions:
+        - AttributeName: customerId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customerId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref ReadCapacityUnits
+        WriteCapacityUnits: !Ref WriteCapacityUnits
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePointInTimeRecovery, true, false]
+      BillingMode: PROVISIONED
+      TableClass: STANDARD
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: CustomerMetadata
+      DeletionProtectionEnabled: !If [IsProduction, true, false]
+
+  # Lambda Function for Support Agent Logic
+  SupportAgentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${LambdaFunctionName}-${AWS::StackName}
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          MEMORY_ID: !GetAtt AgentCoreMemory.MemoryId
+          DDB_TABLE_NAME: !Ref CustomerDataTable
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          LOG_LEVEL: !If [IsProduction, INFO, DEBUG]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          from typing import Dict, List, Any, Optional
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          # Initialize AWS clients
+          bedrock_agentcore = boto3.client('bedrock-agentcore')
+          bedrock_runtime = boto3.client('bedrock-runtime')
+          dynamodb = boto3.resource('dynamodb')
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Main Lambda handler for customer support interactions.
+              Processes customer messages, retrieves context from memory,
+              generates AI responses, and stores interactions.
+              """
+              try:
+                  logger.info(f"Processing support request: {event}")
+                  
+                  # Parse incoming request
+                  body = json.loads(event['body']) if 'body' in event else event
+                  customer_id = body.get('customerId')
+                  message = body.get('message')
+                  session_id = body.get('sessionId', f"session-{customer_id}-{int(datetime.now().timestamp())}")
+                  
+                  # Validate required fields
+                  if not customer_id or not message:
+                      return create_error_response(400, "customerId and message are required")
+                  
+                  # Retrieve customer context from DynamoDB
+                  table = dynamodb.Table(os.environ['DDB_TABLE_NAME'])
+                  customer_data = get_customer_data(table, customer_id)
+                  
+                  # Retrieve relevant memories from AgentCore
+                  memory_context = retrieve_memory_context(customer_id, message)
+                  
+                  # Generate AI response using Bedrock
+                  ai_response = generate_support_response(message, memory_context, customer_data)
+                  
+                  # Store interaction in AgentCore Memory
+                  store_interaction(customer_id, session_id, message, ai_response)
+                  
+                  # Update customer data if needed
+                  update_customer_data(table, customer_id, body.get('metadata', {}))
+                  
+                  response = {
+                      'response': ai_response,
+                      'sessionId': session_id,
+                      'customerId': customer_id,
+                      'timestamp': datetime.now().isoformat()
+                  }
+                  
+                  logger.info(f"Successfully processed request for customer: {customer_id}")
+                  return create_success_response(response)
+                  
+              except Exception as e:
+                  logger.error(f"Error processing support request: {str(e)}", exc_info=True)
+                  return create_error_response(500, "Internal server error")
+
+          def create_success_response(data: Dict[str, Any]) -> Dict[str, Any]:
+              """Create standardized success response"""
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Access-Control-Allow-Methods': 'POST, OPTIONS'
+                  },
+                  'body': json.dumps(data)
+              }
+
+          def create_error_response(status_code: int, message: str) -> Dict[str, Any]:
+              """Create standardized error response"""
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps({'error': message})
+              }
+
+          def get_customer_data(table: Any, customer_id: str) -> Dict[str, Any]:
+              """Retrieve customer metadata from DynamoDB"""
+              try:
+                  response = table.get_item(Key={'customerId': customer_id})
+                  customer_data = response.get('Item', {})
+                  logger.debug(f"Retrieved customer data for {customer_id}: {customer_data}")
+                  return customer_data
+              except Exception as e:
+                  logger.error(f"Error retrieving customer data for {customer_id}: {e}")
+                  return {}
+
+          def retrieve_memory_context(customer_id: str, query: str) -> List[str]:
+              """Retrieve relevant memory context from AgentCore"""
+              try:
+                  response = bedrock_agentcore.retrieve_memory_records(
+                      memoryId=os.environ['MEMORY_ID'],
+                      query=query,
+                      filter={'customerId': customer_id},
+                      maxResults=5
+                  )
+                  context = [record['content'] for record in response.get('memoryRecords', [])]
+                  logger.debug(f"Retrieved {len(context)} memory records for customer {customer_id}")
+                  return context
+              except Exception as e:
+                  logger.error(f"Error retrieving memory context for {customer_id}: {e}")
+                  return []
+
+          def generate_support_response(message: str, memory_context: List[str], customer_data: Dict[str, Any]) -> str:
+              """Generate AI response using Bedrock foundation model"""
+              try:
+                  # Prepare context for AI model
+                  context_parts = []
+                  
+                  if memory_context:
+                      context_parts.append(f"Previous interactions: {'; '.join(memory_context)}")
+                  
+                  if customer_data:
+                      # Format customer profile safely
+                      profile_info = []
+                      if customer_data.get('name'):
+                          profile_info.append(f"Name: {customer_data['name']}")
+                      if customer_data.get('supportTier'):
+                          profile_info.append(f"Support tier: {customer_data['supportTier']}")
+                      if customer_data.get('preferredChannel'):
+                          profile_info.append(f"Preferred contact: {customer_data['preferredChannel']}")
+                      if customer_data.get('productInterests'):
+                          interests = customer_data['productInterests']
+                          if isinstance(interests, list):
+                              profile_info.append(f"Product interests: {', '.join(interests)}")
+                      
+                      if profile_info:
+                          context_parts.append(f"Customer profile: {'; '.join(profile_info)}")
+                  
+                  context_parts.append(f"Current query: {message}")
+                  
+                  full_context = f"""
+                  You are a helpful customer support agent. Based on the following information, provide a personalized, professional response:
+                  
+                  {' | '.join(context_parts)}
+                  
+                  Guidelines:
+                  - Be empathetic and professional
+                  - Reference relevant past interactions when appropriate
+                  - Provide specific, actionable assistance
+                  - Ask clarifying questions if needed
+                  - Keep responses concise but complete
+                  """
+                  
+                  # Invoke Bedrock model
+                  response = bedrock_runtime.invoke_model(
+                      modelId=os.environ['BEDROCK_MODEL_ID'],
+                      body=json.dumps({
+                          'anthropic_version': 'bedrock-2023-05-31',
+                          'max_tokens': 500,
+                          'messages': [
+                              {
+                                  'role': 'user',
+                                  'content': full_context
+                              }
+                          ]
+                      })
+                  )
+                  
+                  result = json.loads(response['body'].read())
+                  ai_response = result['content'][0]['text']
+                  logger.debug(f"Generated AI response: {ai_response[:100]}...")
+                  return ai_response
+                  
+              except Exception as e:
+                  logger.error(f"Error generating AI response: {e}")
+                  return "I apologize, but I'm experiencing technical difficulties. Please try again or contact our support team directly."
+
+          def store_interaction(customer_id: str, session_id: str, user_message: str, agent_response: str) -> None:
+              """Store conversation in AgentCore Memory"""
+              try:
+                  timestamp = datetime.now().isoformat()
+                  
+                  # Store user message
+                  bedrock_agentcore.create_event(
+                      memoryId=os.environ['MEMORY_ID'],
+                      sessionId=session_id,
+                      eventData={
+                          'type': 'user_message',
+                          'customerId': customer_id,
+                          'content': user_message,
+                          'timestamp': timestamp
+                      }
+                  )
+                  
+                  # Store agent response
+                  bedrock_agentcore.create_event(
+                      memoryId=os.environ['MEMORY_ID'],
+                      sessionId=session_id,
+                      eventData={
+                          'type': 'agent_response',
+                          'customerId': customer_id,
+                          'content': agent_response,
+                          'timestamp': timestamp
+                      }
+                  )
+                  
+                  logger.debug(f"Stored interaction in memory for customer {customer_id}, session {session_id}")
+                  
+              except Exception as e:
+                  logger.error(f"Error storing interaction for {customer_id}: {e}")
+
+          def update_customer_data(table: Any, customer_id: str, metadata: Dict[str, Any]) -> None:
+              """Update customer metadata in DynamoDB"""
+              try:
+                  if metadata:
+                      update_data = {
+                          'customerId': customer_id,
+                          'lastInteraction': datetime.now().isoformat(),
+                          **metadata
+                      }
+                      table.put_item(Item=update_data)
+                      logger.debug(f"Updated customer data for {customer_id}")
+              except Exception as e:
+                  logger.error(f"Error updating customer data for {customer_id}: {e}")
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: CustomerSupportAgent
+
+  # Lambda Function Version for Alias Management
+  SupportAgentFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref SupportAgentFunction
+      Description: !Sub 'Version deployed on ${AWS::StackName}'
+
+  # Lambda Function Alias for Production Traffic
+  SupportAgentFunctionAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref SupportAgentFunction
+      FunctionVersion: !GetAtt SupportAgentFunctionVersion.Version
+      Name: !Ref Environment
+      Description: !Sub 'Alias for ${Environment} environment'
+
+  # API Gateway REST API
+  SupportAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${APIGatewayName}-${AWS::StackName}
+      Description: Customer Support Agent API with AgentCore Memory integration
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: CustomerSupportAPI
+
+  # API Gateway Resource for Support Endpoint
+  SupportResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SupportAPI
+      ParentId: !GetAtt SupportAPI.RootResourceId
+      PathPart: support
+
+  # API Gateway POST Method
+  SupportMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SupportAPI
+      ResourceId: !Ref SupportResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SupportAgentFunction}:${Environment}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # API Gateway OPTIONS Method for CORS
+  SupportOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SupportAPI
+      ResourceId: !Ref SupportResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # Lambda Permission for API Gateway
+  APIGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Sub '${SupportAgentFunction}:${Environment}'
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SupportAPI}/*/*'
+
+  # API Gateway Deployment
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SupportMethod
+      - SupportOptionsMethod
+    Properties:
+      RestApiId: !Ref SupportAPI
+      StageName: !Ref APIGatewayStageName
+      StageDescription:
+        Description: !Sub 'Deployment for ${Environment} environment'
+        LoggingLevel: !If [IsProduction, ERROR, INFO]
+        MetricsEnabled: true
+        DataTraceEnabled: !If [IsProduction, false, true]
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+      Description: !Sub 'API deployment for ${AWS::StackName}'
+
+  # Bedrock AgentCore Memory
+  AgentCoreMemory:
+    Type: AWS::BedrockAgentCore::Memory
+    Properties:
+      Name: !Sub ${MemoryName}-${AWS::StackName}
+      Description: Memory for customer support agent with persistent context
+      EventExpiryDuration: !Ref EventExpiryDuration
+      MemoryStrategies:
+        - Summarization:
+            Enabled: true
+        - SemanticMemory:
+            Enabled: true
+        - UserPreferences:
+            Enabled: true
+        - Custom:
+            Enabled: true
+            SystemPrompt: 'Extract the following from customer support conversations: 1) Customer preferences and requirements, 2) Technical issues and their resolutions, 3) Product interests and purchasing intent, 4) Satisfaction levels and feedback. Focus on actionable insights that improve future support interactions.'
+            ModelId: !Ref BedrockModelId
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: CustomerMemory
+
+  # CloudWatch Log Group for Lambda Function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SupportAgentFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # CloudWatch Log Group for API Gateway
+  APIGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub 'API-Gateway-Execution-Logs_${SupportAPI}/${APIGatewayStageName}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+Outputs:
+  # API Gateway Outputs
+  APIGatewayURL:
+    Description: URL of the Customer Support API Gateway endpoint
+    Value: !Sub 'https://${SupportAPI}.execute-api.${AWS::Region}.amazonaws.com/${APIGatewayStageName}/support'
+    Export:
+      Name: !Sub '${AWS::StackName}-APIGatewayURL'
+
+  APIGatewayId:
+    Description: ID of the API Gateway REST API
+    Value: !Ref SupportAPI
+    Export:
+      Name: !Sub '${AWS::StackName}-APIGatewayId'
+
+  # Lambda Function Outputs
+  LambdaFunctionArn:
+    Description: ARN of the Support Agent Lambda function
+    Value: !GetAtt SupportAgentFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaFunctionName:
+    Description: Name of the Support Agent Lambda function
+    Value: !Ref SupportAgentFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  # DynamoDB Outputs
+  CustomerDataTableName:
+    Description: Name of the DynamoDB table for customer data
+    Value: !Ref CustomerDataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomerDataTableName'
+
+  CustomerDataTableArn:
+    Description: ARN of the DynamoDB table for customer data
+    Value: !GetAtt CustomerDataTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomerDataTableArn'
+
+  # AgentCore Memory Outputs
+  AgentCoreMemoryId:
+    Description: ID of the Bedrock AgentCore Memory
+    Value: !GetAtt AgentCoreMemory.MemoryId
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentCoreMemoryId'
+
+  AgentCoreMemoryName:
+    Description: Name of the Bedrock AgentCore Memory
+    Value: !Ref AgentCoreMemory
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentCoreMemoryName'
+
+  # IAM Role Outputs
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # Environment Information
+  StackEnvironment:
+    Description: Environment for this stack deployment
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  # Cost Information
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for this infrastructure (excluding Bedrock usage)
+    Value: !Sub 
+      - 'DynamoDB: ~$${DDBCost}/month, Lambda: ~$${LambdaCost}/month, API Gateway: ~$${APICost}/month'
+      - DDBCost: !If [IsProduction, '2.50', '1.25']
+        LambdaCost: !If [IsProduction, '5.00', '1.00']
+        APICost: !If [IsProduction, '3.50', '0.50']
+
+  # Sample Test Command
+  SampleTestCommand:
+    Description: Sample curl command to test the API
+    Value: !Sub |
+      curl -X POST ${SupportAPI}.execute-api.${AWS::Region}.amazonaws.com/${APIGatewayStageName}/support \
+      -H "Content-Type: application/json" \
+      -d '{
+        "customerId": "test-customer-001",
+        "message": "I need help with my account settings",
+        "metadata": {
+          "userAgent": "test-client",
+          "sessionLocation": "settings-page"
+        }
+      }'

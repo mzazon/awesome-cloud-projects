@@ -6,10 +6,10 @@ difficulty: 100
 subject: aws
 services: Certificate Manager, CloudFront, S3
 estimated-time: 45 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ssl, https, certificate, cloudfront, s3, static-website, security
 recipe-generator-version: 1.3
@@ -130,38 +130,40 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
 
 2. **Upload Sample Website Content**:
 
+   Creating sample website content allows us to test the SSL certificate implementation and verify HTTPS functionality. This content demonstrates the secure connection established between users and the CloudFront distribution.
+
    ```bash
    # Create basic HTML files for testing
    cat > index.html << 'EOF'
-   <!DOCTYPE html>
-   <html>
-   <head>
-       <title>Secure Static Website</title>
-       <style>
-           body { font-family: Arial, sans-serif; margin: 50px; }
-           .secure { color: green; font-weight: bold; }
-       </style>
-   </head>
-   <body>
-       <h1>Welcome to Your <span class="secure">Secure</span> Website</h1>
-       <p>This website is served over HTTPS using AWS Certificate Manager.</p>
-       <p>SSL/TLS certificate automatically managed by AWS ACM.</p>
-   </body>
-   </html>
-   EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Secure Static Website</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 50px; }
+        .secure { color: green; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>Welcome to Your <span class="secure">Secure</span> Website</h1>
+    <p>This website is served over HTTPS using AWS Certificate Manager.</p>
+    <p>SSL/TLS certificate automatically managed by AWS ACM.</p>
+</body>
+</html>
+EOF
    
    cat > error.html << 'EOF'
-   <!DOCTYPE html>
-   <html>
-   <head>
-       <title>Page Not Found</title>
-   </head>
-   <body>
-       <h1>404 - Page Not Found</h1>
-       <p>The requested page could not be found.</p>
-   </body>
-   </html>
-   EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Page Not Found</title>
+</head>
+<body>
+    <h1>404 - Page Not Found</h1>
+    <p>The requested page could not be found.</p>
+</body>
+</html>
+EOF
    
    # Upload files to S3 bucket
    aws s3 cp index.html s3://${BUCKET_NAME}/
@@ -231,51 +233,67 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
    
    echo "✅ Certificate validated successfully"
    
+   # Create CloudFront distribution configuration file
+   cat > distribution-config.json << EOF
+{
+    "CallerReference": "static-website-${RANDOM_SUFFIX}",
+    "DefaultRootObject": "index.html",
+    "Origins": {
+        "Quantity": 1,
+        "Items": [
+            {
+                "Id": "S3-${BUCKET_NAME}",
+                "DomainName": "${BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com",
+                "OriginAccessControlId": "${OAC_ID}",
+                "S3OriginConfig": {
+                    "OriginAccessIdentity": ""
+                }
+            }
+        ]
+    },
+    "DefaultCacheBehavior": {
+        "TargetOriginId": "S3-${BUCKET_NAME}",
+        "ViewerProtocolPolicy": "redirect-to-https",
+        "AllowedMethods": {
+            "Quantity": 2,
+            "Items": ["HEAD", "GET"],
+            "CachedMethods": {
+                "Quantity": 2,
+                "Items": ["HEAD", "GET"]
+            }
+        },
+        "ForwardedValues": {
+            "QueryString": false,
+            "Cookies": {
+                "Forward": "none"
+            }
+        },
+        "TrustedSigners": {
+            "Enabled": false,
+            "Quantity": 0
+        },
+        "MinTTL": 0,
+        "DefaultTTL": 86400,
+        "MaxTTL": 31536000,
+        "Compress": true
+    },
+    "Comment": "CloudFront distribution for ${DOMAIN_NAME}",
+    "Enabled": true,
+    "ViewerCertificate": {
+        "ACMCertificateArn": "${CERTIFICATE_ARN}",
+        "SSLSupportMethod": "sni-only",
+        "MinimumProtocolVersion": "TLSv1.2_2021"
+    },
+    "Aliases": {
+        "Quantity": 2,
+        "Items": ["${DOMAIN_NAME}", "${SUBDOMAIN}"]
+    }
+}
+EOF
+   
    # Create CloudFront distribution
    DISTRIBUTION_ID=$(aws cloudfront create-distribution \
-       --distribution-config '{
-           "CallerReference": "static-website-'${RANDOM_SUFFIX}'",
-           "DefaultRootObject": "index.html",
-           "Origins": {
-               "Quantity": 1,
-               "Items": [
-                   {
-                       "Id": "S3-'${BUCKET_NAME}'",
-                       "DomainName": "'${BUCKET_NAME}'.s3.'${AWS_REGION}'.amazonaws.com",
-                       "OriginAccessControlId": "'${OAC_ID}'",
-                       "S3OriginConfig": {
-                           "OriginAccessIdentity": ""
-                       }
-                   }
-               ]
-           },
-           "DefaultCacheBehavior": {
-               "TargetOriginId": "S3-'${BUCKET_NAME}'",
-               "ViewerProtocolPolicy": "redirect-to-https",
-               "MinTTL": 0,
-               "ForwardedValues": {
-                   "QueryString": false,
-                   "Cookies": {
-                       "Forward": "none"
-                   }
-               },
-               "TrustedSigners": {
-                   "Enabled": false,
-                   "Quantity": 0
-               }
-           },
-           "Comment": "CloudFront distribution for '${DOMAIN_NAME}'",
-           "Enabled": true,
-           "ViewerCertificate": {
-               "ACMCertificateArn": "'${CERTIFICATE_ARN}'",
-               "SSLSupportMethod": "sni-only",
-               "MinimumProtocolVersion": "TLSv1.2_2021"
-           },
-           "Aliases": {
-               "Quantity": 2,
-               "Items": ["'${DOMAIN_NAME}'", "'${SUBDOMAIN}'"]
-           }
-       }' \
+       --distribution-config file://distribution-config.json \
        --query 'Distribution.Id' \
        --output text)
    
@@ -287,29 +305,31 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
 
 6. **Update S3 Bucket Policy for CloudFront Access**:
 
+   The S3 bucket policy ensures that only the specific CloudFront distribution can access the bucket content through Origin Access Control. This configuration follows the principle of least privilege by restricting access to the cloudfront.amazonaws.com service principal with a condition that validates the source ARN matches our distribution.
+
    ```bash
    # Create bucket policy for CloudFront access
    cat > bucket-policy.json << EOF
-   {
-       "Version": "2012-10-17",
-       "Statement": [
-           {
-               "Sid": "AllowCloudFrontServicePrincipal",
-               "Effect": "Allow",
-               "Principal": {
-                   "Service": "cloudfront.amazonaws.com"
-               },
-               "Action": "s3:GetObject",
-               "Resource": "arn:aws:s3:::${BUCKET_NAME}/*",
-               "Condition": {
-                   "StringEquals": {
-                       "AWS:SourceArn": "arn:aws:cloudfront::${AWS_ACCOUNT_ID}:distribution/${DISTRIBUTION_ID}"
-                   }
-               }
-           }
-       ]
-   }
-   EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowCloudFrontServicePrincipal",
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "cloudfront.amazonaws.com"
+            },
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::${BUCKET_NAME}/*",
+            "Condition": {
+                "StringEquals": {
+                    "AWS:SourceArn": "arn:aws:cloudfront::${AWS_ACCOUNT_ID}:distribution/${DISTRIBUTION_ID}"
+                }
+            }
+        }
+    ]
+}
+EOF
    
    # Apply bucket policy
    aws s3api put-bucket-policy \
@@ -334,6 +354,8 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
 
 8. **Configure DNS Records**:
 
+   Route 53 DNS configuration creates alias records that point your custom domain to the CloudFront distribution. The hardcoded hosted zone ID "Z2FDTNDATAQYW2" is the universal CloudFront hosted zone ID used for all alias records pointing to CloudFront distributions.
+
    ```bash
    # Get hosted zone ID for the domain
    HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name \
@@ -343,35 +365,35 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
    
    # Create DNS records for custom domain
    cat > dns-records.json << EOF
-   {
-       "Changes": [
-           {
-               "Action": "CREATE",
-               "ResourceRecordSet": {
-                   "Name": "${DOMAIN_NAME}",
-                   "Type": "A",
-                   "AliasTarget": {
-                       "DNSName": "${CLOUDFRONT_DOMAIN}",
-                       "EvaluateTargetHealth": false,
-                       "HostedZoneId": "Z2FDTNDATAQYW2"
-                   }
-               }
-           },
-           {
-               "Action": "CREATE",
-               "ResourceRecordSet": {
-                   "Name": "${SUBDOMAIN}",
-                   "Type": "A",
-                   "AliasTarget": {
-                       "DNSName": "${CLOUDFRONT_DOMAIN}",
-                       "EvaluateTargetHealth": false,
-                       "HostedZoneId": "Z2FDTNDATAQYW2"
-                   }
-               }
-           }
-       ]
-   }
-   EOF
+{
+    "Changes": [
+        {
+            "Action": "CREATE",
+            "ResourceRecordSet": {
+                "Name": "${DOMAIN_NAME}",
+                "Type": "A",
+                "AliasTarget": {
+                    "DNSName": "${CLOUDFRONT_DOMAIN}",
+                    "EvaluateTargetHealth": false,
+                    "HostedZoneId": "Z2FDTNDATAQYW2"
+                }
+            }
+        },
+        {
+            "Action": "CREATE",
+            "ResourceRecordSet": {
+                "Name": "${SUBDOMAIN}",
+                "Type": "A",
+                "AliasTarget": {
+                    "DNSName": "${CLOUDFRONT_DOMAIN}",
+                    "EvaluateTargetHealth": false,
+                    "HostedZoneId": "Z2FDTNDATAQYW2"
+                }
+            }
+        }
+    ]
+}
+EOF
    
    # Update DNS records
    aws route53 change-resource-record-sets \
@@ -438,7 +460,7 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
    # Test 404 error page
    curl -I https://${DOMAIN_NAME}/nonexistent-page
    
-   # Verify security headers
+   # Verify security headers (may not be present by default)
    curl -I https://${DOMAIN_NAME} | grep -i "strict-transport-security"
    ```
 
@@ -500,35 +522,35 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
    ```bash
    # Remove DNS records
    cat > dns-delete.json << EOF
-   {
-       "Changes": [
-           {
-               "Action": "DELETE",
-               "ResourceRecordSet": {
-                   "Name": "${DOMAIN_NAME}",
-                   "Type": "A",
-                   "AliasTarget": {
-                       "DNSName": "${CLOUDFRONT_DOMAIN}",
-                       "EvaluateTargetHealth": false,
-                       "HostedZoneId": "Z2FDTNDATAQYW2"
-                   }
-               }
-           },
-           {
-               "Action": "DELETE",
-               "ResourceRecordSet": {
-                   "Name": "${SUBDOMAIN}",
-                   "Type": "A",
-                   "AliasTarget": {
-                       "DNSName": "${CLOUDFRONT_DOMAIN}",
-                       "EvaluateTargetHealth": false,
-                       "HostedZoneId": "Z2FDTNDATAQYW2"
-                   }
-               }
-           }
-       ]
-   }
-   EOF
+{
+    "Changes": [
+        {
+            "Action": "DELETE",
+            "ResourceRecordSet": {
+                "Name": "${DOMAIN_NAME}",
+                "Type": "A",
+                "AliasTarget": {
+                    "DNSName": "${CLOUDFRONT_DOMAIN}",
+                    "EvaluateTargetHealth": false,
+                    "HostedZoneId": "Z2FDTNDATAQYW2"
+                }
+            }
+        },
+        {
+            "Action": "DELETE",
+            "ResourceRecordSet": {
+                "Name": "${SUBDOMAIN}",
+                "Type": "A",
+                "AliasTarget": {
+                    "DNSName": "${CLOUDFRONT_DOMAIN}",
+                    "EvaluateTargetHealth": false,
+                    "HostedZoneId": "Z2FDTNDATAQYW2"
+                }
+            }
+        }
+    ]
+}
+EOF
    
    aws route53 change-resource-record-sets \
        --hosted-zone-id ${HOSTED_ZONE_ID} \
@@ -554,7 +576,8 @@ echo "✅ Bucket name: ${BUCKET_NAME}"
    ```bash
    # Remove local configuration files
    rm -f index.html error.html bucket-policy.json \
-       dns-records.json dns-delete.json disabled-config.json
+       dns-records.json dns-delete.json disabled-config.json \
+       distribution-config.json
    
    echo "✅ Local files cleaned up"
    ```
@@ -567,7 +590,7 @@ The CloudFront integration enables global content delivery with SSL termination 
 
 Cost optimization is achieved through ACM's free certificate service combined with CloudFront's pay-per-use pricing model. The solution scales automatically based on traffic patterns without requiring infrastructure provisioning or capacity planning. For additional security enhancements, consider implementing [AWS WAF](https://docs.aws.amazon.com/waf/latest/developerguide/waf-chapter.html) with CloudFront to protect against common web exploits and DDoS attacks.
 
-The DNS validation method provides automated domain ownership verification without requiring email-based validation, making it suitable for automated deployment pipelines. Certificate renewal occurs automatically 60 days before expiration, ensuring continuous availability without manual intervention as documented in the [ACM User Guide](https://docs.aws.amazon.com/acm/latest/userguide/acm-renewal.html).
+The [DNS validation method](https://docs.aws.amazon.com/acm/latest/userguide/dns-validation.html) provides automated domain ownership verification without requiring email-based validation, making it suitable for automated deployment pipelines. Certificate renewal occurs automatically 60 days before expiration, ensuring continuous availability without manual intervention as documented in the [ACM User Guide](https://docs.aws.amazon.com/acm/latest/userguide/acm-renewal.html).
 
 > **Tip**: Monitor certificate expiration dates using CloudWatch alarms and ACM certificate status to ensure continuous HTTPS availability.
 

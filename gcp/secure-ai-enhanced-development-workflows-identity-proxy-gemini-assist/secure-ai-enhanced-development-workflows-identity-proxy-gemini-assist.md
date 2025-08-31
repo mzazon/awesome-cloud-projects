@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Identity-Aware Proxy, Gemini Code Assist, Cloud Secrets Manager, Cloud Build
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: zero-trust, ai-development, secure-coding, identity-management
 recipe-generator-version: 1.3
@@ -94,7 +94,6 @@ graph TB
 export PROJECT_ID="secure-dev-$(date +%s)"
 export REGION="us-central1"
 export ZONE="us-central1-a"
-export ORG_ID=$(gcloud organizations list --format="value(name)" --limit=1)
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
@@ -102,18 +101,19 @@ export APP_NAME="secure-dev-app-${RANDOM_SUFFIX}"
 export WORKSTATION_NAME="secure-workstation-${RANDOM_SUFFIX}"
 export SECRET_NAME="app-secrets-${RANDOM_SUFFIX}"
 
-# Set default project and region
+# Create the project and set as active
+gcloud projects create ${PROJECT_ID}
 gcloud config set project ${PROJECT_ID}
+
+# Link billing account (uses first available billing account)
+BILLING_ACCOUNT=$(gcloud billing accounts list \
+    --format="value(name)" --limit=1)
+gcloud billing projects link ${PROJECT_ID} \
+    --billing-account=${BILLING_ACCOUNT}
+
+# Set default project, region, and zone
 gcloud config set compute/region ${REGION}
 gcloud config set compute/zone ${ZONE}
-
-# Create the project
-gcloud projects create ${PROJECT_ID} --organization=${ORG_ID}
-gcloud config set project ${PROJECT_ID}
-
-# Link billing account (replace with your billing account ID)
-BILLING_ACCOUNT=$(gcloud billing accounts list --format="value(name)" --limit=1)
-gcloud billing projects link ${PROJECT_ID} --billing-account=${BILLING_ACCOUNT}
 
 # Enable required APIs
 gcloud services enable iap.googleapis.com \
@@ -124,7 +124,8 @@ gcloud services enable iap.googleapis.com \
     workstations.googleapis.com \
     run.googleapis.com \
     artifactregistry.googleapis.com \
-    sourcerepo.googleapis.com
+    sourcerepo.googleapis.com \
+    aiplatform.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled successfully"
@@ -203,11 +204,14 @@ echo "✅ APIs enabled successfully"
        --network="projects/${PROJECT_ID}/global/networks/default" \
        --subnetwork="projects/${PROJECT_ID}/regions/${REGION}/subnetworks/default"
    
-   # Wait for cluster creation
+   # Wait for cluster creation to complete
    echo "Waiting for workstation cluster creation..."
-   sleep 120
+   gcloud workstations clusters describe secure-dev-cluster \
+       --region=${REGION} \
+       --format="value(state)"
+   sleep 60
    
-   # Create workstation configuration with Gemini Code Assist
+   # Create workstation configuration with security features
    gcloud workstations configs create secure-dev-config \
        --cluster=secure-dev-cluster \
        --region=${REGION} \
@@ -281,7 +285,7 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
 EOF
 
-   # Create Dockerfile
+   # Create Dockerfile with security best practices
    cat > secure-app/Dockerfile << 'EOF'
 FROM python:3.11-slim
 
@@ -295,7 +299,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ .
 
 # Run as non-root user for security
-RUN adduser --disabled-password --gecos '' appuser
+RUN adduser --disabled-password --gecos '' appuser && \
+    chown -R appuser:appuser /app
 USER appuser
 
 # Health check
@@ -307,14 +312,14 @@ EXPOSE 8080
 CMD ["python", "main.py"]
 EOF
 
-   # Create requirements.txt
+   # Create requirements.txt with current versions
    cat > secure-app/requirements.txt << 'EOF'
-Flask==2.3.2
-google-cloud-secret-manager==2.16.2
+Flask==3.0.0
+google-cloud-secret-manager==2.18.1
 gunicorn==21.2.0
 EOF
 
-   # Deploy to Cloud Run with IAP integration
+   # Deploy to Cloud Run with security configurations
    cd secure-app
    gcloud run deploy ${APP_NAME} \
        --source . \
@@ -325,7 +330,8 @@ EOF
        --max-instances=10 \
        --memory=512Mi \
        --cpu=1 \
-       --port=8080
+       --port=8080 \
+       --execution-environment=gen2
    
    cd ..
    
@@ -347,19 +353,20 @@ EOF
    # Create OAuth consent screen (if not already configured)
    gcloud iap oauth-brands create \
        --application_title="Secure Development Environment" \
-       --support_email=$(gcloud config get-value account) || echo "OAuth brand may already exist"
+       --support_email=$(gcloud config get-value account) || \
+       echo "OAuth brand may already exist"
    
    # Enable IAP for Cloud Run service
    gcloud run services update ${APP_NAME} \
        --region=${REGION} \
-       --add-env-vars="IAP_ENABLED=true"
+       --set-env-vars="IAP_ENABLED=true"
    
-   # Configure IAP access policy
+   # Configure IAP access policy for current user
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="user:$(gcloud config get-value account)" \
        --role="roles/iap.httpsResourceAccessor"
    
-   # Add developer team members (replace with actual email addresses)
+   # Example: Add developer team members (uncomment and modify as needed)
    # gcloud projects add-iam-policy-binding ${PROJECT_ID} \
    #     --member="user:developer@company.com" \
    #     --role="roles/iap.httpsResourceAccessor"
@@ -384,7 +391,7 @@ EOF
        --location=${REGION} \
        --description="Secure development container images"
    
-   # Create Cloud Build configuration
+   # Create Cloud Build configuration with security best practices
    cat > cloudbuild.yaml << 'EOF'
 steps:
   # Build the container image
@@ -396,7 +403,7 @@ steps:
   - name: 'gcr.io/cloud-builders/docker'
     args: ['push', '${_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE}:${SHORT_SHA}']
   
-  # Deploy to Cloud Run
+  # Deploy to Cloud Run with security configurations
   - name: 'gcr.io/cloud-builders/gcloud'
     args:
     - 'run'
@@ -406,12 +413,13 @@ steps:
     - '--region=${_REGION}'
     - '--service-account=${_SERVICE_ACCOUNT}'
     - '--no-allow-unauthenticated'
+    - '--execution-environment=gen2'
 
 substitutions:
   _LOCATION: us-central1
   _REPOSITORY: secure-dev-images
   _IMAGE: secure-dev-app
-  _SERVICE_NAME: secure-dev-app
+  _SERVICE_NAME: ${APP_NAME}
   _REGION: us-central1
   _SERVICE_ACCOUNT: secure-app-sa@${PROJECT_ID}.iam.gserviceaccount.com
 
@@ -421,7 +429,8 @@ options:
 EOF
 
    # Grant Cloud Build necessary permissions
-   PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} --format="value(projectNumber)")
+   PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} \
+       --format="value(projectNumber)")
    
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
@@ -441,9 +450,6 @@ EOF
    Gemini Code Assist provides AI-powered coding assistance that understands your codebase context while maintaining enterprise-grade security and privacy controls. By integrating Gemini Code Assist with your secure development environment, developers gain intelligent code completion, bug detection, and optimization suggestions without compromising intellectual property or security requirements.
 
    ```bash
-   # Enable Gemini Code Assist API
-   gcloud services enable aiplatform.googleapis.com
-   
    # Create service account for Gemini Code Assist
    gcloud iam service-accounts create gemini-code-assist-sa \
        --display-name="Gemini Code Assist Service Account" \
@@ -454,7 +460,7 @@ EOF
        --member="serviceAccount:gemini-code-assist-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
        --role="roles/aiplatform.user"
    
-   # Configure Cloud Workstation for Gemini integration
+   # Update Cloud Workstation configuration for Gemini integration
    gcloud workstations configs update secure-dev-config \
        --cluster=secure-dev-cluster \
        --region=${REGION} \
@@ -464,14 +470,18 @@ EOF
    gcloud workstations stop ${WORKSTATION_NAME} \
        --cluster=secure-dev-cluster \
        --config=secure-dev-config \
-       --region=${REGION}
+       --region=${REGION} \
+       --async
    
-   sleep 30
+   # Wait for workstation to stop
+   echo "Waiting for workstation to stop..."
+   sleep 60
    
    gcloud workstations start ${WORKSTATION_NAME} \
        --cluster=secure-dev-cluster \
        --config=secure-dev-config \
-       --region=${REGION}
+       --region=${REGION} \
+       --async
    
    echo "✅ Gemini Code Assist integration configured"
    echo "Access your workstation at: https://workstations.googleusercontent.com/"
@@ -484,13 +494,15 @@ EOF
 1. **Verify IAP Protection**:
 
    ```bash
-   # Test unauthenticated access (should fail)
+   # Get service URL
    SERVICE_URL=$(gcloud run services describe ${APP_NAME} \
        --region=${REGION} \
        --format="value(status.url)")
    
+   # Test unauthenticated access (should fail)
    echo "Testing unauthenticated access..."
-   curl -s -o /dev/null -w "%{http_code}" ${SERVICE_URL}/health
+   HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${SERVICE_URL}/health)
+   echo "HTTP Status: ${HTTP_STATUS}"
    ```
 
    Expected output: `403` (Forbidden) indicating IAP is properly protecting the service.
@@ -498,7 +510,7 @@ EOF
 2. **Test Secret Manager Integration**:
 
    ```bash
-   # Verify secrets are accessible by the application
+   # Verify secrets are accessible
    echo "Testing secret access..."
    gcloud secrets versions access latest --secret=${SECRET_NAME}-db
    gcloud secrets versions access latest --secret=${SECRET_NAME}-api
@@ -520,11 +532,13 @@ EOF
 
    ```bash
    # Check workstation status
-   gcloud workstations describe ${WORKSTATION_NAME} \
+   WORKSTATION_STATE=$(gcloud workstations describe ${WORKSTATION_NAME} \
        --cluster=secure-dev-cluster \
        --config=secure-dev-config \
        --region=${REGION} \
-       --format="value(state)"
+       --format="value(state)")
+   
+   echo "Workstation state: ${WORKSTATION_STATE}"
    ```
 
    Expected output: `STATE_RUNNING` indicating the workstation is operational.
@@ -537,7 +551,7 @@ EOF
    
    # Test authenticated access to the application
    curl -H "Authorization: Bearer ${IAP_TOKEN}" \
-        ${SERVICE_URL}/api/config
+        "${SERVICE_URL}/api/config"
    ```
 
    Expected output: JSON response showing successful secret access and configuration loading.
@@ -600,8 +614,9 @@ EOF
    gcloud secrets delete ${SECRET_NAME}-db --quiet
    gcloud secrets delete ${SECRET_NAME}-api --quiet
    
-   # Delete KMS key (note: keys are soft-deleted and recoverable)
-   gcloud kms keys destroy secret-encryption-key \
+   # Schedule KMS key for destruction (keys cannot be immediately deleted)
+   gcloud kms keys versions destroy 1 \
+       --key=secret-encryption-key \
        --location=${REGION} \
        --keyring=secure-dev-keyring \
        --quiet

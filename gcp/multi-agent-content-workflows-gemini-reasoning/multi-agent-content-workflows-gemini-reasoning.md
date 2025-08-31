@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Vertex AI, Cloud Workflows, Cloud Storage, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: gemini, multi-agent, content-intelligence, workflows, vertex-ai, reasoning
 recipe-generator-version: 1.3
@@ -113,7 +113,8 @@ gcloud config set compute/region ${REGION}
 gcloud config set functions/region ${REGION}
 
 # Create the project and enable required APIs
-gcloud projects create ${PROJECT_ID} --name="Content Intelligence Workflows"
+gcloud projects create ${PROJECT_ID} \
+    --name="Content Intelligence Workflows"
 gcloud config set project ${PROJECT_ID}
 
 # Enable required Google Cloud APIs
@@ -132,8 +133,13 @@ gsutil mb -p ${PROJECT_ID} \
     -l ${REGION} \
     gs://${BUCKET_NAME}
 
-# Create directories for different content types
-gsutil -m cp -r gs://gcp-public-data-landsat/LC08/01/044/034/LC08_L1TP_044034_20140318_20170424_01_T1/ gs://${BUCKET_NAME}/sample-content/ || echo "Using local content structure"
+# Enable versioning for data protection
+gsutil versioning set on gs://${BUCKET_NAME}
+
+# Create directory structure for organized content processing
+gsutil -m mkdir gs://${BUCKET_NAME}/input/
+gsutil -m mkdir gs://${BUCKET_NAME}/results/
+gsutil -m mkdir gs://${BUCKET_NAME}/config/
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Bucket created: ${BUCKET_NAME}"
@@ -564,15 +570,15 @@ echo "✅ Required APIs enabled"
    EOF
 
    cat > requirements.txt << 'EOF'
-   functions-framework==3.5.0
+   functions-framework==3.8.1
    google-cloud-workflows==1.14.1
-   google-cloud-storage==2.10.0
+   google-cloud-storage==2.18.0
    EOF
 
    # Deploy the Cloud Function with proper environment variables
    gcloud functions deploy ${FUNCTION_NAME} \
        --gen2 \
-       --runtime=python311 \
+       --runtime=python312 \
        --region=${REGION} \
        --source=. \
        --entry-point=trigger_content_analysis \
@@ -623,7 +629,7 @@ echo "✅ Required APIs enabled"
    # Update Cloud Function to use the service account
    gcloud functions deploy ${FUNCTION_NAME} \
        --gen2 \
-       --runtime=python311 \
+       --runtime=python312 \
        --region=${REGION} \
        --source=cloud-function-trigger \
        --entry-point=trigger_content_analysis \
@@ -651,14 +657,16 @@ echo "✅ Required APIs enabled"
    # Upload test content to trigger the workflow
    gsutil cp test-document.txt gs://${BUCKET_NAME}/input/
 
-   # Upload a sample image (you can use any business-related image)
-   # For testing, we'll use a public sample image
-   curl -o sample-chart.png "https://developers.google.com/static/chart/interactive/docs/images/gallery/combochart.png"
+   # Upload a sample image for testing image analysis capabilities
+   curl -o sample-chart.png \
+       "https://developers.google.com/static/chart/interactive/docs/images/gallery/combochart.png"
    gsutil cp sample-chart.png gs://${BUCKET_NAME}/input/
 
    # Monitor workflow executions
    echo "Monitoring workflow executions..."
-   gcloud workflows executions list --workflow=${WORKFLOW_NAME} --location=${REGION}
+   gcloud workflows executions list \
+       --workflow=${WORKFLOW_NAME} \
+       --location=${REGION}
 
    # Wait for processing and check results
    sleep 60
@@ -667,8 +675,9 @@ echo "✅ Required APIs enabled"
    echo "Checking for analysis results..."
    gsutil ls gs://${BUCKET_NAME}/results/
 
-   # Download and examine a result file
-   gsutil cp gs://${BUCKET_NAME}/results/test-document.txt_analysis.json ./ 2>/dev/null || echo "Results still processing..."
+   # Download and examine a result file if available
+   gsutil cp gs://${BUCKET_NAME}/results/test-document.txt_analysis.json ./ \
+       2>/dev/null || echo "Results still processing..."
 
    echo "✅ Multi-modal content processing test initiated"
    echo "✅ Monitor Cloud Console for detailed execution logs"
@@ -724,18 +733,30 @@ echo "✅ Required APIs enabled"
    # Store configuration in Cloud Storage for workflow access
    gsutil cp gemini-config.json gs://${BUCKET_NAME}/config/
 
-   # Update workflow with enhanced configuration parameters
+   # Create enhanced workflow with improved error handling
    cat > enhanced-workflow.yaml << 'EOF'
    main:
      params: [input]
      steps:
        - load_configuration:
-           call: http.get
-           args:
-             url: ${"https://storage.googleapis.com/" + sys.get_env("BUCKET_NAME") + "/config/gemini-config.json"}
-             headers:
-               Authorization: ${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
-           result: config_response
+           try:
+             call: http.get
+             args:
+               url: ${"https://storage.googleapis.com/" + sys.get_env("BUCKET_NAME") + "/config/gemini-config.json"}
+               headers:
+                 Authorization: ${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+             result: config_response
+           except:
+             as: e
+             steps:
+               - log_config_error:
+                   call: sys.log
+                   args:
+                     text: ${"Configuration loading failed: " + e}
+               - use_default_config:
+                   assign:
+                     - config_response:
+                         body: '{"reasoning_config": {"temperature": 0.1, "top_p": 0.9, "max_output_tokens": 4096}}'
        
        - parse_config:
            assign:
@@ -751,62 +772,81 @@ echo "✅ Required APIs enabled"
              content_uri: ${content_uri}
              config: ${config}
            result: enhanced_intelligence
+       
+       - return_final_results:
+           return: ${enhanced_intelligence}
 
    gemini_reasoning_engine_v2:
      params: [analysis_data, content_uri, config]
      steps:
        - advanced_reasoning:
-           call: http.post
-           args:
-             url: https://us-central1-aiplatform.googleapis.com/v1/projects/${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}/locations/us-central1/publishers/google/models/gemini-2.5-pro:generateContent
-             headers:
-               Authorization: ${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
-               Content-Type: application/json
-             body:
-               contents:
-                 - parts:
-                   - text: |
-                       ADVANCED REASONING ENGINE - CONTENT INTELLIGENCE SYNTHESIS
-                       
-                       Configuration: ${json.encode(config.reasoning_config)}
-                       Agent Analysis: ${json.encode(analysis_data)}
-                       Content URI: ${content_uri}
-                       
-                       Execute deep reasoning across the following dimensions:
-                       
-                       1. CROSS-MODAL COHERENCE ANALYSIS:
-                          - Identify consistency patterns across text, visual, and audio elements
-                          - Detect contradictions or reinforcing evidence between modalities
-                          - Synthesize unified narrative that reconciles all data sources
-                       
-                       2. EMERGENT INSIGHT DETECTION:
-                          - Apply reasoning to discover insights not apparent to individual agents
-                          - Identify hidden relationships and implications
-                          - Generate novel perspectives through multi-agent synthesis
-                       
-                       3. BUSINESS INTELLIGENCE REASONING:
-                          - Transform technical analysis into strategic business insights
-                          - Reason about market implications and competitive positioning
-                          - Generate actionable recommendations with risk assessment
-                       
-                       4. CONFIDENCE AND UNCERTAINTY REASONING:
-                          - Assess reliability of insights across different modalities
-                          - Identify areas requiring additional analysis or validation
-                          - Provide confidence intervals for key findings
-                       
-                       5. TREND AND PATTERN REASONING:
-                          - Analyze content within broader industry and market contexts
-                          - Identify alignment with or deviation from established patterns
-                          - Predict potential future implications and opportunities
-                       
-                       Apply advanced reasoning to provide comprehensive intelligence that exceeds
-                       the sum of individual agent capabilities. Focus on actionable insights
-                       that drive business decision-making.
-               generationConfig:
-                 temperature: ${config.reasoning_config.temperature}
-                 topP: ${config.reasoning_config.top_p}
-                 maxOutputTokens: ${config.reasoning_config.max_output_tokens}
-           result: reasoning_result
+           try:
+             call: http.post
+             args:
+               url: https://us-central1-aiplatform.googleapis.com/v1/projects/${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}/locations/us-central1/publishers/google/models/gemini-2.5-pro:generateContent
+               headers:
+                 Authorization: ${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+                 Content-Type: application/json
+               body:
+                 contents:
+                   - parts:
+                     - text: |
+                         ADVANCED REASONING ENGINE - CONTENT INTELLIGENCE SYNTHESIS
+                         
+                         Configuration: ${json.encode(config.reasoning_config)}
+                         Agent Analysis: ${json.encode(analysis_data)}
+                         Content URI: ${content_uri}
+                         
+                         Execute deep reasoning across the following dimensions:
+                         
+                         1. CROSS-MODAL COHERENCE ANALYSIS:
+                            - Identify consistency patterns across text, visual, and audio elements
+                            - Detect contradictions or reinforcing evidence between modalities
+                            - Synthesize unified narrative that reconciles all data sources
+                         
+                         2. EMERGENT INSIGHT DETECTION:
+                            - Apply reasoning to discover insights not apparent to individual agents
+                            - Identify hidden relationships and implications
+                            - Generate novel perspectives through multi-agent synthesis
+                         
+                         3. BUSINESS INTELLIGENCE REASONING:
+                            - Transform technical analysis into strategic business insights
+                            - Reason about market implications and competitive positioning
+                            - Generate actionable recommendations with risk assessment
+                         
+                         4. CONFIDENCE AND UNCERTAINTY REASONING:
+                            - Assess reliability of insights across different modalities
+                            - Identify areas requiring additional analysis or validation
+                            - Provide confidence intervals for key findings
+                         
+                         5. TREND AND PATTERN REASONING:
+                            - Analyze content within broader industry and market contexts
+                            - Identify alignment with or deviation from established patterns
+                            - Predict potential future implications and opportunities
+                         
+                         Apply advanced reasoning to provide comprehensive intelligence that exceeds
+                         the sum of individual agent capabilities. Focus on actionable insights
+                         that drive business decision-making.
+                 generationConfig:
+                   temperature: ${config.reasoning_config.temperature}
+                   topP: ${config.reasoning_config.top_p}
+                   maxOutputTokens: ${config.reasoning_config.max_output_tokens}
+             result: reasoning_result
+           except:
+             as: e
+             steps:
+               - log_reasoning_error:
+                   call: sys.log
+                   args:
+                     text: ${"Reasoning engine error: " + e}
+               - return_error_response:
+                   assign:
+                     - reasoning_result:
+                         body:
+                           candidates:
+                             - content:
+                                 parts:
+                                   - text: "Error processing content with reasoning engine"
        - return_enhanced_intelligence:
            return:
              reasoning_depth: "comprehensive"
@@ -832,10 +872,12 @@ echo "✅ Required APIs enabled"
 
    ```bash
    # Check workflow deployment status
-   gcloud workflows describe ${WORKFLOW_NAME} --location=${REGION}
+   gcloud workflows describe ${WORKFLOW_NAME} \
+       --location=${REGION}
    
    # Verify Cloud Function trigger configuration
-   gcloud functions describe ${FUNCTION_NAME} --region=${REGION}
+   gcloud functions describe ${FUNCTION_NAME} \
+       --region=${REGION}
    
    # Check service account permissions
    gcloud projects get-iam-policy ${PROJECT_ID} \
@@ -854,13 +896,18 @@ echo "✅ Required APIs enabled"
    
    # Monitor workflow execution
    sleep 30
-   gcloud workflows executions list --workflow=${WORKFLOW_NAME} --location=${REGION} --limit=5
+   gcloud workflows executions list \
+       --workflow=${WORKFLOW_NAME} \
+       --location=${REGION} \
+       --limit=5
    
    # Check for generated results
    gsutil ls -la gs://${BUCKET_NAME}/results/
    
    # Download and examine analysis results
-   gsutil cp gs://${BUCKET_NAME}/results/*business-analysis* ./results/ 2>/dev/null || echo "Processing in progress..."
+   mkdir -p results
+   gsutil cp gs://${BUCKET_NAME}/results/*business-analysis* ./results/ \
+       2>/dev/null || echo "Processing in progress..."
    ```
 
    Expected output: Should show successful workflow executions and generated analysis files in the results directory.
@@ -885,7 +932,8 @@ echo "✅ Required APIs enabled"
    fi
    
    # Verify API quotas and usage
-   gcloud services list --enabled --filter="name:aiplatform.googleapis.com"
+   gcloud services list --enabled \
+       --filter="name:aiplatform.googleapis.com"
    ```
 
    Expected output: Detailed execution logs showing successful API calls to Vertex AI, Vision API, and Speech-to-Text API with reasoning synthesis completion.

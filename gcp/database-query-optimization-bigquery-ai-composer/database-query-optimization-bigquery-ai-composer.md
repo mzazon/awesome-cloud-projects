@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: BigQuery, Cloud Composer, Vertex AI, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: bigquery, query-optimization, machine-learning, workflow-orchestration, automation
 recipe-generator-version: 1.3
@@ -91,7 +91,7 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for the project
+# Set environment variables for GCP resources
 export PROJECT_ID="bq-optimization-$(date +%s)"
 export REGION="us-central1"
 export ZONE="us-central1-a"
@@ -105,6 +105,7 @@ export BUCKET_NAME="query-optimization-${PROJECT_ID}-${RANDOM_SUFFIX}"
 # Set default project and region
 gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
+gcloud config set compute/zone ${ZONE}
 
 # Enable required APIs
 gcloud services enable bigquery.googleapis.com \
@@ -167,10 +168,10 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    Cloud Composer provides the orchestration backbone for our automated optimization pipeline. Built on Apache Airflow, it enables us to create complex workflows that can monitor BigQuery performance, trigger optimization analyses, and implement improvements on schedule or based on performance thresholds. The managed service handles the infrastructure complexity while providing the flexibility needed for custom optimization logic.
 
    ```bash
-   # Create Cloud Composer environment with adequate resources
+   # Create Cloud Composer 2 environment with adequate resources
    gcloud composer environments create ${COMPOSER_ENV_NAME} \
        --location=${REGION} \
-       --python-version=3 \
+       --image-version=composer-2-airflow-2 \
        --node-count=3 \
        --disk-size=100GB \
        --machine-type=n1-standard-2 \
@@ -253,6 +254,7 @@ import joblib
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 import numpy as np
+import os
 
 def extract_query_features(query_text):
     """Extract features from SQL query text for optimization prediction"""
@@ -274,6 +276,9 @@ def extract_query_features(query_text):
 def train_optimization_model():
     """Train model to predict query optimization opportunities"""
     client = bigquery.Client()
+    
+    PROJECT_ID = os.environ.get('PROJECT_ID')
+    DATASET_NAME = os.environ.get('DATASET_NAME')
     
     # Query historical performance data
     query = f"""
@@ -306,19 +311,31 @@ EOF
        --display-name="query-optimization-training" \
        --config=<(cat << EOF
 {
-  "workerPoolSpecs": [
-    {
-      "machineSpec": {
-        "machineType": "n1-standard-4"
-      },
-      "replicaCount": 1,
-      "pythonPackageSpec": {
-        "executorImageUri": "gcr.io/cloud-aiplatform/training/scikit-learn-cpu.0-23:latest",
-        "packageUris": ["gs://${BUCKET_NAME}/ml/query_optimization_model.py"],
-        "pythonModule": "query_optimization_model"
+  "jobSpec": {
+    "workerPoolSpecs": [
+      {
+        "machineSpec": {
+          "machineType": "n1-standard-4"
+        },
+        "replicaCount": 1,
+        "pythonPackageSpec": {
+          "executorImageUri": "gcr.io/cloud-aiplatform/training/scikit-learn-cpu.0-23:latest",
+          "packageUris": ["gs://${BUCKET_NAME}/ml/query_optimization_model.py"],
+          "pythonModule": "query_optimization_model",
+          "env": [
+            {
+              "name": "PROJECT_ID",
+              "value": "${PROJECT_ID}"
+            },
+            {
+              "name": "DATASET_NAME", 
+              "value": "${DATASET_NAME}"
+            }
+          ]
+        }
       }
-    }
-  ]
+    ]
+  }
 }
 EOF
 )
@@ -369,14 +386,14 @@ def analyze_query_performance(**context):
     query = f"""
     WITH performance_analysis AS (
       SELECT 
-        query_hash,
+        FARM_FINGERPRINT(query) as query_hash,
         query,
         AVG(duration_ms) as avg_duration,
         AVG(total_slot_ms) as avg_slots,
         COUNT(*) as execution_count
       FROM `{PROJECT_ID}.{DATASET_NAME}.query_performance_metrics`
       WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
-      GROUP BY query_hash, query
+      GROUP BY query
       HAVING execution_count >= 3 AND avg_duration > 5000
     )
     SELECT * FROM performance_analysis
@@ -421,7 +438,7 @@ def generate_optimization_recommendations(**context):
         
         recommendations.append({
             'recommendation_id': f"rec_{row['query_hash']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            'query_hash': row['query_hash'],
+            'query_hash': str(row['query_hash']),
             'original_query': query,
             'optimized_query': optimized_query,
             'optimization_type': optimization_type,
@@ -549,14 +566,15 @@ EOF
 EOF
    
    # Create the monitoring dashboard
-   gcloud monitoring dashboards create --config-from-file=monitoring_dashboard.json
+   gcloud monitoring dashboards create \
+       --config-from-file=monitoring_dashboard.json
    
    # Create alert policy for optimization failures
    gcloud alpha monitoring policies create \
        --display-name="Query Optimization Failures" \
        --condition-display-name="High failure rate" \
-       --condition-filter='resource.type="gce_instance"' \
-       --condition-comparison="COMPARISON_GT" \
+       --condition-filter='resource.type="composer_environment"' \
+       --condition-comparison="COMPARISON_GREATER_THAN" \
        --condition-threshold=5 \
        --condition-duration=300s \
        --notification-channels="" \
@@ -731,6 +749,7 @@ EOF
    gcloud projects delete ${PROJECT_ID} --quiet
    
    echo "✅ Project deletion initiated"
+   echo "Note: Project deletion may take several minutes to complete"
    ```
 
 ## Discussion

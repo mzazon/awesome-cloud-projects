@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Resource Graph, Azure Monitor Workbooks, Azure Policy, Azure Logic Apps
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: governance, compliance, monitoring, automation, dashboards
 recipe-generator-version: 1.3
@@ -100,7 +100,8 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
 # Verify Resource Graph provider registration
 az provider register --namespace Microsoft.ResourceGraph
-az provider show --namespace Microsoft.ResourceGraph --query "registrationState"
+az provider show --namespace Microsoft.ResourceGraph \
+    --query "registrationState"
 
 echo "✅ Azure Resource Graph provider registered"
 ```
@@ -157,7 +158,7 @@ echo "✅ Azure Resource Graph provider registered"
        --graph-query "resources | summarize count() by type | top 10 by count_" \
        --subscriptions ${SUBSCRIPTION_ID}
    
-   # Test policy compliance query
+   # Test policy compliance query if policies exist
    az graph query \
        --graph-query "policyresources | where type == 'microsoft.policyinsights/policystates' | summarize count() by complianceState" \
        --subscriptions ${SUBSCRIPTION_ID}
@@ -251,10 +252,13 @@ echo "✅ Azure Resource Graph provider registered"
    Deploying the workbook template creates our governance dashboard in Azure Monitor. This step establishes the interactive visualization layer that will display our governance metrics, compliance data, and security insights. The workbook deployment enables stakeholders to access real-time governance information through an intuitive web interface.
 
    ```bash
+   # Generate UUID for workbook name (required by Azure CLI)
+   WORKBOOK_UUID=$(uuidgen)
+   
    # Deploy the workbook using Azure CLI
    az monitor app-insights workbook create \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${WORKBOOK_NAME} \
+       --name ${WORKBOOK_UUID} \
        --display-name "Governance Dashboard" \
        --description "Automated governance and compliance dashboard" \
        --category "governance" \
@@ -264,7 +268,7 @@ echo "✅ Azure Resource Graph provider registered"
    # Get the workbook resource ID
    WORKBOOK_ID=$(az monitor app-insights workbook show \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${WORKBOOK_NAME} \
+       --name ${WORKBOOK_UUID} \
        --query id --output tsv)
    
    echo "✅ Governance workbook deployed: ${WORKBOOK_ID}"
@@ -275,46 +279,51 @@ echo "✅ Azure Resource Graph provider registered"
    Azure Logic Apps enables automated responses to governance violations and compliance issues. By creating a Logic App workflow, we establish the automation layer that can trigger remediation actions, send notifications, and execute governance policies automatically. This automation reduces manual intervention and ensures consistent governance enforcement.
 
    ```bash
+   # Create definition file for Logic App
+   cat > logic-app-definition.json << 'EOF'
+   {
+     "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+     "contentVersion": "1.0.0.0",
+     "parameters": {},
+     "triggers": {
+       "manual": {
+         "type": "Request",
+         "kind": "Http",
+         "inputs": {
+           "schema": {
+             "properties": {
+               "alertType": { "type": "string" },
+               "resourceId": { "type": "string" },
+               "severity": { "type": "string" }
+             },
+             "type": "object"
+           }
+         }
+       }
+     },
+     "actions": {
+       "Send_notification": {
+         "type": "Http",
+         "inputs": {
+           "method": "POST",
+           "uri": "https://requestbin.com/r/example",
+           "body": {
+             "text": "Governance Alert: @{triggerBody()?['alertType']} for resource @{triggerBody()?['resourceId']}"
+           }
+         }
+       }
+     }
+   }
+   EOF
+   
    # Create Logic App for governance automation
    az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${LOGIC_APP_NAME} \
        --location ${LOCATION} \
-       --definition '{
-         "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-         "contentVersion": "1.0.0.0",
-         "parameters": {},
-         "triggers": {
-           "manual": {
-             "type": "Request",
-             "kind": "Http",
-             "inputs": {
-               "schema": {
-                 "properties": {
-                   "alertType": { "type": "string" },
-                   "resourceId": { "type": "string" },
-                   "severity": { "type": "string" }
-                 },
-                 "type": "object"
-               }
-             }
-           }
-         },
-         "actions": {
-           "Send_notification": {
-             "type": "Http",
-             "inputs": {
-               "method": "POST",
-               "uri": "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK",
-               "body": {
-                 "text": "Governance Alert: @{triggerBody()?[\"alertType\"]} for resource @{triggerBody()?[\"resourceId\"]}"
-               }
-             }
-           }
-         }
-       }'
+       --definition @logic-app-definition.json
    
-   # Get the Logic App trigger URL
+   # Get the Logic App callback URL
    LOGIC_APP_URL=$(az logic workflow show \
        --resource-group ${RESOURCE_GROUP} \
        --name ${LOGIC_APP_NAME} \
@@ -335,27 +344,7 @@ echo "✅ Azure Resource Graph provider registered"
        --short-name "gov-alerts" \
        --action webhook governance-webhook ${LOGIC_APP_URL}
    
-   # Create alert rule for non-compliant resources
-   az monitor metrics alert create \
-       --name "governance-compliance-alert" \
-       --resource-group ${RESOURCE_GROUP} \
-       --scopes "/subscriptions/${SUBSCRIPTION_ID}" \
-       --condition "avg ActivityLog.Category == 'Policy' and ActivityLog.Level == 'Error'" \
-       --description "Alert for policy compliance violations" \
-       --evaluation-frequency 5m \
-       --window-size 5m \
-       --severity 2 \
-       --action "governance-alerts"
-   
-   echo "✅ Governance alerts configured"
-   ```
-
-7. **Create Scheduled Query for Automated Reporting**:
-
-   Scheduled queries enable automatic execution of governance assessments at regular intervals. This automation ensures continuous monitoring of compliance posture without manual intervention. The scheduled queries feed data into our workbook dashboard and trigger alerts when governance thresholds are exceeded.
-
-   ```bash
-   # Create Log Analytics workspace for governance data
+   # Create Log Analytics workspace for alert rules
    az monitor log-analytics workspace create \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name "governance-workspace-${RANDOM_SUFFIX}" \
@@ -365,14 +354,22 @@ echo "✅ Azure Resource Graph provider registered"
    WORKSPACE_ID=$(az monitor log-analytics workspace show \
        --resource-group ${RESOURCE_GROUP} \
        --workspace-name "governance-workspace-${RANDOM_SUFFIX}" \
-       --query customerId --output tsv)
+       --query id --output tsv)
    
-   # Create scheduled query rule
+   echo "✅ Governance alerts infrastructure configured"
+   ```
+
+7. **Create Scheduled Query for Automated Reporting**:
+
+   Scheduled queries enable automatic execution of governance assessments at regular intervals. This automation ensures continuous monitoring of compliance posture without manual intervention. The scheduled queries feed data into our workbook dashboard and trigger alerts when governance thresholds are exceeded.
+
+   ```bash
+   # Create scheduled query rule for governance monitoring
    az monitor scheduled-query create \
        --name "governance-compliance-check" \
        --resource-group ${RESOURCE_GROUP} \
-       --scopes "/subscriptions/${SUBSCRIPTION_ID}" \
-       --condition "count 'Heartbeat | where TimeGenerated > ago(5m)' > 0" \
+       --scopes ${WORKSPACE_ID} \
+       --condition "count 'Heartbeat | where TimeGenerated > ago(5m) | summarize count()' > 0" \
        --description "Scheduled governance compliance check" \
        --evaluation-frequency 15m \
        --window-size 15m \
@@ -392,15 +389,15 @@ echo "✅ Azure Resource Graph provider registered"
        --graph-query "resources | limit 1" \
        --subscriptions ${SUBSCRIPTION_ID}
    
-   # Test Logic App trigger
+   # Test Logic App trigger (using example webhook)
    curl -X POST \
        -H "Content-Type: application/json" \
        -d '{"alertType": "test", "resourceId": "test-resource", "severity": "high"}' \
-       ${LOGIC_APP_URL}
+       "${LOGIC_APP_URL}/triggers/manual/paths/invoke?api-version=2016-10-01&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0"
    
    # Verify workbook accessibility
    echo "Access your governance dashboard at:"
-   echo "https://portal.azure.com/#blade/Microsoft_Azure_Monitoring/WorkbooksMenuBlade/workbook/${WORKBOOK_ID}"
+   echo "https://portal.azure.com/#@/resource${WORKBOOK_ID}/workbook"
    
    echo "✅ End-to-end governance workflow tested"
    ```
@@ -425,7 +422,7 @@ echo "✅ Azure Resource Graph provider registered"
    # Verify workbook deployment
    az monitor app-insights workbook show \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${WORKBOOK_NAME} \
+       --name ${WORKBOOK_UUID} \
        --query "displayName" --output tsv
    ```
 
@@ -446,9 +443,9 @@ echo "✅ Azure Resource Graph provider registered"
 4. **Test Alert Configuration**:
 
    ```bash
-   # Verify alert rules
-   az monitor metrics alert show \
-       --name "governance-compliance-alert" \
+   # Verify scheduled query rules
+   az monitor scheduled-query show \
+       --name "governance-compliance-check" \
        --resource-group ${RESOURCE_GROUP} \
        --query "enabled" --output tsv
    ```
@@ -460,9 +457,9 @@ echo "✅ Azure Resource Graph provider registered"
 1. **Remove Alert Rules and Action Groups**:
 
    ```bash
-   # Delete alert rules
-   az monitor metrics alert delete \
-       --name "governance-compliance-alert" \
+   # Delete scheduled query rules
+   az monitor scheduled-query delete \
+       --name "governance-compliance-check" \
        --resource-group ${RESOURCE_GROUP}
    
    # Delete action groups
@@ -490,7 +487,7 @@ echo "✅ Azure Resource Graph provider registered"
    # Delete workbook
    az monitor app-insights workbook delete \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${WORKBOOK_NAME}
+       --name ${WORKBOOK_UUID}
    
    # Delete Log Analytics workspace
    az monitor log-analytics workspace delete \
@@ -516,13 +513,13 @@ echo "✅ Azure Resource Graph provider registered"
 
 ## Discussion
 
-Azure Resource Graph combined with Azure Monitor Workbooks creates a powerful governance platform that provides comprehensive visibility into Azure resource compliance and security posture. This solution leverages Resource Graph's ability to query across multiple subscriptions at scale, providing near real-time insights into resource configurations, policy compliance, and security assessments. The integration with Azure Monitor Workbooks enables rich visualizations and interactive dashboards that make governance data accessible to stakeholders across the organization. For comprehensive guidance on Azure governance, see the [Azure governance documentation](https://docs.microsoft.com/en-us/azure/governance/) and [Resource Graph best practices](https://docs.microsoft.com/en-us/azure/governance/resource-graph/overview).
+Azure Resource Graph combined with Azure Monitor Workbooks creates a powerful governance platform that provides comprehensive visibility into Azure resource compliance and security posture. This solution leverages Resource Graph's ability to query across multiple subscriptions at scale, providing near real-time insights into resource configurations, policy compliance, and security assessments. The integration with Azure Monitor Workbooks enables rich visualizations and interactive dashboards that make governance data accessible to stakeholders across the organization. For comprehensive guidance on Azure governance, see the [Azure governance documentation](https://learn.microsoft.com/en-us/azure/governance/) and [Resource Graph best practices](https://learn.microsoft.com/en-us/azure/governance/resource-graph/overview).
 
-The automated workflow capabilities provided by Azure Logic Apps transform static governance reporting into proactive compliance management. When governance violations are detected through Resource Graph queries, the system can automatically trigger remediation actions, send notifications to responsible teams, and create audit trails for compliance reporting. This automation reduces the time between violation detection and remediation, improving overall security posture and compliance adherence. The solution follows Azure Well-Architected Framework principles by implementing automated monitoring, proactive alerting, and efficient resource management practices.
+The automated workflow capabilities provided by Azure Logic Apps transform static governance reporting into proactive compliance management. When governance violations are detected through Resource Graph queries, the system can automatically trigger remediation actions, send notifications to responsible teams, and create audit trails for compliance reporting. This automation reduces the time between violation detection and remediation, improving overall security posture and compliance adherence. The solution follows Azure Well-Architected Framework principles by implementing automated monitoring, proactive alerting, and efficient resource management practices outlined in the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/well-architected/).
 
-From a cost perspective, this solution provides significant value by preventing governance violations before they become costly security incidents or compliance failures. Azure Resource Graph queries are free for the first 1,000 requests per month, and Azure Monitor Workbooks have no additional charges beyond the underlying data storage. Logic Apps pricing is based on execution frequency, making it cost-effective for governance automation scenarios. For detailed cost optimization strategies, review the [Azure Monitor pricing guide](https://docs.microsoft.com/en-us/azure/azure-monitor/usage-estimated-costs) and [Logic Apps pricing documentation](https://docs.microsoft.com/en-us/azure/logic-apps/logic-apps-pricing).
+From a cost perspective, this solution provides significant value by preventing governance violations before they become costly security incidents or compliance failures. Azure Resource Graph queries are free for the first 1,000 requests per month, and Azure Monitor Workbooks have no additional charges beyond the underlying data storage. Logic Apps pricing is based on execution frequency, making it cost-effective for governance automation scenarios. For detailed cost optimization strategies, review the [Azure Monitor pricing guide](https://learn.microsoft.com/en-us/azure/azure-monitor/usage-estimated-costs) and [Logic Apps pricing documentation](https://learn.microsoft.com/en-us/azure/logic-apps/logic-apps-pricing).
 
-> **Tip**: Use Azure Policy integration with Resource Graph to create policy-driven governance dashboards that automatically update based on your organization's compliance requirements. The [Azure Policy documentation](https://docs.microsoft.com/en-us/azure/governance/policy/) provides comprehensive guidance on implementing governance policies and monitoring compliance across your Azure environment.
+> **Tip**: Use Azure Policy integration with Resource Graph to create policy-driven governance dashboards that automatically update based on your organization's compliance requirements. The [Azure Policy documentation](https://learn.microsoft.com/en-us/azure/governance/policy/) provides comprehensive guidance on implementing governance policies and monitoring compliance across your Azure environment.
 
 ## Challenge
 

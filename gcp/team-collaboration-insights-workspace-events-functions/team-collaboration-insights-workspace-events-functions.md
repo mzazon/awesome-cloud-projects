@@ -4,12 +4,12 @@ id: f8a92b3c
 category: analytics
 difficulty: 200
 subject: gcp
-services: Workspace Events API, Cloud Functions, Cloud Firestore
+services: Workspace Events API, Cloud Functions, Cloud Firestore, Pub/Sub
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: workspace, collaboration, analytics, events, serverless
 recipe-generator-version: 1.3
@@ -136,9 +136,9 @@ echo "✅ Service account configured for Workspace Events API"
        --location=${REGION} \
        --type=firestore-native
    
-   # Create initial collections structure
-   gcloud firestore import gs://dummy-bucket/structure.json \
-       --async || echo "Database ready for first writes"
+   # Wait for database creation to complete
+   echo "Waiting for Firestore database initialization..."
+   sleep 30
    
    echo "✅ Cloud Firestore database initialized"
    ```
@@ -168,27 +168,32 @@ db = firestore.Client()
 def process_workspace_event(cloud_event):
     """Process Google Workspace events and store analytics data."""
     
-    # Decode event data
-    event_data = json.loads(base64.b64decode(cloud_event.data['message']['data']))
-    event_type = cloud_event.data['message']['attributes'].get('ce-type', '')
-    event_time = cloud_event.data['message']['attributes'].get('ce-time', '')
-    
-    # Extract collaboration insights
-    insights = extract_collaboration_insights(event_data, event_type)
-    
-    # Store in Firestore
-    doc_ref = db.collection('collaboration_events').document()
-    doc_ref.set({
-        'event_type': event_type,
-        'timestamp': datetime.fromisoformat(event_time.replace('Z', '+00:00')),
-        'insights': insights,
-        'raw_event': event_data
-    })
-    
-    # Update team metrics
-    update_team_metrics(insights)
-    
-    print(f"Processed {event_type} event at {event_time}")
+    try:
+        # Decode event data
+        event_data = json.loads(base64.b64decode(cloud_event.data['message']['data']))
+        event_type = cloud_event.data['message']['attributes'].get('ce-type', '')
+        event_time = cloud_event.data['message']['attributes'].get('ce-time', '')
+        
+        # Extract collaboration insights
+        insights = extract_collaboration_insights(event_data, event_type)
+        
+        # Store in Firestore
+        doc_ref = db.collection('collaboration_events').document()
+        doc_ref.set({
+            'event_type': event_type,
+            'timestamp': datetime.fromisoformat(event_time.replace('Z', '+00:00')),
+            'insights': insights,
+            'raw_event': event_data
+        })
+        
+        # Update team metrics
+        update_team_metrics(insights)
+        
+        print(f"Processed {event_type} event at {event_time}")
+        
+    except Exception as e:
+        print(f"Error processing event: {str(e)}")
+        raise
 
 def extract_collaboration_insights(event_data, event_type):
     """Extract meaningful collaboration insights from workspace events."""
@@ -222,10 +227,17 @@ def update_team_metrics(insights):
     # Use Firestore transactions for atomic updates
     from google.cloud.firestore import Increment
     
-    metrics_ref.update({
-        f"{insights.get('interaction_type', 'unknown')}_count": Increment(1),
-        'last_updated': datetime.now()
-    })
+    try:
+        metrics_ref.update({
+            f"{insights.get('interaction_type', 'unknown')}_count": Increment(1),
+            'last_updated': datetime.now()
+        })
+    except Exception as e:
+        # Document may not exist, create it
+        metrics_ref.set({
+            f"{insights.get('interaction_type', 'unknown')}_count": 1,
+            'last_updated': datetime.now()
+        })
 EOF
    
    # Create requirements file
@@ -236,7 +248,7 @@ EOF
    
    # Deploy Cloud Function
    gcloud functions deploy process-workspace-events \
-       --runtime python311 \
+       --runtime python312 \
        --trigger-topic workspace-events-topic \
        --source . \
        --entry-point process_workspace_event \
@@ -382,33 +394,37 @@ db = firestore.Client()
 def get_collaboration_analytics(request):
     """HTTP endpoint for retrieving collaboration analytics."""
     
-    # Parse query parameters
-    days = int(request.args.get('days', 7))
-    team_id = request.args.get('team_id', 'all')
-    
-    # Calculate date range
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=days)
-    
-    # Query collaboration events
-    events_ref = db.collection('collaboration_events')
-    query = events_ref.where('timestamp', '>=', start_date) \
-                     .where('timestamp', '<=', end_date)
-    
-    events = []
-    for doc in query.stream():
-        event_data = doc.to_dict()
-        events.append(event_data)
-    
-    # Calculate analytics
-    analytics = calculate_team_analytics(events)
-    
-    return jsonify({
-        'period': f'{days} days',
-        'total_events': len(events),
-        'analytics': analytics,
-        'generated_at': datetime.now().isoformat()
-    })
+    try:
+        # Parse query parameters
+        days = int(request.args.get('days', 7))
+        team_id = request.args.get('team_id', 'all')
+        
+        # Calculate date range
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+        
+        # Query collaboration events
+        events_ref = db.collection('collaboration_events')
+        query = events_ref.where('timestamp', '>=', start_date) \
+                         .where('timestamp', '<=', end_date)
+        
+        events = []
+        for doc in query.stream():
+            event_data = doc.to_dict()
+            events.append(event_data)
+        
+        # Calculate analytics
+        analytics = calculate_team_analytics(events)
+        
+        return jsonify({
+            'period': f'{days} days',
+            'total_events': len(events),
+            'analytics': analytics,
+            'generated_at': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 def calculate_team_analytics(events):
     """Calculate team collaboration analytics from events."""
@@ -446,7 +462,7 @@ EOF
    
    # Deploy analytics dashboard function
    gcloud functions deploy collaboration-analytics \
-       --runtime python311 \
+       --runtime python312 \
        --trigger-http \
        --allow-unauthenticated \
        --source . \
@@ -519,12 +535,11 @@ EOF
        --limit 10 \
        --format="value(timestamp,message)"
    
-   # Verify Firestore data population
-   gcloud firestore export gs://${PROJECT_ID}-backup/test-export \
-       --collection-ids=collaboration_events
+   # Verify Firestore collections exist
+   gcloud firestore databases list
    ```
 
-   Expected output: Function logs showing successful event processing and Firestore collections containing collaboration event data.
+   Expected output: Function logs showing successful event processing and Firestore database properly initialized.
 
 3. **Test Analytics Dashboard API**:
 

@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: AI Hypercomputer, Vertex AI Training, Cloud Workstations, Cloud Storage
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: machine learning, mlops, ai hypercomputer, vertex ai, enterprise, model lifecycle, training pipelines, data science
 recipe-generator-version: 1.3
@@ -84,13 +84,13 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with billing enabled and the following APIs enabled:
-   - AI Platform API
    - Vertex AI API
    - Cloud Workstations API
    - Compute Engine API
    - Cloud Storage API
    - BigQuery API
    - Artifact Registry API
+   - Container File System API (optional for faster startup)
 2. Google Cloud CLI installed and configured (or Cloud Shell)
 3. Understanding of machine learning concepts and Python programming
 4. Familiarity with containerization and Docker concepts
@@ -643,16 +643,25 @@ echo "✅ Artifact Registry repository created"
 2. **Clean Up Vertex AI Resources**:
 
    ```bash
-   # Delete training jobs
-   gcloud ai custom-jobs cancel ${JOB_ID} \
-       --region=${REGION} \
-       --quiet
+   # Cancel training jobs if still running
+   if [ ! -z "${JOB_ID}" ]; then
+       gcloud ai custom-jobs cancel ${JOB_ID} \
+           --region=${REGION} \
+           --quiet
+   fi
    
-   # Delete models and endpoints
-   gcloud ai models delete \
+   # Delete models from model registry
+   MODEL_IDS=$(gcloud ai models list \
        --region=${REGION} \
-       --quiet \
-       --ids=$(gcloud ai models list --region=${REGION} --format="value(name)")
+       --format="value(name)")
+   
+   if [ ! -z "${MODEL_IDS}" ]; then
+       echo "${MODEL_IDS}" | while read model_id; do
+           gcloud ai models delete ${model_id} \
+               --region=${REGION} \
+               --quiet
+       done
+   fi
    
    echo "✅ Vertex AI resources cleaned up"
    ```

@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure AI Content Safety, Azure Logic Apps, Azure Event Grid, Azure Storage
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: content-moderation, ai-safety, automation, workflow-orchestration
 recipe-generator-version: 1.3
@@ -90,7 +90,7 @@ graph TB
 
 ```bash
 # Set environment variables
-export RESOURCE_GROUP="rg-content-moderation"
+export RESOURCE_GROUP="rg-content-moderation-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export RANDOM_SUFFIX=$(openssl rand -hex 3)
 export STORAGE_ACCOUNT="stcontentmod${RANDOM_SUFFIX}"
@@ -135,7 +135,7 @@ echo "✅ Foundation resources created successfully"
        --name ${AI_SERVICES_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --kind ContentSafety \
+       --kind AIServices \
        --sku S0 \
        --yes
    
@@ -294,7 +294,7 @@ echo "✅ Foundation resources created successfully"
                    "type": "Http",
                    "inputs": {
                        "method": "POST",
-                       "uri": "${AI_ENDPOINT}contentsafety/text:analyze?api-version=2023-10-01",
+                       "uri": "${AI_ENDPOINT}contentsafety/text:analyze?api-version=2024-09-01",
                        "headers": {
                            "Ocp-Apim-Subscription-Key": "${AI_KEY}",
                            "Content-Type": "application/json"
@@ -381,7 +381,7 @@ echo "✅ Foundation resources created successfully"
 
    ```bash
    # Test the Content Safety API
-   curl -X POST "${AI_ENDPOINT}contentsafety/text:analyze?api-version=2023-10-01" \
+   curl -X POST "${AI_ENDPOINT}contentsafety/text:analyze?api-version=2024-09-01" \
        -H "Ocp-Apim-Subscription-Key: ${AI_KEY}" \
        -H "Content-Type: application/json" \
        -d '{
@@ -452,7 +452,8 @@ echo "✅ Foundation resources created successfully"
    ```bash
    unset RESOURCE_GROUP LOCATION RANDOM_SUFFIX STORAGE_ACCOUNT
    unset AI_SERVICES_NAME LOGIC_APP_NAME EVENT_GRID_TOPIC
-   unset STORAGE_CONNECTION AI_ENDPOINT AI_KEY
+   unset STORAGE_CONNECTION AI_ENDPOINT AI_KEY EVENT_GRID_ENDPOINT
+   unset EVENT_GRID_KEY LOGIC_APP_ID WORKSPACE_ID
    
    echo "✅ Environment variables cleared"
    ```
@@ -463,7 +464,7 @@ Azure AI Content Safety and Logic Apps create a powerful combination for automat
 
 The event-driven architecture provides natural decoupling between content ingestion and processing, allowing independent scaling of each component. Event Grid's reliable delivery guarantees ensure no content goes unmoderated, while Logic Apps' visual workflow designer enables rapid policy updates without code changes. This flexibility is crucial for adapting to evolving content threats and regulatory requirements. The [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) principles guide this design for reliability and security.
 
-From a compliance perspective, the solution maintains complete audit trails of all moderation decisions, supporting regulatory requirements across different jurisdictions. The quarantine mechanism ensures potentially harmful content is isolated but preserved for legal purposes. Integration with Azure Monitor provides real-time insights into moderation patterns and system health. For comprehensive monitoring strategies, review the [Azure Monitor documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/overview) and [content moderation best practices](https://learn.microsoft.com/en-us/azure/ai-services/content-safety/concepts/best-practices).
+From a compliance perspective, the solution maintains complete audit trails of all moderation decisions, supporting regulatory requirements across different jurisdictions. The quarantine mechanism ensures potentially harmful content is isolated but preserved for legal purposes. Integration with Azure Monitor provides real-time insights into moderation patterns and system health. For comprehensive monitoring strategies, review the [Azure Monitor documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/overview) and [content moderation best practices](https://learn.microsoft.com/en-us/azure/ai-services/content-safety/overview).
 
 > **Tip**: Implement custom blocklists in Azure AI Content Safety to catch platform-specific harmful content that generic models might miss. Use Logic Apps' conditional logic to route content to specialized human review queues based on confidence scores.
 

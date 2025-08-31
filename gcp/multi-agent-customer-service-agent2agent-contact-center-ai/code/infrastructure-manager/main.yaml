@@ -1,0 +1,667 @@
+# Infrastructure Manager Configuration for Multi-Agent Customer Service
+# This configuration deploys a complete multi-agent customer service system
+# using Contact Center AI, Vertex AI, Cloud Functions, and Firestore
+
+# Copyright 2025 Google LLC
+# Licensed under the Apache License, Version 2.0
+
+# Infrastructure Manager metadata
+apiVersion: v1
+kind: InfrastructureManagerDeployment
+metadata:
+  name: multi-agent-customer-service
+  description: "Multi-agent customer service system with Agent2Agent protocol"
+  labels:
+    solution: "customer-service"
+    ai-type: "multi-agent"
+    complexity: "advanced"
+
+# Variable definitions for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+  
+  region:
+    type: string
+    description: "Primary deployment region"
+    default: "us-central1"
+    validation:
+      - condition: "var.region in ['us-central1', 'us-east1', 'us-west1', 'europe-west1', 'asia-southeast1']"
+        error_message: "Region must be a supported Google Cloud region"
+  
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+    validation:
+      - condition: "var.environment in ['dev', 'staging', 'prod']"
+        error_message: "Environment must be dev, staging, or prod"
+  
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Functions"
+    default: "256Mi"
+  
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Functions in seconds"
+    default: "60s"
+
+# Local values for resource naming and configuration
+locals:
+  # Generate unique suffix for resource names
+  random_suffix: "${random_id.suffix.hex}"
+  
+  # Standardized naming convention
+  name_prefix: "ma-cs-${var.environment}-${local.random_suffix}"
+  
+  # Common labels for all resources
+  common_labels:
+    solution: "multi-agent-customer-service"
+    environment: "${var.environment}"
+    managed-by: "infrastructure-manager"
+    recipe-version: "1.1"
+  
+  # Required APIs for the solution
+  required_apis:
+    - "aiplatform.googleapis.com"
+    - "cloudfunctions.googleapis.com"
+    - "firestore.googleapis.com"
+    - "bigquery.googleapis.com"
+    - "dialogflow.googleapis.com"
+    - "contactcenteraiplatform.googleapis.com"
+    - "storage-component.googleapis.com"
+    - "pubsub.googleapis.com"
+    - "cloudbuild.googleapis.com"
+
+# Random ID generator for unique resource naming
+resources:
+  random_suffix:
+    type: "random_id"
+    properties:
+      byte_length: 3
+
+  # Enable required Google Cloud APIs
+  enable_apis:
+    type: "google_project_service"
+    count: "${length(local.required_apis)}"
+    properties:
+      project: "${var.project_id}"
+      service: "${local.required_apis[count.index]}"
+      disable_dependent_services: true
+      disable_on_destroy: false
+
+  # Cloud Storage bucket for function source code and artifacts
+  function_source_bucket:
+    type: "google_storage_bucket"
+    properties:
+      name: "${local.name_prefix}-functions"
+      project: "${var.project_id}"
+      location: "${var.region}"
+      storage_class: "STANDARD"
+      uniform_bucket_level_access: true
+      labels: "${local.common_labels}"
+      
+      # Lifecycle management for cost optimization
+      lifecycle_rule:
+        - condition:
+            age: 30
+          action:
+            type: "Delete"
+      
+      # Security configuration
+      public_access_prevention: "enforced"
+    depends_on:
+      - "enable_apis[4]"  # storage-component.googleapis.com
+
+  # Firestore database for knowledge base and conversation storage
+  firestore_database:
+    type: "google_firestore_database"
+    properties:
+      project: "${var.project_id}"
+      name: "(default)"
+      location_id: "${var.region}"
+      type: "FIRESTORE_NATIVE"
+      
+      # Backup configuration for data protection
+      point_in_time_recovery_enablement: "POINT_IN_TIME_RECOVERY_ENABLED"
+      delete_protection_state: "DELETE_PROTECTION_ENABLED"
+    depends_on:
+      - "enable_apis[2]"  # firestore.googleapis.com
+
+  # Vertex AI dataset for agent training and model management
+  vertex_ai_dataset:
+    type: "google_vertex_ai_dataset"
+    properties:
+      display_name: "${local.name_prefix}-dataset"
+      project: "${var.project_id}"
+      region: "${var.region}"
+      metadata_schema_uri: "gs://google-cloud-aiplatform/schema/dataset/metadata/text_1.0.0.yaml"
+      labels: "${local.common_labels}"
+    depends_on:
+      - "enable_apis[0]"  # aiplatform.googleapis.com
+
+  # BigQuery dataset for analytics and conversation logging
+  bigquery_dataset:
+    type: "google_bigquery_dataset"
+    properties:
+      dataset_id: "${replace(local.name_prefix, "-", "_")}_analytics"
+      project: "${var.project_id}"
+      location: "${var.region}"
+      friendly_name: "Multi-Agent Customer Service Analytics"
+      description: "Analytics data for multi-agent customer service system"
+      
+      labels: "${local.common_labels}"
+      
+      # Data retention and access control
+      default_table_expiration_ms: 7776000000  # 90 days
+      access:
+        - role: "OWNER"
+          user_by_email: "${data.google_client_openid_userinfo.me.email}"
+        - role: "READER"
+          special_group: "projectReaders"
+    depends_on:
+      - "enable_apis[3]"  # bigquery.googleapis.com
+
+  # BigQuery table for conversation logs
+  conversation_logs_table:
+    type: "google_bigquery_table"
+    properties:
+      dataset_id: "${google_bigquery_dataset.bigquery_dataset.dataset_id}"
+      table_id: "conversation_logs"
+      project: "${var.project_id}"
+      
+      # Schema definition for conversation data
+      schema: |
+        [
+          {
+            "name": "session_id",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Unique session identifier"
+          },
+          {
+            "name": "timestamp",
+            "type": "TIMESTAMP",
+            "mode": "REQUIRED",
+            "description": "Event timestamp"
+          },
+          {
+            "name": "agent_type",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Type of agent (billing, technical, sales)"
+          },
+          {
+            "name": "customer_message",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Customer message content"
+          },
+          {
+            "name": "agent_response",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Agent response content"
+          },
+          {
+            "name": "confidence_score",
+            "type": "FLOAT",
+            "mode": "NULLABLE",
+            "description": "Confidence score for routing decision"
+          },
+          {
+            "name": "handoff_reason",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Reason for agent handoff"
+          }
+        ]
+      
+      # Partitioning for performance optimization
+      time_partitioning:
+        type: "DAY"
+        field: "timestamp"
+        expiration_ms: 7776000000  # 90 days
+      
+      # Clustering for query performance
+      clustering:
+        - "agent_type"
+        - "session_id"
+    depends_on:
+      - "bigquery_dataset"
+
+  # IAM Service Account for Cloud Functions
+  function_service_account:
+    type: "google_service_account"
+    properties:
+      account_id: "${local.name_prefix}-functions-sa"
+      project: "${var.project_id}"
+      display_name: "Multi-Agent Functions Service Account"
+      description: "Service account for multi-agent customer service functions"
+
+  # IAM bindings for function service account
+  function_sa_firestore_binding:
+    type: "google_project_iam_member"
+    properties:
+      project: "${var.project_id}"
+      role: "roles/datastore.user"
+      member: "serviceAccount:${google_service_account.function_service_account.email}"
+
+  function_sa_aiplatform_binding:
+    type: "google_project_iam_member"
+    properties:
+      project: "${var.project_id}"
+      role: "roles/aiplatform.user"
+      member: "serviceAccount:${google_service_account.function_service_account.email}"
+
+  function_sa_bigquery_binding:
+    type: "google_project_iam_member"
+    properties:
+      project: "${var.project_id}"
+      role: "roles/bigquery.dataEditor"
+      member: "serviceAccount:${google_service_account.function_service_account.email}"
+
+  # Cloud Function: Agent Router
+  # Routes customer inquiries to appropriate specialist agents
+  agent_router_function:
+    type: "google_cloudfunctions2_function"
+    properties:
+      name: "${local.name_prefix}-router"
+      project: "${var.project_id}"
+      location: "${var.region}"
+      description: "Intelligent agent routing for customer inquiries"
+      
+      build_config:
+        runtime: "python311"
+        entry_point: "route_agent"
+        source:
+          storage_source:
+            bucket: "${google_storage_bucket.function_source_bucket.name}"
+            object: "router-source.zip"
+        environment_variables:
+          FIRESTORE_PROJECT: "${var.project_id}"
+          BIGQUERY_DATASET: "${google_bigquery_dataset.bigquery_dataset.dataset_id}"
+      
+      service_config:
+        max_instance_count: 100
+        min_instance_count: 0
+        available_memory: "${var.function_memory}"
+        timeout_seconds: "${var.function_timeout}"
+        environment_variables:
+          ENVIRONMENT: "${var.environment}"
+          PROJECT_ID: "${var.project_id}"
+        service_account_email: "${google_service_account.function_service_account.email}"
+        
+        # Security configuration
+        ingress_settings: "ALLOW_ALL"
+        all_traffic_on_latest_revision: true
+      
+      labels: "${merge(local.common_labels, {function_type = "router"})}"
+    depends_on:
+      - "enable_apis[1]"  # cloudfunctions.googleapis.com
+      - "function_sa_firestore_binding"
+      - "function_sa_aiplatform_binding"
+
+  # Cloud Function: Message Broker
+  # Manages Agent2Agent protocol communication
+  message_broker_function:
+    type: "google_cloudfunctions2_function"
+    properties:
+      name: "${local.name_prefix}-broker"
+      project: "${var.project_id}"
+      location: "${var.region}"
+      description: "Agent2Agent protocol message broker"
+      
+      build_config:
+        runtime: "python311"
+        entry_point: "broker_message"
+        source:
+          storage_source:
+            bucket: "${google_storage_bucket.function_source_bucket.name}"
+            object: "broker-source.zip"
+        environment_variables:
+          FIRESTORE_PROJECT: "${var.project_id}"
+          BIGQUERY_DATASET: "${google_bigquery_dataset.bigquery_dataset.dataset_id}"
+      
+      service_config:
+        max_instance_count: 100
+        min_instance_count: 0
+        available_memory: "512Mi"  # Higher memory for message processing
+        timeout_seconds: "120s"   # Longer timeout for A2A protocol
+        environment_variables:
+          ENVIRONMENT: "${var.environment}"
+          PROJECT_ID: "${var.project_id}"
+        service_account_email: "${google_service_account.function_service_account.email}"
+        
+        ingress_settings: "ALLOW_ALL"
+        all_traffic_on_latest_revision: true
+      
+      labels: "${merge(local.common_labels, {function_type = "broker"})}"
+    depends_on:
+      - "function_sa_firestore_binding"
+      - "function_sa_bigquery_binding"
+
+  # Cloud Function: Billing Agent
+  # Specialized agent for billing and payment inquiries
+  billing_agent_function:
+    type: "google_cloudfunctions2_function"
+    properties:
+      name: "${local.name_prefix}-billing"
+      project: "${var.project_id}"
+      location: "${var.region}"
+      description: "Specialized billing support agent"
+      
+      build_config:
+        runtime: "python311"
+        entry_point: "billing_agent"
+        source:
+          storage_source:
+            bucket: "${google_storage_bucket.function_source_bucket.name}"
+            object: "billing-source.zip"
+        environment_variables:
+          FIRESTORE_PROJECT: "${var.project_id}"
+          AGENT_SPECIALIZATION: "billing"
+      
+      service_config:
+        max_instance_count: 50
+        min_instance_count: 0
+        available_memory: "${var.function_memory}"
+        timeout_seconds: "${var.function_timeout}"
+        environment_variables:
+          ENVIRONMENT: "${var.environment}"
+          PROJECT_ID: "${var.project_id}"
+        service_account_email: "${google_service_account.function_service_account.email}"
+        
+        ingress_settings: "ALLOW_ALL"
+        all_traffic_on_latest_revision: true
+      
+      labels: "${merge(local.common_labels, {function_type = "billing-agent"})}"
+
+  # Cloud Function: Technical Agent
+  # Specialized agent for technical support inquiries
+  technical_agent_function:
+    type: "google_cloudfunctions2_function"
+    properties:
+      name: "${local.name_prefix}-technical"
+      project: "${var.project_id}"
+      location: "${var.region}"
+      description: "Specialized technical support agent"
+      
+      build_config:
+        runtime: "python311"
+        entry_point: "technical_agent"
+        source:
+          storage_source:
+            bucket: "${google_storage_bucket.function_source_bucket.name}"
+            object: "technical-source.zip"
+        environment_variables:
+          FIRESTORE_PROJECT: "${var.project_id}"
+          AGENT_SPECIALIZATION: "technical"
+      
+      service_config:
+        max_instance_count: 50
+        min_instance_count: 0
+        available_memory: "${var.function_memory}"
+        timeout_seconds: "${var.function_timeout}"
+        environment_variables:
+          ENVIRONMENT: "${var.environment}"
+          PROJECT_ID: "${var.project_id}"
+        service_account_email: "${google_service_account.function_service_account.email}"
+        
+        ingress_settings: "ALLOW_ALL"
+        all_traffic_on_latest_revision: true
+      
+      labels: "${merge(local.common_labels, {function_type = "technical-agent"})}"
+
+  # Cloud Function: Sales Agent
+  # Specialized agent for sales and product inquiries
+  sales_agent_function:
+    type: "google_cloudfunctions2_function"
+    properties:
+      name: "${local.name_prefix}-sales"
+      project: "${var.project_id}"
+      location: "${var.region}"
+      description: "Specialized sales support agent"
+      
+      build_config:
+        runtime: "python311"
+        entry_point: "sales_agent"
+        source:
+          storage_source:
+            bucket: "${google_storage_bucket.function_source_bucket.name}"
+            object: "sales-source.zip"
+        environment_variables:
+          FIRESTORE_PROJECT: "${var.project_id}"
+          AGENT_SPECIALIZATION: "sales"
+      
+      service_config:
+        max_instance_count: 50
+        min_instance_count: 0
+        available_memory: "${var.function_memory}"
+        timeout_seconds: "${var.function_timeout}"
+        environment_variables:
+          ENVIRONMENT: "${var.environment}"
+          PROJECT_ID: "${var.project_id}"
+        service_account_email: "${google_service_account.function_service_account.email}"
+        
+        ingress_settings: "ALLOW_ALL"
+        all_traffic_on_latest_revision: true
+      
+      labels: "${merge(local.common_labels, {function_type = "sales-agent"})}"
+
+  # HTTP triggers for Cloud Functions (making them accessible via HTTP)
+  router_function_trigger:
+    type: "google_cloudfunctions2_function_iam_member"
+    properties:
+      project: "${var.project_id}"
+      location: "${var.region}"
+      cloud_function: "${google_cloudfunctions2_function.agent_router_function.name}"
+      role: "roles/cloudfunctions.invoker"
+      member: "allUsers"
+
+  broker_function_trigger:
+    type: "google_cloudfunctions2_function_iam_member"
+    properties:
+      project: "${var.project_id}"
+      location: "${var.region}"
+      cloud_function: "${google_cloudfunctions2_function.message_broker_function.name}"
+      role: "roles/cloudfunctions.invoker"
+      member: "allUsers"
+
+  billing_function_trigger:
+    type: "google_cloudfunctions2_function_iam_member"
+    properties:
+      project: "${var.project_id}"
+      location: "${var.region}"
+      cloud_function: "${google_cloudfunctions2_function.billing_agent_function.name}"
+      role: "roles/cloudfunctions.invoker"
+      member: "allUsers"
+
+  technical_function_trigger:
+    type: "google_cloudfunctions2_function_iam_member"
+    properties:
+      project: "${var.project_id}"
+      location: "${var.region}"
+      cloud_function: "${google_cloudfunctions2_function.technical_agent_function.name}"
+      role: "roles/cloudfunctions.invoker"
+      member: "allUsers"
+
+  sales_function_trigger:
+    type: "google_cloudfunctions2_function_iam_member"
+    properties:
+      project: "${var.project_id}"
+      location: "${var.region}"
+      cloud_function: "${google_cloudfunctions2_function.sales_agent_function.name}"
+      role: "roles/cloudfunctions.invoker"
+      member: "allUsers"
+
+  # Pub/Sub topic for asynchronous agent communication
+  agent_communication_topic:
+    type: "google_pubsub_topic"
+    properties:
+      name: "${local.name_prefix}-agent-communication"
+      project: "${var.project_id}"
+      labels: "${local.common_labels}"
+      
+      # Message retention for reliability
+      message_retention_duration: "604800s"  # 7 days
+
+  # Pub/Sub subscription for agent communication
+  agent_communication_subscription:
+    type: "google_pubsub_subscription"
+    properties:
+      name: "${local.name_prefix}-agent-comm-sub"
+      project: "${var.project_id}"
+      topic: "${google_pubsub_topic.agent_communication_topic.name}"
+      
+      # Acknowledgment deadline and retry policy
+      ack_deadline_seconds: 60
+      message_retention_duration: "604800s"
+      retain_acked_messages: false
+      
+      # Dead letter queue configuration
+      dead_letter_policy:
+        dead_letter_topic: "${google_pubsub_topic.agent_communication_topic.id}"
+        max_delivery_attempts: 5
+      
+      retry_policy:
+        minimum_backoff: "10s"
+        maximum_backoff: "600s"
+      
+      labels: "${local.common_labels}"
+
+  # Cloud Monitoring notification channel for alerting
+  notification_channel:
+    type: "google_monitoring_notification_channel"
+    properties:
+      project: "${var.project_id}"
+      display_name: "${local.name_prefix}-alerts"
+      type: "email"
+      labels:
+        email_address: "${data.google_client_openid_userinfo.me.email}"
+      description: "Email notifications for multi-agent system alerts"
+
+  # Cloud Monitoring alert for function errors
+  function_error_alert:
+    type: "google_monitoring_alert_policy"
+    properties:
+      project: "${var.project_id}"
+      display_name: "${local.name_prefix}-function-errors"
+      documentation:
+        content: "Alert when Cloud Functions experience high error rates"
+        mime_type: "text/markdown"
+      
+      conditions:
+        - display_name: "Function error rate"
+          condition_threshold:
+            filter: 'resource.type="cloud_function" resource.label.function_name=~"${local.name_prefix}-.*"'
+            comparison: "COMPARISON_GREATER_THAN"
+            threshold_value: 0.05  # 5% error rate
+            duration: "300s"
+            aggregations:
+              - alignment_period: "60s"
+                per_series_aligner: "ALIGN_RATE"
+                cross_series_reducer: "REDUCE_MEAN"
+                group_by_fields:
+                  - "resource.label.function_name"
+      
+      notification_channels:
+        - "${google_monitoring_notification_channel.notification_channel.name}"
+      
+      # Alert policy configuration
+      alert_strategy:
+        auto_close: "1800s"  # 30 minutes
+      
+      enabled: true
+
+# Data sources for deployment context
+data:
+  google_client_openid_userinfo:
+    me: {}
+
+# Output values for verification and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: "${var.project_id}"
+  
+  region:
+    description: "Deployment region"
+    value: "${var.region}"
+  
+  environment:
+    description: "Environment name"
+    value: "${var.environment}"
+  
+  # Function endpoints for testing and integration
+  router_function_url:
+    description: "Agent Router Function HTTP trigger URL"
+    value: "${google_cloudfunctions2_function.agent_router_function.service_config[0].uri}"
+  
+  broker_function_url:
+    description: "Message Broker Function HTTP trigger URL"
+    value: "${google_cloudfunctions2_function.message_broker_function.service_config[0].uri}"
+  
+  billing_agent_url:
+    description: "Billing Agent Function HTTP trigger URL"
+    value: "${google_cloudfunctions2_function.billing_agent_function.service_config[0].uri}"
+  
+  technical_agent_url:
+    description: "Technical Agent Function HTTP trigger URL"
+    value: "${google_cloudfunctions2_function.technical_agent_function.service_config[0].uri}"
+  
+  sales_agent_url:
+    description: "Sales Agent Function HTTP trigger URL"
+    value: "${google_cloudfunctions2_function.sales_agent_function.service_config[0].uri}"
+  
+  # Storage and database endpoints
+  function_source_bucket:
+    description: "Cloud Storage bucket for function source code"
+    value: "${google_storage_bucket.function_source_bucket.name}"
+  
+  firestore_database:
+    description: "Firestore database for knowledge base"
+    value: "${google_firestore_database.firestore_database.name}"
+  
+  bigquery_dataset:
+    description: "BigQuery dataset for analytics"
+    value: "${google_bigquery_dataset.bigquery_dataset.dataset_id}"
+  
+  # AI/ML resources
+  vertex_ai_dataset:
+    description: "Vertex AI dataset for agent training"
+    value: "${google_vertex_ai_dataset.vertex_ai_dataset.name}"
+  
+  # Communication resources
+  pubsub_topic:
+    description: "Pub/Sub topic for agent communication"
+    value: "${google_pubsub_topic.agent_communication_topic.name}"
+  
+  # Service account for functions
+  function_service_account_email:
+    description: "Service account email for Cloud Functions"
+    value: "${google_service_account.function_service_account.email}"
+  
+  # Resource naming prefix
+  resource_prefix:
+    description: "Resource naming prefix with random suffix"
+    value: "${local.name_prefix}"
+  
+  # Cost estimation guidance
+  estimated_monthly_cost:
+    description: "Estimated monthly cost for this deployment (USD)"
+    value: "$15-50 depending on usage patterns and data volume"
+  
+  # Deployment instructions
+  next_steps:
+    description: "Next steps after infrastructure deployment"
+    value: |
+      1. Upload function source code to the created storage bucket
+      2. Initialize Firestore with agent knowledge base documents
+      3. Configure Contact Center AI Platform integration
+      4. Test agent routing and A2A protocol communication
+      5. Set up monitoring dashboards and alerts
+      6. Review security configurations and IAM permissions

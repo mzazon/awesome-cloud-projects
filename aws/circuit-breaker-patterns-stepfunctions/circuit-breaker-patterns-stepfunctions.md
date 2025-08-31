@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: Step Functions, Lambda, DynamoDB, CloudWatch
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: circuit-breaker, resilience, step-functions, fault-tolerance
 recipe-generator-version: 1.3
@@ -197,10 +197,10 @@ EOF
    # Create deployment package
    zip downstream-service.zip downstream-service.py
    
-   # Deploy downstream service function
+   # Deploy downstream service function with updated Python runtime
    aws lambda create-function \
        --function-name $DOWNSTREAM_SERVICE_FUNCTION \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_EXECUTION_ROLE}" \
        --handler downstream-service.lambda_handler \
        --zip-file fileb://downstream-service.zip \
@@ -245,10 +245,10 @@ EOF
    # Create deployment package
    zip fallback-service.zip fallback-service.py
    
-   # Deploy fallback service function
+   # Deploy fallback service function with updated Python runtime
    aws lambda create-function \
        --function-name $FALLBACK_SERVICE_FUNCTION \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_EXECUTION_ROLE}" \
        --handler fallback-service.lambda_handler \
        --zip-file fileb://fallback-service.zip \
@@ -347,10 +347,10 @@ EOF
    # Create deployment package
    zip health-check.zip health-check.py
    
-   # Deploy health check function
+   # Deploy health check function with updated Python runtime
    aws lambda create-function \
        --function-name $HEALTH_CHECK_FUNCTION \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_EXECUTION_ROLE}" \
        --handler health-check.lambda_handler \
        --zip-file fileb://health-check.zip \
@@ -366,40 +366,42 @@ EOF
    Proper IAM permissions are critical for secure operation of the circuit breaker pattern. The Step Functions execution role needs permissions to invoke Lambda functions and interact with DynamoDB, while Lambda functions require permissions to write logs and access DynamoDB for state management. This follows the principle of least privilege, granting only the minimum permissions required for operation.
 
    ```bash
-   # Attach policies to Step Functions role
-   aws iam attach-role-policy \
-       --role-name $CIRCUIT_BREAKER_ROLE \
-       --policy-arn arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess
-   
-   aws iam attach-role-policy \
-       --role-name $CIRCUIT_BREAKER_ROLE \
-       --policy-arn arn:aws:iam::aws:policy/AWSLambdaRole
-   
-   # Create custom policy for DynamoDB access
+   # Create custom policy for Step Functions role (least privilege)
    aws iam put-role-policy \
        --role-name $CIRCUIT_BREAKER_ROLE \
-       --policy-name DynamoDBCircuitBreakerPolicy \
+       --policy-name StepFunctionsCircuitBreakerPolicy \
        --policy-document '{
            "Version": "2012-10-17",
            "Statement": [
                {
                    "Effect": "Allow",
                    "Action": [
+                       "lambda:InvokeFunction"
+                   ],
+                   "Resource": [
+                       "arn:aws:lambda:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':function:'${DOWNSTREAM_SERVICE_FUNCTION}'",
+                       "arn:aws:lambda:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':function:'${FALLBACK_SERVICE_FUNCTION}'",
+                       "arn:aws:lambda:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':function:'${HEALTH_CHECK_FUNCTION}'"
+                   ]
+               },
+               {
+                   "Effect": "Allow",
+                   "Action": [
                        "dynamodb:GetItem",
                        "dynamodb:PutItem",
-                       "dynamodb:UpdateItem",
-                       "dynamodb:DeleteItem"
+                       "dynamodb:UpdateItem"
                    ],
                    "Resource": "arn:aws:dynamodb:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':table/'${CIRCUIT_BREAKER_TABLE}'"
                }
            ]
        }'
    
-   # Attach policies to Lambda execution role
+   # Attach basic execution role for Lambda functions
    aws iam attach-role-policy \
        --role-name $LAMBDA_EXECUTION_ROLE \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
    
+   # Create custom policy for Lambda functions (least privilege)
    aws iam put-role-policy \
        --role-name $LAMBDA_EXECUTION_ROLE \
        --policy-name DynamoDBLambdaPolicy \
@@ -421,7 +423,7 @@ EOF
    echo "✅ IAM policies attached to roles"
    ```
 
-   The IAM permissions are now configured to enable secure interaction between all components of the circuit breaker system. This security configuration ensures that each component can only perform its designated functions, protecting against potential security vulnerabilities. For more information on IAM best practices, see the [IAM Security Best Practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html).
+   The IAM permissions are now configured using least privilege principles, ensuring each component can only perform its designated functions. This security configuration protects against potential vulnerabilities while enabling secure interaction between all components. For more information on IAM best practices, see the [IAM Security Best Practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html).
 
 6. **Create Circuit Breaker State Machine**:
 
@@ -691,6 +693,13 @@ EOF
 }
 EOF
    
+   # Substitute environment variables in the state machine definition
+   sed -i.bak "s/\$CIRCUIT_BREAKER_TABLE/${CIRCUIT_BREAKER_TABLE}/g; \
+               s/\$DOWNSTREAM_SERVICE_FUNCTION/${DOWNSTREAM_SERVICE_FUNCTION}/g; \
+               s/\$FALLBACK_SERVICE_FUNCTION/${FALLBACK_SERVICE_FUNCTION}/g; \
+               s/\$HEALTH_CHECK_FUNCTION/${HEALTH_CHECK_FUNCTION}/g" \
+               circuit-breaker-state-machine.json
+   
    # Create the Step Functions state machine
    aws stepfunctions create-state-machine \
        --name "CircuitBreakerStateMachine-${RANDOM_SUFFIX}" \
@@ -723,7 +732,7 @@ EOF
        --threshold 1 \
        --comparison-operator GreaterThanOrEqualToThreshold \
        --evaluation-periods 1 \
-       --alarm-actions "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:circuit-breaker-alerts"
+       --treat-missing-data notBreaching
    
    # Create CloudWatch alarm for service failures
    aws cloudwatch put-metric-alarm \
@@ -735,7 +744,8 @@ EOF
        --period 300 \
        --threshold 5 \
        --comparison-operator GreaterThanOrEqualToThreshold \
-       --evaluation-periods 2
+       --evaluation-periods 2 \
+       --treat-missing-data notBreaching
    
    echo "✅ CloudWatch alarms created for monitoring"
    ```
@@ -924,18 +934,10 @@ EOF
 5. **Delete IAM Roles**:
 
    ```bash
-   # Detach policies and delete roles
-   aws iam detach-role-policy \
-       --role-name $CIRCUIT_BREAKER_ROLE \
-       --policy-arn arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess
-   
-   aws iam detach-role-policy \
-       --role-name $CIRCUIT_BREAKER_ROLE \
-       --policy-arn arn:aws:iam::aws:policy/AWSLambdaRole
-   
+   # Delete custom policies and roles
    aws iam delete-role-policy \
        --role-name $CIRCUIT_BREAKER_ROLE \
-       --policy-name DynamoDBCircuitBreakerPolicy
+       --policy-name StepFunctionsCircuitBreakerPolicy
    
    aws iam delete-role \
        --role-name $CIRCUIT_BREAKER_ROLE
@@ -961,7 +963,7 @@ EOF
    rm -f downstream-service.py downstream-service.zip
    rm -f fallback-service.py fallback-service.zip
    rm -f health-check.py health-check.zip
-   rm -f circuit-breaker-state-machine.json
+   rm -f circuit-breaker-state-machine.json circuit-breaker-state-machine.json.bak
    rm -f test-input.json health-check-result.json
    
    echo "✅ Cleaned up local files"
@@ -969,7 +971,7 @@ EOF
 
 ## Discussion
 
-The circuit breaker pattern is a critical resilience pattern for distributed systems, and AWS Step Functions provides an excellent platform for implementing sophisticated circuit breaker logic. This implementation demonstrates how to combine Step Functions' error handling capabilities with DynamoDB's consistency guarantees to create a robust circuit breaker system. For a comprehensive understanding of resilience patterns in AWS, see the [Building resilient applications on AWS](https://aws.amazon.com/architecture/resilient-apps/).
+The circuit breaker pattern is a critical resilience pattern for distributed systems, and AWS Step Functions provides an excellent platform for implementing sophisticated circuit breaker logic. This implementation demonstrates how to combine Step Functions' error handling capabilities with DynamoDB's consistency guarantees to create a robust circuit breaker system. For a comprehensive understanding of resilience patterns in AWS, see the [Building resilient applications on AWS](https://aws.amazon.com/architecture/resilient-apps/) architecture guidance.
 
 The solution uses three distinct states: CLOSED (normal operation), OPEN (service blocked), and HALF_OPEN (testing recovery). When failures exceed the threshold, the circuit breaker trips to OPEN state, immediately routing requests to the fallback service. This prevents cascading failures and allows the downstream service time to recover. The health check mechanism periodically tests service availability and automatically resets the circuit breaker when the service recovers.
 

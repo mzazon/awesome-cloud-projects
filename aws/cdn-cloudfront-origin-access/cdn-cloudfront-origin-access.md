@@ -4,19 +4,18 @@ id: 2a5f9947
 category: networking
 difficulty: 300
 subject: aws
-services: CloudFront, S3, IAM, CloudWatch
+services: CloudFront, S3, WAF, CloudWatch
 estimated-time: 75 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cloudfront, cdn, origin-access-control, s3, security
 recipe-generator-version: 1.3
 ---
 
 # CDN with CloudFront Origin Access Controls
-
 
 ## Problem
 
@@ -220,27 +219,12 @@ echo "✅ Environment prepared with sample content"
 
 3. **Create Origin Access Control (OAC)**:
 
-   Origin Access Control represents AWS's next-generation approach to securing S3 origins, replacing the legacy Origin Access Identity (OAI) with enhanced security and broader compatibility. OAC uses AWS Signature Version 4 authentication, supports all AWS regions including opt-in regions, and enables access to S3 objects encrypted with AWS KMS. This modern authentication mechanism ensures that only your CloudFront distribution can access your S3 content, eliminating the security vulnerabilities associated with public S3 buckets. For detailed comparisons, see the [AWS CloudFront OAC documentation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html).
+   Origin Access Control represents AWS's next-generation approach to securing S3 origins, replacing the legacy Origin Access Identity (OAI) with enhanced security and broader compatibility. OAC uses AWS Signature Version 4 authentication, supports all AWS regions including opt-in regions, and enables access to S3 objects encrypted with AWS KMS. This modern authentication mechanism ensures that only your CloudFront distribution can access your S3 content, eliminating the security vulnerabilities associated with public S3 buckets.
 
    ```bash
-   # Create OAC configuration
-   cat > oac-config.json << EOF
-   {
-       "Name": "${OAC_NAME}",
-       "Description": "Origin Access Control for ${BUCKET_NAME}",
-       "OriginAccessControlConfig": {
-           "Name": "${OAC_NAME}",
-           "Description": "OAC for secure S3 access",
-           "SigningProtocol": "sigv4",
-           "SigningBehavior": "always",
-           "OriginAccessControlOriginType": "s3"
-       }
-   }
-   EOF
-   
-   # Create the OAC
+   # Create Origin Access Control
    OAC_OUTPUT=$(aws cloudfront create-origin-access-control \
-       --origin-access-control-config file://oac-config.json)
+       --origin-access-control-config Name="${OAC_NAME}",Description="OAC for ${BUCKET_NAME}",SigningProtocol=sigv4,SigningBehavior=always,OriginAccessControlOriginType=s3)
    
    export OAC_ID=$(echo $OAC_OUTPUT | \
        jq -r '.OriginAccessControl.Id')
@@ -252,7 +236,7 @@ echo "✅ Environment prepared with sample content"
 
 4. **Create WAF Web ACL for security**:
 
-   AWS WAF provides application-layer security that protects your CDN from common web attacks and abuse patterns. The managed rule sets automatically update to defend against emerging threats like SQL injection, cross-site scripting (XSS), and known bad IP addresses. Rate limiting prevents abuse by blocking IP addresses that exceed your defined request thresholds, protecting your infrastructure from both malicious attacks and unintentional traffic spikes. This proactive security approach reduces server load and prevents service disruptions before they impact legitimate users. Learn more about [AWS WAF with CloudFront](https://docs.aws.amazon.com/waf/latest/developerguide/cloudfront-features.html).
+   AWS WAF provides application-layer security that protects your CDN from common web attacks and abuse patterns. The managed rule sets automatically update to defend against emerging threats like SQL injection, cross-site scripting (XSS), and known bad IP addresses. Rate limiting prevents abuse by blocking IP addresses that exceed your defined request thresholds, protecting your infrastructure from both malicious attacks and unintentional traffic spikes.
 
    ```bash
    # Create WAF rules configuration
@@ -322,7 +306,7 @@ echo "✅ Environment prepared with sample content"
 
 5. **Create CloudFront distribution configuration**:
 
-   The CloudFront distribution configuration defines how your global CDN will behave, including caching strategies, security policies, and performance optimizations. Multiple cache behaviors allow you to optimize different content types - static assets like images and CSS benefit from long-term caching, while dynamic content may require shorter TTL values. The managed cache policies automatically handle optimal cache-control headers, compression, and query string handling based on AWS best practices. Custom error responses provide a seamless user experience by serving your main page instead of generic error pages, essential for single-page applications. For comprehensive configuration options, see the [CloudFront cache behaviors documentation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/DownloadDistValuesCacheBehavior.html).
+   The CloudFront distribution configuration defines how your global CDN will behave, including caching strategies, security policies, and performance optimizations. Multiple cache behaviors allow you to optimize different content types - static assets like images and CSS benefit from long-term caching, while dynamic content may require shorter TTL values. The managed cache policies automatically handle optimal cache-control headers, compression, and query string handling based on AWS best practices.
 
    ```bash
    # Create distribution configuration
@@ -359,7 +343,7 @@ echo "✅ Environment prepared with sample content"
        "DefaultCacheBehavior": {
            "TargetOriginId": "${BUCKET_NAME}",
            "ViewerProtocolPolicy": "redirect-to-https",
-           "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+           "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
            "OriginRequestPolicyId": "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf",
            "ResponseHeadersPolicyId": "5cc3b908-e619-4b99-88e5-2cf7f45965bd",
            "Compress": true,
@@ -380,7 +364,7 @@ echo "✅ Environment prepared with sample content"
                    "PathPattern": "/images/*",
                    "TargetOriginId": "${BUCKET_NAME}",
                    "ViewerProtocolPolicy": "redirect-to-https",
-                   "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+                   "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
                    "Compress": true,
                    "TrustedSigners": {
                        "Enabled": false,
@@ -396,7 +380,7 @@ echo "✅ Environment prepared with sample content"
                    "PathPattern": "/css/*",
                    "TargetOriginId": "${BUCKET_NAME}",
                    "ViewerProtocolPolicy": "redirect-to-https",
-                   "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+                   "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
                    "Compress": true,
                    "TrustedSigners": {
                        "Enabled": false,
@@ -412,7 +396,7 @@ echo "✅ Environment prepared with sample content"
                    "PathPattern": "/js/*",
                    "TargetOriginId": "${BUCKET_NAME}",
                    "ViewerProtocolPolicy": "redirect-to-https",
-                   "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+                   "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
                    "Compress": true,
                    "TrustedSigners": {
                        "Enabled": false,
@@ -659,7 +643,8 @@ echo "✅ Environment prepared with sample content"
    done
    
    # Verify security headers
-   curl -I https://${DISTRIBUTION_DOMAIN} | grep -E "(X-Frame-Options|X-Content-Type-Options|Strict-Transport-Security)"
+   curl -I https://${DISTRIBUTION_DOMAIN} | \
+       grep -E "(X-Frame-Options|X-Content-Type-Options|Strict-Transport-Security)"
    ```
 
 4. **Monitor metrics in CloudWatch**:
@@ -771,9 +756,8 @@ echo "✅ Environment prepared with sample content"
                      "CloudFront-Low-Cache-Hit-Rate-${DISTRIBUTION_ID}"
    
    # Clean up local files
-   rm -f distribution-config.json oac-config.json \
-         bucket-policy.json waf-config.json \
-         current-config.json disable-config.json
+   rm -f distribution-config.json waf-config.json \
+         bucket-policy.json current-config.json disable-config.json
    rm -rf cdn-content/
    
    echo "✅ Cleanup completed"
@@ -783,7 +767,7 @@ echo "✅ Environment prepared with sample content"
 
 This CloudFront CDN implementation showcases modern content delivery best practices that address the critical performance and security requirements of global applications. The Origin Access Control (OAC) feature represents a significant improvement over the legacy Origin Access Identity (OAI) approach, providing enhanced security through AWS Signature Version 4 authentication and support for all AWS regions including opt-in regions.
 
-The caching strategy implemented here uses multiple cache behaviors to optimize different content types. Static assets like images, CSS, and JavaScript benefit from long-term caching at edge locations, reducing origin requests and improving load times. The cache policies leverage CloudFront's managed policies that automatically handle optimal cache-control headers and compression. This approach can reduce origin requests by up to 90% for static content, significantly lowering both latency and costs.
+The caching strategy implemented here uses the CachingOptimized managed policy (ID: 658327ea-f89d-4fab-a63d-7e88639e58f6) which minimizes cache key values while enabling compression for optimal performance. Static assets like images, CSS, and JavaScript benefit from long-term caching at edge locations, reducing origin requests and improving load times. This approach can reduce origin requests by up to 90% for static content, significantly lowering both latency and costs.
 
 Security integration through AWS WAF provides comprehensive protection against common web attacks and implements rate limiting to prevent abuse. The managed rule sets automatically update to protect against new threats, while custom rate limiting rules can be tuned based on your application's traffic patterns. The security headers policy ensures that all responses include modern security headers like HSTS, X-Frame-Options, and X-Content-Type-Options.
 

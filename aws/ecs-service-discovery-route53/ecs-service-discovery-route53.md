@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: ecs, route53, elasticloadbalancing, cloudmap
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ecs, service-discovery, microservices, load-balancing, dns, cloud-map, route53
 recipe-generator-version: 1.3
 ---
 
 # ECS Service Discovery with Route 53
-
 
 ## Problem
 
@@ -199,15 +198,10 @@ echo "✅ Created ECS cluster: ${CLUSTER_NAME}"
        --vpc-id ${VPC_ID} \
        --query "GroupId" --output text)
    
-   # Allow traffic from ALB to ECS tasks
+   # Allow traffic from ALB to ECS tasks on container ports
    aws ec2 authorize-security-group-ingress \
        --group-id ${ECS_SG_ID} \
-       --protocol tcp --port 3000 \
-       --source-group ${ALB_SG_ID}
-   
-   aws ec2 authorize-security-group-ingress \
-       --group-id ${ECS_SG_ID} \
-       --protocol tcp --port 8080 \
+       --protocol tcp --port 80 \
        --source-group ${ALB_SG_ID}
    
    # Allow internal communication between services
@@ -219,7 +213,7 @@ echo "✅ Created ECS cluster: ${CLUSTER_NAME}"
    echo "✅ Created ECS security group: ${ECS_SG_ID}"
    ```
 
-   The security group is configured to allow ALB traffic to reach specific container ports while enabling full internal communication between services. This setup supports both external access through the load balancer and internal service discovery communication, creating a secure foundation for microservice interactions.
+   The security group is configured to allow ALB traffic to reach container ports while enabling full internal communication between services. This setup supports both external access through the load balancer and internal service discovery communication, creating a secure foundation for microservice interactions.
 
 4. **Create Cloud Map services for service discovery**:
 
@@ -263,9 +257,9 @@ echo "✅ Created ECS cluster: ${CLUSTER_NAME}"
    # Create target group for web service
    export WEB_TG_ARN=$(aws elbv2 create-target-group \
        --name "web-tg-${RANDOM_SUFFIX}" \
-       --protocol HTTP --port 3000 \
+       --protocol HTTP --port 80 \
        --target-type ip --vpc-id ${VPC_ID} \
-       --health-check-path "/health" \
+       --health-check-path "/" \
        --health-check-interval-seconds 30 \
        --health-check-timeout-seconds 5 \
        --healthy-threshold-count 2 \
@@ -275,9 +269,9 @@ echo "✅ Created ECS cluster: ${CLUSTER_NAME}"
    # Create target group for API service
    export API_TG_ARN=$(aws elbv2 create-target-group \
        --name "api-tg-${RANDOM_SUFFIX}" \
-       --protocol HTTP --port 8080 \
+       --protocol HTTP --port 80 \
        --target-type ip --vpc-id ${VPC_ID} \
-       --health-check-path "/health" \
+       --health-check-path "/" \
        --health-check-interval-seconds 30 \
        --health-check-timeout-seconds 5 \
        --healthy-threshold-count 2 \
@@ -287,7 +281,7 @@ echo "✅ Created ECS cluster: ${CLUSTER_NAME}"
    echo "✅ Created target groups for ALB"
    ```
 
-   The target groups are configured with health checks that monitor the `/health` endpoint of each service. This ensures that ALB only routes traffic to healthy instances while providing fast detection of unhealthy tasks. The IP target type enables direct communication with Fargate task IP addresses, supporting the serverless container model.
+   The target groups are configured with health checks that monitor the root path of each service. This ensures that ALB only routes traffic to healthy instances while providing fast detection of unhealthy tasks. The IP target type enables direct communication with Fargate task IP addresses, supporting the serverless container model.
 
 6. **Create ALB listeners with routing rules**:
 
@@ -370,7 +364,6 @@ EOF
       "portMappings": [
         {
           "containerPort": 80,
-          "hostPort": 3000,
           "protocol": "tcp"
         }
       ],
@@ -399,7 +392,7 @@ EOF
 
 9. **Create API service task definition**:
 
-   The API service task definition follows the same pattern as the web service but uses different port mappings to avoid conflicts and enable proper traffic routing. Each service maintains its own task definition family, allowing independent versioning and updates. This separation of concerns enables teams to deploy and manage different microservices independently while maintaining consistency in infrastructure patterns.
+   The API service task definition follows the same pattern as the web service but uses different container image and configuration to avoid conflicts and enable proper traffic routing. Each service maintains its own task definition family, allowing independent versioning and updates. This separation of concerns enables teams to deploy and manage different microservices independently while maintaining consistency in infrastructure patterns.
 
    ```bash
    # Create task definition for API service
@@ -418,7 +411,6 @@ EOF
       "portMappings": [
         {
           "containerPort": 80,
-          "hostPort": 8080,
           "protocol": "tcp"
         }
       ],
@@ -456,6 +448,11 @@ EOF
         --query "Subnets[?MapPublicIpOnLaunch==\`false\`].SubnetId" \
         --output text)
     
+    # If no private subnets found, use all subnets
+    if [ -z "${PRIVATE_SUBNET_IDS}" ]; then
+        export PRIVATE_SUBNET_IDS=${SUBNET_IDS}
+    fi
+    
     # Create web service with service discovery and ALB integration
     aws ecs create-service \
         --cluster ${CLUSTER_NAME} \
@@ -463,7 +460,7 @@ EOF
         --task-definition "web-service-${RANDOM_SUFFIX}" \
         --desired-count 2 \
         --launch-type FARGATE \
-        --network-configuration "awsvpcConfiguration={subnets=[${PRIVATE_SUBNET_IDS// /,}],securityGroups=[${ECS_SG_ID}],assignPublicIp=DISABLED}" \
+        --network-configuration "awsvpcConfiguration={subnets=[${PRIVATE_SUBNET_IDS// /,}],securityGroups=[${ECS_SG_ID}],assignPublicIp=ENABLED}" \
         --load-balancers "targetGroupArn=${WEB_TG_ARN},containerName=web-container,containerPort=80" \
         --service-registries "registryArn=arn:aws:servicediscovery:${AWS_REGION}:${AWS_ACCOUNT_ID}:service/${WEB_SERVICE_ID}"
     
@@ -474,14 +471,14 @@ EOF
         --task-definition "api-service-${RANDOM_SUFFIX}" \
         --desired-count 2 \
         --launch-type FARGATE \
-        --network-configuration "awsvpcConfiguration={subnets=[${PRIVATE_SUBNET_IDS// /,}],securityGroups=[${ECS_SG_ID}],assignPublicIp=DISABLED}" \
+        --network-configuration "awsvpcConfiguration={subnets=[${PRIVATE_SUBNET_IDS// /,}],securityGroups=[${ECS_SG_ID}],assignPublicIp=ENABLED}" \
         --load-balancers "targetGroupArn=${API_TG_ARN},containerName=api-container,containerPort=80" \
         --service-registries "registryArn=arn:aws:servicediscovery:${AWS_REGION}:${AWS_ACCOUNT_ID}:service/${API_SERVICE_ID}"
     
     echo "✅ Created ECS services with service discovery"
     ```
 
-    The ECS services are now running with automatic service discovery and load balancer integration. Tasks are deployed in private subnets for security, with each service maintaining the desired count of 2 instances for high availability. The integration between ECS, Cloud Map, and ALB enables seamless traffic routing for both internal and external communications.
+    The ECS services are now running with automatic service discovery and load balancer integration. Tasks are deployed in subnets with each service maintaining the desired count of 2 instances for high availability. The integration between ECS, Cloud Map, and ALB enables seamless traffic routing for both internal and external communications.
 
 ## Validation & Testing
 
@@ -548,7 +545,7 @@ EOF
        --cluster ${CLUSTER_NAME} \
        --task-definition "dns-test-${RANDOM_SUFFIX}" \
        --launch-type FARGATE \
-       --network-configuration "awsvpcConfiguration={subnets=[${PRIVATE_SUBNET_IDS%% *}],securityGroups=[${ECS_SG_ID}],assignPublicIp=DISABLED}" \
+       --network-configuration "awsvpcConfiguration={subnets=[${PRIVATE_SUBNET_IDS%% *}],securityGroups=[${ECS_SG_ID}],assignPublicIp=ENABLED}" \
        --query "tasks[0].taskArn" --output text)
    
    echo "✅ Test task created: ${TASK_ARN}"
@@ -586,6 +583,11 @@ EOF
        --cluster ${CLUSTER_NAME} \
        --service api-service \
        --desired-count 0
+   
+   # Wait for services to scale down
+   aws ecs wait services-stable \
+       --cluster ${CLUSTER_NAME} \
+       --services web-service api-service
    
    # Delete services
    aws ecs delete-service \
@@ -670,15 +672,13 @@ EOF
 
 ## Discussion
 
-This implementation demonstrates a robust microservices architecture pattern combining ECS service discovery with Application Load Balancer routing. AWS Cloud Map automatically creates and manages DNS records in Route 53 private hosted zones, enabling services to discover each other using familiar DNS names like `api.internal.local` or `database.internal.local`. This approach eliminates the need for hardcoded IP addresses or complex service registries.
+This implementation demonstrates a robust microservices architecture pattern combining ECS service discovery with Application Load Balancer routing. AWS Cloud Map automatically creates and manages DNS records in Route 53 private hosted zones, enabling services to discover each other using familiar DNS names like `api.internal.local` or `database.internal.local`. This approach eliminates the need for hardcoded IP addresses or complex service registries, following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles for operational excellence.
 
-The integration between ECS and Cloud Map provides automatic health checking and service registration. When ECS tasks start, they automatically register with Cloud Map, and when tasks stop or fail health checks, they're automatically deregistered. This ensures that DNS queries always return healthy service endpoints. The Route 53 integration provides high availability and geographic distribution capabilities for service discovery.
+The integration between ECS and Cloud Map provides automatic health checking and service registration. When ECS tasks start, they automatically register with Cloud Map, and when tasks stop or fail health checks, they're automatically deregistered. This ensures that DNS queries always return healthy service endpoints. The Route 53 integration provides high availability and geographic distribution capabilities for service discovery, as documented in the [ECS Service Discovery guide](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-discovery.html).
 
-The Application Load Balancer integration allows external traffic to reach microservices while maintaining internal service-to-service communication through DNS. ALB provides path-based routing, SSL termination, and health checking, while Cloud Map handles internal service discovery. This dual approach supports both public-facing APIs and internal microservice communication patterns effectively.
+The Application Load Balancer integration allows external traffic to reach microservices while maintaining internal service-to-service communication through DNS. ALB provides path-based routing, SSL termination, and health checking, while Cloud Map handles internal service discovery. This dual approach supports both public-facing APIs and internal microservice communication patterns effectively. Cost optimization considerations include using appropriate task sizing, leveraging Fargate Spot pricing for non-critical workloads, and implementing ALB request routing to minimize cross-AZ traffic.
 
-Cost optimization considerations include using appropriate task sizing, leveraging Fargate Spot pricing for non-critical workloads, and implementing ALB request routing to minimize cross-AZ traffic. The Route 53 private hosted zone incurs minimal costs, while Cloud Map charges are based on the number of service discovery requests.
-
-> **Warning**: Ensure your container applications implement proper health check endpoints at `/health` before deploying to production. ALB health checks depend on these endpoints to determine instance health and routing decisions.
+> **Warning**: Ensure your container applications implement proper health check endpoints before deploying to production. ALB health checks depend on these endpoints to determine instance health and routing decisions. See the [ALB health checks documentation](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/target-group-health-checks.html) for detailed configuration guidance.
 
 > **Tip**: Configure CloudWatch Container Insights to monitor ECS services and correlate metrics with service discovery events for better operational visibility. See the [Container Insights documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html) for setup guidance.
 

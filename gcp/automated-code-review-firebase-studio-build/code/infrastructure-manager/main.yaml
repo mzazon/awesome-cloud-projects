@@ -1,0 +1,737 @@
+# Infrastructure Manager Configuration for Automated Code Review Pipeline
+# This configuration deploys Firebase Studio, Cloud Build, and Cloud Tasks integration
+# for automated code review workflows with AI-powered analysis capabilities
+
+# Provider configuration
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+
+# Input variables for customization
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for the code review pipeline"
+    validation:
+      condition: length(var.project_id) > 0
+      error_message: "Project ID must not be empty."
+  
+  region:
+    type: string
+    description: "Google Cloud region for resources"
+    default: "us-central1"
+    validation:
+      condition: contains(["us-central1", "us-east1", "us-west1", "europe-west1", "asia-east1"], var.region)
+      error_message: "Region must be a valid Google Cloud region."
+  
+  zone:
+    type: string
+    description: "Google Cloud zone for zonal resources"
+    default: "us-central1-a"
+  
+  # Resource naming
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+    validation:
+      condition: contains(["dev", "staging", "prod"], var.environment)
+      error_message: "Environment must be dev, staging, or prod."
+  
+  resource_suffix:
+    type: string
+    description: "Unique suffix for resource names"
+    default: ""
+  
+  # Firebase configuration
+  firebase_project_id:
+    type: string
+    description: "Firebase project ID (can be same as GCP project)"
+    default: ""
+  
+  # Build configuration
+  github_repo_owner:
+    type: string
+    description: "GitHub repository owner/organization"
+    default: ""
+  
+  github_repo_name:
+    type: string
+    description: "GitHub repository name"
+    default: ""
+  
+  # AI configuration
+  enable_gemini_api:
+    type: bool
+    description: "Enable Gemini AI API for code analysis"
+    default: true
+  
+  # Resource limits and configuration
+  cloud_build_timeout:
+    type: string
+    description: "Cloud Build timeout duration"
+    default: "1200s"
+  
+  cloud_function_memory:
+    type: string
+    description: "Cloud Function memory allocation"
+    default: "1GB"
+    validation:
+      condition: contains(["256MB", "512MB", "1GB", "2GB", "4GB"], var.cloud_function_memory)
+      error_message: "Memory must be a valid Cloud Function memory size."
+  
+  cloud_tasks_max_concurrent:
+    type: number
+    description: "Maximum concurrent task executions"
+    default: 10
+    validation:
+      condition: var.cloud_tasks_max_concurrent >= 1 && var.cloud_tasks_max_concurrent <= 100
+      error_message: "Max concurrent tasks must be between 1 and 100."
+
+# Local values for computed configurations
+locals:
+  # Generate unique resource names with suffix
+  resource_suffix = var.resource_suffix != "" ? var.resource_suffix : substr(md5(var.project_id), 0, 6)
+  
+  # Resource names
+  queue_name = "code-review-queue-${local.resource_suffix}"
+  function_name = "code-review-handler-${local.resource_suffix}"
+  metrics_function_name = "code-review-metrics-${local.resource_suffix}"
+  repo_name = "code-review-repo-${local.resource_suffix}"
+  build_bucket_name = "${var.project_id}-build-artifacts-${local.resource_suffix}"
+  metrics_bucket_name = "${var.project_id}-code-review-metrics-${local.resource_suffix}"
+  
+  # Firebase project configuration
+  firebase_project = var.firebase_project_id != "" ? var.firebase_project_id : var.project_id
+  
+  # API services to enable
+  required_apis = [
+    "cloudbuild.googleapis.com",
+    "cloudtasks.googleapis.com",
+    "cloudfunctions.googleapis.com",
+    "sourcerepo.googleapis.com",
+    "firebase.googleapis.com",
+    "aiplatform.googleapis.com",
+    "storage.googleapis.com",
+    "logging.googleapis.com",
+    "monitoring.googleapis.com",
+    "secretmanager.googleapis.com"
+  ]
+  
+  # Common labels for resource organization
+  common_labels = {
+    environment = var.environment
+    project = "code-review-pipeline"
+    managed-by = "infrastructure-manager"
+    component = "automated-code-review"
+  }
+}
+
+# Enable required Google Cloud APIs
+resource "google_project_service" "required_apis" {
+  for_each = toset(local.required_apis)
+  
+  project = var.project_id
+  service = each.value
+  
+  disable_dependent_services = false
+  disable_on_destroy = false
+  
+  timeouts {
+    create = "10m"
+    update = "10m"
+  }
+}
+
+# Cloud Source Repository for code storage and triggers
+resource "google_sourcerepo_repository" "code_review_repo" {
+  name    = local.repo_name
+  project = var.project_id
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Cloud Storage bucket for build artifacts
+resource "google_storage_bucket" "build_artifacts" {
+  name     = local.build_bucket_name
+  location = var.region
+  project  = var.project_id
+  
+  # Lifecycle configuration for cost optimization
+  lifecycle_rule {
+    condition {
+      age = 30
+    }
+    action {
+      type = "Delete"
+    }
+  }
+  
+  lifecycle_rule {
+    condition {
+      age = 7
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+  }
+  
+  # Security configurations
+  uniform_bucket_level_access = true
+  
+  versioning {
+    enabled = true
+  }
+  
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Cloud Storage bucket for metrics and analytics
+resource "google_storage_bucket" "metrics_storage" {
+  name     = local.metrics_bucket_name
+  location = var.region
+  project  = var.project_id
+  
+  # Lifecycle configuration for long-term storage
+  lifecycle_rule {
+    condition {
+      age = 365
+    }
+    action {
+      type = "Delete"
+    }
+  }
+  
+  lifecycle_rule {
+    condition {
+      age = 90
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "COLDLINE"
+    }
+  }
+  
+  lifecycle_rule {
+    condition {
+      age = 30
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+  }
+  
+  # Security configurations
+  uniform_bucket_level_access = true
+  
+  versioning {
+    enabled = true
+  }
+  
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Cloud Tasks queue for asynchronous code analysis
+resource "google_cloud_tasks_queue" "code_review_queue" {
+  name     = local.queue_name
+  location = var.region
+  project  = var.project_id
+  
+  # Rate limiting configuration
+  rate_limits {
+    max_concurrent_dispatches = var.cloud_tasks_max_concurrent
+    max_dispatches_per_second = 10
+  }
+  
+  # Retry configuration for reliability
+  retry_config {
+    max_attempts       = 3
+    max_retry_duration = "300s"
+    max_backoff        = "60s"
+    min_backoff        = "5s"
+    max_doublings      = 5
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Service account for Cloud Functions
+resource "google_service_account" "code_review_function_sa" {
+  account_id   = "code-review-function-${local.resource_suffix}"
+  display_name = "Code Review Cloud Function Service Account"
+  description  = "Service account for code review processing functions"
+  project      = var.project_id
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# IAM bindings for function service account
+resource "google_project_iam_member" "function_sa_permissions" {
+  for_each = toset([
+    "roles/logging.logWriter",
+    "roles/monitoring.metricWriter",
+    "roles/storage.objectAdmin",
+    "roles/cloudtasks.enqueuer",
+    "roles/aiplatform.user"
+  ])
+  
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.code_review_function_sa.email}"
+}
+
+# Secret for Gemini API key (to be populated manually)
+resource "google_secret_manager_secret" "gemini_api_key" {
+  count = var.enable_gemini_api ? 1 : 0
+  
+  secret_id = "gemini-api-key-${local.resource_suffix}"
+  project   = var.project_id
+  
+  replication {
+    user_managed {
+      replicas {
+        location = var.region
+      }
+    }
+  }
+  
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# IAM binding for function to access secret
+resource "google_secret_manager_secret_iam_member" "function_secret_access" {
+  count = var.enable_gemini_api ? 1 : 0
+  
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.gemini_api_key[0].secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.code_review_function_sa.email}"
+}
+
+# Cloud Function for code review processing
+resource "google_cloudfunctions2_function" "code_review_processor" {
+  name        = local.function_name
+  location    = var.region
+  project     = var.project_id
+  description = "AI-powered code review analysis function"
+  
+  build_config {
+    runtime     = "python311"
+    entry_point = "analyze_code"
+    
+    source {
+      storage_source {
+        bucket = google_storage_bucket.build_artifacts.name
+        object = "functions/code-review-processor.zip"
+      }
+    }
+  }
+  
+  service_config {
+    max_instance_count = 10
+    min_instance_count = 0
+    
+    available_memory   = var.cloud_function_memory
+    timeout_seconds    = 540
+    
+    service_account_email = google_service_account.code_review_function_sa.email
+    
+    environment_variables = {
+      PROJECT_ID = var.project_id
+      REGION     = var.region
+      QUEUE_NAME = local.queue_name
+    }
+    
+    dynamic "secret_environment_variables" {
+      for_each = var.enable_gemini_api ? [1] : []
+      content {
+        key        = "GEMINI_API_KEY"
+        project_id = var.project_id
+        secret     = google_secret_manager_secret.gemini_api_key[0].secret_id
+        version    = "latest"
+      }
+    }
+  }
+  
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_storage_bucket.build_artifacts
+  ]
+}
+
+# Cloud Function for metrics collection
+resource "google_cloudfunctions2_function" "metrics_collector" {
+  name        = local.metrics_function_name
+  location    = var.region
+  project     = var.project_id
+  description = "Code review metrics collection and analysis function"
+  
+  build_config {
+    runtime     = "python311"
+    entry_point = "collect_review_metrics"
+    
+    source {
+      storage_source {
+        bucket = google_storage_bucket.build_artifacts.name
+        object = "functions/metrics-collector.zip"
+      }
+    }
+  }
+  
+  service_config {
+    max_instance_count = 5
+    min_instance_count = 0
+    
+    available_memory   = "512MB"
+    timeout_seconds    = 120
+    
+    service_account_email = google_service_account.code_review_function_sa.email
+    
+    environment_variables = {
+      PROJECT_ID           = var.project_id
+      REGION              = var.region
+      METRICS_BUCKET_NAME = local.metrics_bucket_name
+    }
+  }
+  
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_storage_bucket.build_artifacts,
+    google_storage_bucket.metrics_storage
+  ]
+}
+
+# Cloud Build trigger for main branch
+resource "google_cloudbuild_trigger" "main_branch_trigger" {
+  name        = "code-review-main-trigger-${local.resource_suffix}"
+  description = "Automated code review pipeline for main branch"
+  location    = var.region
+  project     = var.project_id
+  
+  # Source repository configuration
+  source_to_build {
+    uri       = google_sourcerepo_repository.code_review_repo.url
+    ref       = "refs/heads/main"
+    repo_type = "CLOUD_SOURCE_REPOSITORIES"
+  }
+  
+  # Git file source configuration
+  git_file_source {
+    path      = "cloudbuild.yaml"
+    uri       = google_sourcerepo_repository.code_review_repo.url
+    revision  = "refs/heads/main"
+    repo_type = "CLOUD_SOURCE_REPOSITORIES"
+  }
+  
+  # Build configuration
+  build {
+    timeout = var.cloud_build_timeout
+    
+    options {
+      logging         = "CLOUD_LOGGING_ONLY"
+      machine_type    = "E2_MEDIUM"
+      substitution_option = "ALLOW_LOOSE"
+    }
+    
+    # Environment variables for build steps
+    substitutions = {
+      _REPO_NAME       = local.repo_name
+      _FUNCTION_URL    = google_cloudfunctions2_function.code_review_processor.service_config[0].uri
+      _METRICS_URL     = google_cloudfunctions2_function.metrics_collector.service_config[0].uri
+      _QUEUE_NAME      = local.queue_name
+      _BUILD_BUCKET    = local.build_bucket_name
+      _ENVIRONMENT     = var.environment
+    }
+  }
+  
+  # Filter for main branch only
+  included_files = ["**/*"]
+  
+  tags = ["automated", "code-review", "main-branch"]
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_sourcerepo_repository.code_review_repo,
+    google_cloudfunctions2_function.code_review_processor,
+    google_cloudfunctions2_function.metrics_collector
+  ]
+}
+
+# Cloud Build trigger for feature branches
+resource "google_cloudbuild_trigger" "feature_branch_trigger" {
+  name        = "code-review-feature-trigger-${local.resource_suffix}"
+  description = "Code review pipeline for feature branches"
+  location    = var.region
+  project     = var.project_id
+  
+  # Source repository configuration
+  source_to_build {
+    uri       = google_sourcerepo_repository.code_review_repo.url
+    ref       = "refs/heads/feature/*"
+    repo_type = "CLOUD_SOURCE_REPOSITORIES"
+  }
+  
+  # Git file source configuration
+  git_file_source {
+    path      = "cloudbuild.yaml"
+    uri       = google_sourcerepo_repository.code_review_repo.url
+    revision  = "refs/heads/feature/*"
+    repo_type = "CLOUD_SOURCE_REPOSITORIES"
+  }
+  
+  # Build configuration
+  build {
+    timeout = var.cloud_build_timeout
+    
+    options {
+      logging         = "CLOUD_LOGGING_ONLY"
+      machine_type    = "E2_MEDIUM"
+      substitution_option = "ALLOW_LOOSE"
+    }
+    
+    # Environment variables for build steps
+    substitutions = {
+      _REPO_NAME       = local.repo_name
+      _FUNCTION_URL    = google_cloudfunctions2_function.code_review_processor.service_config[0].uri
+      _METRICS_URL     = google_cloudfunctions2_function.metrics_collector.service_config[0].uri
+      _QUEUE_NAME      = local.queue_name
+      _BUILD_BUCKET    = local.build_bucket_name
+      _ENVIRONMENT     = var.environment
+    }
+  }
+  
+  # Filter for feature branches
+  included_files = ["**/*"]
+  
+  tags = ["automated", "code-review", "feature-branch"]
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_sourcerepo_repository.code_review_repo,
+    google_cloudfunctions2_function.code_review_processor,
+    google_cloudfunctions2_function.metrics_collector
+  ]
+}
+
+# GitHub integration trigger (optional, if GitHub repo is specified)
+resource "google_cloudbuild_trigger" "github_integration_trigger" {
+  count = var.github_repo_owner != "" && var.github_repo_name != "" ? 1 : 0
+  
+  name        = "code-review-github-trigger-${local.resource_suffix}"
+  description = "Code review pipeline for GitHub integration"
+  location    = var.region
+  project     = var.project_id
+  
+  # GitHub configuration
+  github {
+    owner = var.github_repo_owner
+    name  = var.github_repo_name
+    
+    pull_request {
+      branch = ".*"
+    }
+  }
+  
+  # Build configuration file
+  filename = "cloudbuild.yaml"
+  
+  tags = ["automated", "code-review", "github", "pull-request"]
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_cloudfunctions2_function.code_review_processor
+  ]
+}
+
+# Firebase project configuration (if different from GCP project)
+resource "google_firebase_project" "code_review_firebase" {
+  count = local.firebase_project != var.project_id ? 1 : 0
+  
+  provider = google-beta
+  project  = local.firebase_project
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Log-based metrics for monitoring
+resource "google_logging_metric" "code_review_success_rate" {
+  name   = "code_review_success_rate_${local.resource_suffix}"
+  filter = "resource.type=\"cloud_function\" AND resource.labels.function_name=\"${local.function_name}\" AND severity=\"INFO\" AND textPayload:\"Successfully analyzed\""
+  
+  metric_descriptor {
+    metric_kind = "GAUGE"
+    value_type  = "INT64"
+    display_name = "Code Review Success Rate"
+    description  = "Rate of successful code review analyses"
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+resource "google_logging_metric" "code_review_error_rate" {
+  name   = "code_review_error_rate_${local.resource_suffix}"
+  filter = "resource.type=\"cloud_function\" AND resource.labels.function_name=\"${local.function_name}\" AND severity=\"ERROR\""
+  
+  metric_descriptor {
+    metric_kind = "GAUGE"
+    value_type  = "INT64"
+    display_name = "Code Review Error Rate"
+    description  = "Rate of code review analysis errors"
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Monitoring alert policy for function errors
+resource "google_monitoring_alert_policy" "code_review_function_errors" {
+  display_name = "Code Review Function Error Rate Alert"
+  combiner     = "OR"
+  
+  conditions {
+    display_name = "High error rate in code review function"
+    
+    condition_threshold {
+      filter          = "resource.type=\"cloud_function\" resource.label.function_name=\"${local.function_name}\""
+      duration        = "300s"
+      comparison      = "COMPARISON_GREATER_THAN"
+      threshold_value = 5
+      
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+  
+  notification_channels = []
+  
+  alert_strategy {
+    auto_close = "1800s"
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Output values for integration and verification
+output "project_id" {
+  description = "Google Cloud Project ID"
+  value       = var.project_id
+}
+
+output "region" {
+  description = "Google Cloud region for resources"
+  value       = var.region
+}
+
+output "source_repository_url" {
+  description = "Cloud Source Repository URL for code commits"
+  value       = google_sourcerepo_repository.code_review_repo.url
+}
+
+output "source_repository_clone_url" {
+  description = "Git clone URL for the source repository"
+  value       = "https://source.developers.google.com/p/${var.project_id}/r/${local.repo_name}"
+}
+
+output "code_review_function_url" {
+  description = "Cloud Function URL for code review processing"
+  value       = google_cloudfunctions2_function.code_review_processor.service_config[0].uri
+}
+
+output "metrics_function_url" {
+  description = "Cloud Function URL for metrics collection"
+  value       = google_cloudfunctions2_function.metrics_collector.service_config[0].uri
+}
+
+output "cloud_tasks_queue_name" {
+  description = "Cloud Tasks queue name for asynchronous processing"
+  value       = google_cloud_tasks_queue.code_review_queue.name
+}
+
+output "build_artifacts_bucket" {
+  description = "Cloud Storage bucket for build artifacts"
+  value       = google_storage_bucket.build_artifacts.name
+}
+
+output "metrics_storage_bucket" {
+  description = "Cloud Storage bucket for metrics and analytics"
+  value       = google_storage_bucket.metrics_storage.name
+}
+
+output "firebase_studio_import_url" {
+  description = "Firebase Studio workspace import URL"
+  value       = "https://studio.firebase.google.com/project/${local.firebase_project}/workspace/import"
+}
+
+output "cloud_build_triggers" {
+  description = "Created Cloud Build trigger names"
+  value = {
+    main_branch    = google_cloudbuild_trigger.main_branch_trigger.name
+    feature_branch = google_cloudbuild_trigger.feature_branch_trigger.name
+    github         = var.github_repo_owner != "" && var.github_repo_name != "" ? google_cloudbuild_trigger.github_integration_trigger[0].name : null
+  }
+}
+
+output "service_account_email" {
+  description = "Service account email for Cloud Functions"
+  value       = google_service_account.code_review_function_sa.email
+}
+
+output "gemini_api_secret_name" {
+  description = "Secret Manager secret name for Gemini API key"
+  value       = var.enable_gemini_api ? google_secret_manager_secret.gemini_api_key[0].secret_id : null
+}
+
+output "monitoring_metrics" {
+  description = "Created monitoring metrics for observability"
+  value = {
+    success_rate = google_logging_metric.code_review_success_rate.name
+    error_rate   = google_logging_metric.code_review_error_rate.name
+  }
+}
+
+output "deployment_instructions" {
+  description = "Next steps for completing the deployment"
+  value = <<-EOT
+    Deployment completed successfully! Next steps:
+    
+    1. Set up Gemini API key (if enabled):
+       gcloud secrets versions add ${var.enable_gemini_api ? google_secret_manager_secret.gemini_api_key[0].secret_id : "gemini-api-key"} --data-file=/path/to/api-key
+    
+    2. Clone the source repository:
+       gcloud source repos clone ${local.repo_name} --project=${var.project_id}
+    
+    3. Import workspace in Firebase Studio:
+       Visit: ${google_firebase_project.code_review_firebase != null ? "https://studio.firebase.google.com/project/${local.firebase_project}/workspace/import" : "https://studio.firebase.google.com/project/${var.project_id}/workspace/import"}
+    
+    4. Upload Cloud Function source code to:
+       gs://${google_storage_bucket.build_artifacts.name}/functions/
+    
+    5. Configure GitHub integration (if needed):
+       Connect GitHub repository: ${var.github_repo_owner}/${var.github_repo_name}
+    
+    6. Monitor the pipeline:
+       Cloud Build: https://console.cloud.google.com/cloud-build/triggers?project=${var.project_id}
+       Cloud Functions: https://console.cloud.google.com/functions/list?project=${var.project_id}
+       Cloud Tasks: https://console.cloud.google.com/cloudtasks/queues?project=${var.project_id}
+  EOT
+}

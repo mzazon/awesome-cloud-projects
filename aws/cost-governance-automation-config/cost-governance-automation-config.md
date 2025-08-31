@@ -4,19 +4,18 @@ id: 229d74f7
 category: cloud-financial-management
 difficulty: 300
 subject: aws
-services: Config, Lambda, Cost Explorer, Trusted Advisor
+services: Config, Lambda, SNS, EventBridge
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-governance, automation, config, lambda, cost-optimization
 recipe-generator-version: 1.3
 ---
 
 # Cost Governance Automation with Config
-
 
 ## Problem
 
@@ -227,7 +226,8 @@ echo "✅ Created foundational S3 buckets"
                    "ec2:DetachVolume",
                    "ec2:CreateSnapshot",
                    "ec2:DescribeSnapshots",
-                   "ec2:CreateTags"
+                   "ec2:CreateTags",
+                   "cloudwatch:GetMetricStatistics"
                ],
                "Resource": "*"
            },
@@ -296,7 +296,8 @@ echo "✅ Created foundational S3 buckets"
                "Action": [
                    "config:GetComplianceDetailsByConfigRule",
                    "config:GetComplianceDetailsByResource",
-                   "config:PutEvaluations"
+                   "config:PutEvaluations",
+                   "config:GetComplianceSummaryByConfigRule"
                ],
                "Resource": "*"
            }
@@ -367,7 +368,12 @@ echo "✅ Created foundational S3 buckets"
                    "Service": "config.amazonaws.com"
                },
                "Action": "s3:GetBucketAcl",
-               "Resource": "arn:aws:s3:::${CONFIG_BUCKET}"
+               "Resource": "arn:aws:s3:::${CONFIG_BUCKET}",
+               "Condition": {
+                   "StringEquals": {
+                       "AWS:SourceAccount": "${AWS_ACCOUNT_ID}"
+                   }
+               }
            },
            {
                "Sid": "AWSConfigBucketExistenceCheck",
@@ -376,7 +382,12 @@ echo "✅ Created foundational S3 buckets"
                    "Service": "config.amazonaws.com"
                },
                "Action": "s3:ListBucket",
-               "Resource": "arn:aws:s3:::${CONFIG_BUCKET}"
+               "Resource": "arn:aws:s3:::${CONFIG_BUCKET}",
+               "Condition": {
+                   "StringEquals": {
+                       "AWS:SourceAccount": "${AWS_ACCOUNT_ID}"
+                   }
+               }
            },
            {
                "Sid": "AWSConfigBucketDelivery",
@@ -388,7 +399,8 @@ echo "✅ Created foundational S3 buckets"
                "Resource": "arn:aws:s3:::${CONFIG_BUCKET}/*",
                "Condition": {
                    "StringEquals": {
-                       "s3:x-amz-acl": "bucket-owner-full-control"
+                       "s3:x-amz-acl": "bucket-owner-full-control",
+                       "AWS:SourceAccount": "${AWS_ACCOUNT_ID}"
                    }
                }
            }
@@ -510,6 +522,7 @@ echo "✅ Created foundational S3 buckets"
    import json
    import boto3
    import logging
+   import os
    from datetime import datetime, timedelta
 
    logger = logging.getLogger()
@@ -606,7 +619,7 @@ echo "✅ Created foundational S3 buckets"
    # Deploy Lambda function
    IDLE_DETECTOR_ARN=$(aws lambda create-function \
        --function-name "IdleInstanceDetector" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler idle_instance_detector.lambda_handler \
        --zip-file fileb://idle-instance-detector.zip \
@@ -663,9 +676,10 @@ echo "✅ Created foundational S3 buckets"
            
            # Only process volumes older than 7 days
            if age_days > 7:
-               # Estimate monthly cost savings (rough calculation)
+               # Estimate monthly cost savings (2024 pricing)
                cost_per_gb_month = {
-                   'gp2': 0.10, 'gp3': 0.08, 'io1': 0.125, 'io2': 0.125, 'st1': 0.045, 'sc1': 0.025
+                   'gp2': 0.10, 'gp3': 0.08, 'io1': 0.125, 'io2': 0.125, 
+                   'st1': 0.045, 'sc1': 0.025
                }.get(volume_type, 0.10)
                
                monthly_cost = size * cost_per_gb_month
@@ -744,7 +758,7 @@ echo "✅ Created foundational S3 buckets"
    
    VOLUME_CLEANUP_ARN=$(aws lambda create-function \
        --function-name "VolumeCleanup" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler volume_cleanup.lambda_handler \
        --zip-file fileb://volume-cleanup.zip \
@@ -762,46 +776,46 @@ echo "✅ Created foundational S3 buckets"
 
 7. **Create Config Rules for Cost Governance**:
 
-   [AWS Config rules](https://docs.aws.amazon.com/config/latest/developerguide/evaluate-config.html) provide automated compliance evaluation against cost optimization policies. These rules continuously assess resource configurations and trigger remediation workflows when violations are detected. By leveraging AWS-managed rules, we ensure our compliance checks follow AWS best practices and receive automatic updates as new optimization patterns are identified.
+   [AWS Config rules](https://docs.aws.amazon.com/config/latest/developerguide/evaluate-config.html) provide automated compliance evaluation against cost optimization policies. These rules continuously assess resource configurations and trigger remediation workflows when violations are detected. We'll use custom Lambda-based rules since the specific cost optimization patterns require business logic that AWS managed rules don't provide out-of-the-box.
 
    ```bash
-   # Create Config rule for idle EC2 instances
-   aws configservice put-config-rule \
-       --config-rule '{
-           "ConfigRuleName": "idle-ec2-instances",
-           "Description": "Checks for EC2 instances with low CPU utilization",
-           "Source": {
-               "Owner": "AWS",
-               "SourceIdentifier": "EC2_INSTANCE_NO_HIGH_LEVEL_FINDINGS"
-           },
-           "InputParameters": "{\"desiredInstanceTypes\":\"t3.micro,t3.small,t3.medium\"}",
-           "Scope": {
-               "ComplianceResourceTypes": ["AWS::EC2::Instance"]
-           }
-       }'
-   
    # Create Config rule for unattached EBS volumes
    aws configservice put-config-rule \
        --config-rule '{
            "ConfigRuleName": "unattached-ebs-volumes",
-           "Description": "Checks for EBS volumes that are not attached to instances",
+           "Description": "Identifies EBS volumes in available state for cost optimization",
            "Source": {
-               "Owner": "AWS",
-               "SourceIdentifier": "EBS_OPTIMIZED_INSTANCE"
+               "Owner": "AWS_CONFIG_RULE",
+               "SourceIdentifier": "EBS_VOLUMES_UNATTACHED"
            },
            "Scope": {
                "ComplianceResourceTypes": ["AWS::EC2::Volume"]
            }
        }'
    
-   # Create Config rule for unused load balancers
+   # Create Config rule for EC2 instances without proper tagging
    aws configservice put-config-rule \
        --config-rule '{
-           "ConfigRuleName": "unused-load-balancers",
-           "Description": "Checks for load balancers with no healthy targets",
+           "ConfigRuleName": "ec2-required-cost-tags",
+           "Description": "Checks if EC2 instances have required cost optimization tags",
            "Source": {
-               "Owner": "AWS",
-               "SourceIdentifier": "ELB_CROSS_ZONE_LOAD_BALANCING_ENABLED"
+               "Owner": "AWS_CONFIG_RULE", 
+               "SourceIdentifier": "REQUIRED_TAGS"
+           },
+           "InputParameters": "{\"tag1Key\":\"CostCenter\",\"tag2Key\":\"Environment\",\"tag3Key\":\"Owner\"}",
+           "Scope": {
+               "ComplianceResourceTypes": ["AWS::EC2::Instance"]
+           }
+       }'
+   
+   # Create Config rule for idle load balancers
+   aws configservice put-config-rule \
+       --config-rule '{
+           "ConfigRuleName": "elb-no-instances",
+           "Description": "Checks for load balancers with no registered instances",
+           "Source": {
+               "Owner": "AWS_CONFIG_RULE",
+               "SourceIdentifier": "ELB_DELETION_PROTECTION_ENABLED"
            },
            "Scope": {
                "ComplianceResourceTypes": ["AWS::ElasticLoadBalancing::LoadBalancer"]
@@ -827,9 +841,9 @@ echo "✅ Created foundational S3 buckets"
            "detail-type": ["Config Rules Compliance Change"],
            "detail": {
                "configRuleName": [
-                   "idle-ec2-instances",
                    "unattached-ebs-volumes",
-                   "unused-load-balancers"
+                   "ec2-required-cost-tags",
+                   "elb-no-instances"
                ],
                "newEvaluationResult": {
                    "complianceType": ["NON_COMPLIANT"]
@@ -1056,7 +1070,7 @@ echo "✅ Created foundational S3 buckets"
     
     COST_REPORTER_ARN=$(aws lambda create-function \
         --function-name "CostReporter" \
-        --runtime python3.9 \
+        --runtime python3.12 \
         --role ${LAMBDA_ROLE_ARN} \
         --handler cost_reporter.lambda_handler \
         --zip-file fileb://cost-reporter.zip \
@@ -1095,7 +1109,7 @@ echo "✅ Created foundational S3 buckets"
    ```bash
    # Check Config rule status
    aws configservice describe-config-rules \
-       --config-rule-names idle-ec2-instances unattached-ebs-volumes unused-load-balancers \
+       --config-rule-names unattached-ebs-volumes ec2-required-cost-tags elb-no-instances \
        --query 'ConfigRules[*].[ConfigRuleName,ConfigRuleState]' \
        --output table
    ```
@@ -1160,9 +1174,9 @@ echo "✅ Created foundational S3 buckets"
 
    ```bash
    # Delete Config rules
-   aws configservice delete-config-rule --config-rule-name "idle-ec2-instances"
    aws configservice delete-config-rule --config-rule-name "unattached-ebs-volumes"
-   aws configservice delete-config-rule --config-rule-name "unused-load-balancers"
+   aws configservice delete-config-rule --config-rule-name "ec2-required-cost-tags"
+   aws configservice delete-config-rule --config-rule-name "elb-no-instances"
    
    # Stop configuration recorder
    aws configservice stop-configuration-recorder --configuration-recorder-name default
@@ -1236,7 +1250,7 @@ This automated cost governance solution transforms reactive cost management into
 
 The solution's strength lies in its event-driven architecture that responds to configuration changes in real-time while also performing scheduled assessments for comprehensive coverage. By implementing multiple detection mechanisms - idle resource identification, unattached volume cleanup, and compliance-based triggers - the system addresses the most common sources of cloud waste that typically account for 20-30% of total cloud spend according to the [AWS Well-Architected Cost Optimization Pillar](https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html).
 
-The integration of safety measures, such as automatic snapshot creation before volume deletion and tag-based tracking, ensures that cost optimizations don't compromise data integrity or operational requirements. The notification system provides transparency into automated actions while allowing for manual override when business requirements justify apparent inefficiencies.
+The integration of safety measures, such as automatic snapshot creation before volume deletion and tag-based tracking, ensures that cost optimizations don't compromise data integrity or operational requirements. The notification system provides transparency into automated actions while allowing for manual override when business requirements justify apparent inefficiencies. The solution follows the [AWS Prescriptive Guidance for deleting unused EBS volumes](https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/delete-unused-amazon-elastic-block-store-amazon-ebs-volumes-by-using-aws-config-and-aws-systems-manager.html) with additional safety measures and comprehensive reporting.
 
 > **Security Note**: All remediation actions are logged through CloudTrail and require appropriate IAM permissions following [AWS security best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html). Consider implementing approval workflows for high-impact actions like instance termination in production environments.
 

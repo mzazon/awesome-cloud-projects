@@ -1,0 +1,563 @@
+# Google Cloud Infrastructure Manager configuration for API Rate Limiting and Analytics
+# This configuration deploys:
+# - Cloud Run service for API gateway with rate limiting
+# - Firestore database for quota tracking and analytics
+# - Cloud Build for container deployment
+# - IAM roles and permissions
+# - Cloud Monitoring resources
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+  
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+  
+  service_name:
+    type: string
+    description: "Name for the Cloud Run service"
+    default: "api-rate-limiter"
+  
+  container_image:
+    type: string
+    description: "Container image for the API gateway (will be built if not provided)"
+    default: ""
+  
+  max_instances:
+    type: number
+    description: "Maximum number of Cloud Run instances"
+    default: 10
+  
+  memory_limit:
+    type: string
+    description: "Memory limit for Cloud Run service"
+    default: "1Gi"
+  
+  cpu_limit:
+    type: string
+    description: "CPU limit for Cloud Run service"
+    default: "1"
+  
+  default_rate_limit:
+    type: number
+    description: "Default rate limit (requests per hour)"
+    default: 100
+  
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/run.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      dependsOn: []
+
+  - name: enable-firestore-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/firestore.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      dependsOn: []
+
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/cloudbuild.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      dependsOn: []
+
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/monitoring.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      dependsOn: []
+
+  # Create Firestore database in native mode
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/${project_id}
+      databaseId: "(default)"
+      database:
+        type: FIRESTORE_NATIVE
+        locationId: ${region}
+        concurrencyMode: OPTIMISTIC
+        appEngineIntegrationMode: DISABLED
+    metadata:
+      dependsOn:
+        - enable-firestore-api
+
+  # IAM Service Account for Cloud Run service
+  - name: api-gateway-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: ${service_name}-sa
+      serviceAccount:
+        displayName: "API Gateway Service Account"
+        description: "Service account for API rate limiting gateway"
+    metadata:
+      dependsOn: []
+
+  # Grant Firestore Data Editor role to service account
+  - name: firestore-editor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/datastore.user
+      member: serviceAccount:${service_name}-sa@${project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - api-gateway-service-account
+
+  # Grant Cloud Monitoring Metric Writer role for custom metrics
+  - name: monitoring-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:${service_name}-sa@${project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - api-gateway-service-account
+
+  # Grant Cloud Trace Agent role for distributed tracing
+  - name: trace-agent-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/cloudtrace.agent
+      member: serviceAccount:${service_name}-sa@${project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - api-gateway-service-account
+
+  # Cloud Build configuration for containerizing the application
+  - name: cloudbuild-trigger
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      parent: projects/${project_id}
+      trigger:
+        name: ${service_name}-build-trigger
+        description: "Build trigger for API gateway container"
+        disabled: true  # Manual trigger initially
+        substitutions:
+          _SERVICE_NAME: ${service_name}
+          _REGION: ${region}
+        build:
+          steps:
+            # Build the container image
+            - name: gcr.io/cloud-builders/docker
+              args:
+                - build
+                - -t
+                - gcr.io/${project_id}/${service_name}:latest
+                - .
+              dir: src
+            
+            # Push the image to Container Registry
+            - name: gcr.io/cloud-builders/docker
+              args:
+                - push
+                - gcr.io/${project_id}/${service_name}:latest
+            
+            # Deploy to Cloud Run
+            - name: gcr.io/cloud-builders/gcloud
+              args:
+                - run
+                - deploy
+                - ${service_name}
+                - --image=gcr.io/${project_id}/${service_name}:latest
+                - --region=${region}
+                - --platform=managed
+                - --allow-unauthenticated
+                - --service-account=${service_name}-sa@${project_id}.iam.gserviceaccount.com
+                - --set-env-vars=PROJECT_ID=${project_id},DEFAULT_RATE_LIMIT=${default_rate_limit}
+                - --memory=${memory_limit}
+                - --cpu=${cpu_limit}
+                - --max-instances=${max_instances}
+                - --timeout=300
+          options:
+            logging: CLOUD_LOGGING_ONLY
+    metadata:
+      dependsOn:
+        - enable-cloudbuild-api
+        - api-gateway-service-account
+
+  # Cloud Run service for the API gateway
+  - name: api-gateway-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/${project_id}
+      location: ${region}
+      service:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: ${service_name}
+          annotations:
+            run.googleapis.com/ingress: all
+            run.googleapis.com/execution-environment: gen2
+        spec:
+          template:
+            metadata:
+              annotations:
+                run.googleapis.com/execution-environment: gen2
+                autoscaling.knative.dev/maxScale: "${max_instances}"
+                autoscaling.knative.dev/minScale: "0"
+                run.googleapis.com/cpu-throttling: "false"
+            spec:
+              serviceAccountName: ${service_name}-sa@${project_id}.iam.gserviceaccount.com
+              containerConcurrency: 100
+              timeoutSeconds: 300
+              containers:
+                - image: gcr.io/cloudrun/hello  # Placeholder image, will be updated by Cloud Build
+                  ports:
+                    - containerPort: 8080
+                      protocol: TCP
+                  env:
+                    - name: PROJECT_ID
+                      value: ${project_id}
+                    - name: DEFAULT_RATE_LIMIT
+                      value: "${default_rate_limit}"
+                    - name: ENVIRONMENT
+                      value: ${environment}
+                  resources:
+                    limits:
+                      cpu: ${cpu_limit}
+                      memory: ${memory_limit}
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 30
+                    timeoutSeconds: 10
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+    metadata:
+      dependsOn:
+        - enable-apis
+        - api-gateway-service-account
+        - firestore-editor-binding
+
+  # IAM policy to allow unauthenticated access to Cloud Run service
+  - name: cloud-run-invoker-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/run.invoker
+      member: allUsers
+    metadata:
+      dependsOn:
+        - api-gateway-service
+
+  # Cloud Monitoring Alert Policy for high error rates
+  - name: high-error-rate-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${project_id}
+      alertPolicy:
+        displayName: "API Gateway High Error Rate"
+        documentation:
+          content: "Alert when API gateway error rate exceeds threshold"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "High 4xx/5xx Error Rate"
+            conditionThreshold:
+              filter: >
+                resource.type="cloud_run_revision" AND
+                resource.labels.service_name="${service_name}" AND
+                metric.type="run.googleapis.com/request_count" AND
+                metric.labels.response_code_class!="2xx"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: "10"
+              duration: "300s"
+              aggregations:
+                - alignmentPeriod: "60s"
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        alertStrategy:
+          autoClose: "1800s"
+        enabled: true
+        severity: ERROR
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - api-gateway-service
+
+  # Cloud Monitoring Alert Policy for rate limit violations
+  - name: rate-limit-violations-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${project_id}
+      alertPolicy:
+        displayName: "API Gateway Rate Limit Violations"
+        documentation:
+          content: "Alert when rate limit violations exceed threshold"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "High Rate Limit Violations"
+            conditionThreshold:
+              filter: >
+                resource.type="cloud_run_revision" AND
+                resource.labels.service_name="${service_name}" AND
+                metric.type="run.googleapis.com/request_count" AND
+                metric.labels.response_code="429"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: "20"
+              duration: "300s"
+              aggregations:
+                - alignmentPeriod: "60s"
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        alertStrategy:
+          autoClose: "1800s"
+        enabled: true
+        severity: WARNING
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - api-gateway-service
+
+  # Cloud Monitoring Dashboard for API Gateway Analytics
+  - name: api-gateway-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/${project_id}
+      dashboard:
+        displayName: "API Gateway Analytics Dashboard"
+        mosaicLayout:
+          tiles:
+            # Request rate chart
+            - width: 6
+              height: 4
+              widget:
+                title: "API Request Rate"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: >
+                            resource.type="cloud_run_revision" AND
+                            resource.labels.service_name="${service_name}" AND
+                            metric.type="run.googleapis.com/request_count"
+                          aggregation:
+                            alignmentPeriod: "60s"
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                      plotType: LINE
+                  yAxis:
+                    label: "Requests per second"
+                    scale: LINEAR
+                  xAxis:
+                    scale: LINEAR
+            
+            # Response status codes chart
+            - width: 6
+              height: 4
+              widget:
+                title: "Response Status Codes"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: >
+                            resource.type="cloud_run_revision" AND
+                            resource.labels.service_name="${service_name}" AND
+                            metric.type="run.googleapis.com/request_count"
+                          aggregation:
+                            alignmentPeriod: "60s"
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                            groupByFields:
+                              - metric.labels.response_code_class
+                      plotType: STACKED_AREA
+                  yAxis:
+                    label: "Requests per second"
+                    scale: LINEAR
+            
+            # Service latency chart
+            - width: 6
+              height: 4
+              widget:
+                title: "Request Latency"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: >
+                            resource.type="cloud_run_revision" AND
+                            resource.labels.service_name="${service_name}" AND
+                            metric.type="run.googleapis.com/request_latencies"
+                          aggregation:
+                            alignmentPeriod: "60s"
+                            perSeriesAligner: ALIGN_DELTA
+                            crossSeriesReducer: REDUCE_MEAN
+                      plotType: LINE
+                  yAxis:
+                    label: "Latency (ms)"
+                    scale: LINEAR
+            
+            # Instance count chart
+            - width: 6
+              height: 4
+              widget:
+                title: "Active Instances"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: >
+                            resource.type="cloud_run_revision" AND
+                            resource.labels.service_name="${service_name}" AND
+                            metric.type="run.googleapis.com/container/instance_count"
+                          aggregation:
+                            alignmentPeriod: "60s"
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_SUM
+                      plotType: LINE
+                  yAxis:
+                    label: "Instance count"
+                    scale: LINEAR
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - api-gateway-service
+
+  # Firestore security rules for rate limiting and analytics collections
+  - name: firestore-security-rules
+    type: gcp-types/firestore-v1:projects.databases.securityRules
+    properties:
+      parent: projects/${project_id}/databases/(default)
+      securityRules:
+        name: projects/${project_id}/databases/(default)/securityRules
+        source: |
+          rules_version = '2';
+          service cloud.firestore {
+            match /databases/{database}/documents {
+              // Rate limits collection - allow service account access
+              match /rate_limits/{document} {
+                allow read, write: if request.auth != null &&
+                  request.auth.token.email.matches('.*@${project_id}.iam.gserviceaccount.com');
+              }
+              
+              // API analytics collection - allow service account writes
+              match /api_analytics/{document} {
+                allow write: if request.auth != null &&
+                  request.auth.token.email.matches('.*@${project_id}.iam.gserviceaccount.com');
+                allow read: if request.auth != null &&
+                  request.auth.token.email.matches('.*@${project_id}.iam.gserviceaccount.com');
+              }
+              
+              // Default deny all other access
+              match /{document=**} {
+                allow read, write: if false;
+              }
+            }
+          }
+    metadata:
+      dependsOn:
+        - firestore-database
+        - api-gateway-service-account
+
+# Output values for validation and integration
+outputs:
+  - name: service_url
+    description: "URL of the deployed Cloud Run service"
+    value: $(ref.api-gateway-service.status.url)
+  
+  - name: service_account_email
+    description: "Email of the service account used by Cloud Run"
+    value: $(ref.api-gateway-service-account.email)
+  
+  - name: firestore_database_name
+    description: "Name of the created Firestore database"
+    value: $(ref.firestore-database.name)
+  
+  - name: project_id
+    description: "Google Cloud Project ID"
+    value: ${project_id}
+  
+  - name: region
+    description: "Deployment region"
+    value: ${region}
+  
+  - name: dashboard_url
+    description: "URL to the monitoring dashboard"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.api-gateway-dashboard.name)?project=${project_id}"
+  
+  - name: build_trigger_name
+    description: "Name of the Cloud Build trigger"
+    value: $(ref.cloudbuild-trigger.name)
+  
+  - name: firestore_console_url
+    description: "URL to Firestore console"
+    value: "https://console.cloud.google.com/firestore/data?project=${project_id}"
+
+# Metadata for the deployment
+metadata:
+  version: "1.0"
+  description: "Infrastructure Manager configuration for API rate limiting and analytics solution"
+  author: "Google Cloud Infrastructure Manager"
+  created: "2025-01-17"
+  tags:
+    - api-gateway
+    - rate-limiting
+    - analytics
+    - serverless
+    - cloud-run
+    - firestore
+    - monitoring
+  
+  # Resource dependencies visualization
+  dependencies:
+    - source: enable-apis
+      targets: [api-gateway-service]
+    - source: enable-firestore-api
+      targets: [firestore-database, firestore-security-rules]
+    - source: enable-cloudbuild-api
+      targets: [cloudbuild-trigger]
+    - source: enable-monitoring-api
+      targets: [high-error-rate-alert, rate-limit-violations-alert, api-gateway-dashboard]
+    - source: api-gateway-service-account
+      targets: [firestore-editor-binding, monitoring-writer-binding, trace-agent-binding, api-gateway-service]
+    - source: firestore-database
+      targets: [firestore-security-rules]
+    - source: api-gateway-service
+      targets: [cloud-run-invoker-binding, high-error-rate-alert, rate-limit-violations-alert, api-gateway-dashboard]
+  
+  # Cost estimation guidance
+  cost_estimate:
+    description: "Estimated monthly cost for development workload"
+    breakdown:
+      - service: "Cloud Run"
+        cost: "$0-10/month (includes generous free tier)"
+      - service: "Firestore"
+        cost: "$0-5/month (free tier: 1GB storage, 50K reads, 20K writes/day)"
+      - service: "Cloud Monitoring"
+        cost: "$0-2/month (free tier: first 150MB of logs)"
+      - service: "Cloud Build"
+        cost: "$0-2/month (free tier: 120 build minutes/day)"
+    total_estimated: "$0-20/month for development usage"
+    notes: "Actual costs depend on usage patterns and may be lower with free tier benefits"

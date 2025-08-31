@@ -1,0 +1,297 @@
+---
+# Infrastructure Manager Configuration for Job Description Generation with Gemini and Firestore
+# This configuration deploys the complete HR automation solution using Google Cloud services
+
+imports:
+  - name: project-services
+    path: templates/project_services.jinja
+  - name: firestore-database
+    path: templates/firestore.jinja
+  - name: cloud-functions
+    path: templates/functions.jinja
+  - name: iam-bindings
+    path: templates/iam.jinja
+
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: project-services
+    properties:
+      project: $(ref.project.name)
+      services:
+        - aiplatform.googleapis.com
+        - firestore.googleapis.com
+        - cloudfunctions.googleapis.com
+        - cloudbuild.googleapis.com
+        - storage.googleapis.com
+        - logging.googleapis.com
+        - monitoring.googleapis.com
+
+  # Create Firestore database in Native mode
+  - name: hr-automation-firestore
+    type: firestore-database
+    properties:
+      project: $(ref.project.name)
+      databaseId: "(default)"
+      locationId: us-central1
+      type: FIRESTORE_NATIVE
+      deleteProtectionState: DELETE_PROTECTION_DISABLED
+      pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_DISABLED
+    depends_on:
+      - enable-apis
+
+  # Cloud Storage bucket for Cloud Functions source code
+  - name: functions-source-bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      project: $(ref.project.name)
+      name: $(ref.project.name)-functions-source
+      location: US-CENTRAL1
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              isLive: false
+    depends_on:
+      - enable-apis
+
+  # Service Account for Cloud Functions
+  - name: hr-functions-service-account
+    type: gcp-types/iam-v1:serviceAccount
+    properties:
+      project: $(ref.project.name)
+      accountId: hr-functions-sa
+      serviceAccount:
+        displayName: "HR Automation Functions Service Account"
+        description: "Service account for HR automation Cloud Functions"
+
+  # IAM bindings for service account
+  - name: functions-iam-bindings
+    type: iam-bindings
+    properties:
+      project: $(ref.project.name)
+      serviceAccount: $(ref.hr-functions-service-account.email)
+      roles:
+        # Vertex AI access for Gemini model usage
+        - roles/aiplatform.user
+        # Firestore access for data operations
+        - roles/datastore.user
+        # Cloud Functions runtime permissions
+        - roles/cloudsql.client
+        # Logging permissions
+        - roles/logging.logWriter
+        # Monitoring permissions
+        - roles/monitoring.metricWriter
+    depends_on:
+      - hr-functions-service-account
+
+  # Cloud Function for job description generation
+  - name: generate-job-description-function
+    type: gcp-types/cloudfunctions-v1:function
+    properties:
+      project: $(ref.project.name)
+      location: us-central1
+      function: generate-job-description
+      sourceArchiveUrl: gs://$(ref.functions-source-bucket.name)/job-description-generator.zip
+      entryPoint: generate_job_description_http
+      runtime: python311
+      timeout: 300s
+      availableMemoryMb: 512
+      serviceAccountEmail: $(ref.hr-functions-service-account.email)
+      environmentVariables:
+        GCP_PROJECT: $(ref.project.name)
+        FUNCTION_REGION: us-central1
+      httpsTrigger: {}
+      labels:
+        application: hr-automation
+        component: job-generator
+        environment: production
+    depends_on:
+      - functions-source-bucket
+      - hr-automation-firestore
+      - functions-iam-bindings
+
+  # Cloud Function for compliance validation
+  - name: validate-compliance-function
+    type: gcp-types/cloudfunctions-v1:function
+    properties:
+      project: $(ref.project.name)
+      location: us-central1
+      function: validate-compliance
+      sourceArchiveUrl: gs://$(ref.functions-source-bucket.name)/compliance-validator.zip
+      entryPoint: validate_compliance
+      runtime: python311
+      timeout: 60s
+      availableMemoryMb: 256
+      serviceAccountEmail: $(ref.hr-functions-service-account.email)
+      environmentVariables:
+        GCP_PROJECT: $(ref.project.name)
+        FUNCTION_REGION: us-central1
+      httpsTrigger: {}
+      labels:
+        application: hr-automation
+        component: compliance-validator
+        environment: production
+    depends_on:
+      - functions-source-bucket
+      - hr-automation-firestore
+      - functions-iam-bindings
+
+  # Cloud Monitoring alerting policy for function errors
+  - name: function-error-alert-policy
+    type: gcp-types/monitoring-v1:alertPolicy
+    properties:
+      project: $(ref.project.name)
+      displayName: "HR Automation Function Errors"
+      documentation:
+        content: "Alert when HR automation functions encounter errors"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Function error rate"
+          conditionThreshold:
+            filter: 'resource.type="cloud_function" AND resource.labels.function_name=~"generate-job-description|validate-compliance"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.1
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.labels.function_name
+      alertStrategy:
+        autoClose: 86400s
+      enabled: true
+    depends_on:
+      - generate-job-description-function
+      - validate-compliance-function
+
+  # Firestore security rules (placeholder - would need actual rules file)
+  - name: firestore-security-rules
+    type: gcp-types/firestore-v1:ruleset
+    properties:
+      project: $(ref.project.name)
+      source:
+        files:
+          - name: firestore.rules
+            content: |
+              rules_version = '2';
+              service cloud.firestore {
+                match /databases/{database}/documents {
+                  // Allow read/write access to company_culture collection
+                  match /company_culture/{document} {
+                    allow read, write: if request.auth != null;
+                  }
+                  
+                  // Allow read/write access to job_templates collection
+                  match /job_templates/{document} {
+                    allow read, write: if request.auth != null;
+                  }
+                  
+                  // Allow read/write access to generated_jobs collection
+                  match /generated_jobs/{document} {
+                    allow read, write: if request.auth != null;
+                  }
+                }
+              }
+    depends_on:
+      - hr-automation-firestore
+
+# Template definitions for reusable components
+templates:
+  # Project services template
+  - name: templates/project_services.jinja
+    content: |
+      resources:
+      {% for service in properties.services %}
+      - name: {{ service.replace('.', '-') }}
+        type: gcp-types/serviceusage-v1:services
+        properties:
+          name: projects/{{ properties.project }}/services/{{ service }}
+          disableDependentServices: false
+      {% endfor %}
+
+  # Firestore database template
+  - name: templates/firestore.jinja
+    content: |
+      resources:
+      - name: firestore-database
+        type: gcp-types/firestore-v1:database
+        properties:
+          project: {{ properties.project }}
+          databaseId: {{ properties.databaseId }}
+          locationId: {{ properties.locationId }}
+          type: {{ properties.type }}
+          deleteProtectionState: {{ properties.deleteProtectionState }}
+          pointInTimeRecoveryEnablement: {{ properties.pointInTimeRecoveryEnablement }}
+
+  # IAM bindings template
+  - name: templates/iam.jinja
+    content: |
+      resources:
+      {% for role in properties.roles %}
+      - name: {{ role.replace('/', '-').replace('.', '-') }}-binding
+        type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+        properties:
+          resource: {{ properties.project }}
+          role: {{ role }}
+          member: serviceAccount:{{ properties.serviceAccount }}
+      {% endfor %}
+
+# Outputs for integration and verification
+outputs:
+  # Project information
+  - name: project_id
+    value: $(ref.project.name)
+    description: "Google Cloud Project ID"
+
+  # Firestore database information
+  - name: firestore_database_name
+    value: $(ref.hr-automation-firestore.name)
+    description: "Firestore database name"
+
+  # Cloud Function URLs
+  - name: job_generation_function_url
+    value: $(ref.generate-job-description-function.httpsTrigger.url)
+    description: "URL for job description generation function"
+
+  - name: compliance_validation_function_url
+    value: $(ref.validate-compliance-function.httpsTrigger.url)
+    description: "URL for compliance validation function"
+
+  # Service account email
+  - name: service_account_email
+    value: $(ref.hr-functions-service-account.email)
+    description: "Service account email for HR automation functions"
+
+  # Storage bucket name
+  - name: functions_source_bucket
+    value: $(ref.functions-source-bucket.name)
+    description: "Cloud Storage bucket for function source code"
+
+  # Monitoring alert policy
+  - name: alert_policy_name
+    value: $(ref.function-error-alert-policy.name)
+    description: "Cloud Monitoring alert policy for function errors"
+
+# Metadata for deployment tracking
+metadata:
+  version: "1.0"
+  description: "HR Automation System with Gemini AI and Firestore"
+  author: "Google Cloud Infrastructure Manager"
+  created: "2025-07-12"
+  recipe: "job-description-generation-gemini-firestore"
+  components:
+    - "Vertex AI (Gemini)"
+    - "Cloud Firestore"
+    - "Cloud Functions (2nd gen)"
+    - "Cloud Storage"
+    - "Cloud Monitoring"
+    - "Cloud IAM"
+  estimated_cost: "$10-15 per month for moderate usage"
+  deployment_time: "10-15 minutes"

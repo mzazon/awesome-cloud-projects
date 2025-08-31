@@ -1,0 +1,754 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Policy Enforcement Automation with VPC Lattice and AWS Config - Automated compliance monitoring and remediation for VPC Lattice service networks'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+          - NotificationEmail
+      - Label:
+          default: "Compliance Configuration"
+        Parameters:
+          - RequireAuthPolicy
+          - RequireServiceAuth
+          - ServiceNamePrefix
+          - EnableAutoRemediation
+      - Label:
+          default: "VPC Configuration"
+        Parameters:
+          - VpcCidrBlock
+          - CreateTestResources
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      NotificationEmail:
+        default: "Notification Email Address"
+      RequireAuthPolicy:
+        default: "Require Auth Policy on Service Networks"
+      RequireServiceAuth:
+        default: "Require Authentication on Services"
+      ServiceNamePrefix:
+        default: "Required Service Name Prefix"
+      EnableAutoRemediation:
+        default: "Enable Automatic Remediation"
+      VpcCidrBlock:
+        default: "VPC CIDR Block"
+      CreateTestResources:
+        default: "Create Test Resources for Validation"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'lattice-compliance'
+    Description: 'Name prefix for all resources created by this template'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only letters, numbers, and hyphens'
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment designation for resource tagging and naming'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address to receive compliance violation notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  RequireAuthPolicy:
+    Type: String
+    Default: 'true'
+    Description: 'Whether service networks must have auth policies configured'
+    AllowedValues: ['true', 'false']
+
+  RequireServiceAuth:
+    Type: String
+    Default: 'true'
+    Description: 'Whether services must have authentication enabled (not NONE)'
+    AllowedValues: ['true', 'false']
+
+  ServiceNamePrefix:
+    Type: String
+    Default: 'secure-'
+    Description: 'Required prefix for compliant service network names'
+    MaxLength: 20
+
+  EnableAutoRemediation:
+    Type: String
+    Default: 'true'
+    Description: 'Enable automatic remediation of compliance violations'
+    AllowedValues: ['true', 'false']
+
+  VpcCidrBlock:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'CIDR block for the test VPC (only used if CreateTestResources is true)'
+    AllowedPattern: '^(10\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\/16)$'
+
+  CreateTestResources:
+    Type: String
+    Default: 'false'
+    Description: 'Create test VPC Lattice resources for validation (incurs additional costs)'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  EnableAutoRemediationCondition: !Equals [!Ref EnableAutoRemediation, 'true']
+  CreateTestResourcesCondition: !Equals [!Ref CreateTestResources, 'true']
+
+Resources:
+  # S3 Bucket for AWS Config
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-config-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-config-bucket-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'AWS Config Configuration History'
+
+  # S3 Bucket Policy for AWS Config
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSConfigBucketPermissionsCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: AWSConfigBucketExistenceCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:ListBucket
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: AWSConfigBucketDelivery
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${ConfigBucket.Arn}/AWSLogs/${AWS::AccountId}/Config/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': 'bucket-owner-full-control'
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+
+  # IAM Role for AWS Config Service
+  ConfigServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ConfigServiceRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/ConfigRole
+      Policies:
+        - PolicyName: ConfigS3DeliveryRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                  - s3:ListBucket
+                Resource: !GetAtt ConfigBucket.Arn
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${ConfigBucket.Arn}/AWSLogs/${AWS::AccountId}/Config/*'
+                Condition:
+                  StringEquals:
+                    's3:x-amz-acl': 'bucket-owner-full-control'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ConfigServiceRole-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # AWS Config Configuration Recorder
+  ConfigurationRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: !Sub '${ProjectName}-config-recorder-${Environment}'
+      RoleARN: !GetAtt ConfigServiceRole.Arn
+      RecordingGroup:
+        AllSupported: false
+        IncludeGlobalResourceTypes: false
+        ResourceTypes:
+          - 'AWS::VpcLattice::ServiceNetwork'
+          - 'AWS::VpcLattice::Service'
+
+  # AWS Config Delivery Channel
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      Name: !Sub '${ProjectName}-delivery-channel-${Environment}'
+      S3BucketName: !Ref ConfigBucket
+
+  # SNS Topic for Compliance Notifications
+  ComplianceNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-compliance-alerts-${Environment}'
+      DisplayName: 'VPC Lattice Compliance Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-compliance-alerts-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic Policy
+  ComplianceNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref ComplianceNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ComplianceEvaluatorRole.Arn
+            Action: sns:Publish
+            Resource: !Ref ComplianceNotificationTopic
+
+  # SNS Email Subscription
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ComplianceNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda Functions
+  ComplianceEvaluatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ComplianceEvaluatorRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ComplianceEvaluatorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - vpc-lattice:GetServiceNetwork
+                  - vpc-lattice:GetService
+                  - vpc-lattice:GetAuthPolicy
+                  - vpc-lattice:PutAuthPolicy
+                  - vpc-lattice:UpdateService
+                  - vpc-lattice:ListServices
+                  - vpc-lattice:ListServiceNetworks
+                  - config:PutEvaluations
+                  - config:StartConfigRulesEvaluation
+                  - sns:Publish
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ComplianceEvaluatorRole-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Compliance Evaluation
+  ComplianceEvaluatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-compliance-evaluator-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ComplianceEvaluatorRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ComplianceNotificationTopic
+          AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """Evaluate VPC Lattice resources for compliance."""
+              
+              config_client = boto3.client('config')
+              lattice_client = boto3.client('vpc-lattice')
+              sns_client = boto3.client('sns')
+              
+              compliance_type = 'COMPLIANT'
+              annotation = 'Resource is compliant with security policies'
+              
+              try:
+                  configuration_item = event['configurationItem']
+                  rule_parameters = json.loads(event.get('ruleParameters', '{}'))
+                  
+                  resource_type = configuration_item['resourceType']
+                  resource_id = configuration_item['resourceId']
+                  
+                  logger.info(f"Evaluating {resource_type}: {resource_id}")
+                  
+                  if resource_type == 'AWS::VpcLattice::ServiceNetwork':
+                      compliance_type, annotation = evaluate_service_network(
+                          lattice_client, resource_id, rule_parameters
+                      )
+                  elif resource_type == 'AWS::VpcLattice::Service':
+                      compliance_type, annotation = evaluate_service(
+                          lattice_client, resource_id, rule_parameters
+                      )
+                  
+                  # Send notification if non-compliant
+                  if compliance_type == 'NON_COMPLIANT':
+                      send_compliance_notification(sns_client, resource_id, annotation, resource_type)
+                      
+              except Exception as e:
+                  logger.error(f"Error evaluating compliance: {str(e)}")
+                  compliance_type = 'NOT_APPLICABLE'
+                  annotation = f"Error during evaluation: {str(e)}"
+              
+              # Return evaluation result to Config
+              try:
+                  config_client.put_evaluations(
+                      Evaluations=[
+                          {
+                              'ComplianceResourceType': configuration_item['resourceType'],
+                              'ComplianceResourceId': configuration_item['resourceId'],
+                              'ComplianceType': compliance_type,
+                              'Annotation': annotation,
+                              'OrderingTimestamp': configuration_item['configurationItemCaptureTime']
+                          }
+                      ],
+                      ResultToken=event['resultToken']
+                  )
+              except Exception as e:
+                  logger.error(f"Failed to put evaluations: {str(e)}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'Evaluation complete: {compliance_type}')
+              }
+
+          def evaluate_service_network(client, network_id, parameters):
+              """Evaluate service network compliance."""
+              try:
+                  # Get service network details
+                  response = client.get_service_network(serviceNetworkIdentifier=network_id)
+                  network = response['serviceNetwork']
+                  
+                  # Check for auth policy requirement
+                  if parameters.get('requireAuthPolicy', 'true') == 'true':
+                      try:
+                          client.get_auth_policy(resourceIdentifier=network_id)
+                      except client.exceptions.ResourceNotFoundException:
+                          return 'NON_COMPLIANT', 'Service network missing required auth policy'
+                  
+                  # Check network name compliance
+                  name_prefix = parameters.get('namePrefix', 'secure-')
+                  if not network['name'].startswith(name_prefix):
+                      return 'NON_COMPLIANT', f"Service network name must start with '{name_prefix}'"
+                  
+                  return 'COMPLIANT', 'Service network meets all security requirements'
+                  
+              except Exception as e:
+                  logger.error(f"Error evaluating service network {network_id}: {str(e)}")
+                  return 'NOT_APPLICABLE', f"Unable to evaluate service network: {str(e)}"
+
+          def evaluate_service(client, service_id, parameters):
+              """Evaluate service compliance."""
+              try:
+                  response = client.get_service(serviceIdentifier=service_id)
+                  service = response['service']
+                  
+                  # Check auth type requirement
+                  if parameters.get('requireAuth', 'true') == 'true':
+                      if service.get('authType') == 'NONE':
+                          return 'NON_COMPLIANT', 'Service must have authentication enabled'
+                  
+                  return 'COMPLIANT', 'Service meets security requirements'
+                  
+              except Exception as e:
+                  logger.error(f"Error evaluating service {service_id}: {str(e)}")
+                  return 'NOT_APPLICABLE', f"Unable to evaluate service: {str(e)}"
+
+          def send_compliance_notification(sns_client, resource_id, message, resource_type):
+              """Send SNS notification for compliance violations."""
+              try:
+                  sns_client.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f'VPC Lattice Compliance Violation - {resource_type}',
+                      Message=f"""
+          Compliance violation detected:
+
+          Resource Type: {resource_type}
+          Resource ID: {resource_id}
+          Issue: {message}
+          Timestamp: {datetime.utcnow().isoformat()}
+          Project: {os.environ.get('PROJECT_NAME', 'Unknown')}
+          Environment: {os.environ.get('ENVIRONMENT', 'Unknown')}
+
+          Please review and remediate this resource immediately.
+                      """
+                  )
+                  logger.info(f"Sent compliance notification for {resource_id}")
+              except Exception as e:
+                  logger.error(f"Failed to send SNS notification: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-compliance-evaluator-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Permission for AWS Config
+  ConfigLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ComplianceEvaluatorFunction
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  # AWS Config Rule
+  VpcLatticeComplianceRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigLambdaPermission
+    Properties:
+      ConfigRuleName: !Sub '${ProjectName}-vpc-lattice-compliance-${Environment}'
+      Description: 'Evaluates VPC Lattice resources for compliance with security policies'
+      Source:
+        Owner: AWS_LAMBDA
+        SourceIdentifier: !GetAtt ComplianceEvaluatorFunction.Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ConfigurationItemChangeNotification
+          - EventSource: aws.config
+            MessageType: OversizedConfigurationItemChangeNotification
+      InputParameters: !Sub |
+        {
+          "requireAuthPolicy": "${RequireAuthPolicy}",
+          "namePrefix": "${ServiceNamePrefix}",
+          "requireAuth": "${RequireServiceAuth}"
+        }
+
+  # Auto-Remediation Lambda Function (Conditional)
+  AutoRemediationFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableAutoRemediationCondition
+    Properties:
+      FunctionName: !Sub '${ProjectName}-auto-remediation-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ComplianceEvaluatorRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          CONFIG_RULE_NAME: !Ref VpcLatticeComplianceRule
+          AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """Automatically remediate VPC Lattice compliance violations."""
+              
+              lattice_client = boto3.client('vpc-lattice')
+              config_client = boto3.client('config')
+              
+              try:
+                  # Parse SNS message
+                  for record in event['Records']:
+                      message = json.loads(record['Sns']['Message'])
+                      resource_id = extract_resource_id(message)
+                      
+                      if not resource_id:
+                          logger.error("Unable to extract resource ID from message")
+                          continue
+                      
+                      logger.info(f"Attempting remediation for resource: {resource_id}")
+                      
+                      # Attempt remediation based on resource type
+                      if 'service-network' in resource_id or resource_id.startswith('sn-'):
+                          remediate_service_network(lattice_client, resource_id)
+                      elif 'service' in resource_id or resource_id.startswith('svc-'):
+                          remediate_service(lattice_client, resource_id)
+                      
+                      # Trigger Config re-evaluation
+                      config_client.start_config_rules_evaluation(
+                          ConfigRuleNames=[os.environ['CONFIG_RULE_NAME']]
+                      )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Remediation completed successfully')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Remediation failed: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Remediation failed: {str(e)}')
+                  }
+
+          def extract_resource_id(message):
+              """Extract resource ID from compliance message."""
+              message_text = str(message)
+              lines = message_text.split('\n')
+              for line in lines:
+                  if 'Resource ID:' in line:
+                      return line.split('Resource ID:')[1].strip()
+              return None
+
+          def remediate_service_network(client, network_id):
+              """Apply remediation to service network."""
+              try:
+                  # Create basic auth policy if missing
+                  auth_policy = {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                          {
+                              "Effect": "Allow",
+                              "Principal": "*",
+                              "Action": "vpc-lattice-svcs:*",
+                              "Resource": "*",
+                              "Condition": {
+                                  "StringEquals": {
+                                      "aws:PrincipalAccount": os.environ['AWS_ACCOUNT_ID']
+                                  }
+                              }
+                          }
+                      ]
+                  }
+                  
+                  client.put_auth_policy(
+                      resourceIdentifier=network_id,
+                      policy=json.dumps(auth_policy)
+                  )
+                  
+                  logger.info(f"Applied auth policy to service network: {network_id}")
+                  
+              except Exception as e:
+                  logger.error(f"Failed to remediate service network {network_id}: {str(e)}")
+
+          def remediate_service(client, service_id):
+              """Apply remediation to service."""
+              try:
+                  # Update service to require authentication
+                  client.update_service(
+                      serviceIdentifier=service_id,
+                      authType='AWS_IAM'
+                  )
+                  
+                  logger.info(f"Updated service authentication: {service_id}")
+                  
+              except Exception as e:
+                  logger.error(f"Failed to remediate service {service_id}: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-auto-remediation-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Subscription for Auto-Remediation (Conditional)
+  AutoRemediationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableAutoRemediationCondition
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref ComplianceNotificationTopic
+      Endpoint: !GetAtt AutoRemediationFunction.Arn
+
+  # Lambda Permission for SNS (Conditional)
+  SnsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableAutoRemediationCondition
+    Properties:
+      FunctionName: !Ref AutoRemediationFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref ComplianceNotificationTopic
+
+  # Test VPC (Conditional)
+  TestVpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateTestResourcesCondition
+    Properties:
+      CidrBlock: !Ref VpcCidrBlock
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-test-vpc-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'VPC Lattice Compliance Testing'
+
+  # Test VPC Lattice Service Network (Conditional)
+  TestServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Condition: CreateTestResourcesCondition
+    Properties:
+      Name: !Sub 'test-network-${ProjectName}-${Environment}'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-test-service-network-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Compliance Testing'
+
+  # Test Service Network VPC Association (Conditional)
+  TestServiceNetworkVpcAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Condition: CreateTestResourcesCondition
+    Properties:
+      ServiceNetworkIdentifier: !Ref TestServiceNetwork
+      VpcIdentifier: !Ref TestVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-test-association-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  ConfigBucketName:
+    Description: 'Name of the S3 bucket used for AWS Config'
+    Value: !Ref ConfigBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigBucket'
+
+  ConfigurationRecorderName:
+    Description: 'Name of the AWS Config configuration recorder'
+    Value: !Ref ConfigurationRecorder
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigurationRecorder'
+
+  ComplianceNotificationTopicArn:
+    Description: 'ARN of the SNS topic for compliance notifications'
+    Value: !Ref ComplianceNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceNotificationTopic'
+
+  ComplianceEvaluatorFunctionArn:
+    Description: 'ARN of the Lambda function for compliance evaluation'
+    Value: !GetAtt ComplianceEvaluatorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceEvaluatorFunction'
+
+  AutoRemediationFunctionArn:
+    Condition: EnableAutoRemediationCondition
+    Description: 'ARN of the Lambda function for automatic remediation'
+    Value: !GetAtt AutoRemediationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoRemediationFunction'
+
+  VpcLatticeComplianceRuleName:
+    Description: 'Name of the AWS Config rule for VPC Lattice compliance'
+    Value: !Ref VpcLatticeComplianceRule
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcLatticeComplianceRule'
+
+  TestServiceNetworkId:
+    Condition: CreateTestResourcesCondition
+    Description: 'ID of the test VPC Lattice service network'
+    Value: !Ref TestServiceNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-TestServiceNetwork'
+
+  TestVpcId:
+    Condition: CreateTestResourcesCondition
+    Description: 'ID of the test VPC'
+    Value: !Ref TestVpc
+    Export:
+      Name: !Sub '${AWS::StackName}-TestVpc'
+
+  ComplianceRuleParameters:
+    Description: 'Parameters configured for the compliance rule'
+    Value: !Sub |
+      RequireAuthPolicy: ${RequireAuthPolicy}
+      ServiceNamePrefix: ${ServiceNamePrefix}
+      RequireServiceAuth: ${RequireServiceAuth}
+
+  NextSteps:
+    Description: 'Instructions for using this compliance monitoring system'
+    Value: |
+      1. Confirm email subscription by clicking the link sent to your email
+      2. Create VPC Lattice service networks and services to test compliance
+      3. View compliance results in AWS Config dashboard
+      4. Monitor SNS notifications for violations
+      5. Check CloudWatch logs for Lambda function execution details

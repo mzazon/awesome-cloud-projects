@@ -1,21 +1,21 @@
 ---
-title: Edge Computing with IoT Greengrass
+title: Edge Computing with IoT Greengrass and Lambda
 id: 9c4f7e1a
 category: iot
 difficulty: 300
 subject: aws
-services: iot-core, greengrass, lambda
+services: iot-core, greengrass, lambda, iam
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: iot,edge-computing,greengrass,lambda,device-management
 recipe-generator-version: 1.3
 ---
 
-# Edge Computing with IoT Greengrass
+# Edge Computing with IoT Greengrass and Lambda
 
 ## Problem
 
@@ -59,10 +59,11 @@ graph TB
 ## Prerequisites
 
 1. AWS account with permissions for IoT Core, Greengrass, Lambda, and IAM
-2. Ubuntu 18.04+ or Amazon Linux 2 device for Greengrass Core
+2. Ubuntu 18.04+ or Amazon Linux 2 device for Greengrass Core (minimum 1GB RAM, 1GB storage)
 3. AWS CLI v2 installed and configured
-4. Basic knowledge of IoT concepts and Lambda functions
-5. Estimated cost: $5-10 per month for testing (device messaging, Lambda execution)
+4. Java runtime (OpenJDK 11 or Amazon Corretto 11+) installed on edge device
+5. Basic knowledge of IoT concepts and Lambda functions
+6. Estimated cost: $5-10 per month for testing (device messaging, Lambda execution)
 
 > **Note**: This recipe uses AWS IoT Greengrass V2, which provides improved performance and simplified deployment compared to V1. See [AWS IoT Greengrass V2 documentation](https://docs.aws.amazon.com/greengrass/v2/developerguide/what-is-iot-greengrass.html) for detailed service information.
 
@@ -99,12 +100,16 @@ echo "Core device name: ${CORE_DEVICE_NAME}"
    aws iot create-thing --thing-name ${THING_NAME}
    
    # Create certificate and keys for device authentication
-   CERT_ARN=$(aws iot create-keys-and-certificate \
+   CERT_OUTPUT=$(aws iot create-keys-and-certificate \
        --set-as-active \
-       --query 'certificateArn' --output text)
+       --certificate-pem-outfile "${THING_NAME}.cert.pem" \
+       --public-key-outfile "${THING_NAME}.public.key" \
+       --private-key-outfile "${THING_NAME}.private.key" \
+       --output json)
    
-   # Get certificate ID for policy attachment
-   CERT_ID=$(echo ${CERT_ARN} | cut -d'/' -f2)
+   # Extract certificate ARN and ID
+   CERT_ARN=$(echo $CERT_OUTPUT | jq -r '.certificateArn')
+   CERT_ID=$(echo $CERT_OUTPUT | jq -r '.certificateId')
    
    echo "✅ IoT Thing created: ${THING_NAME}"
    echo "✅ Certificate created: ${CERT_ID}"
@@ -135,6 +140,15 @@ echo "Core device name: ${CORE_DEVICE_NAME}"
            {
                "Effect": "Allow",
                "Action": [
+                   "iot:GetThingShadow",
+                   "iot:UpdateThingShadow",
+                   "iot:DeleteThingShadow"
+               ],
+               "Resource": "*"
+           },
+           {
+               "Effect": "Allow",
+               "Action": [
                    "greengrass:*"
                ],
                "Resource": "*"
@@ -151,6 +165,11 @@ echo "Core device name: ${CORE_DEVICE_NAME}"
    aws iot attach-policy \
        --policy-name "greengrass-policy-${RANDOM_SUFFIX}" \
        --target ${CERT_ARN}
+   
+   # Attach certificate to Thing
+   aws iot attach-thing-principal \
+       --thing-name ${THING_NAME} \
+       --principal ${CERT_ARN}
    
    echo "✅ IoT policy created and attached"
    ```
@@ -216,7 +235,12 @@ echo "Core device name: ${CORE_DEVICE_NAME}"
        --role-name "greengrass-core-role-${RANDOM_SUFFIX}" \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSGreengrassResourceAccessRolePolicy
    
-   echo "✅ IAM role created for Greengrass Core"
+   # Create role alias for token exchange
+   aws iot create-role-alias \
+       --role-alias "greengrass-role-alias-${RANDOM_SUFFIX}" \
+       --role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/greengrass-core-role-${RANDOM_SUFFIX}"
+   
+   echo "✅ IAM role and role alias created for Greengrass Core"
    ```
 
    The IAM role now provides the necessary AWS service permissions for Greengrass Core operations while maintaining security through role-based access control.
@@ -232,6 +256,7 @@ echo "Core device name: ${CORE_DEVICE_NAME}"
    import json
    import logging
    import time
+   import os
    
    logger = logging.getLogger()
    logger.setLevel(logging.INFO)
@@ -248,8 +273,13 @@ echo "Core device name: ${CORE_DEVICE_NAME}"
            "device_id": event.get("device_id", "unknown"),
            "temperature": event.get("temperature", 0),
            "status": "processed_at_edge",
-           "processing_time": 0.1
+           "processing_time": 0.1,
+           "location": os.environ.get("DEVICE_LOCATION", "edge")
        }
+       
+       # Basic threshold check
+       if processed_data["temperature"] > 30:
+           processed_data["alert"] = "High temperature detected"
        
        return {
            "statusCode": 200,
@@ -266,148 +296,112 @@ echo "Core device name: ${CORE_DEVICE_NAME}"
    aws lambda create-function \
        --function-name "edge-processor-${RANDOM_SUFFIX}" \
        --runtime python3.9 \
-       --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/greengrass-core-role-${RANDOM_SUFFIX} \
+       --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/greengrass-core-role-${RANDOM_SUFFIX}" \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://edge-processor.zip \
        --timeout 30 \
-       --memory-size 128
+       --memory-size 128 \
+       --environment "Variables={DEVICE_LOCATION=edge-device}"
    
    echo "✅ Lambda function created for edge processing"
    ```
 
    The Lambda function is now ready for deployment to Greengrass Core, providing local processing capabilities that can operate independently of cloud connectivity.
 
-6. **Install and Configure Greengrass Core Software**:
+6. **Download and Install Greengrass Core Software**:
 
-   The Greengrass Core software transforms edge devices into AWS-managed compute environments. Installation creates a local runtime that manages Lambda functions, messaging, and cloud synchronization, enabling sophisticated edge computing scenarios.
+   The Greengrass Core software transforms edge devices into AWS-managed compute environments. The latest installation method uses the automatic provisioning installer that simplifies the setup process by creating required AWS resources automatically.
 
    ```bash
-   # Download and install Greengrass Core V2
+   # Download Greengrass Core V2 installer
    curl -s https://d2s8p88vqu9w66.cloudfront.net/releases/greengrass-nucleus-latest.zip \
        -o greengrass-nucleus-latest.zip
    
-   unzip greengrass-nucleus-latest.zip -d GreengrassCore
+   # Extract the installer
+   unzip greengrass-nucleus-latest.zip -d GreengrassInstaller
    
-   # Create configuration file
-   cat > greengrass-config.yaml << EOF
-   ---
-   system:
-     certificateFilePath: "/greengrass/v2/device.pem.crt"
-     privateKeyPath: "/greengrass/v2/private.pem.key"
-     rootCaPath: "/greengrass/v2/AmazonRootCA1.pem"
-     thingName: "${THING_NAME}"
-   services:
-     aws.greengrass.Nucleus:
-       componentType: "NUCLEUS"
-       version: "2.0.0"
-       configuration:
-         awsRegion: "${AWS_REGION}"
-         iotRoleAlias: "GreengrassV2TokenExchangeRoleAlias"
-         iotDataEndpoint: "$(aws iot describe-endpoint --endpoint-type iot:Data-ATS --query endpointAddress --output text)"
-         iotCredEndpoint: "$(aws iot describe-endpoint --endpoint-type iot:CredentialProvider --query endpointAddress --output text)"
-   EOF
+   # Install Greengrass Core with automatic provisioning
+   sudo -E java -Droot="/greengrass/v2" \
+       -Dlog.store=FILE \
+       -jar ./GreengrassInstaller/lib/Greengrass.jar \
+       --aws-region ${AWS_REGION} \
+       --thing-name ${THING_NAME} \
+       --thing-group-name ${THING_GROUP_NAME} \
+       --thing-policy-name "greengrass-policy-${RANDOM_SUFFIX}" \
+       --tes-role-name "greengrass-core-role-${RANDOM_SUFFIX}" \
+       --tes-role-alias-name "greengrass-role-alias-${RANDOM_SUFFIX}" \
+       --component-default-user ggc_user:ggc_group \
+       --provision true \
+       --setup-system-service true
    
-   echo "✅ Greengrass Core software prepared for installation"
+   echo "✅ Greengrass Core software installed successfully"
    ```
 
-   The Greengrass Core software is now configured with the necessary certificates and endpoints to establish secure communication with AWS IoT services.
-
-> **Warning**: Ensure your device has sufficient resources (minimum 1GB RAM, 1GB storage) for Greengrass Core operation. See [AWS IoT Greengrass system requirements](https://docs.aws.amazon.com/greengrass/v2/developerguide/setting-up.html#greengrass-v2-requirements) for detailed specifications.
+   The Greengrass Core software is now installed and running as a system service with automatic resource provisioning, establishing secure communication with AWS IoT services.
 
 7. **Deploy Lambda Component to Greengrass Core**:
 
    Component deployment distributes Lambda functions and configurations to edge devices through AWS IoT Greengrass. This managed deployment process ensures consistent application delivery and enables centralized management of edge computing workloads.
 
    ```bash
-   # Create component recipe for Lambda function
-   cat > lambda-component-recipe.yaml << EOF
-   ---
-   RecipeFormatVersion: "2020-01-25"
-   ComponentName: "com.example.EdgeProcessor"
-   ComponentVersion: "1.0.0"
-   ComponentDescription: "Edge processing Lambda component"
-   ComponentPublisher: "AWS"
-   ComponentConfiguration:
-     DefaultConfiguration:
-       accessControl:
-         aws.greengrass.ipc.mqttproxy:
-           "com.example.EdgeProcessor:mqttproxy:1":
-             policyDescription: "Allows access to MQTT proxy"
-             operations:
-               - "aws.greengrass#PublishToIoTCore"
-               - "aws.greengrass#SubscribeToIoTCore"
-   Manifests:
-     - Platform:
-         os: linux
-       Artifacts:
-         - URI: "s3://DOC-EXAMPLE-BUCKET/lambda-edge-function.zip"
-           Permission:
-             Read: OWNER
-             Execute: OWNER
-       Lifecycle:
-         Install:
-           Script: "python3 -m pip install --user -t {artifacts:decompressedPath}/lambda-edge-function -r {artifacts:decompressedPath}/requirements.txt"
-         Run:
-           Script: "python3 {artifacts:decompressedPath}/lambda-edge-function/lambda_function.py"
-   EOF
-   
-   # Create deployment for the component
+   # Create deployment for Lambda function component
    aws greengrassv2 create-deployment \
        --target-arn "arn:aws:iot:${AWS_REGION}:${AWS_ACCOUNT_ID}:thinggroup/${THING_GROUP_NAME}" \
        --deployment-name "edge-processor-deployment-${RANDOM_SUFFIX}" \
        --components '{
            "aws.greengrass.Nucleus": {
-               "componentVersion": "2.0.0"
+               "componentVersion": "2.12.0"
+           },
+           "aws.greengrass.Cli": {
+               "componentVersion": "2.12.0"
+           }
+       }' \
+       --deployment-policies '{
+           "failureHandlingPolicy": "ROLLBACK",
+           "componentUpdatePolicy": {
+               "timeoutInSeconds": 60,
+               "action": "NOTIFY_COMPONENTS"
+           },
+           "configurationValidationPolicy": {
+               "timeoutInSeconds": 60
            }
        }'
    
-   echo "✅ Lambda component deployed to Greengrass Core"
+   echo "✅ Lambda component deployment created"
    ```
 
-   The Lambda component is now deployed to the Greengrass Core, enabling local execution of edge processing logic with automatic lifecycle management.
+   The Lambda component deployment is now queued for the Greengrass Core, enabling local execution of edge processing logic with automatic lifecycle management.
 
 8. **Configure Stream Manager for Data Routing**:
 
    Stream Manager provides reliable data ingestion and routing capabilities for IoT applications. It handles data buffering, batching, and automatic retry logic, ensuring reliable data flow between edge devices and cloud services even during network interruptions.
 
    ```bash
-   # Create Stream Manager configuration
-   cat > stream-manager-config.json << 'EOF'
-   {
-       "streams": [
-           {
-               "name": "sensor-data-stream",
-               "maxSize": 1000,
-               "streamSegmentSize": 100,
-               "timeToLiveMillis": 3600000,
-               "strategyOnFull": "OverwriteOldestData",
-               "exportDefinition": {
-                   "kinesis": [
-                       {
-                           "identifier": "sensor-data-export",
-                           "kinesisStreamName": "sensor-data-stream",
-                           "batchSize": 10,
-                           "batchIntervalMillis": 5000
-                       }
-                   ]
-               }
-           }
-       ]
-   }
-   EOF
-   
    # Deploy Stream Manager component
    aws greengrassv2 create-deployment \
        --target-arn "arn:aws:iot:${AWS_REGION}:${AWS_ACCOUNT_ID}:thinggroup/${THING_GROUP_NAME}" \
        --deployment-name "stream-manager-deployment-${RANDOM_SUFFIX}" \
        --components '{
            "aws.greengrass.StreamManager": {
-               "componentVersion": "2.0.0",
+               "componentVersion": "2.1.7",
                "configurationUpdate": {
-                   "merge": "'$(cat stream-manager-config.json)'"
+                   "merge": "{\"STREAM_MANAGER_STORE_ROOT_DIR\":\"/tmp\",\"STREAM_MANAGER_SERVER_PORT\":\"8088\",\"LOG_LEVEL\":\"INFO\"}"
                }
            }
+       }' \
+       --deployment-policies '{
+           "failureHandlingPolicy": "ROLLBACK",
+           "componentUpdatePolicy": {
+               "timeoutInSeconds": 60,
+               "action": "NOTIFY_COMPONENTS"
+           },
+           "configurationValidationPolicy": {
+               "timeoutInSeconds": 60
+           }
        }'
+   
+   # Wait for deployment to complete
+   sleep 30
    
    echo "✅ Stream Manager configured for data routing"
    ```
@@ -421,7 +415,7 @@ echo "Core device name: ${CORE_DEVICE_NAME}"
 1. **Verify Greengrass Core Installation**:
 
    ```bash
-   # Check Greengrass Core status
+   # Check Greengrass Core service status
    sudo systemctl status greengrass
    
    # Verify core device registration
@@ -434,7 +428,7 @@ echo "Core device name: ${CORE_DEVICE_NAME}"
 2. **Test Lambda Function Execution**:
 
    ```bash
-   # Invoke edge Lambda function
+   # Invoke cloud Lambda function for testing
    aws lambda invoke \
        --function-name "edge-processor-${RANDOM_SUFFIX}" \
        --payload '{"device_id": "sensor-001", "temperature": 25.5}' \
@@ -444,39 +438,70 @@ echo "Core device name: ${CORE_DEVICE_NAME}"
    cat response.json
    ```
 
-   Expected output: JSON response with processed sensor data
+   Expected output: JSON response with processed sensor data including edge processing indicators
 
-3. **Verify Stream Manager Operation**:
+3. **Verify Greengrass Components**:
 
    ```bash
-   # Check Stream Manager logs
-   sudo journalctl -u greengrass -f | grep StreamManager
+   # List installed components on core device
+   aws greengrassv2 list-installed-components \
+       --core-device-thing-name ${THING_NAME}
    
-   # Verify data export to cloud
+   # Check deployment status
+   aws greengrassv2 list-deployments \
+       --target-arn "arn:aws:iot:${AWS_REGION}:${AWS_ACCOUNT_ID}:thinggroup/${THING_GROUP_NAME}"
+   ```
+
+   Expected output: Components should show "RUNNING" or "FINISHED" lifecycle states
+
+4. **Verify Stream Manager Operation**:
+
+   ```bash
+   # Check Greengrass logs for Stream Manager
+   sudo tail -f /greengrass/v2/logs/aws.greengrass.StreamManager.log
+   
+   # Verify CloudWatch log groups
    aws logs describe-log-groups \
        --log-group-name-prefix "/aws/greengrass"
    ```
 
-   Expected output: Log entries showing successful stream processing
+   Expected output: Log entries showing successful stream processing and component startup
 
 ## Cleanup
 
 1. **Remove Greengrass Deployments**:
 
    ```bash
-   # List and delete deployments
+   # List and cancel active deployments
    DEPLOYMENTS=$(aws greengrassv2 list-deployments \
        --target-arn "arn:aws:iot:${AWS_REGION}:${AWS_ACCOUNT_ID}:thinggroup/${THING_GROUP_NAME}" \
-       --query 'deployments[].deploymentId' --output text)
+       --query 'deployments[?deploymentStatus==`ACTIVE`].deploymentId' \
+       --output text)
    
    for deployment in $DEPLOYMENTS; do
-       aws greengrassv2 cancel-deployment --deployment-id $deployment
+       aws greengrassv2 cancel-deployment \
+           --deployment-id $deployment
    done
    
    echo "✅ Deployments cancelled"
    ```
 
-2. **Remove Lambda Function**:
+2. **Stop and Remove Greengrass Service**:
+
+   ```bash
+   # Stop Greengrass service
+   sudo systemctl stop greengrass
+   
+   # Disable service startup
+   sudo systemctl disable greengrass
+   
+   # Remove installation directory
+   sudo rm -rf /greengrass/v2
+   
+   echo "✅ Greengrass service stopped and removed"
+   ```
+
+3. **Remove Lambda Function**:
 
    ```bash
    # Delete Lambda function
@@ -486,7 +511,7 @@ echo "Core device name: ${CORE_DEVICE_NAME}"
    echo "✅ Lambda function deleted"
    ```
 
-3. **Remove IoT Resources**:
+4. **Remove IoT Resources**:
 
    ```bash
    # Detach and delete policy
@@ -496,6 +521,11 @@ echo "Core device name: ${CORE_DEVICE_NAME}"
    
    aws iot delete-policy \
        --policy-name "greengrass-policy-${RANDOM_SUFFIX}"
+   
+   # Detach certificate from Thing
+   aws iot detach-thing-principal \
+       --thing-name ${THING_NAME} \
+       --principal ${CERT_ARN}
    
    # Delete certificate
    aws iot update-certificate \
@@ -515,9 +545,13 @@ echo "Core device name: ${CORE_DEVICE_NAME}"
    echo "✅ IoT resources deleted"
    ```
 
-4. **Remove IAM Role**:
+5. **Remove IAM Resources**:
 
    ```bash
+   # Delete role alias
+   aws iot delete-role-alias \
+       --role-alias "greengrass-role-alias-${RANDOM_SUFFIX}"
+   
    # Detach policies and delete role
    aws iam detach-role-policy \
        --role-name "greengrass-core-role-${RANDOM_SUFFIX}" \
@@ -526,7 +560,11 @@ echo "Core device name: ${CORE_DEVICE_NAME}"
    aws iam delete-role \
        --role-name "greengrass-core-role-${RANDOM_SUFFIX}"
    
-   echo "✅ IAM role deleted"
+   # Clean up local files
+   rm -f greengrass-*.json *.pem *.key edge-processor.zip
+   rm -rf lambda-edge-function GreengrassInstaller
+   
+   echo "✅ IAM resources and local files cleaned up"
    ```
 
 ## Discussion
@@ -535,19 +573,21 @@ AWS IoT Greengrass enables powerful edge computing scenarios by extending AWS se
 
 The architecture demonstrated here showcases key edge computing patterns including local processing, data streaming, and selective cloud synchronization. Stream Manager provides sophisticated data routing capabilities with automatic retry and buffering, ensuring reliable data flow even during network interruptions. The component-based deployment model enables consistent application delivery across device fleets while supporting diverse hardware platforms.
 
-Security considerations are paramount in edge computing deployments. The recipe implements AWS security best practices including certificate-based device authentication, least-privilege IAM roles, and encrypted communication channels. These security measures ensure that edge devices maintain the same security posture as cloud-based applications while operating in potentially untrusted environments.
+Security considerations are paramount in edge computing deployments. The recipe implements AWS security best practices including certificate-based device authentication, least-privilege IAM roles, and encrypted communication channels. These security measures ensure that edge devices maintain the same security posture as cloud-based applications while operating in potentially untrusted environments. The implementation follows the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles for operational excellence and security.
 
-Performance optimization becomes critical in resource-constrained edge environments. Greengrass provides configurable resource limits, component lifecycle management, and selective component deployment to optimize resource utilization. Organizations should monitor device resources and adjust component configurations based on actual workload requirements and hardware capabilities.
+Performance optimization becomes critical in resource-constrained edge environments. Greengrass provides configurable resource limits, component lifecycle management, and selective component deployment to optimize resource utilization. Organizations should monitor device resources and adjust component configurations based on actual workload requirements and hardware capabilities. For production deployments, consider using the automatic installation method which simplifies provisioning and reduces configuration errors.
+
+> **Note**: The automatic provisioning installer used in this recipe significantly reduces setup complexity compared to manual provisioning methods. For production environments, consider using fleet provisioning for large-scale device deployments.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Sensor Data Fusion**: Create Lambda functions that aggregate data from multiple sensor types and apply machine learning models for predictive analytics
-2. **Edge-to-Edge Communication**: Implement direct device-to-device messaging using Greengrass local messaging capabilities
-3. **Offline Operation Mode**: Configure local data storage and processing for extended offline operation with automatic synchronization upon reconnection
-4. **Fleet Management Dashboard**: Build a web dashboard using IoT Device Management APIs to monitor and manage multiple Greengrass devices
-5. **Custom Component Development**: Create native Greengrass components for specialized hardware integration or performance-critical applications
+1. **Multi-Sensor Data Fusion**: Create Lambda functions that aggregate data from multiple sensor types and apply machine learning models for predictive analytics using SageMaker Neo
+2. **Edge-to-Edge Communication**: Implement direct device-to-device messaging using Greengrass local messaging capabilities and MQTT broker components
+3. **Offline Operation Mode**: Configure local data storage using SQLite component and processing for extended offline operation with automatic synchronization upon reconnection
+4. **Fleet Management Dashboard**: Build a web dashboard using IoT Device Management APIs to monitor and manage multiple Greengrass devices with real-time status updates
+5. **Custom Component Development**: Create native Greengrass components for specialized hardware integration or performance-critical applications using the Greengrass Development Kit
 
 ## Infrastructure Code
 

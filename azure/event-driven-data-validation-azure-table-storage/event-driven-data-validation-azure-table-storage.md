@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Table Storage, Azure Event Grid, Azure Logic Apps, Azure Functions
 estimated-time: 105 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: real-time, data-validation, event-driven, serverless, automation, business-rules
 recipe-generator-version: 1.3
@@ -267,36 +267,71 @@ echo "✅ Storage connection string retrieved"
    import os
    from azure.storage.table import TableServiceClient
    from azure.eventgrid import EventGridPublisherClient
+   from azure.core.credentials import AzureKeyCredential
    
    def main(event: func.EventGridEvent):
        logging.info('Data validation function triggered')
        
        # Parse event data
        event_data = event.get_json()
+       subject = event.subject
+       
+       # Only process table entity events
+       if 'tables' not in subject.lower():
+           logging.info('Skipping non-table event')
+           return
+       
+       # Extract entity data from event
+       data = event_data.get('data', {})
        
        # Validation rules
        validation_results = {
-           'entity_id': event_data.get('id', 'unknown'),
+           'entity_id': data.get('RowKey', 'unknown'),
+           'partition_key': data.get('PartitionKey', 'unknown'),
            'validation_status': 'valid',
            'errors': []
        }
        
        # Basic validation logic
-       if 'amount' in event_data:
-           amount = float(event_data['amount'])
-           if amount < 0:
-               validation_results['errors'].append('Amount cannot be negative')
-           if amount > 10000:
-               validation_results['errors'].append('Amount exceeds maximum limit')
+       if 'amount' in data:
+           try:
+               amount = float(data['amount'])
+               if amount < 0:
+                   validation_results['errors'].append('Amount cannot be negative')
+               if amount > 10000:
+                   validation_results['errors'].append('Amount exceeds maximum limit')
+           except (ValueError, TypeError):
+               validation_results['errors'].append('Invalid amount format')
        
-       if 'email' in event_data:
-           email = event_data['email']
-           if '@' not in email:
+       if 'customerEmail' in data:
+           email = data['customerEmail']
+           if '@' not in email or '.' not in email:
                validation_results['errors'].append('Invalid email format')
        
        # Set validation status
        if validation_results['errors']:
            validation_results['validation_status'] = 'invalid'
+           
+           # Publish validation failure event
+           try:
+               endpoint = os.environ.get('EVENT_GRID_TOPIC_ENDPOINT')
+               key = os.environ.get('EVENT_GRID_TOPIC_KEY')
+               
+               if endpoint and key:
+                   credential = AzureKeyCredential(key)
+                   client = EventGridPublisherClient(endpoint, credential)
+                   
+                   validation_event = {
+                       "subject": f"validation/failed/{validation_results['entity_id']}",
+                       "eventType": "DataValidation.Failed",
+                       "data": validation_results,
+                       "dataVersion": "1.0"
+                   }
+                   
+                   client.send([validation_event])
+                   logging.info('Validation failure event published')
+           except Exception as e:
+               logging.error(f'Failed to publish validation event: {str(e)}')
        
        # Log results
        logging.info(f'Validation results: {validation_results}')
@@ -338,11 +373,16 @@ echo "✅ Storage connection string retrieved"
              "inputs": {
                "schema": {
                  "properties": {
+                   "subject": {"type": "string"},
+                   "eventType": {"type": "string"},
                    "data": {
                      "properties": {
-                       "amount": {"type": "number"},
-                       "customerEmail": {"type": "string"},
-                       "orderId": {"type": "string"}
+                       "entity_id": {"type": "string"},
+                       "validation_status": {"type": "string"},
+                       "errors": {
+                         "type": "array",
+                         "items": {"type": "string"}
+                       }
                      },
                      "type": "object"
                    }
@@ -353,33 +393,29 @@ echo "✅ Storage connection string retrieved"
            }
          },
          "actions": {
-           "Condition": {
+           "Condition_Check_Validation_Failed": {
              "type": "If",
              "expression": {
-               "and": [
-                 {
-                   "greater": [
-                     "@triggerBody().data.amount",
-                     1000
-                   ]
-                 }
+               "equals": [
+                 "@triggerBody()?[\"eventType\"]",
+                 "DataValidation.Failed"
                ]
              },
              "actions": {
-               "Send_approval_email": {
+               "Send_Alert_Email": {
                  "type": "ApiConnection",
                  "inputs": {
                    "host": {
                      "connection": {
-                       "name": "@parameters('$connections')['office365']['connectionId']"
+                       "name": "@parameters(\"$connections\")[\"office365\"][\"connectionId\"]"
                      }
                    },
                    "method": "post",
                    "path": "/v2/Mail",
                    "body": {
                      "To": "admin@company.com",
-                     "Subject": "High-value order requires approval",
-                     "Body": "Order @{triggerBody().data.orderId} for $@{triggerBody().data.amount} needs approval"
+                     "Subject": "Data Validation Failed",
+                     "Body": "Entity @{triggerBody()?[\"data\"]?[\"entity_id\"]} failed validation. Errors: @{join(triggerBody()?[\"data\"]?[\"errors\"], \", \")}"
                    }
                  }
                }
@@ -398,7 +434,7 @@ echo "✅ Storage connection string retrieved"
    Event Grid subscriptions connect event sources to event handlers, enabling automated workflow triggers based on data changes. Subscriptions support advanced filtering, retry policies, and dead letter queues to ensure reliable event processing even in failure scenarios.
 
    ```bash
-   # Create Event Grid subscription for Function
+   # Create Event Grid subscription for Function to process storage events
    az eventgrid event-subscription create \
        --name "function-validation-subscription" \
        --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}" \
@@ -413,13 +449,14 @@ echo "✅ Storage connection string retrieved"
        --resource-group ${RESOURCE_GROUP} \
        --query "accessEndpoint" --output tsv)
    
-   # Create Event Grid subscription for Logic App
+   # Create Event Grid subscription for Logic App to process validation events
    az eventgrid event-subscription create \
        --name "logicapp-validation-subscription" \
        --source-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.EventGrid/topics/${EVENT_GRID_TOPIC}" \
        --endpoint-type webhook \
        --endpoint "${LOGIC_APP_TRIGGER_URL}" \
-       --event-delivery-schema eventgridschema
+       --event-delivery-schema eventgridschema \
+       --included-event-types "DataValidation.Failed"
    
    echo "✅ Event Grid subscriptions configured"
    ```
@@ -441,13 +478,13 @@ echo "✅ Storage connection string retrieved"
    az storage entity insert \
        --connection-string "${STORAGE_CONNECTION_STRING}" \
        --table-name "ValidationRules" \
-       RowKey="MaxAmount" \
+       --entity PartitionKey="OrderValidation" RowKey="MaxAmount" \
        Rule="amount <= 10000" Description="Maximum order amount validation"
    
    az storage entity insert \
        --connection-string "${STORAGE_CONNECTION_STRING}" \
        --table-name "ValidationRules" \
-       RowKey="EmailFormat" \
+       --entity PartitionKey="OrderValidation" RowKey="EmailFormat" \
        Rule="email contains @" Description="Email format validation"
    
    echo "✅ Validation rules configured in table storage"

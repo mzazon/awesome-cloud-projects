@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Error Reporting, Cloud Functions, Cloud Monitoring, Cloud Logging
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-24
 passed-qa: null
 tags: error-reporting, cloud-functions, monitoring, debugging, automation, logging, alerting
 recipe-generator-version: 1.3
@@ -93,7 +93,7 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables for consistent resource naming
+# Set environment variables for GCP resources
 export PROJECT_ID="error-monitoring-$(date +%s)"
 export REGION="us-central1"
 export ZONE="us-central1-a"
@@ -278,21 +278,22 @@ echo "✅ Storage bucket created: ${STORAGE_BUCKET}"
    
    # Create requirements.txt
    cat > requirements.txt << 'EOF'
-   google-cloud-error-reporting>=1.9.0
-   google-cloud-monitoring>=2.15.0
-   google-cloud-firestore>=2.11.0
-   google-cloud-pubsub>=2.18.0
-   functions-framework>=3.4.0
+   google-cloud-error-reporting>=1.11.0
+   google-cloud-monitoring>=2.21.0
+   google-cloud-firestore>=2.16.0
+   google-cloud-pubsub>=2.23.0
+   functions-framework>=3.5.0
    EOF
    
-   # Deploy the error processor function
+   # Deploy the error processor function using 2nd generation
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime=python39 \
+       --gen2 \
+       --runtime=python312 \
        --trigger-topic=${PUBSUB_TOPIC} \
        --source=. \
        --entry-point=process_error \
        --set-env-vars="ALERT_TOPIC=${PUBSUB_TOPIC}-alerts" \
-       --memory=256MB \
+       --memory=256Mi \
        --timeout=60s \
        --region=${REGION}
    
@@ -362,7 +363,7 @@ echo "✅ Storage bucket created: ${STORAGE_BUCKET}"
            "conditions": [{
                "display_name": "Error rate condition",
                "condition_threshold": {
-                   "filter": f'resource.type="gae_app" AND resource.label.module_id="{error_info["service"]}"',
+                   "filter": f'resource.type="cloud_function" AND resource.label.function_name="{error_info["service"]}"',
                    "comparison": "COMPARISON_GREATER_THAN",
                    "threshold_value": 5,
                    "duration": "300s"
@@ -490,20 +491,21 @@ echo "✅ Storage bucket created: ${STORAGE_BUCKET}"
    
    # Create requirements for alert router
    cat > requirements_alert.txt << 'EOF'
-   google-cloud-monitoring>=2.15.0
-   google-cloud-firestore>=2.11.0
-   functions-framework>=3.4.0
-   requests>=2.28.0
+   google-cloud-monitoring>=2.21.0
+   google-cloud-firestore>=2.16.0
+   functions-framework>=3.5.0
+   requests>=2.31.0
    EOF
    
-   # Deploy the alert router function
+   # Deploy the alert router function using 2nd generation
    gcloud functions deploy ${FUNCTION_NAME}-router \
-       --runtime=python39 \
+       --gen2 \
+       --runtime=python312 \
        --trigger-topic=${PUBSUB_TOPIC}-alerts \
        --source=. \
        --entry-point=route_alerts \
        --requirements-file=requirements_alert.txt \
-       --memory=256MB \
+       --memory=256Mi \
        --timeout=60s \
        --region=${REGION}
    
@@ -602,8 +604,8 @@ echo "✅ Storage bucket created: ${STORAGE_BUCKET}"
            end_time = timestamp + timedelta(minutes=5)
            
            filter_str = f"""
-           resource.type="gae_app"
-           resource.labels.module_id="{service}"
+           resource.type="cloud_function"
+           resource.labels.function_name="{service}"
            timestamp>="{start_time.isoformat()}Z"
            timestamp<="{end_time.isoformat()}Z"
            """
@@ -640,7 +642,7 @@ echo "✅ Storage bucket created: ${STORAGE_BUCKET}"
            interval.start_time.seconds = int((timestamp - timedelta(minutes=10)).timestamp())
            
            # Request metrics
-           filter_str = f'resource.type="gae_app" AND resource.label.module_id="{service}"'
+           filter_str = f'resource.type="cloud_function" AND resource.label.function_name="{service}"'
            
            request = monitoring_v3.ListTimeSeriesRequest()
            request.name = project_name
@@ -794,25 +796,26 @@ echo "✅ Storage bucket created: ${STORAGE_BUCKET}"
    
    # Create requirements for debug automation
    cat > requirements_debug.txt << 'EOF'
-   google-cloud-logging>=3.8.0
-   google-cloud-monitoring>=2.15.0
-   google-cloud-firestore>=2.11.0
-   google-cloud-storage>=2.10.0
-   functions-framework>=3.4.0
+   google-cloud-logging>=3.10.0
+   google-cloud-monitoring>=2.21.0
+   google-cloud-firestore>=2.16.0
+   google-cloud-storage>=2.17.0
+   functions-framework>=3.5.0
    EOF
    
    # Create another Pub/Sub topic for debug automation
    gcloud pubsub topics create ${PUBSUB_TOPIC}-debug
    
-   # Deploy the debug automation function
+   # Deploy the debug automation function using 2nd generation
    gcloud functions deploy ${FUNCTION_NAME}-debug \
-       --runtime=python39 \
+       --gen2 \
+       --runtime=python312 \
        --trigger-topic=${PUBSUB_TOPIC}-debug \
        --source=. \
        --entry-point=automate_debugging \
        --requirements-file=requirements_debug.txt \
        --set-env-vars="DEBUG_BUCKET=${STORAGE_BUCKET}" \
-       --memory=512MB \
+       --memory=512Mi \
        --timeout=120s \
        --region=${REGION}
    
@@ -944,20 +947,21 @@ echo "✅ Storage bucket created: ${STORAGE_BUCKET}"
    
    # Create requirements for sample app
    cat > requirements_sample.txt << 'EOF'
-   google-cloud-error-reporting>=1.9.0
-   google-cloud-logging>=3.8.0
-   flask>=2.3.0
-   functions-framework>=3.4.0
+   google-cloud-error-reporting>=1.11.0
+   google-cloud-logging>=3.10.0
+   flask>=3.0.0
+   functions-framework>=3.5.0
    EOF
    
-   # Deploy the sample application
+   # Deploy the sample application using 2nd generation
    gcloud functions deploy sample-error-app \
-       --runtime=python39 \
+       --gen2 \
+       --runtime=python312 \
        --trigger-http \
        --source=. \
        --entry-point=sample_app \
        --requirements-file=requirements_sample.txt \
-       --memory=128MB \
+       --memory=128Mi \
        --timeout=60s \
        --region=${REGION} \
        --allow-unauthenticated
@@ -988,12 +992,12 @@ echo "✅ Storage bucket created: ${STORAGE_BUCKET}"
                  {
                    "timeSeriesQuery": {
                      "timeSeriesFilter": {
-                       "filter": "resource.type=\"gae_app\"",
+                       "filter": "resource.type=\"cloud_function\"",
                        "aggregation": {
                          "alignmentPeriod": "60s",
                          "perSeriesAligner": "ALIGN_RATE",
                          "crossSeriesReducer": "REDUCE_SUM",
-                         "groupByFields": ["resource.label.module_id"]
+                         "groupByFields": ["resource.label.function_name"]
                        }
                      }
                    }
@@ -1103,7 +1107,7 @@ echo "✅ Storage bucket created: ${STORAGE_BUCKET}"
    ```bash
    # Get the sample app URL
    SAMPLE_APP_URL=$(gcloud functions describe sample-error-app \
-       --region=${REGION} --format="value(httpsTrigger.url)")
+       --region=${REGION} --format="value(serviceConfig.uri)")
    
    # Test critical error generation
    curl -X POST "${SAMPLE_APP_URL}" \
@@ -1143,9 +1147,11 @@ echo "✅ Storage bucket created: ${STORAGE_BUCKET}"
 
    ```bash
    # Check Firestore for error records
-   gcloud firestore documents list errors \
-       --format="table(name,createTime)" \
-       --limit=5
+   gcloud firestore export gs://${STORAGE_BUCKET}/firestore-backup/ \
+       --collection-ids=errors
+   
+   # List the export to verify data
+   gsutil ls gs://${STORAGE_BUCKET}/firestore-backup/
    
    # Check debug reports in Cloud Storage
    gsutil ls gs://${STORAGE_BUCKET}/debug_reports/
@@ -1207,9 +1213,8 @@ echo "✅ Storage bucket created: ${STORAGE_BUCKET}"
    # Delete Cloud Storage bucket
    gsutil -m rm -r gs://${STORAGE_BUCKET}
    
-   # Delete Firestore collections (be careful in production)
-   gcloud firestore documents delete \
-       --all-collections \
+   # Delete Firestore database
+   gcloud firestore databases delete --database="(default)" \
        --quiet
    
    echo "✅ Storage and Firestore data deleted"
@@ -1241,13 +1246,13 @@ echo "✅ Storage bucket created: ${STORAGE_BUCKET}"
 
 ## Discussion
 
-This intelligent error monitoring solution demonstrates the power of combining Google Cloud's native observability services with serverless automation to create a comprehensive error management system. The architecture leverages [Cloud Error Reporting](https://cloud.google.com/error-reporting/docs) for automatic error aggregation, [Cloud Functions](https://cloud.google.com/functions/docs) for serverless processing, and [Cloud Monitoring](https://cloud.google.com/monitoring/docs) for alerting and dashboards.
+This intelligent error monitoring solution demonstrates the power of combining Google Cloud's native observability services with serverless automation to create a comprehensive error management system. The architecture leverages [Cloud Error Reporting](https://cloud.google.com/error-reporting/docs) for automatic error aggregation, [Cloud Functions](https://cloud.google.com/functions/docs) (2nd generation) for serverless processing, and [Cloud Monitoring](https://cloud.google.com/monitoring/docs) for alerting and dashboards.
 
 The system's intelligence lies in its ability to automatically classify errors by severity, detect patterns that might indicate systemic issues, and route notifications through appropriate channels. By using [Firestore](https://cloud.google.com/firestore/docs) for error tracking and pattern analysis, the solution builds historical context that improves over time. The debug automation function demonstrates how to automatically collect relevant context around errors, reducing the manual effort required for troubleshooting.
 
 The integration with [Cloud Logging](https://cloud.google.com/logging/docs) through log sinks creates a real-time pipeline that triggers automated responses as errors occur, rather than requiring manual monitoring. This proactive approach significantly reduces mean time to detection (MTTD) and mean time to recovery (MTTR) for critical issues.
 
-The solution follows Google Cloud best practices for [observability](https://cloud.google.com/architecture/monitoring) and demonstrates how to build resilient systems that can automatically respond to failures. The use of Pub/Sub for event routing ensures loose coupling between components and enables the system to scale with error volume.
+The solution follows Google Cloud best practices for [observability](https://cloud.google.com/architecture/framework/operational-excellence/monitoring-alerting-observability) and demonstrates how to build resilient systems that can automatically respond to failures. The use of Pub/Sub for event routing ensures loose coupling between components and enables the system to scale with error volume.
 
 > **Tip**: Consider implementing rate limiting in the alert router function to prevent alert storms during system-wide outages. Use exponential backoff for retries and implement circuit breaker patterns for external service integrations.
 

@@ -1,21 +1,21 @@
 ---
-title: IoT Device Lifecycle Management
+title: IoT Device Lifecycle Management with AWS IoT Core
 id: 6f0e97d8
 category: iot
 difficulty: 300
 subject: aws
-services: iot-core, iot-device-management, cloudwatch
+services: iot-core, iot-device-management, cloudwatch, iot-jobs
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: iot, device-management, fleet-management, firmware-updates
+tags: iot, device-management, fleet-management, firmware-updates, ota-updates
 recipe-generator-version: 1.3
 ---
 
-# IoT Device Lifecycle Management
+# IoT Device Lifecycle Management with AWS IoT Core
 
 ## Problem
 
@@ -23,7 +23,7 @@ Manufacturing companies and fleet operators struggle with managing thousands of 
 
 ## Solution
 
-AWS IoT Device Management provides a centralized platform for organizing, monitoring, and managing IoT devices at scale. The solution uses device groups and fleet indexing to organize devices logically, enables remote device provisioning and configuration, and supports over-the-air (OTA) firmware updates. This approach eliminates the need for physical access to devices while providing comprehensive visibility and control over the entire device fleet.
+AWS IoT Device Management provides a centralized platform for organizing, monitoring, and managing IoT devices at scale. The solution uses device groups and fleet indexing to organize devices logically, enables remote device provisioning and configuration, and supports over-the-air (OTA) firmware updates. This approach eliminates the need for physical access to devices while providing comprehensive visibility and control over the entire device fleet through AWS IoT Core services.
 
 ## Architecture Diagram
 
@@ -52,14 +52,15 @@ graph TB
     
     subgraph "Monitoring & Management"
         CW[CloudWatch]
+        METRICS[Fleet Metrics]
+        LOGS[CloudWatch Logs]
         CONSOLE[AWS Console]
-        API[Management APIs]
     end
     
-    D1 --> CORE
-    D2 --> CORE
-    D3 --> CORE
-    D4 --> CORE
+    D1 -->|MQTT/HTTPS| CORE
+    D2 -->|MQTT/HTTPS| CORE
+    D3 -->|MQTT/HTTPS| CORE
+    D4 -->|MQTT/HTTPS| CORE
     
     CORE --> REGISTRY
     CORE --> SHADOW
@@ -73,25 +74,29 @@ graph TB
     DM --> GROUPS
     DM --> POLICIES
     
-    FLEET --> CW
+    FLEET --> METRICS
     GROUPS --> CONSOLE
-    POLICIES --> API
+    POLICIES --> LOGS
+    METRICS --> CW
+    LOGS --> CW
     
     style CORE fill:#FF9900
     style DM fill:#3F8624
     style FLEET fill:#146EB4
     style GROUPS fill:#FF9900
+    style METRICS fill:#E7157B
 ```
 
 ## Prerequisites
 
-1. AWS account with IoT Core and Device Management permissions
+1. AWS account with IoT Core, IoT Device Management, and CloudWatch permissions
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of IoT concepts and device management
 4. Familiarity with JSON and command-line operations
-5. Estimated cost: $0.50-$2.00 per hour for resources created (varies by region and usage)
+5. `jq` utility installed for JSON processing
+6. Estimated cost: $0.50-$2.00 per hour for resources created (varies by region and usage)
 
-> **Note**: Fleet indexing and device monitoring may incur additional charges based on the number of devices and data indexed.
+> **Note**: Fleet indexing and device monitoring may incur additional charges based on the number of devices and data indexed. See [AWS IoT Core pricing](https://aws.amazon.com/iot-core/pricing/) for detailed cost information.
 
 ## Preparation
 
@@ -126,7 +131,7 @@ echo "✅ Fleet indexing enabled for device management"
 
 1. **Create IoT Thing Type for Device Templates**:
 
-   IoT Thing Types serve as templates that define the attributes and capabilities of similar devices in your fleet. By creating a standardized thing type, you establish a schema for device metadata that enables consistent fleet management, search operations, and automated workflows. This foundational step ensures all temperature sensors in your fleet follow the same attribute structure.
+   IoT Thing Types serve as templates that define the attributes and capabilities of similar devices in your fleet. By creating a standardized thing type, you establish a schema for device metadata that enables consistent fleet management, search operations, and automated workflows. This foundational step ensures all temperature sensors in your fleet follow the same attribute structure and can be efficiently managed through the AWS IoT registry.
 
    ```bash
    # Create a thing type to define device characteristics
@@ -135,7 +140,7 @@ echo "✅ Fleet indexing enabled for device management"
        --thing-type-properties \
        "thingTypeDescription=Temperature sensor device type,searchableAttributes=location,firmwareVersion,manufacturer"
    
-   # Store the thing type ARN
+   # Store the thing type ARN for later use
    THING_TYPE_ARN=$(aws iot describe-thing-type \
        --thing-type-name $THING_TYPE_NAME \
        --query thingTypeArn --output text)
@@ -143,11 +148,11 @@ echo "✅ Fleet indexing enabled for device management"
    echo "✅ Created thing type: $THING_TYPE_NAME"
    ```
 
-   The thing type is now established with searchable attributes that enable fleet indexing to quickly locate devices by location, firmware version, or manufacturer. This template will be applied to all devices created in subsequent steps, ensuring consistent metadata structure across your entire IoT fleet.
+   The thing type is now established with searchable attributes that enable fleet indexing to quickly locate devices by location, firmware version, or manufacturer. This template will be applied to all devices created in subsequent steps, ensuring consistent metadata structure across your entire IoT fleet and enabling powerful search capabilities.
 
 2. **Create Thing Group for Device Organization**:
 
-   Thing Groups provide logical organization for devices, enabling batch operations like firmware updates, policy changes, and monitoring. Unlike individual device management, groups allow you to apply configurations and jobs to hundreds or thousands of devices simultaneously. This hierarchical organization mirrors real-world deployment patterns and simplifies fleet administration.
+   Thing Groups provide logical organization for devices, enabling batch operations like firmware updates, policy changes, and monitoring. Unlike individual device management, groups allow you to apply configurations and jobs to hundreds or thousands of devices simultaneously. This hierarchical organization mirrors real-world deployment patterns and simplifies fleet administration through centralized management operations.
 
    ```bash
    # Create a thing group for organizing devices
@@ -156,7 +161,7 @@ echo "✅ Fleet indexing enabled for device management"
        --thing-group-properties \
        "thingGroupDescription=Production temperature sensors,attributePayload={attributes={Environment=Production,Location=Factory1}}"
    
-   # Get the thing group ARN
+   # Get the thing group ARN for targeting operations
    THING_GROUP_ARN=$(aws iot describe-thing-group \
        --thing-group-name $THING_GROUP_NAME \
        --query thingGroupArn --output text)
@@ -164,14 +169,14 @@ echo "✅ Fleet indexing enabled for device management"
    echo "✅ Created thing group: $THING_GROUP_NAME"
    ```
 
-   The thing group now serves as a container for production temperature sensors with shared attributes and policies. Any IoT jobs or configuration changes applied to this group will automatically propagate to all member devices, enabling efficient fleet-wide management operations.
+   The thing group now serves as a container for production temperature sensors with shared attributes and policies. Any IoT jobs or configuration changes applied to this group will automatically propagate to all member devices, enabling efficient fleet-wide management operations while maintaining logical organization based on business requirements.
 
 3. **Create IoT Policy for Device Permissions**:
 
-   IoT policies implement fine-grained access control using the principle of least privilege, ensuring devices can only access the specific resources they need. The policy uses dynamic variables like `${iot:Connection.Thing.ThingName}` to automatically scope permissions to each device, preventing unauthorized cross-device access and maintaining security isolation.
+   IoT policies implement fine-grained access control using the principle of least privilege, ensuring devices can only access the specific resources they need. The policy uses dynamic variables like `${iot:Connection.Thing.ThingName}` to automatically scope permissions to each device, preventing unauthorized cross-device access and maintaining security isolation. This follows AWS IoT security best practices for device authentication and authorization.
 
    ```bash
-   # Create IAM policy document for IoT devices
+   # Create IoT policy document for device permissions
    cat > device-policy.json << 'EOF'
    {
      "Version": "2012-10-17",
@@ -205,7 +210,7 @@ echo "✅ Fleet indexing enabled for device management"
    }
    EOF
    
-   # Create the IoT policy
+   # Create the IoT policy with device permissions
    aws iot create-policy \
        --policy-name $POLICY_NAME \
        --policy-document file://device-policy.json
@@ -213,11 +218,11 @@ echo "✅ Fleet indexing enabled for device management"
    echo "✅ Created IoT policy: $POLICY_NAME"
    ```
 
-   The IoT policy now enforces security boundaries that allow devices to communicate only through their designated topics and manage their own device shadows. This security model scales automatically as new devices are added while maintaining isolation between different devices in the fleet.
+   The IoT policy now enforces security boundaries that allow devices to communicate only through their designated topics and manage their own device shadows. This security model scales automatically as new devices are added while maintaining isolation between different devices in the fleet, following AWS security best practices.
 
 4. **Provision Multiple IoT Devices**:
 
-   Device provisioning creates individual IoT Things that represent physical devices in your fleet. Each thing inherits the structure from the thing type while maintaining unique attributes like location and device-specific identifiers. This step demonstrates bulk provisioning patterns that can be automated for large-scale deployments across multiple facilities.
+   Device provisioning creates individual IoT Things that represent physical devices in your fleet. Each thing inherits the structure from the thing type while maintaining unique attributes like location and device-specific identifiers. This step demonstrates bulk provisioning patterns that can be automated for large-scale deployments across multiple facilities using the AWS IoT Device Management service.
 
    ```bash
    # Create multiple devices for fleet demonstration
@@ -228,14 +233,14 @@ echo "✅ Fleet indexing enabled for device management"
        DEVICE_NAME="${DEVICES[$i]}"
        LOCATION="${LOCATIONS[$i]}"
        
-       # Create IoT thing
+       # Create IoT thing with metadata attributes
        aws iot create-thing \
            --thing-name $DEVICE_NAME \
            --thing-type-name $THING_TYPE_NAME \
            --attribute-payload \
            "{\"attributes\":{\"location\":\"$LOCATION\",\"firmwareVersion\":\"1.0.0\",\"manufacturer\":\"AcmeSensors\"}}"
        
-       # Add thing to group
+       # Add thing to group for batch management
        aws iot add-thing-to-thing-group \
            --thing-name $DEVICE_NAME \
            --thing-group-name $THING_GROUP_NAME
@@ -244,16 +249,16 @@ echo "✅ Fleet indexing enabled for device management"
    done
    ```
 
-   Four temperature sensors are now registered in the IoT registry with location-specific attributes and automatic group membership. The fleet indexing service can now search and filter these devices by any attribute, enabling powerful fleet management operations like location-based firmware updates or building-specific monitoring.
+   Four temperature sensors are now registered in the IoT registry with location-specific attributes and automatic group membership. The fleet indexing service can now search and filter these devices by any attribute, enabling powerful fleet management operations like location-based firmware updates or building-specific monitoring configurations.
 
 5. **Create Device Certificates and Attach Policies**:
 
-   X.509 certificates provide mutual authentication between devices and AWS IoT Core, ensuring secure, encrypted communication channels. Each device receives a unique certificate that serves as its digital identity, enabling secure connection establishment and message encryption. This PKI-based security model eliminates the need for shared secrets or API keys.
+   X.509 certificates provide mutual authentication between devices and AWS IoT Core, ensuring secure, encrypted communication channels. Each device receives a unique certificate that serves as its digital identity, enabling secure connection establishment and message encryption. This PKI-based security model eliminates the need for shared secrets or API keys while providing robust authentication capabilities.
 
    ```bash
    # Create certificates for each device
    for DEVICE in "${DEVICES[@]}"; do
-       # Create certificate
+       # Create certificate and keys for device authentication
        CERT_OUTPUT=$(aws iot create-keys-and-certificate \
            --set-as-active \
            --query '{certificateArn:certificateArn,certificateId:certificateId}' \
@@ -262,12 +267,12 @@ echo "✅ Fleet indexing enabled for device management"
        CERT_ARN=$(echo $CERT_OUTPUT | jq -r '.certificateArn')
        CERT_ID=$(echo $CERT_OUTPUT | jq -r '.certificateId')
        
-       # Attach policy to certificate
+       # Attach IoT policy to certificate for permissions
        aws iot attach-policy \
            --policy-name $POLICY_NAME \
            --target $CERT_ARN
        
-       # Attach certificate to thing
+       # Attach certificate to thing for identity binding
        aws iot attach-thing-principal \
            --thing-name $DEVICE \
            --principal $CERT_ARN
@@ -276,11 +281,11 @@ echo "✅ Fleet indexing enabled for device management"
    done
    ```
 
-   Each device now has a unique certificate with attached IoT policies that enforce access controls. The certificate-to-thing binding establishes the device's identity for all subsequent IoT operations, while the attached policy ensures the device can only access authorized resources and topics.
+   Each device now has a unique certificate with attached IoT policies that enforce access controls. The certificate-to-thing binding establishes the device's identity for all subsequent IoT operations, while the attached policy ensures the device can only access authorized resources and topics according to the principle of least privilege.
 
-6. **Create Dynamic Thing Group for Monitoring**:
+6. **Create Dynamic Thing Groups for Monitoring**:
 
-   Dynamic Thing Groups automatically organize devices based on real-time attribute queries, enabling self-maintaining organizational structures. Unlike static groups that require manual device addition, dynamic groups automatically include or exclude devices as their attributes change, ensuring accurate targeting for monitoring, updates, and compliance checks.
+   Dynamic Thing Groups automatically organize devices based on real-time attribute queries, enabling self-maintaining organizational structures. Unlike static groups that require manual device addition, dynamic groups automatically include or exclude devices as their attributes change, ensuring accurate targeting for monitoring, updates, and compliance checks. This automation reduces operational overhead and ensures groups remain current.
 
    ```bash
    # Create dynamic group for devices with old firmware
@@ -300,11 +305,11 @@ echo "✅ Fleet indexing enabled for device management"
    echo "✅ Created dynamic thing groups for monitoring"
    ```
 
-   Dynamic groups now provide automated organization based on firmware versions and device locations. As devices receive firmware updates or are relocated, they automatically move between groups, enabling targeted management operations and ensuring accurate fleet visibility without manual intervention.
+   Dynamic groups now provide automated organization based on firmware versions and device locations. As devices receive firmware updates or are relocated, they automatically move between groups, enabling targeted management operations and ensuring accurate fleet visibility without manual intervention or administrative overhead.
 
 7. **Set Up Fleet Monitoring and Logging**:
 
-   Comprehensive logging provides visibility into device behavior, connection patterns, and operational issues across the fleet. Group-level logging enables centralized monitoring while CloudWatch integration provides searchable logs, metrics, and alerting capabilities essential for production IoT deployments at scale.
+   Comprehensive logging provides visibility into device behavior, connection patterns, and operational issues across the fleet. Group-level logging enables centralized monitoring while CloudWatch integration provides searchable logs, metrics, and alerting capabilities essential for production IoT deployments at scale. This monitoring foundation enables proactive issue detection and troubleshooting.
 
    ```bash
    # Set logging level for the thing group
@@ -325,7 +330,7 @@ echo "✅ Fleet indexing enabled for device management"
 
 8. **Create IoT Job for Firmware Updates**:
 
-   IoT Jobs enable over-the-air (OTA) updates and remote device management without requiring physical access to devices. Continuous jobs automatically include new devices added to the target group, ensuring consistent firmware versions across the fleet. The job execution controls prevent overwhelming the network and infrastructure by limiting concurrent updates.
+   IoT Jobs enable over-the-air (OTA) updates and remote device management without requiring physical access to devices. Continuous jobs automatically include new devices added to the target group, ensuring consistent firmware versions across the fleet. The job execution controls prevent overwhelming the network and infrastructure by limiting concurrent updates and providing timeout protection.
 
    ```bash
    # Create job document for firmware update
@@ -334,7 +339,7 @@ echo "✅ Fleet indexing enabled for device management"
      "operation": "firmwareUpdate",
      "firmwareVersion": "1.1.0",
      "downloadUrl": "https://example-firmware-bucket.s3.amazonaws.com/firmware-v1.1.0.bin",
-     "checksum": "abc123def456",
+     "checksum": "sha256:abc123def456789abcdef123456789abcdef123456789abcdef123456789abcdef",
      "rebootRequired": true,
      "timeout": 300
    }
@@ -357,25 +362,27 @@ echo "✅ Fleet indexing enabled for device management"
 
    The firmware update job is now deployed to all devices in the sensor group with built-in safety controls including concurrent execution limits and timeouts. Devices will receive the job notification and execute the firmware update according to their individual schedules, providing detailed status reporting throughout the process.
 
-   > **Warning**: Always test firmware updates on a small subset of devices before deploying to the entire fleet to prevent widespread outages from faulty firmware.
+   > **Warning**: Always test firmware updates on a small subset of devices before deploying to the entire fleet to prevent widespread outages from faulty firmware. Consider implementing a canary deployment strategy for critical updates.
 
 9. **Configure Device Monitoring with Device Shadows**:
 
-   Device Shadows maintain the current and desired state of IoT devices, enabling robust offline-first communication patterns. The shadow acts as a persistent, JSON-based representation of device state that applications can interact with even when devices are disconnected, ensuring reliable device management across intermittent network conditions.
+   Device Shadows maintain the current and desired state of IoT devices, enabling robust offline-first communication patterns. The shadow acts as a persistent, JSON-based representation of device state that applications can interact with even when devices are disconnected, ensuring reliable device management across intermittent network conditions. This mechanism enables asynchronous device state management and configuration.
 
    ```bash
    # Update device shadow for one device to simulate telemetry
    DEVICE_NAME="${DEVICES[0]}"
    
-   # Create shadow document
-   cat > shadow-update.json << 'EOF'
+   # Create shadow document with current timestamp
+   CURRENT_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+   
+   cat > shadow-update.json << EOF
    {
      "state": {
        "reported": {
          "temperature": 22.5,
          "humidity": 45.2,
          "batteryLevel": 85,
-         "lastSeen": "2024-01-15T10:30:00Z",
+         "lastSeen": "$CURRENT_TIMESTAMP",
          "firmwareVersion": "1.0.0"
        },
        "desired": {
@@ -386,7 +393,7 @@ echo "✅ Fleet indexing enabled for device management"
    }
    EOF
    
-   # Update device shadow
+   # Update device shadow with current state
    aws iot-data update-thing-shadow \
        --thing-name $DEVICE_NAME \
        --payload file://shadow-update.json \
@@ -395,15 +402,15 @@ echo "✅ Fleet indexing enabled for device management"
    echo "✅ Updated device shadow for $DEVICE_NAME"
    ```
 
-   The device shadow now contains both the current sensor readings (reported state) and the desired configuration (desired state). When the device reconnects, it will compare these states and adjust its behavior accordingly, demonstrating the shadow's role in enabling reliable device state management.
+   The device shadow now contains both the current sensor readings (reported state) and the desired configuration (desired state). When the device reconnects, it will compare these states and adjust its behavior accordingly, demonstrating the shadow's role in enabling reliable device state management and configuration synchronization.
 
 10. **Create Fleet Metrics for Monitoring**:
 
-    Fleet Metrics provide aggregated insights into device fleet health and characteristics by automatically collecting and analyzing data from the fleet index. These metrics enable proactive monitoring, trend analysis, and automated alerting based on fleet-wide conditions rather than individual device monitoring.
+    Fleet Metrics provide aggregated insights into device fleet health and characteristics by automatically collecting and analyzing data from the fleet index. These metrics enable proactive monitoring, trend analysis, and automated alerting based on fleet-wide conditions rather than individual device monitoring. The metrics integrate with CloudWatch for comprehensive monitoring capabilities.
 
     ```bash
     # Create fleet metric for device connectivity
-    aws iot put-fleet-metric \
+    aws iot create-fleet-metric \
         --metric-name "ConnectedDevices-${RANDOM_SUFFIX}" \
         --query-string "connectivity.connected:true" \
         --aggregation-type name=Statistics,values=count \
@@ -412,7 +419,7 @@ echo "✅ Fleet indexing enabled for device management"
         --description "Count of connected devices in fleet"
     
     # Create fleet metric for firmware versions
-    aws iot put-fleet-metric \
+    aws iot create-fleet-metric \
         --metric-name "FirmwareVersions-${RANDOM_SUFFIX}" \
         --query-string "attributes.firmwareVersion:*" \
         --aggregation-type name=Statistics,values=count \
@@ -423,9 +430,9 @@ echo "✅ Fleet indexing enabled for device management"
     echo "✅ Created fleet metrics for monitoring"
     ```
 
-    Fleet metrics now continuously monitor device connectivity status and firmware version distribution across the entire fleet. These metrics integrate with CloudWatch to enable automated alerting when connectivity drops below thresholds or when firmware compliance issues are detected.
+    Fleet metrics now continuously monitor device connectivity status and firmware version distribution across the entire fleet. These metrics integrate with CloudWatch to enable automated alerting when connectivity drops below thresholds or when firmware compliance issues are detected, providing proactive fleet health monitoring.
 
-    > **Note**: Fleet metrics are published to CloudWatch at regular intervals, enabling integration with existing monitoring dashboards and alerting systems. See [AWS IoT Fleet Metrics documentation](https://docs.aws.amazon.com/iot/latest/developerguide/fleet-metrics.html) for advanced configuration options.
+    > **Note**: Fleet metrics are published to CloudWatch at regular intervals, enabling integration with existing monitoring dashboards and alerting systems. See [AWS IoT Fleet Metrics documentation](https://docs.aws.amazon.com/iot/latest/developerguide/fleet-metrics.html) for advanced configuration options and pricing details.
 
 ## Validation & Testing
 
@@ -441,7 +448,7 @@ echo "✅ Fleet indexing enabled for device management"
        --thing-group-name "outdated-firmware-${RANDOM_SUFFIX}"
    ```
 
-   Expected output: JSON array with device names in each group
+   Expected output: JSON array containing device names organized by group membership
 
 2. **Test Device Search and Fleet Indexing**:
 
@@ -457,35 +464,48 @@ echo "✅ Fleet indexing enabled for device management"
        --query-string "attributes.location:Building-A"
    ```
 
-   Expected output: Device details matching the search criteria
+   Expected output: Device details matching the search criteria with full attribute information
 
 3. **Verify IoT Job Status**:
 
    ```bash
-   # Check job status
+   # Check job status and execution details
    aws iot describe-job \
        --job-id "firmware-update-${RANDOM_SUFFIX}"
    
-   # List job executions
+   # List job executions for each device
    aws iot list-job-executions-for-job \
        --job-id "firmware-update-${RANDOM_SUFFIX}"
    ```
 
-   Expected output: Job details and execution status for each device
+   Expected output: Job details including status, target information, and execution progress
 
 4. **Test Device Shadow Operations**:
 
    ```bash
-   # Retrieve device shadow
+   # Retrieve device shadow state
    aws iot-data get-thing-shadow \
        --thing-name ${DEVICES[0]} \
        retrieved-shadow.json
    
-   # Display shadow contents
+   # Display shadow contents with formatting
    cat retrieved-shadow.json | jq '.'
    ```
 
-   Expected output: Device shadow with reported and desired states
+   Expected output: Device shadow containing both reported and desired states with metadata
+
+5. **Verify Fleet Metrics Creation**:
+
+   ```bash
+   # List created fleet metrics
+   aws iot list-fleet-metrics
+   
+   # Describe specific fleet metric
+   aws iot describe-fleet-metric \
+       --metric-name "ConnectedDevices-${RANDOM_SUFFIX}"
+   ```
+
+   Expected output: Fleet metric configuration details and current status
 
 ## Cleanup
 
@@ -494,10 +514,12 @@ echo "✅ Fleet indexing enabled for device management"
    ```bash
    # Cancel and delete IoT job
    aws iot cancel-job \
-       --job-id "firmware-update-${RANDOM_SUFFIX}"
+       --job-id "firmware-update-${RANDOM_SUFFIX}" \
+       --force
    
    aws iot delete-job \
-       --job-id "firmware-update-${RANDOM_SUFFIX}"
+       --job-id "firmware-update-${RANDOM_SUFFIX}" \
+       --force
    
    # Delete fleet metrics
    aws iot delete-fleet-metric \
@@ -536,7 +558,7 @@ echo "✅ Fleet indexing enabled for device management"
                --certificate-id $CERT_ID \
                --new-status INACTIVE
            
-           # Delete certificate
+           # Delete certificate after deactivation
            aws iot delete-certificate \
                --certificate-id $CERT_ID
        done
@@ -572,12 +594,12 @@ echo "✅ Fleet indexing enabled for device management"
 4. **Remove IoT Things and Policies**:
 
    ```bash
-   # Delete IoT things
+   # Delete IoT things from registry
    for DEVICE in "${DEVICES[@]}"; do
        aws iot delete-thing --thing-name $DEVICE
    done
    
-   # Delete thing type
+   # Delete thing type template
    aws iot delete-thing-type \
        --thing-type-name $THING_TYPE_NAME
    
@@ -604,27 +626,27 @@ echo "✅ Fleet indexing enabled for device management"
 
 ## Discussion
 
-AWS IoT Device Management provides a comprehensive solution for managing IoT devices at scale through several key capabilities. The device registry serves as the central repository for device metadata, while thing groups enable logical organization of devices based on function, location, or other criteria. Fleet indexing allows for powerful search and filtering capabilities across the entire device fleet, making it easy to identify devices that need attention or updates.
+AWS IoT Device Management provides a comprehensive solution for managing IoT devices at scale through several key capabilities that follow the AWS Well-Architected Framework. The device registry serves as the central repository for device metadata, while thing groups enable logical organization of devices based on function, location, or other business criteria. Fleet indexing allows for powerful search and filtering capabilities across the entire device fleet, making it easy to identify devices that need attention or updates based on various attributes and states.
 
-The integration with AWS IoT Jobs enables remote management operations such as firmware updates, configuration changes, and troubleshooting commands. Jobs can be targeted at individual devices, groups of devices, or dynamic groups that automatically include devices matching specific criteria. This eliminates the need for physical access to devices while ensuring consistent management across the fleet.
+The integration with AWS IoT Jobs enables remote management operations such as firmware updates, configuration changes, and troubleshooting commands without requiring physical access to devices. Jobs can be targeted at individual devices, groups of devices, or dynamic groups that automatically include devices matching specific criteria. This eliminates the need for field technicians to visit device locations while ensuring consistent management across the fleet, reducing operational costs and improving response times.
 
-Device shadows provide a powerful mechanism for managing device state, allowing applications to interact with devices even when they're offline. The shadow document maintains the last known state and desired configuration, enabling robust offline-first device management. Combined with IoT policies, this creates a secure and scalable foundation for device communication and management.
+Device shadows provide a powerful mechanism for managing device state, allowing applications to interact with devices even when they're offline. The shadow document maintains the last known state and desired configuration, enabling robust offline-first device management patterns. Combined with IoT policies that implement fine-grained access controls, this creates a secure and scalable foundation for device communication and management that follows security best practices.
 
-> **Tip**: Use dynamic thing groups to automatically categorize devices based on attributes like firmware version, location, or health status. This enables automated management workflows and reduces manual operational overhead.
+Cost optimization is achieved through efficient use of fleet indexing, which only indexes the attributes you need for searching and monitoring. Consider using lifecycle policies for CloudWatch logs and implementing device-level logging controls to manage costs effectively. The continuous job feature ensures that new devices added to groups automatically receive necessary updates without manual intervention, reducing administrative overhead. For additional cost optimization strategies, see the [AWS IoT Core pricing documentation](https://aws.amazon.com/iot-core/pricing/) and [AWS Well-Architected IoT Lens](https://docs.aws.amazon.com/wellarchitected/latest/iot-lens/welcome.html).
 
-> **Warning**: IoT certificates have a maximum lifetime of 10 years and cannot be renewed. Implement certificate rotation procedures before certificates expire to maintain device connectivity.
+> **Tip**: Use dynamic thing groups to automatically categorize devices based on attributes like firmware version, location, or health status. This enables automated management workflows and reduces manual operational overhead while ensuring accurate targeting for updates and monitoring.
 
-Cost optimization is achieved through efficient use of fleet indexing, which only indexes the attributes you need for searching and monitoring. Consider using lifecycle policies for CloudWatch logs and implementing device-level logging controls to manage costs effectively. The continuous job feature ensures that new devices added to groups automatically receive necessary updates without manual intervention.
+> **Warning**: IoT certificates have a maximum lifetime of 10 years and cannot be renewed. Implement certificate rotation procedures before certificates expire to maintain device connectivity. Use AWS IoT Device Management to track certificate expiration dates and automate rotation processes.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Advanced OTA Updates**: Implement delta updates for firmware to reduce bandwidth usage and update times, especially for devices on constrained networks
-2. **Device Health Monitoring**: Create automated health checks using device shadows and fleet metrics to detect and alert on device anomalies or failures
-3. **Compliance Automation**: Build automated compliance checking using AWS Config rules to ensure devices maintain security baselines and required configurations
-4. **Multi-Region Fleet Management**: Extend the solution to manage devices across multiple AWS regions with centralized monitoring and cross-region failover capabilities
-5. **Integration with IoT Analytics**: Connect device management data with AWS IoT Analytics to create predictive maintenance models and operational insights
+1. **Advanced OTA Updates**: Implement delta updates for firmware to reduce bandwidth usage and update times, especially for devices on constrained networks. Use AWS IoT Jobs with file streaming capabilities for efficient updates.
+2. **Device Health Monitoring**: Create automated health checks using device shadows and fleet metrics to detect and alert on device anomalies or failures. Integrate with AWS CloudWatch alarms for proactive monitoring.
+3. **Compliance Automation**: Build automated compliance checking using AWS Config rules to ensure devices maintain security baselines and required configurations. Implement automated remediation for common compliance violations.
+4. **Multi-Region Fleet Management**: Extend the solution to manage devices across multiple AWS regions with centralized monitoring and cross-region failover capabilities for global IoT deployments.
+5. **Integration with IoT Analytics**: Connect device management data with AWS IoT Analytics to create predictive maintenance models and operational insights based on device telemetry and management events.
 
 ## Infrastructure Code
 

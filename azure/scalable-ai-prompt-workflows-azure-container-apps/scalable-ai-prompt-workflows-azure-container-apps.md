@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure AI Studio, Azure Container Apps, Azure Container Registry, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: ai, serverless, prompt-engineering, containerization, monitoring
 recipe-generator-version: 1.3
@@ -78,23 +78,27 @@ graph TB
 ## Preparation
 
 ```bash
-# Set environment variables
+# Set environment variables for Azure resources
+export RESOURCE_GROUP="rg-ai-serverless-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
-export RESOURCE_GROUP="rg-ai-serverless-${RANDOM}"
-export AI_HUB_NAME="hub-ai-${RANDOM}"
-export AI_PROJECT_NAME="project-promptflow-${RANDOM}"
-export ACR_NAME="acr${RANDOM}"
-export ACA_ENV_NAME="env-serverless-${RANDOM}"
-export ACA_APP_NAME="app-promptflow-${RANDOM}"
-export WORKSPACE_NAME="ws-ai-${RANDOM}"
+export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
-# Generate unique suffix for resources
+# Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
+
+# Set additional environment variables with unique names
+export AI_HUB_NAME="hub-ai-${RANDOM_SUFFIX}"
+export AI_PROJECT_NAME="project-promptflow-${RANDOM_SUFFIX}"
+export ACR_NAME="acr${RANDOM_SUFFIX}"
+export ACA_ENV_NAME="env-serverless-${RANDOM_SUFFIX}"
+export ACA_APP_NAME="app-promptflow-${RANDOM_SUFFIX}"
+export WORKSPACE_NAME="ws-ai-${RANDOM_SUFFIX}"
 
 # Create resource group
 az group create \
     --name ${RESOURCE_GROUP} \
-    --location ${LOCATION}
+    --location ${LOCATION} \
+    --tags purpose=recipe environment=demo
 
 echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
@@ -103,7 +107,8 @@ az acr create \
     --name ${ACR_NAME} \
     --resource-group ${RESOURCE_GROUP} \
     --sku Basic \
-    --admin-enabled true
+    --admin-enabled true \
+    --tags purpose=recipe environment=demo
 
 echo "✅ Container Registry created: ${ACR_NAME}"
 ```
@@ -121,15 +126,17 @@ echo "✅ Container Registry created: ${ACR_NAME}"
        --name ${STORAGE_ACCOUNT} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --sku Standard_LRS
+       --sku Standard_LRS \
+       --tags purpose=recipe environment=demo
    
-   # Create AI Hub
+   # Create AI Hub using ML workspace
    az ml workspace create \
        --name ${AI_HUB_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --kind hub \
-       --storage-account ${STORAGE_ACCOUNT}
+       --storage-account ${STORAGE_ACCOUNT} \
+       --tags purpose=recipe,environment=demo
    
    # Create AI Project
    az ml workspace create \
@@ -137,7 +144,8 @@ echo "✅ Container Registry created: ${ACR_NAME}"
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --kind project \
-       --hub-id "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.MachineLearningServices/workspaces/${AI_HUB_NAME}"
+       --hub-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.MachineLearningServices/workspaces/${AI_HUB_NAME}" \
+       --tags purpose=recipe,environment=demo
    
    echo "✅ AI Hub and Project created successfully"
    ```
@@ -157,15 +165,16 @@ echo "✅ Container Registry created: ${ACR_NAME}"
        --location ${LOCATION} \
        --kind OpenAI \
        --sku S0 \
-       --custom-domain ${OPENAI_NAME}
+       --custom-domain ${OPENAI_NAME} \
+       --tags purpose=recipe environment=demo
    
-   # Deploy GPT model
+   # Deploy GPT model with current version
    az cognitiveservices account deployment create \
        --name ${OPENAI_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --deployment-name "gpt-35-turbo" \
        --model-name "gpt-35-turbo" \
-       --model-version "0613" \
+       --model-version "0125" \
        --model-format OpenAI \
        --sku-name "Standard" \
        --sku-capacity 10
@@ -184,6 +193,8 @@ echo "✅ Container Registry created: ${ACR_NAME}"
    echo "✅ Azure OpenAI deployed with endpoint: ${OPENAI_ENDPOINT}"
    ```
 
+   The Azure OpenAI service is now configured with the latest GPT-3.5 Turbo model version, providing reliable access to state-of-the-art language capabilities for your prompt flows.
+
 3. **Create Container Apps Environment**:
 
    Azure Container Apps provides a serverless platform for running containerized workloads with automatic scaling and built-in observability. The environment acts as a secure boundary for your applications, providing networking isolation, shared logging, and Dapr integration for microservices patterns. This serverless approach eliminates cluster management while providing Kubernetes-based scaling capabilities.
@@ -193,7 +204,8 @@ echo "✅ Container Registry created: ${ACR_NAME}"
    az monitor log-analytics workspace create \
        --name ${WORKSPACE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION}
+       --location ${LOCATION} \
+       --tags purpose=recipe environment=demo
    
    # Get Log Analytics credentials
    LOG_ANALYTICS_ID=$(az monitor log-analytics workspace show \
@@ -212,7 +224,8 @@ echo "✅ Container Registry created: ${ACR_NAME}"
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --logs-workspace-id ${LOG_ANALYTICS_ID} \
-       --logs-workspace-key ${LOG_ANALYTICS_KEY}
+       --logs-workspace-key ${LOG_ANALYTICS_KEY} \
+       --tags purpose=recipe environment=demo
    
    echo "✅ Container Apps environment created with integrated monitoring"
    ```
@@ -256,15 +269,18 @@ echo "✅ Container Registry created: ${ACR_NAME}"
    {{question}}
    EOF
    
-   # Create requirements file
+   # Create requirements file with updated versions
    cat > requirements.txt << EOF
-   promptflow==1.10.0
+   promptflow==1.15.0
    promptflow-tools==1.4.0
    python-dotenv==1.0.0
+   openai==1.40.0
    EOF
    
    echo "✅ Prompt flow files created"
    ```
+
+   The prompt flow configuration is now ready with optimized settings for production deployment. These files define the AI workflow structure and dependencies needed for containerization.
 
 5. **Containerize Prompt Flow**:
 
@@ -327,7 +343,7 @@ echo "✅ Container Registry created: ${ACR_NAME}"
        --name ${ACR_NAME} \
        --query passwords[0].value -o tsv)
    
-   # Create Container App
+   # Create Container App with updated parameters
    az containerapp create \
        --name ${ACA_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
@@ -340,12 +356,10 @@ echo "✅ Container Registry created: ${ACR_NAME}"
        --ingress external \
        --min-replicas 0 \
        --max-replicas 10 \
-       --scale-rule-name http-rule \
-       --scale-rule-type http \
-       --scale-rule-http-concurrency 10 \
        --env-vars \
            AZURE_OPENAI_ENDPOINT=${OPENAI_ENDPOINT} \
-           AZURE_OPENAI_API_KEY=${OPENAI_KEY}
+           AZURE_OPENAI_API_KEY=${OPENAI_KEY} \
+       --tags purpose=recipe environment=demo
    
    # Get Container App URL
    APP_URL=$(az containerapp show \
@@ -368,9 +382,10 @@ echo "✅ Container Registry created: ${ACR_NAME}"
        --app ${ACA_APP_NAME}-insights \
        --location ${LOCATION} \
        --resource-group ${RESOURCE_GROUP} \
-       --workspace ${WORKSPACE_NAME}
+       --workspace ${WORKSPACE_NAME} \
+       --tags purpose=recipe environment=demo
    
-   # Get Application Insights key
+   # Get Application Insights connection string
    INSTRUMENTATION_KEY=$(az monitor app-insights component show \
        --app ${ACA_APP_NAME}-insights \
        --resource-group ${RESOURCE_GROUP} \
@@ -387,14 +402,17 @@ echo "✅ Container Registry created: ${ACR_NAME}"
    az monitor metrics alert create \
        --name "${ACA_APP_NAME}-response-time-alert" \
        --resource-group ${RESOURCE_GROUP} \
-       --scopes "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/containerApps/${ACA_APP_NAME}" \
+       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/containerApps/${ACA_APP_NAME}" \
        --condition "avg ResponseTime > 1000" \
        --window-size 5m \
        --evaluation-frequency 1m \
-       --description "Alert when average response time exceeds 1 second"
+       --description "Alert when average response time exceeds 1 second" \
+       --tags purpose=recipe environment=demo
    
    echo "✅ Monitoring and alerts configured"
    ```
+
+   Comprehensive monitoring is now in place with Application Insights providing detailed telemetry and alerting capabilities. This ensures production-ready observability for your AI prompt workflows.
 
 > **Tip**: Use Application Insights Live Metrics to monitor real-time performance during load testing and identify optimization opportunities for your prompt flows.
 
@@ -449,7 +467,7 @@ echo "✅ Container Registry created: ${ACR_NAME}"
        --tail 50
    
    # Check Application Insights metrics
-   echo "View detailed metrics at: https://portal.azure.com/#resource/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/microsoft.insights/components/${ACA_APP_NAME}-insights/overview"
+   echo "View detailed metrics at: https://portal.azure.com/#resource/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/microsoft.insights/components/${ACA_APP_NAME}-insights/overview"
    ```
 
 ## Cleanup

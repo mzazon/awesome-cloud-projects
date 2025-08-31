@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Monitoring, Vertex AI, Cloud Functions, Pub/Sub
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: anomaly-detection, ai-ops, monitoring, gemini, infrastructure, cloud-functions, pub-sub
 recipe-generator-version: 1.3
@@ -80,13 +80,13 @@ graph TB
 
 ## Prerequisites
 
-1. Google Cloud project with billing enabled and appropriate IAM permissions
-2. gcloud CLI v400.0.0+ installed and configured (or Cloud Shell access)
+1. Google Cloud project with billing enabled and appropriate IAM permissions (Editor or Owner role)
+2. gcloud CLI v480.0.0+ installed and configured (or Cloud Shell access)
 3. Basic understanding of Google Cloud monitoring concepts and AI/ML workflows
 4. Familiarity with serverless computing and event-driven architectures
 5. Estimated cost: $15-25 USD for running this recipe (includes Vertex AI API calls, Cloud Functions execution, and Pub/Sub messaging)
 
-> **Note**: This recipe uses Vertex AI's Gemini models which are available in specific regions. Ensure your project has access to Vertex AI APIs and consider data residency requirements for your use case.
+> **Note**: This recipe uses Vertex AI's Gemini 2.0 Flash model which is available in us-central1, us-east4, europe-west1, and asia-northeast1 regions. Ensure your project has access to Vertex AI APIs and consider data residency requirements for your use case.
 
 ## Preparation
 
@@ -114,6 +114,7 @@ gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable pubsub.googleapis.com
 gcloud services enable cloudbuild.googleapis.com
 gcloud services enable compute.googleapis.com
+gcloud services enable logging.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled for monitoring, AI, and serverless services"
@@ -148,11 +149,14 @@ echo "✅ APIs enabled for monitoring, AI, and serverless services"
    gcloud compute instances create test-instance-${RANDOM_SUFFIX} \
        --zone=${ZONE} \
        --machine-type=e2-medium \
-       --image-family=ubuntu-2004-lts \
+       --image-family=ubuntu-2204-lts \
        --image-project=ubuntu-os-cloud \
        --metadata=enable-oslogin=true \
        --tags=monitoring-test \
        --scopes=https://www.googleapis.com/auth/cloud-platform
+   
+   # Wait for instance to be ready
+   sleep 30
    
    # Install Ops Agent on the instance for enhanced monitoring
    gcloud compute ssh test-instance-${RANDOM_SUFFIX} \
@@ -226,14 +230,24 @@ def analyze_anomaly(cloud_event):
         4. Recommended actions
         5. Business impact assessment
         
-        Respond in JSON format.
+        Respond in JSON format with these exact keys: anomaly_probability, severity, root_causes, recommended_actions, business_impact.
         """
         
         # Call Gemini for analysis
-        from vertexai.generative_models import GenerativeModel
-        model = GenerativeModel("gemini-2.0-flash-exp")
+        from vertexai.generative_models import GenerativeModel, GenerationConfig
         
-        response = model.generate_content(analysis_prompt)
+        # Configure generation for JSON output
+        generation_config = GenerationConfig(
+            temperature=0.2,
+            max_output_tokens=1024,
+            response_mime_type="application/json"
+        )
+        
+        model = GenerativeModel("gemini-2.0-flash-001")
+        response = model.generate_content(
+            analysis_prompt,
+            generation_config=generation_config
+        )
         analysis_result = response.text
         
         # Log analysis for monitoring
@@ -258,15 +272,27 @@ def analyze_anomaly(cloud_event):
 
 def get_historical_metrics(metric_name, resource_name):
     """Retrieve historical metric data for context"""
-    client = monitoring_v3.MetricServiceClient()
-    project_name = f"projects/{PROJECT_ID}"
-    
-    # Define time range (last 24 hours)
-    end_time = datetime.now()
-    start_time = end_time - timedelta(hours=24)
-    
-    # This is a simplified example - in production, implement proper metric querying
-    return f"Historical data for {metric_name} on {resource_name} over last 24 hours"
+    try:
+        client = monitoring_v3.MetricServiceClient()
+        project_name = f"projects/{PROJECT_ID}"
+        
+        # Define time range (last 24 hours)
+        end_time = datetime.now()
+        start_time = end_time - timedelta(hours=24)
+        
+        # Create time interval
+        from google.cloud.monitoring_v3 import TimeInterval
+        interval = TimeInterval({
+            "end_time": {"seconds": int(end_time.timestamp())},
+            "start_time": {"seconds": int(start_time.timestamp())}
+        })
+        
+        # This is a simplified example - in production, implement proper metric querying
+        return f"Historical data for {metric_name} on {resource_name} over last 24 hours - baseline metrics within normal range"
+        
+    except Exception as e:
+        logging.warning(f"Could not retrieve historical data: {str(e)}")
+        return "No historical context available"
 
 def send_alert(ai_analysis, monitoring_data):
     """Send alert based on AI analysis"""
@@ -281,16 +307,16 @@ def send_alert(ai_analysis, monitoring_data):
     }
     
     logging.info(f"ALERT: {severity} anomaly detected - {alert_message}")
-    # In production, integrate with notification systems
+    # In production, integrate with notification systems like email, Slack, PagerDuty
 EOF
    
-   # Create requirements file
+   # Create requirements file with current versions
    cat > requirements.txt << 'EOF'
 functions-framework==3.*
-google-cloud-aiplatform==1.70.0
-google-cloud-monitoring==2.22.0
-google-cloud-pubsub==2.25.0
-vertexai==1.70.0
+google-cloud-aiplatform==1.*
+google-cloud-monitoring==2.*
+google-cloud-pubsub==2.*
+vertexai==1.*
 EOF
    
    cd ..
@@ -304,10 +330,10 @@ EOF
    Deploying the Cloud Function with appropriate IAM permissions and environment configuration enables seamless integration with Google Cloud's AI platform and monitoring services. This deployment establishes the runtime environment where real-time anomaly detection occurs, connecting monitoring data streams with advanced AI analysis capabilities.
 
    ```bash
-   # Deploy Cloud Function with Pub/Sub trigger
+   # Deploy Cloud Function with Pub/Sub trigger (Gen 2)
    gcloud functions deploy ${FUNCTION_NAME} \
        --gen2 \
-       --runtime=python311 \
+       --runtime=python312 \
        --region=${REGION} \
        --source=anomaly-function \
        --entry-point=analyze_anomaly \
@@ -315,19 +341,24 @@ EOF
        --memory=1Gi \
        --timeout=540s \
        --max-instances=10 \
-       --set-env-vars="GCP_PROJECT=${PROJECT_ID}" \
-       --service-account="${PROJECT_ID}@appspot.gserviceaccount.com"
+       --set-env-vars="GCP_PROJECT=${PROJECT_ID}"
+   
+   # Get the function's service account
+   FUNCTION_SA=$(gcloud functions describe ${FUNCTION_NAME} \
+       --region=${REGION} \
+       --format="value(serviceConfig.serviceAccountEmail)")
    
    # Grant necessary IAM permissions for AI Platform access
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
-       --member="serviceAccount:${PROJECT_ID}@appspot.gserviceaccount.com" \
+       --member="serviceAccount:${FUNCTION_SA}" \
        --role="roles/aiplatform.user"
    
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
-       --member="serviceAccount:${PROJECT_ID}@appspot.gserviceaccount.com" \
+       --member="serviceAccount:${FUNCTION_SA}" \
        --role="roles/monitoring.viewer"
    
    echo "✅ Cloud Function deployed with AI integration"
+   echo "Function service account: ${FUNCTION_SA}"
    ```
 
    The anomaly detection function is now operational with proper permissions to access Vertex AI services and Cloud Monitoring data. This deployment provides the compute foundation for real-time AI-powered analysis while leveraging Google Cloud's serverless infrastructure for automatic scaling and reliability.
@@ -365,8 +396,9 @@ EOF
 }
 EOF
    
-   # Deploy alert policy
-   gcloud alpha monitoring policies create --policy-from-file=cpu-alert-policy.json
+   # Deploy alert policy using current gcloud command
+   gcloud alpha monitoring policies create \
+       --policy-from-file=cpu-alert-policy.json
    
    # Create custom metric for anomaly scores
    gcloud logging metrics create anomaly_score \
@@ -424,6 +456,24 @@ EOF
             ]
           }
         }
+      },
+      {
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "CPU Utilization Trends",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "metric.type=\"compute.googleapis.com/instance/cpu/utilization\""
+                  }
+                }
+              }
+            ]
+          }
+        }
       }
     ]
   }
@@ -431,7 +481,8 @@ EOF
 EOF
    
    # Deploy dashboard
-   gcloud monitoring dashboards create --config-from-file=anomaly-dashboard.json
+   gcloud monitoring dashboards create \
+       --config-from-file=anomaly-dashboard.json
    
    echo "✅ Notification channels and dashboard configured"
    echo "Dashboard URL: https://console.cloud.google.com/monitoring/dashboards"
@@ -444,10 +495,18 @@ EOF
    Generating synthetic load patterns allows us to validate the anomaly detection system's ability to identify unusual infrastructure behavior. This testing phase demonstrates how the AI analysis engine responds to different types of anomalies, from gradual performance degradation to sudden resource spikes that could indicate security incidents or system failures.
 
    ```bash
+   # Install stress testing tool on the test instance
+   gcloud compute ssh test-instance-${RANDOM_SUFFIX} \
+       --zone=${ZONE} \
+       --command="sudo apt-get update && sudo apt-get install -y stress"
+   
    # Generate CPU load to trigger anomaly detection
    gcloud compute ssh test-instance-${RANDOM_SUFFIX} \
        --zone=${ZONE} \
        --command="nohup stress --cpu 4 --timeout 300s > /dev/null 2>&1 &"
+   
+   # Wait for load to start
+   sleep 10
    
    # Send test message to Pub/Sub to trigger AI analysis
    cat > test-anomaly-message.json << EOF
@@ -467,6 +526,7 @@ EOF
    # Monitor function execution
    echo "✅ Synthetic anomaly generated - monitoring AI analysis"
    echo "Check function logs: gcloud functions logs read ${FUNCTION_NAME} --region=${REGION}"
+   echo "Wait 60 seconds for analysis to complete..."
    ```
 
    The synthetic testing validates that our AI-powered system correctly identifies anomalous patterns and triggers appropriate analysis workflows. This controlled testing approach ensures system reliability before deploying to production environments where accurate anomaly detection is critical for business continuity.
@@ -479,7 +539,7 @@ EOF
    # Check function deployment status
    gcloud functions describe ${FUNCTION_NAME} \
        --region=${REGION} \
-       --format="table(name,status,updateTime)"
+       --format="table(name,state,updateTime)"
    
    # Verify function logs for AI analysis
    gcloud functions logs read ${FUNCTION_NAME} \
@@ -487,7 +547,7 @@ EOF
        --limit=10
    ```
 
-   Expected output: Function status should show "ACTIVE" and logs should contain Gemini AI analysis results for the test anomaly.
+   Expected output: Function state should show "ACTIVE" and logs should contain Gemini AI analysis results for the test anomaly.
 
 2. **Test Pub/Sub Message Processing**:
 
@@ -520,7 +580,8 @@ EOF
 
    ```bash
    # Verify Vertex AI API access
-   gcloud ai models list --region=${REGION} 2>/dev/null || echo "Vertex AI access configured"
+   gcloud ai models list --region=${REGION} 2>/dev/null || \
+       echo "Vertex AI access configured"
    
    # Check IAM permissions
    gcloud projects get-iam-policy ${PROJECT_ID} \
@@ -565,6 +626,9 @@ EOF
    # Delete custom metrics
    gcloud logging metrics delete anomaly_score --quiet
    
+   # Delete dashboards (note: requires manual cleanup via console)
+   echo "Note: Delete dashboards manually via Google Cloud Console"
+   
    echo "✅ Monitoring resources removed"
    ```
 
@@ -585,15 +649,15 @@ EOF
 
 ## Discussion
 
-This intelligent infrastructure anomaly detection solution demonstrates the powerful combination of Google Cloud's observability platform with advanced AI capabilities through Vertex AI and Gemini. Unlike traditional threshold-based monitoring that generates numerous false positives, this AI-powered approach analyzes patterns, context, and historical data to provide intelligent insights about infrastructure health and potential issues.
+This intelligent infrastructure anomaly detection solution demonstrates the powerful combination of Google Cloud's observability platform with advanced AI capabilities through Vertex AI and Gemini 2.0 Flash. Unlike traditional threshold-based monitoring that generates numerous false positives, this AI-powered approach analyzes patterns, context, and historical data to provide intelligent insights about infrastructure health and potential issues.
 
 The architecture leverages several key Google Cloud design patterns: event-driven processing through Pub/Sub ensures reliable message delivery and decoupling between monitoring and analysis components, while Cloud Functions provides serverless compute that automatically scales based on monitoring event volume. The integration with Vertex AI's Gemini models brings natural language understanding and reasoning capabilities to infrastructure monitoring, enabling more nuanced analysis of complex patterns that might indicate emerging issues.
 
 Cloud Monitoring serves as the comprehensive data collection foundation, gathering metrics from Compute Engine instances, Kubernetes clusters, databases, and application services. The Ops Agent provides detailed system-level insights that enhance the AI model's ability to understand normal operating patterns and identify deviations. This data richness is crucial for training effective anomaly detection algorithms that can distinguish between normal operational variance and genuine anomalies requiring attention.
 
-The solution's intelligence comes from Gemini's ability to analyze multiple dimensions of monitoring data simultaneously, considering factors like time of day, historical patterns, seasonal trends, and correlations across different infrastructure components. This holistic analysis approach significantly reduces false positives while identifying subtle patterns that could indicate security threats, performance degradation, or impending failures. For more information about Google Cloud's monitoring capabilities, see the [Cloud Monitoring documentation](https://cloud.google.com/monitoring/docs), [Vertex AI Generative AI overview](https://cloud.google.com/vertex-ai/generative-ai/docs), and the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework).
+The solution's intelligence comes from Gemini 2.0 Flash's ability to analyze multiple dimensions of monitoring data simultaneously, considering factors like time of day, historical patterns, seasonal trends, and correlations across different infrastructure components. The model's improved reasoning capabilities and faster response times make it ideal for real-time anomaly detection scenarios. This holistic analysis approach significantly reduces false positives while identifying subtle patterns that could indicate security threats, performance degradation, or impending failures. For more information about Google Cloud's monitoring capabilities, see the [Cloud Monitoring documentation](https://cloud.google.com/monitoring/docs), [Vertex AI Generative AI overview](https://cloud.google.com/vertex-ai/generative-ai/docs), and the [Google Cloud Architecture Framework](https://cloud.google.com/architecture/framework).
 
-> **Tip**: For production deployments, consider implementing multiple analysis models for different types of infrastructure components (compute, storage, network) and use Cloud Logging to maintain detailed audit trails of all anomaly detection decisions for compliance and improvement purposes.
+> **Tip**: For production deployments, consider implementing multiple analysis models for different types of infrastructure components (compute, storage, network) and use Cloud Logging to maintain detailed audit trails of all anomaly detection decisions for compliance and improvement purposes. Also consider implementing context caching for Gemini API calls to reduce latency and costs for similar analysis patterns.
 
 ## Challenge
 

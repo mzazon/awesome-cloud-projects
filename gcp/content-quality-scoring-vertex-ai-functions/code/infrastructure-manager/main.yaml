@@ -1,0 +1,416 @@
+# Infrastructure Manager Configuration for Content Quality Scoring with Vertex AI and Functions
+# This configuration deploys a complete content quality scoring system using:
+# - Cloud Storage buckets for content and results
+# - Cloud Functions for serverless processing
+# - Vertex AI for intelligent content analysis
+# - IAM roles and permissions for secure operation
+
+metadata:
+  name: content-quality-scoring
+  description: "Automated content quality scoring system using Vertex AI and Cloud Functions"
+  labels:
+    environment: development
+    purpose: content-analysis
+    cost-center: marketing
+
+# Import external modules for reusable components
+imports:
+  - name: cloud-function
+    source: "https://github.com/GoogleCloudPlatform/cloud-foundation-fabric/modules/cloud-function"
+
+# Input variables for customization
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID where resources will be created"
+    
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    
+  # Resource naming configuration
+  bucket_prefix:
+    type: string
+    description: "Prefix for Cloud Storage bucket names"
+    default: "content-analysis"
+    
+  function_name:
+    type: string
+    description: "Name for the Cloud Function"
+    default: "analyze-content-quality"
+    
+  # Function configuration
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Function"
+    default: "512MiB"
+    
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Function execution"
+    default: "540s"
+    
+  max_instances:
+    type: integer
+    description: "Maximum number of function instances"
+    default: 10
+    
+  # Environment configuration
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+
+# Main resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  enable_apis:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/cloudfunctions.googleapis.com
+    metadata:
+      dependsOn: []
+      
+  enable_storage_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/storage.googleapis.com
+    metadata:
+      dependsOn: []
+      
+  enable_aiplatform_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/aiplatform.googleapis.com
+    metadata:
+      dependsOn: []
+      
+  enable_cloudbuild_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/cloudbuild.googleapis.com
+    metadata:
+      dependsOn: []
+      
+  enable_eventarc_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/eventarc.googleapis.com
+    metadata:
+      dependsOn: []
+
+  # Generate unique suffix for resource names to avoid conflicts
+  random_suffix:
+    type: gcp-types/random-v1:id
+    properties:
+      byte_length: 3
+      
+  # Cloud Storage bucket for content uploads
+  content_storage_bucket:
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: ${bucket_prefix}-content-$(ref.random_suffix.hex)
+      project: ${project_id}
+      location: ${region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      # Enable uniform bucket-level access for simplified permissions
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Lifecycle management to optimize costs
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90  # Delete files older than 90 days
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30  # Move to Nearline after 30 days
+      # Enable notifications for function triggers
+      logging:
+        logBucket: ${bucket_prefix}-logs-$(ref.random_suffix.hex)
+        logObjectPrefix: content-access/
+    metadata:
+      dependsOn:
+        - enable_storage_api
+
+  # Cloud Storage bucket for analysis results
+  results_storage_bucket:
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: ${bucket_prefix}-results-$(ref.random_suffix.hex)
+      project: ${project_id}
+      location: ${region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Results retention policy
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Keep results for 1 year
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 60  # Move to Coldline after 60 days
+    metadata:
+      dependsOn:
+        - enable_storage_api
+
+  # Service account for Cloud Function with minimal required permissions
+  function_service_account:
+    type: gcp-types/iam-v1:serviceAccount
+    properties:
+      accountId: content-quality-function-$(ref.random_suffix.hex)
+      project: ${project_id}
+      displayName: "Content Quality Analysis Function Service Account"
+      description: "Service account for content quality scoring Cloud Function"
+    metadata:
+      dependsOn: []
+
+  # IAM binding for Vertex AI access
+  vertex_ai_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      member: serviceAccount:$(ref.function_service_account.email)
+      role: roles/aiplatform.user
+    metadata:
+      dependsOn:
+        - function_service_account
+
+  # IAM binding for Cloud Storage access (content bucket)
+  storage_content_binding:
+    type: gcp-types/storage-v1:virtual.buckets.iamMemberBinding
+    properties:
+      bucket: $(ref.content_storage_bucket.name)
+      member: serviceAccount:$(ref.function_service_account.email)
+      role: roles/storage.objectViewer
+    metadata:
+      dependsOn:
+        - function_service_account
+        - content_storage_bucket
+
+  # IAM binding for Cloud Storage access (results bucket)
+  storage_results_binding:
+    type: gcp-types/storage-v1:virtual.buckets.iamMemberBinding
+    properties:
+      bucket: $(ref.results_storage_bucket.name)
+      member: serviceAccount:$(ref.function_service_account.email)
+      role: roles/storage.objectAdmin
+    metadata:
+      dependsOn:
+        - function_service_account
+        - results_storage_bucket
+
+  # IAM binding for Cloud Logging
+  logging_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      member: serviceAccount:$(ref.function_service_account.email)
+      role: roles/logging.logWriter
+    metadata:
+      dependsOn:
+        - function_service_account
+
+  # Cloud Function source code archive
+  function_source_archive:
+    type: gcp-types/storage-v1:object
+    properties:
+      bucket: $(ref.content_storage_bucket.name)
+      name: function-source.zip
+      # Base64 encoded ZIP file containing the function source
+      # In practice, this would be generated from the source directory
+      contentType: application/zip
+      # Placeholder for function source - in real deployment, this would contain
+      # the actual function code from the recipe
+      metadata:
+        description: "Cloud Function source code for content quality analysis"
+    metadata:
+      dependsOn:
+        - content_storage_bucket
+
+  # Cloud Function for content quality analysis
+  content_quality_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/${project_id}/locations/${region}
+      function:
+        name: ${function_name}
+        description: "Analyzes content quality using Vertex AI"
+        sourceArchiveUrl: gs://$(ref.content_storage_bucket.name)/function-source.zip
+        entryPoint: analyze_content_quality
+        runtime: python311
+        # Function configuration
+        availableMemoryMb: 512
+        timeout: 540s
+        maxInstances: ${max_instances}
+        # Service account configuration
+        serviceAccountEmail: $(ref.function_service_account.email)
+        # Environment variables for function operation
+        environmentVariables:
+          PROJECT_ID: ${project_id}
+          RESULTS_BUCKET: $(ref.results_storage_bucket.name)
+          VERTEX_AI_REGION: ${region}
+        # Event trigger configuration for Cloud Storage
+        eventTrigger:
+          eventType: google.storage.object.finalize
+          resource: $(ref.content_storage_bucket.name)
+          failurePolicy:
+            retry: {}
+        # Network and security configuration
+        ingressSettings: ALLOW_INTERNAL_ONLY
+        # Labels for resource management
+        labels:
+          environment: ${environment}
+          function-type: content-analysis
+          managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable_apis
+        - enable_aiplatform_api
+        - function_service_account
+        - content_storage_bucket
+        - results_storage_bucket
+        - function_source_archive
+        - vertex_ai_binding
+        - storage_content_binding
+        - storage_results_binding
+        - logging_binding
+
+  # Cloud Monitoring alert policy for function errors
+  function_error_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      alertPolicy:
+        displayName: "Content Quality Function Error Rate"
+        documentation:
+          content: "Alert when content quality function error rate exceeds threshold"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "Function error rate high"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.label.function_name="${function_name}"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0.1  # 10% error rate
+              duration: 300s  # 5 minutes
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.label.function_name
+        combiner: OR
+        enabled: true
+        notificationChannels: []  # Add notification channels as needed
+    metadata:
+      dependsOn:
+        - content_quality_function
+
+  # Budget alert for cost monitoring
+  budget_alert:
+    type: gcp-types/cloudbilling-v1:billingAccounts.budgets
+    properties:
+      parent: billingAccounts/${billing_account_id}
+      budget:
+        displayName: "Content Quality System Budget"
+        budgetFilter:
+          projects:
+            - projects/${project_id}
+          services:
+            - services/storage.googleapis.com
+            - services/cloudfunctions.googleapis.com
+            - services/aiplatform.googleapis.com
+        amount:
+          specifiedAmount:
+            currencyCode: USD
+            units: "50"  # $50 monthly budget
+        thresholdRules:
+          - thresholdPercent: 0.8
+            spendBasis: CURRENT_SPEND
+          - thresholdPercent: 1.0
+            spendBasis: CURRENT_SPEND
+    metadata:
+      dependsOn: []
+
+# Output values for use by other systems or verification
+outputs:
+  # Storage bucket information
+  content_bucket_name:
+    description: "Name of the Cloud Storage bucket for content uploads"
+    value: $(ref.content_storage_bucket.name)
+    
+  results_bucket_name:
+    description: "Name of the Cloud Storage bucket for analysis results"
+    value: $(ref.results_storage_bucket.name)
+    
+  # Function information
+  function_name:
+    description: "Name of the deployed Cloud Function"
+    value: $(ref.content_quality_function.name)
+    
+  function_url:
+    description: "URL of the deployed Cloud Function"
+    value: $(ref.content_quality_function.httpsTrigger.url)
+    
+  function_service_account:
+    description: "Service account email used by the Cloud Function"
+    value: $(ref.function_service_account.email)
+    
+  # Deployment information
+  deployment_region:
+    description: "Google Cloud region where resources are deployed"
+    value: ${region}
+    
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${project_id}
+    
+  # Usage instructions
+  upload_command:
+    description: "Command to upload content for analysis"
+    value: gsutil cp [LOCAL_FILE] gs://$(ref.content_storage_bucket.name)/
+    
+  results_command:
+    description: "Command to view analysis results"
+    value: gsutil ls gs://$(ref.results_storage_bucket.name)/
+
+# Schema validation for Infrastructure Manager
+schema:
+  required:
+    - project_id
+  properties:
+    project_id:
+      type: string
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+    region:
+      type: string
+      enum:
+        - us-central1
+        - us-east1
+        - us-west1
+        - us-west2
+        - europe-west1
+        - europe-west2
+        - asia-east1
+        - asia-southeast1
+    environment:
+      type: string
+      enum:
+        - dev
+        - staging
+        - prod

@@ -1,0 +1,346 @@
+# Infrastructure Manager Configuration for Unit Converter API with Cloud Functions
+# This configuration deploys a serverless REST API using Google Cloud Functions
+# with HTTP triggers for unit conversion functionality.
+
+imports:
+  # Import Google Cloud resource types
+  - path: https://www.googleapis.com/compute/v1/projects
+
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/cloudfunctions.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+    metadata:
+      dependsOn:
+        - project-id
+
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/cloudbuild.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+    metadata:
+      dependsOn:
+        - project-id
+
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/logging.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+    metadata:
+      dependsOn:
+        - project-id
+
+  # Get current project ID
+  - name: project-id
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: {{ env["project"] }}
+
+  # Cloud Storage bucket for function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: unit-converter-source-{{ env["deployment"] }}-$(ref.random-suffix.value)
+      location: {{ properties["region"] }}
+      storageClass: REGIONAL
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              isLive: false
+      labels:
+        purpose: cloud-function-source
+        recipe: unit-converter-api
+    metadata:
+      dependsOn:
+        - random-suffix
+
+  # Generate random suffix for unique resource naming
+  - name: random-suffix
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: {{ env["project"] }}
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  # Cloud Storage object containing the function source code
+  - name: function-source-archive
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.function-source-bucket.name)
+      name: unit-converter-source.zip
+      # Source code will be uploaded separately or via Cloud Build
+      # This is a placeholder for the deployment process
+    metadata:
+      dependsOn:
+        - function-source-bucket
+
+  # IAM Service Account for Cloud Function execution
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: unit-converter-function-sa
+      displayName: Unit Converter Function Service Account
+      description: Service account for executing the unit converter Cloud Function
+      parent: projects/$(ref.project-id.projectId)
+    metadata:
+      dependsOn:
+        - project-id
+
+  # IAM binding for Cloud Function service account
+  - name: function-sa-invoker-binding
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(ref.project-id.projectId)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - serviceAccount:$(ref.function-service-account.email)
+              - allUsers  # Allow public access for demo purposes
+          - role: roles/logging.logWriter
+            members:
+              - serviceAccount:$(ref.function-service-account.email)
+          - role: roles/monitoring.metricWriter
+            members:
+              - serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # Cloud Function for unit conversion API
+  - name: unit-converter-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/{{ properties["region"] }}
+      function:
+        name: projects/$(ref.project-id.projectId)/locations/{{ properties["region"] }}/functions/{{ properties["functionName"] }}
+        description: Serverless REST API for unit conversions supporting temperature, distance, and weight
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/$(ref.function-source-archive.name)
+        
+        # HTTP trigger configuration
+        httpsTrigger:
+          # Security policy - allow unauthenticated for demo
+          securityLevel: SECURE_ALWAYS
+        
+        # Runtime configuration
+        runtime: python312
+        entryPoint: convert_units
+        timeout: 60s
+        availableMemoryMb: 256
+        maxInstances: 100
+        minInstances: 0
+        
+        # Service account configuration
+        serviceAccountEmail: $(ref.function-service-account.email)
+        
+        # Environment variables for function configuration
+        environmentVariables:
+          FUNCTION_TARGET: convert_units
+          FUNCTION_SIGNATURE_TYPE: http
+        
+        # Labels for resource management
+        labels:
+          recipe: unit-converter-api
+          environment: demo
+          function-type: http-api
+          
+        # Ingress settings - allow all traffic for public API
+        ingressSettings: ALLOW_ALL
+        
+        # VPC connector settings (optional, not needed for this simple function)
+        # vpcConnector: ""
+        # vpcConnectorEgressSettings: PRIVATE_RANGES_ONLY
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - enable-cloudbuild-api
+        - function-source-archive
+        - function-service-account
+        - function-sa-invoker-binding
+
+  # Cloud Logging configuration for function logs
+  - name: function-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/$(ref.project-id.projectId)
+      sink:
+        name: unit-converter-function-logs
+        description: Log sink for unit converter function requests and errors
+        destination: logging.googleapis.com/projects/$(ref.project-id.projectId)/logs/cloudfunctions.googleapis.com%2Fcloud-functions
+        filter: >
+          resource.type="cloud_function"
+          resource.labels.function_name="{{ properties["functionName"] }}"
+          resource.labels.region="{{ properties["region"] }}"
+        includeChildren: true
+    metadata:
+      dependsOn:
+        - enable-logging-api
+        - unit-converter-function
+
+  # Cloud Monitoring alert policy for function errors
+  - name: function-error-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project-id.projectId)
+      alertPolicy:
+        displayName: Unit Converter Function Error Rate Alert
+        documentation:
+          content: Alert when the unit converter function experiences high error rates
+          mimeType: text/markdown
+        
+        # Condition for error rate monitoring
+        conditions:
+          - displayName: Function Error Rate
+            conditionThreshold:
+              filter: >
+                resource.type="cloud_function"
+                resource.label.function_name="{{ properties["functionName"] }}"
+                metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                metric.label.status!="ok"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        
+        # Alert policy configuration
+        enabled: true
+        combiner: OR
+        
+        # Notification channels (would need to be configured separately)
+        # notificationChannels: []
+    metadata:
+      dependsOn:
+        - unit-converter-function
+
+# Configuration properties with default values
+properties:
+  # Deployment region for all resources
+  region:
+    type: string
+    default: us-central1
+    description: Google Cloud region for deploying resources
+    
+  # Cloud Function name
+  functionName:
+    type: string
+    default: unit-converter-api
+    description: Name for the Cloud Function
+    pattern: "^[a-z]([a-z0-9-]*[a-z0-9])?$"
+    
+  # Function memory allocation
+  functionMemory:
+    type: integer
+    default: 256
+    description: Memory allocation for the Cloud Function in MB
+    minimum: 128
+    maximum: 8192
+    
+  # Function timeout
+  functionTimeout:
+    type: string
+    default: "60s"
+    description: Timeout for function execution
+    pattern: "^[0-9]+s$"
+    
+  # Maximum function instances
+  maxInstances:
+    type: integer
+    default: 100
+    description: Maximum number of function instances
+    minimum: 1
+    maximum: 1000
+    
+  # Minimum function instances (0 for auto-scaling)
+  minInstances:
+    type: integer
+    default: 0
+    description: Minimum number of function instances (0 for auto-scaling)
+    minimum: 0
+    maximum: 100
+
+# Output values for verification and integration
+outputs:
+  # Cloud Function HTTP trigger URL
+  - name: function-url
+    description: HTTPS URL for the unit converter API
+    value: $(ref.unit-converter-function.httpsTrigger.url)
+    
+  # Function name for CLI operations
+  - name: function-name
+    description: Full name of the deployed Cloud Function
+    value: $(ref.unit-converter-function.name)
+    
+  # Service account email
+  - name: service-account-email
+    description: Email of the function's service account
+    value: $(ref.function-service-account.email)
+    
+  # Storage bucket name
+  - name: source-bucket-name
+    description: Name of the storage bucket containing function source
+    value: $(ref.function-source-bucket.name)
+    
+  # Project ID
+  - name: project-id
+    description: Google Cloud Project ID
+    value: $(ref.project-id.projectId)
+    
+  # Deployment region
+  - name: region
+    description: Deployment region
+    value: {{ properties["region"] }}
+    
+  # Function configuration summary
+  - name: function-config
+    description: Summary of function configuration
+    value:
+      memory: {{ properties["functionMemory"] }}MB
+      timeout: {{ properties["functionTimeout"] }}
+      runtime: python312
+      maxInstances: {{ properties["maxInstances"] }}
+      minInstances: {{ properties["minInstances"] }}
+
+# Metadata for deployment management
+metadata:
+  version: "1.0"
+  author: "GCP Recipe Generator"
+  description: "Infrastructure Manager configuration for deploying a serverless unit converter REST API using Google Cloud Functions"
+  
+  # Resource dependencies and deployment order
+  dependsOn: []
+  
+  # Deployment labels
+  labels:
+    recipe: unit-converter-api-cloud-functions
+    category: serverless
+    difficulty: beginner
+    provider: gcp
+    
+  # Cost estimation (approximate)
+  estimatedCost:
+    description: "Estimated monthly cost for moderate usage"
+    components:
+      - service: "Cloud Functions"
+        cost: "$0.00 - $0.40 per million requests"
+        notes: "Free tier includes 2M requests/month"
+      - service: "Cloud Storage"
+        cost: "$0.020 per GB/month"
+        notes: "For function source code storage"
+      - service: "Cloud Logging"
+        cost: "$0.50 per GB ingested"
+        notes: "First 50GB/month free"
+    totalEstimate: "$0.00 - $5.00/month for typical usage"

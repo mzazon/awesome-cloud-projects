@@ -1,0 +1,591 @@
+# Google Cloud Infrastructure Manager Configuration
+# Legal Document Analysis with Gemini Fine-Tuning and Document AI
+# 
+# This configuration deploys a complete legal document analysis system
+# that combines Document AI for text extraction with a fine-tuned Gemini model
+# for specialized legal terminology and document pattern recognition.
+
+# Infrastructure Manager deployment metadata
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: legal-document-analysis-config
+  labels:
+    app: legal-document-analysis
+    version: "1.1"
+    environment: production
+data:
+  description: "Legal Document Analysis with Gemini Fine-Tuning and Document AI"
+  recipe-id: "f3a7b8c2"
+
+---
+# Import required modules and define variables
+imports:
+  - path: https://github.com/GoogleCloudPlatform/cloud-foundation-fabric/modules/storage/storage-bucket
+    name: storage_bucket
+  - path: https://github.com/GoogleCloudPlatform/cloud-foundation-fabric/modules/cloud-function-v2
+    name: cloud_function_v2
+  - path: https://github.com/GoogleCloudPlatform/cloud-foundation-fabric/modules/iam-service-account
+    name: service_account
+
+# Global variables for the deployment
+variables:
+  # Project configuration
+  project_id:
+    description: "Google Cloud Project ID for deployment"
+    type: string
+    default: "legal-analysis-demo"
+  
+  region:
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+  
+  zone:
+    description: "Google Cloud zone for zonal resources"
+    type: string
+    default: "us-central1-a"
+  
+  # Resource naming configuration
+  resource_prefix:
+    description: "Prefix for all resource names"
+    type: string
+    default: "legal-analysis"
+  
+  # Document AI configuration
+  docai_processor_type:
+    description: "Document AI processor type"
+    type: string
+    default: "FORM_PARSER_PROCESSOR"
+  
+  # Function configuration
+  function_memory:
+    description: "Memory allocation for Cloud Functions"
+    type: string
+    default: "512Mi"
+  
+  function_timeout:
+    description: "Timeout for Cloud Functions in seconds"
+    type: number
+    default: 300
+  
+  # Model tuning configuration
+  tuning_epochs:
+    description: "Number of epochs for model fine-tuning"
+    type: number
+    default: 5
+  
+  learning_rate_multiplier:
+    description: "Learning rate multiplier for fine-tuning"
+    type: number
+    default: 1.0
+
+# Enable required Google Cloud APIs
+resources:
+  # Enable AI Platform API
+  - name: aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/aiplatform.googleapis.com
+      
+  # Enable Document AI API
+  - name: documentai-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/documentai.googleapis.com
+      
+  # Enable Cloud Functions API
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/cloudfunctions.googleapis.com
+      
+  # Enable Cloud Storage API
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/storage.googleapis.com
+      
+  # Enable Cloud Build API for function deployment
+  - name: cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/cloudbuild.googleapis.com
+
+  # Get project information
+  - name: project-info
+    type: gcp-types/cloudresourcemanager-v1:projects
+    action: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.get
+    properties:
+      projectId: $(var.project_id)
+
+  # Create a random suffix for unique resource naming
+  - name: random-suffix
+    type: gcp-types/random-v1:random_id
+    properties:
+      byte_length: 3
+
+  # Storage bucket for legal documents (input)
+  - name: legal-documents-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.resource_prefix)-docs-$(ref.random-suffix.hex)
+      project: $(ref.project-info.projectId)
+      location: $(var.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: ""  # Use Google-managed encryption
+      iamConfiguration:
+        bucketPolicyOnly:
+          enabled: true
+      publicAccessPrevention: enforced
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        purpose: legal-document-input
+        environment: production
+        recipe-id: f3a7b8c2
+    metadata:
+      dependsOn:
+        - storage-api
+
+  # Storage bucket for training data
+  - name: training-data-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.resource_prefix)-training-$(ref.random-suffix.hex)
+      project: $(ref.project-info.projectId)
+      location: $(var.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: ""  # Use Google-managed encryption
+      iamConfiguration:
+        bucketPolicyOnly:
+          enabled: true
+      publicAccessPrevention: enforced
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        purpose: model-training-data
+        environment: production
+        recipe-id: f3a7b8c2
+    metadata:
+      dependsOn:
+        - storage-api
+
+  # Storage bucket for analysis results (output)
+  - name: analysis-results-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.resource_prefix)-results-$(ref.random-suffix.hex)
+      project: $(ref.project-info.projectId)
+      location: $(var.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: ""  # Use Google-managed encryption
+      iamConfiguration:
+        bucketPolicyOnly:
+          enabled: true
+      publicAccessPrevention: enforced
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        purpose: legal-analysis-results
+        environment: production
+        recipe-id: f3a7b8c2
+    metadata:
+      dependsOn:
+        - storage-api
+
+  # Service account for Document AI processing
+  - name: documentai-service-account
+    type: gcp-types/iam-v1:serviceAccounts
+    properties:
+      accountId: $(var.resource_prefix)-docai-sa
+      project: $(ref.project-info.projectId)
+      serviceAccount:
+        displayName: Legal Document AI Service Account
+        description: Service account for Document AI processing in legal analysis pipeline
+    metadata:
+      dependsOn:
+        - project-info
+
+  # Service account for Cloud Functions
+  - name: functions-service-account
+    type: gcp-types/iam-v1:serviceAccounts
+    properties:
+      accountId: $(var.resource_prefix)-functions-sa
+      project: $(ref.project-info.projectId)
+      serviceAccount:
+        displayName: Legal Analysis Functions Service Account
+        description: Service account for Cloud Functions in legal document analysis pipeline
+    metadata:
+      dependsOn:
+        - project-info
+
+  # Service account for Vertex AI model operations
+  - name: vertex-ai-service-account
+    type: gcp-types/iam-v1:serviceAccounts
+    properties:
+      accountId: $(var.resource_prefix)-vertex-sa
+      project: $(ref.project-info.projectId)
+      serviceAccount:
+        displayName: Legal Analysis Vertex AI Service Account
+        description: Service account for Vertex AI model tuning and inference operations
+    metadata:
+      dependsOn:
+        - project-info
+
+  # IAM binding for Document AI service account - Document AI access
+  - name: documentai-sa-documentai-role
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/documentai.apiUser
+      member: serviceAccount:$(ref.documentai-service-account.email)
+    metadata:
+      dependsOn:
+        - documentai-service-account
+
+  # IAM binding for Functions service account - Storage access
+  - name: functions-sa-storage-role
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.functions-service-account.email)
+    metadata:
+      dependsOn:
+        - functions-service-account
+
+  # IAM binding for Functions service account - Document AI access
+  - name: functions-sa-documentai-role
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/documentai.apiUser
+      member: serviceAccount:$(ref.functions-service-account.email)
+    metadata:
+      dependsOn:
+        - functions-service-account
+
+  # IAM binding for Functions service account - Vertex AI access
+  - name: functions-sa-vertex-role
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.functions-service-account.email)
+    metadata:
+      dependsOn:
+        - functions-service-account
+
+  # IAM binding for Vertex AI service account - AI Platform access
+  - name: vertex-sa-aiplatform-role
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/aiplatform.admin
+      member: serviceAccount:$(ref.vertex-ai-service-account.email)
+    metadata:
+      dependsOn:
+        - vertex-ai-service-account
+
+  # IAM binding for Vertex AI service account - Storage access for training data
+  - name: vertex-sa-storage-role
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-info.projectId)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.vertex-ai-service-account.email)
+    metadata:
+      dependsOn:
+        - vertex-ai-service-account
+
+  # Document AI processor for legal document processing
+  - name: legal-document-processor
+    type: gcp-types/documentai-v1:projects.locations.processors
+    properties:
+      parent: projects/$(ref.project-info.projectId)/locations/$(var.region)
+      processor:
+        displayName: Legal Document Processor
+        type: $(var.docai_processor_type)
+        defaultProcessorVersion: ""
+    metadata:
+      dependsOn:
+        - documentai-api
+        - project-info
+
+  # Upload training data to training bucket
+  - name: upload-training-data
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.training-data-bucket.name)
+      name: legal_training_examples.jsonl
+      contentType: application/json
+      # Training data content (legal document analysis examples)
+      source: |
+        {"messages": [{"role": "user", "content": "Analyze this legal clause: WHEREAS, the Company desires to engage the Consultant to provide certain consulting services; and WHEREAS, the Consultant agrees to provide such services subject to the terms and conditions set forth herein;"}, {"role": "assistant", "content": "CONTRACT_TYPE: Consulting Agreement\nPARTIES: Company (Client), Consultant (Service Provider)\nKEY_CLAUSES: Service provision clause, Terms and conditions reference\nCOMPLIANCE_NOTES: Standard recital language establishing intent and agreement"}]}
+        {"messages": [{"role": "user", "content": "Extract key information from: The term of this Agreement shall commence on [DATE] and shall continue for a period of twelve (12) months, unless earlier terminated in accordance with the provisions hereof."}, {"role": "assistant", "content": "CONTRACT_TYPE: Term Agreement\nDURATION: 12 months\nSTART_DATE: [DATE] - Requires completion\nTERMINATION: Early termination provisions referenced\nCOMPLIANCE_NOTES: Fixed-term contract with termination clauses"}]}
+        {"messages": [{"role": "user", "content": "Analyze this confidentiality clause: Confidential Information shall mean any and all non-public, proprietary or confidential information disclosed by either party, including but not limited to technical data, trade secrets, know-how, research, product plans, products, services, customers, customer lists, markets, software, developments, inventions, processes, formulas, technology, designs, drawings, engineering, hardware configuration information, marketing, finances, or other business information."}, {"role": "assistant", "content": "CONTRACT_TYPE: Confidentiality/NDA\nCLAUSE_TYPE: Definition of Confidential Information\nSCOPE: Broad definition including technical, business, and customer data\nKEY_TERMS: Trade secrets, customer lists, proprietary information\nCOMPLIANCE_NOTES: Comprehensive confidentiality scope, review for overly broad terms"}]}
+        {"messages": [{"role": "user", "content": "Review this liability clause: IN NO EVENT SHALL EITHER PARTY BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL OR PUNITIVE DAMAGES, INCLUDING WITHOUT LIMITATION, LOSS OF PROFITS, DATA, USE, GOODWILL, OR OTHER INTANGIBLE LOSSES."}, {"role": "assistant", "content": "CONTRACT_TYPE: Liability Limitation\nCLAUSE_TYPE: Limitation of Liability\nSCOPE: Exclusion of indirect and consequential damages\nKEY_TERMS: Indirect damages, consequential damages, loss of profits\nCOMPLIANCE_NOTES: Standard limitation clause, verify enforceability under applicable law"}]}
+        {"messages": [{"role": "user", "content": "Analyze this termination clause: Either party may terminate this Agreement at any time upon thirty (30) days' written notice to the other party."}, {"role": "assistant", "content": "CONTRACT_TYPE: Termination Clause\nCLAUSE_TYPE: Termination for Convenience\nNOTICE_PERIOD: 30 days written notice\nTERMINATION_RIGHTS: Either party may terminate\nCOMPLIANCE_NOTES: Standard termination provision, consider survival clauses"}}]
+    metadata:
+      dependsOn:
+        - training-data-bucket
+
+  # Cloud Function for document processing (triggered by Cloud Storage)
+  - name: legal-document-processor-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project-info.projectId)/locations/$(var.region)
+      functionId: $(var.resource_prefix)-document-processor
+      function:
+        displayName: Legal Document Processor Function
+        description: Processes legal documents using Document AI and fine-tuned Gemini model
+        buildConfig:
+          runtime: python39
+          entryPoint: legal_document_processor
+          source:
+            storageSource:
+              # Note: In a real deployment, this would reference the actual function source code
+              bucket: $(ref.legal-documents-bucket.name)
+              object: function-source.zip
+        serviceConfig:
+          serviceAccountEmail: $(ref.functions-service-account.email)
+          environmentVariables:
+            PROJECT_ID: $(ref.project-info.projectId)
+            REGION: $(var.region)
+            DOCAI_PROCESSOR_ID: $(ref.legal-document-processor.name)
+            BUCKET_RESULTS: $(ref.analysis-results-bucket.name)
+            BUCKET_TRAINING: $(ref.training-data-bucket.name)
+          availableMemory: $(var.function_memory)
+          timeoutSeconds: $(var.function_timeout)
+          maxInstanceCount: 10
+          minInstanceCount: 0
+        eventTrigger:
+          eventType: google.cloud.storage.object.v1.finalized
+          eventFilters:
+            - attribute: bucket
+              value: $(ref.legal-documents-bucket.name)
+          retryPolicy: RETRY_POLICY_RETRY
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - legal-documents-bucket
+        - functions-service-account
+        - legal-document-processor
+
+  # Cloud Function for generating legal analysis dashboard
+  - name: legal-dashboard-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project-info.projectId)/locations/$(var.region)
+      functionId: $(var.resource_prefix)-dashboard-generator
+      function:
+        displayName: Legal Analysis Dashboard Generator
+        description: Generates comprehensive legal analysis dashboard from processed documents
+        buildConfig:
+          runtime: python39
+          entryPoint: generate_legal_dashboard
+          source:
+            storageSource:
+              # Note: In a real deployment, this would reference the actual function source code
+              bucket: $(ref.analysis-results-bucket.name)
+              object: dashboard-function-source.zip
+        serviceConfig:
+          serviceAccountEmail: $(ref.functions-service-account.email)
+          environmentVariables:
+            BUCKET_RESULTS: $(ref.analysis-results-bucket.name)
+            PROJECT_ID: $(ref.project-info.projectId)
+          availableMemory: 256Mi
+          timeoutSeconds: 60
+          maxInstanceCount: 5
+          minInstanceCount: 0
+          ingressSettings: ALLOW_ALL
+          allTrafficOnLatestRevision: true
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - analysis-results-bucket
+        - functions-service-account
+
+  # Vertex AI model tuning job configuration
+  # Note: This creates the configuration but the actual tuning job needs to be triggered separately
+  - name: vertex-ai-model-tuning-config
+    type: gcp-types/compute-v1:metadata
+    properties:
+      project: $(ref.project-info.projectId)
+      items:
+        - key: legal-model-tuning-config
+          value: |
+            {
+              "baseModel": "gemini-2.5-flash",
+              "supervisedTuningSpec": {
+                "trainingDatasetUri": "gs://$(ref.training-data-bucket.name)/legal_training_examples.jsonl",
+                "hyperParameters": {
+                  "epochCount": $(var.tuning_epochs),
+                  "learningRateMultiplier": $(var.learning_rate_multiplier)
+                }
+              },
+              "tunedModelDisplayName": "$(var.resource_prefix)-legal-gemini-model"
+            }
+    metadata:
+      dependsOn:
+        - aiplatform-api
+        - upload-training-data
+
+  # Cloud Storage bucket lifecycle policy for cost optimization
+  - name: documents-bucket-lifecycle
+    type: gcp-types/storage-v1:buckets.setLifecycle
+    properties:
+      bucket: $(ref.legal-documents-bucket.name)
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30  # Move to Nearline after 30 days
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90  # Move to Coldline after 90 days
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Delete after 1 year (adjust based on legal retention requirements)
+    metadata:
+      dependsOn:
+        - legal-documents-bucket
+
+  # Cloud Storage bucket lifecycle policy for training data
+  - name: training-bucket-lifecycle
+    type: gcp-types/storage-v1:buckets.setLifecycle
+    properties:
+      bucket: $(ref.training-data-bucket.name)
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 30  # Move training data to Coldline after 30 days
+    metadata:
+      dependsOn:
+        - training-data-bucket
+
+  # Cloud Storage bucket lifecycle policy for results
+  - name: results-bucket-lifecycle
+    type: gcp-types/storage-v1:buckets.setLifecycle
+    properties:
+      bucket: $(ref.analysis-results-bucket.name)
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 60  # Move results to Nearline after 60 days
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 180  # Move to Coldline after 180 days
+    metadata:
+      dependsOn:
+        - analysis-results-bucket
+
+# Output values for verification and integration
+outputs:
+  # Project information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(ref.project-info.projectId)
+
+  deployment_region:
+    description: "Deployment region"
+    value: $(var.region)
+
+  # Storage bucket information
+  documents_bucket_name:
+    description: "Cloud Storage bucket for legal documents input"
+    value: $(ref.legal-documents-bucket.name)
+
+  training_bucket_name:
+    description: "Cloud Storage bucket for training data"
+    value: $(ref.training-data-bucket.name)
+
+  results_bucket_name:
+    description: "Cloud Storage bucket for analysis results"
+    value: $(ref.analysis-results-bucket.name)
+
+  # Document AI processor information
+  document_processor_id:
+    description: "Document AI processor ID for legal document processing"
+    value: $(ref.legal-document-processor.name)
+
+  # Cloud Functions information
+  document_processor_function_name:
+    description: "Cloud Function name for document processing"
+    value: $(ref.legal-document-processor-function.name)
+
+  dashboard_function_name:
+    description: "Cloud Function name for dashboard generation"
+    value: $(ref.legal-dashboard-function.name)
+
+  dashboard_function_url:
+    description: "HTTP trigger URL for dashboard generation function"
+    value: $(ref.legal-dashboard-function.serviceConfig.uri)
+
+  # Service account information
+  documentai_service_account_email:
+    description: "Document AI service account email"
+    value: $(ref.documentai-service-account.email)
+
+  functions_service_account_email:
+    description: "Cloud Functions service account email"
+    value: $(ref.functions-service-account.email)
+
+  vertex_ai_service_account_email:
+    description: "Vertex AI service account email"
+    value: $(ref.vertex-ai-service-account.email)
+
+  # Model tuning configuration
+  model_tuning_config_location:
+    description: "Location of model tuning configuration in metadata"
+    value: "projects/$(ref.project-info.projectId)/global/metadata/legal-model-tuning-config"
+
+  # Usage instructions
+  deployment_instructions:
+    description: "Instructions for using the deployed infrastructure"
+    value: |
+      1. Upload legal documents to: gs://$(ref.legal-documents-bucket.name)
+      2. Documents will be automatically processed by the Cloud Function
+      3. View results in: gs://$(ref.analysis-results-bucket.name)
+      4. Generate dashboard by calling: $(ref.legal-dashboard-function.serviceConfig.uri)
+      5. To start model tuning, use the configuration in project metadata: legal-model-tuning-config
+
+# Deployment metadata and labels
+metadata:
+  labels:
+    recipe-id: f3a7b8c2
+    category: ai
+    difficulty: "300"
+    provider: gcp
+    services: vertex-ai,document-ai,cloud-functions,cloud-storage
+    version: "1.1"
+    generator-version: "1.3"
+  annotations:
+    description: "Legal Document Analysis with Gemini Fine-Tuning and Document AI"
+    estimated-cost: "$75-150 for training and processing"
+    estimated-time: "90 minutes"
+    security-features: "IAM service accounts, bucket-level access controls, encryption at rest"
+    compliance-notes: "Includes data retention policies and audit trails for legal workflows"

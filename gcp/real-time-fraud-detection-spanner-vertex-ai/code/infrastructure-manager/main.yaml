@@ -1,0 +1,379 @@
+# Google Cloud Infrastructure Manager Configuration
+# Real-time Fraud Detection with Spanner and Vertex AI
+# 
+# This configuration deploys a complete fraud detection system including:
+# - Cloud Spanner instance and database with fraud detection schema
+# - Pub/Sub topic and subscription for transaction event processing
+# - Cloud Function for serverless fraud detection logic
+# - Cloud Storage bucket for training data and artifacts
+# - IAM roles and service accounts with least privilege access
+#
+# Prerequisites:
+# - Google Cloud project with billing enabled
+# - Required APIs enabled (spanner, aiplatform, cloudfunctions, pubsub, cloudbuild, logging)
+# - Appropriate IAM permissions for resource creation
+
+imports:
+  - path: spanner.yaml
+  - path: pubsub.yaml
+  - path: storage.yaml
+  - path: function.yaml
+  - path: iam.yaml
+
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-spanner-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{env["project"]}}/services/spanner.googleapis.com
+      
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{env["project"]}}/services/aiplatform.googleapis.com
+      
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{env["project"]}}/services/cloudfunctions.googleapis.com
+      
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{env["project"]}}/services/pubsub.googleapis.com
+      
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{env["project"]}}/services/cloudbuild.googleapis.com
+
+  # Service account for Cloud Function execution
+  - name: fraud-detection-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      parent: projects/{{env["project"]}}
+      accountId: fraud-detection-sa
+      serviceAccount:
+        displayName: Fraud Detection Service Account
+        description: Service account for fraud detection Cloud Function
+
+  # Cloud Spanner instance for transaction storage
+  - name: fraud-detection-spanner-instance
+    type: gcp-types/spanner-v1:projects.instances
+    properties:
+      parent: projects/{{env["project"]}}
+      instanceId: fraud-detection-instance
+      instance:
+        config: projects/{{env["project"]}}/instanceConfigs/nam3
+        displayName: Fraud Detection Database Instance
+        processingUnits: 100
+        labels:
+          purpose: fraud-detection
+          environment: production
+    metadata:
+      dependsOn:
+        - enable-spanner-api
+
+  # Cloud Spanner database with fraud detection schema
+  - name: fraud-detection-database
+    type: gcp-types/spanner-v1:projects.instances.databases
+    properties:
+      parent: $(ref.fraud-detection-spanner-instance.name)
+      createStatement: CREATE DATABASE `fraud-detection-db`
+      extraStatements:
+        # Users table for customer information
+        - |
+          CREATE TABLE Users (
+            user_id STRING(36) NOT NULL,
+            email STRING(255),
+            created_at TIMESTAMP,
+            risk_score FLOAT64,
+            country_code STRING(2),
+          ) PRIMARY KEY (user_id)
+        # Transactions table with fraud detection fields
+        - |
+          CREATE TABLE Transactions (
+            transaction_id STRING(36) NOT NULL,
+            user_id STRING(36) NOT NULL,
+            amount NUMERIC,
+            currency STRING(3),
+            merchant_id STRING(50),
+            transaction_time TIMESTAMP,
+            fraud_score FLOAT64,
+            fraud_prediction STRING(20),
+            ip_address STRING(45),
+            device_fingerprint STRING(255),
+            FOREIGN KEY (user_id) REFERENCES Users (user_id)
+          ) PRIMARY KEY (transaction_id),
+          INTERLEAVE IN PARENT Users ON DELETE CASCADE
+        # Performance indexes for fraud detection queries
+        - |
+          CREATE INDEX UserTransactionsByTime
+          ON Transactions (user_id, transaction_time DESC)
+        - |
+          CREATE INDEX FraudScoreIndex
+          ON Transactions (fraud_score DESC)
+    metadata:
+      dependsOn:
+        - fraud-detection-spanner-instance
+
+  # Cloud Storage bucket for training data and artifacts
+  - name: fraud-detection-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: {{env["project"]}}-fraud-detection-data
+      location: {{properties["region"]}}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: projects/{{env["project"]}}/locations/{{properties["region"]}}/keyRings/default/cryptoKeys/default
+      labels:
+        purpose: fraud-detection
+        data-type: training-artifacts
+      lifecycleRule:
+        - condition:
+            age: 365
+          action:
+            type: Delete
+
+  # Pub/Sub topic for transaction events
+  - name: transaction-events-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/{{env["project"]}}/topics/transaction-events
+      labels:
+        purpose: fraud-detection
+        component: event-processing
+      messageRetentionDuration: 604800s  # 7 days
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Pub/Sub subscription for fraud processing
+  - name: fraud-processing-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/{{env["project"]}}/subscriptions/fraud-processing
+      topic: $(ref.transaction-events-topic.name)
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.dead-letter-topic.name)
+        maxDeliveryAttempts: 5
+      labels:
+        purpose: fraud-detection
+        component: event-processing
+
+  # Dead letter topic for failed message processing
+  - name: dead-letter-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/{{env["project"]}}/topics/fraud-processing-dead-letter
+      labels:
+        purpose: fraud-detection
+        component: error-handling
+
+  # Cloud Function for fraud detection processing
+  - name: fraud-detection-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/{{env["project"]}}/locations/{{properties["region"]}}
+      functionId: fraud-detector
+      function:
+        description: Real-time fraud detection processing function
+        buildConfig:
+          runtime: python312
+          entryPoint: process_transaction
+          source:
+            storageSource:
+              bucket: {{env["project"]}}-fraud-detection-data
+              object: function-source.zip
+          environmentVariables:
+            SPANNER_INSTANCE: fraud-detection-instance
+            DATABASE_NAME: fraud-detection-db
+        serviceConfig:
+          maxInstanceCount: 10
+          availableMemory: 512Mi
+          timeoutSeconds: 60
+          environmentVariables:
+            SPANNER_INSTANCE: fraud-detection-instance
+            DATABASE_NAME: fraud-detection-db
+            PROJECT_ID: {{env["project"]}}
+          serviceAccountEmail: $(ref.fraud-detection-service-account.email)
+          ingressSettings: ALLOW_INTERNAL_ONLY
+          vpcConnector: ""
+        eventTrigger:
+          triggerRegion: {{properties["region"]}}
+          eventType: google.cloud.pubsub.topic.v1.messagePublished
+          pubsubTopic: $(ref.transaction-events-topic.name)
+          retryPolicy: RETRY_POLICY_RETRY
+        labels:
+          purpose: fraud-detection
+          component: processing-function
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - fraud-detection-service-account
+        - transaction-events-topic
+        - fraud-detection-database
+
+  # IAM binding for Cloud Function to access Spanner
+  - name: function-spanner-access
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{env["project"]}}
+      role: roles/spanner.databaseUser
+      member: serviceAccount:$(ref.fraud-detection-service-account.email)
+
+  # IAM binding for Cloud Function to access Vertex AI
+  - name: function-vertexai-access
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{env["project"]}}
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.fraud-detection-service-account.email)
+
+  # IAM binding for Cloud Function to write logs
+  - name: function-logging-access
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{env["project"]}}
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.fraud-detection-service-account.email)
+
+  # IAM binding for Cloud Function to access Pub/Sub
+  - name: function-pubsub-access
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{env["project"]}}
+      role: roles/pubsub.subscriber
+      member: serviceAccount:$(ref.fraud-detection-service-account.email)
+
+  # Sample users for testing fraud detection
+  - name: insert-sample-users
+    type: gcp-types/spanner-v1:projects.instances.databases.sessions
+    action: gcp-types/spanner-v1:spanner.projects.instances.databases.sessions.executeSql
+    properties:
+      database: $(ref.fraud-detection-database.name)
+      sql: |
+        INSERT INTO Users (user_id, email, created_at, risk_score, country_code) VALUES
+        ('user-1', 'john.doe@example.com', CURRENT_TIMESTAMP(), 0.1, 'US'),
+        ('user-2', 'jane.smith@example.com', CURRENT_TIMESTAMP(), 0.2, 'CA'),
+        ('user-3', 'bob.johnson@example.com', CURRENT_TIMESTAMP(), 0.8, 'US')
+    metadata:
+      dependsOn:
+        - fraud-detection-database
+
+  # Monitoring dashboard for fraud detection metrics
+  - name: fraud-detection-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/{{env["project"]}}
+      dashboard:
+        displayName: Fraud Detection Monitoring
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: Transaction Volume
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: resource.type="cloud_function" resource.label.function_name="fraud-detector"
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_RATE
+            - width: 6
+              height: 4
+              widget:
+                title: Fraud Detection Latency
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: resource.type="cloud_function" resource.label.function_name="fraud-detector"
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_MEAN
+
+# Configuration properties with default values
+properties:
+  region:
+    type: string
+    default: us-central1
+    description: Google Cloud region for deploying resources
+  
+  zone:
+    type: string
+    default: us-central1-a
+    description: Google Cloud zone for zonal resources
+    
+  spanner_processing_units:
+    type: integer
+    default: 100
+    description: Cloud Spanner processing units (100-4000)
+    
+  function_memory:
+    type: string
+    default: 512Mi
+    description: Memory allocation for Cloud Function
+    
+  function_timeout:
+    type: integer
+    default: 60
+    description: Timeout in seconds for Cloud Function execution
+    
+  environment:
+    type: string
+    default: production
+    description: Environment label for resource tagging
+
+# Outputs for integration and verification
+outputs:
+  spanner_instance_name:
+    description: Name of the created Spanner instance
+    value: $(ref.fraud-detection-spanner-instance.name)
+    
+  database_name:
+    description: Name of the fraud detection database
+    value: $(ref.fraud-detection-database.name)
+    
+  pubsub_topic_name:
+    description: Name of the transaction events Pub/Sub topic
+    value: $(ref.transaction-events-topic.name)
+    
+  function_name:
+    description: Name of the fraud detection Cloud Function
+    value: $(ref.fraud-detection-function.name)
+    
+  storage_bucket_name:
+    description: Name of the Cloud Storage bucket for artifacts
+    value: $(ref.fraud-detection-storage-bucket.name)
+    
+  service_account_email:
+    description: Email of the fraud detection service account
+    value: $(ref.fraud-detection-service-account.email)
+    
+  function_trigger_url:
+    description: HTTP trigger URL for the Cloud Function (if applicable)
+    value: $(ref.fraud-detection-function.serviceConfig.uri)
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: 1.0
+  description: Real-time fraud detection system using Cloud Spanner and Vertex AI
+  author: Infrastructure Manager Generator
+  tags:
+    - fraud-detection
+    - machine-learning
+    - real-time
+    - security
+    - financial-services
+  estimated_cost: $20-50 per day for development/testing
+  cleanup_required: true

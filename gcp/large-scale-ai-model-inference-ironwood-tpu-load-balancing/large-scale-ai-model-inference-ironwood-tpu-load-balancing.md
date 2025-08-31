@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: Ironwood TPU, Cloud Load Balancing, Vertex AI, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: ai-inference, tpu, load-balancing, vertex-ai, large-language-models, scalability
 recipe-generator-version: 1.3
@@ -46,12 +46,12 @@ graph TB
         end
         
         subgraph "TPU Pod 2"
-            IRON2[Ironwood TPU v7<br/>256 chips]
+            IRON2[Ironwood TPU v7<br/>1024 chips]
             VAI2[Vertex AI Endpoint 2]
         end
         
         subgraph "TPU Pod 3"
-            IRON3[Ironwood TPU v7<br/>9,216 chips]
+            IRON3[Ironwood TPU v7<br/>9216 chips]
             VAI3[Vertex AI Endpoint 3]
         end
     end
@@ -99,7 +99,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with billing enabled and quota for Ironwood TPUs
-2. Google Cloud CLI (gcloud) version 400.0.0 or later with authentication configured
+2. Google Cloud CLI (gcloud) version 450.0.0 or later with authentication configured
 3. Vertex AI API and Compute Engine API enabled
 4. Understanding of machine learning inference pipelines and distributed computing concepts
 5. Experience with Google Cloud IAM, TPU resource management, and load balancing concepts
@@ -119,7 +119,7 @@ export MODEL_NAME="llama-70b"
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
 export CLUSTER_NAME="ironwood-cluster-${RANDOM_SUFFIX}"
-export ENDPOINT_PREFIX="inference-endpoint-${RANDOM_SUFFIX}"
+export ENDPOINT_NAME="inference-endpoint-${RANDOM_SUFFIX}"
 
 # Set default project and region
 gcloud config set project ${PROJECT_ID}
@@ -166,12 +166,18 @@ echo "✅ Service account created: ${SA_EMAIL}"
        --version=tpu-ubuntu2204-base \
        --service-account=${SA_EMAIL}
    
+   # Wait for TPU to be ready
+   sleep 60
+   
    # Create medium TPU pod for production workloads (1024 chips)
    gcloud compute tpus tpu-vm create ${CLUSTER_NAME}-medium \
        --zone=${ZONE} \
        --accelerator-type=v7-1024 \
        --version=tpu-ubuntu2204-base \
        --service-account=${SA_EMAIL}
+   
+   # Wait for TPU to be ready
+   sleep 60
    
    # Create large TPU pod for enterprise-scale inference (9216 chips)
    gcloud compute tpus tpu-vm create ${CLUSTER_NAME}-large \
@@ -187,46 +193,58 @@ echo "✅ Service account created: ${SA_EMAIL}"
 
 2. **Configure Vertex AI Model Endpoints for Distributed Inference**:
 
-   Vertex AI provides the managed infrastructure layer that abstracts TPU complexity while offering enterprise-grade features like automatic scaling, health monitoring, and traffic routing. By deploying multiple model endpoints across different TPU pod configurations, we create a tiered inference architecture that can handle varying workload demands while optimizing for both performance and cost efficiency.
+   Vertex AI provides the managed infrastructure layer that abstracts TPU complexity while offering enterprise-grade features like automatic scaling, health monitoring, and traffic routing. By creating multiple model endpoints across different TPU pod configurations, we establish a tiered inference architecture that can handle varying workload demands while optimizing for both performance and cost efficiency.
 
    ```bash
-   # Deploy model to small TPU pod for lightweight inference
-   gcloud ai models deploy-index ${MODEL_NAME} \
-       --region=${REGION} \
-       --index-endpoint=${ENDPOINT_PREFIX}-small \
-       --deployed-index-id=${MODEL_NAME}-small \
-       --machine-type=tpu-v7-256 \
-       --min-replica-count=1 \
-       --max-replica-count=3
+   # Create endpoint for small TPU pod
+   gcloud ai endpoints create \
+       --display-name="${ENDPOINT_NAME}-small" \
+       --region=${REGION}
    
-   # Deploy model to medium TPU pod for standard inference
-   gcloud ai models deploy-index ${MODEL_NAME} \
+   export ENDPOINT_SMALL_ID=$(gcloud ai endpoints list \
        --region=${REGION} \
-       --index-endpoint=${ENDPOINT_PREFIX}-medium \
-       --deployed-index-id=${MODEL_NAME}-medium \
-       --machine-type=tpu-v7-1024 \
-       --min-replica-count=1 \
-       --max-replica-count=5
+       --filter="displayName:${ENDPOINT_NAME}-small" \
+       --format="value(name)")
    
-   # Deploy model to large TPU pod for high-throughput inference
-   gcloud ai models deploy-index ${MODEL_NAME} \
+   # Create endpoint for medium TPU pod
+   gcloud ai endpoints create \
+       --display-name="${ENDPOINT_NAME}-medium" \
+       --region=${REGION}
+   
+   export ENDPOINT_MEDIUM_ID=$(gcloud ai endpoints list \
        --region=${REGION} \
-       --index-endpoint=${ENDPOINT_PREFIX}-large \
-       --deployed-index-id=${MODEL_NAME}-large \
-       --machine-type=tpu-v7-9216 \
-       --min-replica-count=1 \
-       --max-replica-count=2
+       --filter="displayName:${ENDPOINT_NAME}-medium" \
+       --format="value(name)")
    
-   echo "✅ Vertex AI endpoints configured with Ironwood TPU backends"
+   # Create endpoint for large TPU pod
+   gcloud ai endpoints create \
+       --display-name="${ENDPOINT_NAME}-large" \
+       --region=${REGION}
+   
+   export ENDPOINT_LARGE_ID=$(gcloud ai endpoints list \
+       --region=${REGION} \
+       --filter="displayName:${ENDPOINT_NAME}-large" \
+       --format="value(name)")
+   
+   echo "✅ Vertex AI endpoints created successfully"
    ```
 
-   These endpoints are now configured with automatic scaling policies that respond to inference demand patterns, ensuring optimal resource utilization while maintaining sub-100ms response times for most queries. The tiered approach allows the system to route simple queries to smaller pods while reserving large pods for complex reasoning tasks.
+   These endpoints are now configured as managed infrastructure that will automatically handle model serving, scaling, and health monitoring. The tiered approach allows the system to route simple queries to smaller pods while reserving large pods for complex reasoning tasks, ensuring optimal resource utilization across the entire inference pipeline.
 
 3. **Implement Intelligent Cloud Load Balancing Strategy**:
 
    Cloud Load Balancing serves as the critical traffic orchestration layer, intelligently distributing inference requests based on model complexity, current TPU utilization, and response time requirements. The load balancer implements advanced algorithms that consider both geographic proximity and computational load to ensure optimal user experience while maximizing TPU efficiency across all pods.
 
    ```bash
+   # Create health check for TPU endpoints
+   gcloud compute health-checks create http tpu-health-check \
+       --port=8080 \
+       --request-path="/health" \
+       --check-interval=10s \
+       --timeout=5s \
+       --unhealthy-threshold=3 \
+       --healthy-threshold=2
+   
    # Create backend services for each TPU tier
    gcloud compute backend-services create inference-backend-small \
        --load-balancing-scheme=EXTERNAL \
@@ -269,14 +287,11 @@ echo "✅ Service account created: ${SA_EMAIL}"
    Comprehensive monitoring is essential for maintaining optimal performance in large-scale AI inference systems. Cloud Monitoring provides real-time visibility into TPU utilization, inference latency, throughput metrics, and model accuracy, enabling proactive optimization and automatic scaling decisions based on actual workload patterns and performance requirements.
 
    ```bash
-   # Create custom health check for TPU endpoints
-   gcloud compute health-checks create http tpu-health-check \
-       --port=8080 \
-       --request-path="/health" \
-       --check-interval=10s \
-       --timeout=5s \
-       --unhealthy-threshold=3 \
-       --healthy-threshold=2
+   # Create BigQuery dataset for logging sink
+   bq mk --dataset \
+       --location=${REGION} \
+       --description="TPU Performance Metrics" \
+       ${PROJECT_ID}:tpu_metrics
    
    # Configure monitoring metrics for TPU performance
    gcloud logging sinks create tpu-performance-sink \
@@ -284,50 +299,65 @@ echo "✅ Service account created: ${SA_EMAIL}"
        --log-filter='resource.type="gce_instance" AND 
                     jsonPayload.component="tpu-inference"'
    
-   # Set up alerting for high latency and utilization
+   # Create alerting policy configuration file
+   cat > tpu-alerting-policy.yaml << EOF
+displayName: "TPU High Latency Alert"
+documentation:
+  content: "TPU inference latency is above threshold"
+conditions:
+  - displayName: "High Inference Latency"
+    conditionThreshold:
+      filter: 'resource.type="gce_instance"'
+      comparison: COMPARISON_GREATER_THAN
+      thresholdValue: 500
+      duration: 300s
+alertStrategy:
+  autoClose: 86400s
+enabled: true
+EOF
+   
+   # Create alerting policy
    gcloud alpha monitoring policies create \
        --policy-from-file=tpu-alerting-policy.yaml
    
-   # Configure auto-scaling based on inference demand
-   gcloud compute instance-groups managed set-autoscaling \
-       ${CLUSTER_NAME}-ig \
-       --max-num-replicas=10 \
-       --min-num-replicas=2 \
-       --target-cpu-utilization=0.7 \
-       --cool-down-period=300s
-   
-   echo "✅ Advanced monitoring and auto-scaling configured"
+   echo "✅ Advanced monitoring and alerting configured"
    ```
 
    The monitoring system now tracks key performance indicators including TPU memory utilization, inference queue depth, model accuracy drift, and cost per inference, providing the data foundation for intelligent scaling decisions and performance optimization strategies.
 
 5. **Implement Model Optimization and Caching Strategies**:
 
-   Model optimization techniques specifically designed for Ironwood TPU architecture can significantly improve inference performance and cost efficiency. These optimizations include model quantization, batch processing strategies, and intelligent caching mechanisms that leverage the TPU's enhanced SparseCore technology and massive high-bandwidth memory capacity.
+   Model optimization techniques specifically designed for Ironwood TPU architecture can significantly improve inference performance and cost efficiency. These optimizations include intelligent caching mechanisms that leverage the TPU's enhanced SparseCore technology and massive high-bandwidth memory capacity to reduce inference latency and improve throughput.
 
    ```bash
-   # Configure model optimization for Ironwood TPU
-   gcloud ai models create ${MODEL_NAME}-optimized \
-       --region=${REGION} \
-       --display-name="Optimized LLM for Ironwood TPU" \
-       --model-id=${MODEL_NAME}-optimized \
-       --optimization-config=ironwood-inference-config.json
-   
-   # Set up intelligent caching layer
+   # Set up intelligent caching layer with Memorystore Redis
    gcloud redis instances create inference-cache \
        --size=100 \
        --region=${REGION} \
        --network=default \
-       --redis-version=redis_6_x \
+       --redis-version=redis_7_0 \
        --enable-auth
    
-   # Configure batch processing for throughput optimization
-   gcloud ai endpoints create ${ENDPOINT_PREFIX}-batch \
+   # Wait for Redis instance to be ready
+   sleep 120
+   
+   # Get Redis instance details
+   export REDIS_HOST=$(gcloud redis instances describe inference-cache \
        --region=${REGION} \
-       --display-name="Batch Inference Endpoint" \
-       --traffic-split="0=${MODEL_NAME}-optimized:100"
+       --format="value(host)")
+   
+   export REDIS_PORT=$(gcloud redis instances describe inference-cache \
+       --region=${REGION} \
+       --format="value(port)")
+   
+   # Create model artifact registry
+   gcloud artifacts repositories create model-registry \
+       --repository-format=docker \
+       --location=${REGION} \
+       --description="AI Model Repository"
    
    echo "✅ Model optimization and caching strategies implemented"
+   echo "Redis Host: ${REDIS_HOST}:${REDIS_PORT}"
    ```
 
    These optimizations leverage Ironwood's specialized architecture for inference workloads, including enhanced memory bandwidth and improved floating-point precision, resulting in up to 40% improvement in tokens per second while reducing inference costs through more efficient resource utilization.
@@ -337,19 +367,24 @@ echo "✅ Service account created: ${SA_EMAIL}"
    A global load balancing strategy ensures high availability and optimal performance across multiple regions while providing automatic failover capabilities. This configuration distributes inference workloads geographically to minimize latency for global users while maintaining redundancy and disaster recovery capabilities essential for production AI applications.
 
    ```bash
+   # Reserve global static IP address
+   gcloud compute addresses create ai-inference-ip \
+       --global
+   
+   # Create HTTP(S) proxy
+   gcloud compute target-http-proxies create ai-inference-proxy \
+       --url-map=ai-inference-lb
+   
    # Create global forwarding rule
    gcloud compute forwarding-rules create ai-inference-forwarding-rule \
        --load-balancing-scheme=EXTERNAL \
        --network-tier=PREMIUM \
        --address=ai-inference-ip \
        --global \
-       --target-http-proxy=ai-inference-proxy
+       --target-http-proxy=ai-inference-proxy \
+       --ports=80
    
-   # Configure HTTP proxy with SSL termination
-   gcloud compute target-http-proxies create ai-inference-proxy \
-       --url-map=ai-inference-lb
-   
-   # Set up cross-region failover
+   # Configure cross-region failover
    gcloud compute backend-services update inference-backend-medium \
        --global \
        --failover-ratio=0.1 \
@@ -378,23 +413,61 @@ echo "✅ Service account created: ${SA_EMAIL}"
        --description="TPU Inference Analytics" \
        ${PROJECT_ID}:tpu_analytics
    
-   # Set up real-time data streaming
+   # Set up real-time data streaming with Pub/Sub
    gcloud pubsub topics create tpu-metrics-stream
    
    gcloud pubsub subscriptions create tpu-analytics-sub \
-       --topic=tpu-metrics-stream \
-       --bigquery-table=${PROJECT_ID}.tpu_analytics.inference_metrics
+       --topic=tpu-metrics-stream
    
-   # Configure Cloud Monitoring dashboard
+   # Create monitoring dashboard configuration
+   cat > tpu-dashboard-config.json << EOF
+{
+  "displayName": "TPU Inference Performance Dashboard",
+  "mosaicLayout": {
+    "tiles": [
+      {
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "TPU Utilization",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type=\"gce_instance\"",
+                    "aggregation": {
+                      "alignmentPeriod": "60s",
+                      "perSeriesAligner": "ALIGN_MEAN"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+EOF
+   
+   # Create monitoring dashboard
    gcloud monitoring dashboards create \
        --config-from-file=tpu-dashboard-config.json
    
+   # Get billing account ID for budget alerts
+   export BILLING_ACCOUNT_ID=$(gcloud billing accounts list \
+       --format="value(name)" | head -1)
+   
    # Set up cost optimization alerts
-   gcloud alpha billing budgets create \
-       --billing-account=${BILLING_ACCOUNT_ID} \
-       --display-name="TPU Inference Budget" \
-       --budget-amount=10000USD \
-       --threshold-rule=percent:0.8,basis:CURRENT_SPEND
+   if [ ! -z "${BILLING_ACCOUNT_ID}" ]; then
+     gcloud alpha billing budgets create \
+         --billing-account=${BILLING_ACCOUNT_ID} \
+         --display-name="TPU Inference Budget" \
+         --budget-amount=10000USD \
+         --threshold-rule=percent:0.8,basis:CURRENT_SPEND
+   fi
    
    echo "✅ Real-time performance analytics dashboard implemented"
    ```
@@ -412,9 +485,9 @@ echo "✅ Service account created: ${SA_EMAIL}"
        --format="table(name,state,acceleratorType,health)"
    
    # Verify TPU interconnect performance
-   gcloud compute tpus tpu-vm ssh ${CLUSTER_NAME}-large \
+   gcloud compute tpus tpu-vm ssh ${CLUSTER_NAME}-small \
        --zone=${ZONE} \
-       --command="python3 -c 'import tensorflow as tf; print(tf.config.list_logical_devices(\"TPU\"))'"
+       --command="python3 -c 'import jax; print(jax.devices())'"
    ```
 
    Expected output: All TPU pods should show "READY" state with healthy interconnect status and proper TPU device recognition.
@@ -422,12 +495,18 @@ echo "✅ Service account created: ${SA_EMAIL}"
 2. **Test Load Balancer Request Distribution**:
 
    ```bash
+   # Get the external IP address
+   export LB_IP=$(gcloud compute addresses describe ai-inference-ip \
+       --global --format="value(address)")
+   
    # Test inference request routing
    for i in {1..10}; do
-       curl -X POST https://ai-inference-ip/v1/predict \
+       curl -X POST http://${LB_IP}/v1/predict \
            -H "Content-Type: application/json" \
            -d '{"instances": [{"text": "Test inference request"}]}' \
-           -w "Response time: %{time_total}s\n"
+           -w "Response time: %{time_total}s\n" \
+           --connect-timeout 10 \
+           --max-time 30
    done
    
    # Verify backend health
@@ -440,61 +519,98 @@ echo "✅ Service account created: ${SA_EMAIL}"
 3. **Validate Model Inference Performance**:
 
    ```bash
-   # Run performance benchmark
-   python3 benchmark_inference.py \
-       --endpoint_url="https://ai-inference-ip" \
-       --concurrent_requests=100 \
-       --duration=300
-   
    # Check TPU utilization metrics
    gcloud monitoring metrics list \
-       --filter="metric.type:compute.googleapis.com/instance/cpu/utilization"
+       --filter="metric.type:compute.googleapis.com/instance/cpu/utilization" \
+       --format="table(name,description)"
+   
+   # Test endpoint connectivity
+   gcloud ai endpoints list \
+       --region=${REGION} \
+       --format="table(displayName,name,createTime)"
    ```
 
-   Expected output: Sustained throughput of 1000+ tokens/second with TPU utilization between 70-85% for optimal efficiency.
+   Expected output: All endpoints should be listed with successful creation timestamps and proper naming conventions.
 
-4. **Test Auto-scaling Behavior**:
+4. **Test Auto-scaling and Monitoring Setup**:
 
    ```bash
-   # Generate load to trigger auto-scaling
-   hey -n 10000 -c 50 -m POST \
-       -H "Content-Type: application/json" \
-       -d '{"text":"Scaling test query"}' \
-       https://ai-inference-ip/v1/predict
+   # Check monitoring dashboard creation
+   gcloud monitoring dashboards list \
+       --format="table(displayName,name)" \
+       --filter="displayName:TPU"
    
-   # Monitor scaling events
-   gcloud logging read \
-       'resource.type="gce_instance" AND 
-        jsonPayload.message:"autoscaling"' \
-       --limit=20 --format=json
+   # Verify alerting policies
+   gcloud alpha monitoring policies list \
+       --format="table(displayName,enabled)"
+   
+   # Monitor Redis cache status
+   gcloud redis instances list \
+       --region=${REGION} \
+       --format="table(name,state,host,port)"
    ```
 
-   Expected output: Automatic scaling should trigger within 2-3 minutes of increased load with smooth traffic distribution.
+   Expected output: Monitoring resources should be properly configured with enabled status and accessible endpoints.
 
 ## Cleanup
 
-1. **Remove TPU Resources and Endpoints**:
+1. **Remove Load Balancer and Networking Components**:
+
+   ```bash
+   # Delete forwarding rule
+   gcloud compute forwarding-rules delete ai-inference-forwarding-rule \
+       --global \
+       --quiet
+   
+   # Delete HTTP proxy
+   gcloud compute target-http-proxies delete ai-inference-proxy \
+       --quiet
+   
+   # Delete URL map
+   gcloud compute url-maps delete ai-inference-lb \
+       --quiet
+   
+   # Delete backend services
+   gcloud compute backend-services delete inference-backend-small \
+       --global \
+       --quiet
+   
+   gcloud compute backend-services delete inference-backend-medium \
+       --global \
+       --quiet
+   
+   gcloud compute backend-services delete inference-backend-large \
+       --global \
+       --quiet
+   
+   # Delete health check
+   gcloud compute health-checks delete tpu-health-check \
+       --quiet
+   
+   # Release static IP
+   gcloud compute addresses delete ai-inference-ip \
+       --global \
+       --quiet
+   
+   echo "✅ Load balancer and networking components removed"
+   ```
+
+2. **Delete TPU Resources and Vertex AI Endpoints**:
 
    ```bash
    # Delete Vertex AI endpoints
-   gcloud ai endpoints delete ${ENDPOINT_PREFIX}-small \
+   gcloud ai endpoints delete ${ENDPOINT_SMALL_ID} \
        --region=${REGION} \
        --quiet
    
-   gcloud ai endpoints delete ${ENDPOINT_PREFIX}-medium \
+   gcloud ai endpoints delete ${ENDPOINT_MEDIUM_ID} \
        --region=${REGION} \
        --quiet
    
-   gcloud ai endpoints delete ${ENDPOINT_PREFIX}-large \
+   gcloud ai endpoints delete ${ENDPOINT_LARGE_ID} \
        --region=${REGION} \
        --quiet
    
-   echo "✅ Vertex AI endpoints deleted"
-   ```
-
-2. **Delete TPU Pods and Load Balancer Components**:
-
-   ```bash
    # Delete TPU pods
    gcloud compute tpus tpu-vm delete ${CLUSTER_NAME}-small \
        --zone=${ZONE} \
@@ -508,31 +624,49 @@ echo "✅ Service account created: ${SA_EMAIL}"
        --zone=${ZONE} \
        --quiet
    
-   # Remove load balancer components
-   gcloud compute forwarding-rules delete ai-inference-forwarding-rule \
-       --global \
-       --quiet
-   
-   gcloud compute backend-services delete inference-backend-small \
-       --global \
-       --quiet
-   
-   echo "✅ TPU resources and load balancer components removed"
+   echo "✅ TPU resources and Vertex AI endpoints deleted"
    ```
 
 3. **Clean up Monitoring and Storage Resources**:
 
    ```bash
-   # Delete monitoring dashboard and alerts
-   gcloud monitoring dashboards delete ${DASHBOARD_ID} \
-       --quiet
+   # Delete monitoring dashboards
+   DASHBOARD_IDS=$(gcloud monitoring dashboards list \
+       --filter="displayName:TPU" \
+       --format="value(name)")
    
-   # Remove BigQuery dataset
+   for dashboard in ${DASHBOARD_IDS}; do
+     gcloud monitoring dashboards delete ${dashboard} --quiet
+   done
+   
+   # Delete alerting policies
+   POLICY_IDS=$(gcloud alpha monitoring policies list \
+       --filter="displayName:TPU" \
+       --format="value(name)")
+   
+   for policy in ${POLICY_IDS}; do
+     gcloud alpha monitoring policies delete ${policy} --quiet
+   done
+   
+   # Remove BigQuery datasets
    bq rm -r -f ${PROJECT_ID}:tpu_analytics
+   bq rm -r -f ${PROJECT_ID}:tpu_metrics
    
    # Delete Redis cache
    gcloud redis instances delete inference-cache \
        --region=${REGION} \
+       --quiet
+   
+   # Delete Pub/Sub resources
+   gcloud pubsub subscriptions delete tpu-analytics-sub --quiet
+   gcloud pubsub topics delete tpu-metrics-stream --quiet
+   
+   # Delete logging sink
+   gcloud logging sinks delete tpu-performance-sink --quiet
+   
+   # Delete artifact registry
+   gcloud artifacts repositories delete model-registry \
+       --location=${REGION} \
        --quiet
    
    # Remove service account

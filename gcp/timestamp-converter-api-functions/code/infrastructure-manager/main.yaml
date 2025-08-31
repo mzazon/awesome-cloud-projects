@@ -1,0 +1,332 @@
+# Infrastructure Manager configuration for Timestamp Converter API with Cloud Functions
+# This configuration deploys a serverless HTTP API using Google Cloud Functions
+# for converting Unix timestamps to human-readable dates with timezone support
+
+# Import required modules for Infrastructure Manager deployment
+imports:
+  - path: timestamp-converter-function.zip
+    name: function-source
+
+# Global deployment configuration
+deployment:
+  name: timestamp-converter-api
+  description: "Serverless timestamp conversion API using Cloud Functions and Cloud Storage"
+
+# Resource definitions
+resources:
+  # Cloud Storage bucket for function source code
+  - name: timestamp-converter-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      # Generate unique bucket name with random suffix
+      name: timestamp-converter-source-${RANDOM_SUFFIX}
+      project: ${PROJECT_ID}
+      location: ${REGION}
+      storageClass: STANDARD
+      # Enable versioning for source code history and rollback capabilities
+      versioning:
+        enabled: true
+      # Configure lifecycle management to optimize storage costs
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              # Delete old versions after 30 days to manage storage costs
+              age: 30
+              isLive: false
+      # Apply labels for resource organization and cost tracking
+      labels:
+        environment: development
+        application: timestamp-converter
+        cost-center: serverless-apis
+        managed-by: infrastructure-manager
+
+  # Cloud Storage bucket IAM binding for Cloud Functions access
+  - name: function-source-bucket-iam
+    type: gcp-types/storage-v1:buckets/iam
+    properties:
+      bucket: $(ref.timestamp-converter-source-bucket.name)
+      # Grant Cloud Functions service account read access to source code
+      bindings:
+        - role: roles/storage.objectViewer
+          members:
+            - serviceAccount:${PROJECT_ID}@appspot.gserviceaccount.com
+
+  # Cloud Storage object for function source code archive
+  - name: function-source-archive
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.timestamp-converter-source-bucket.name)
+      name: function-source.zip
+      # Source code will be uploaded separately via gcloud or console
+      # This resource ensures the object location is managed by Infrastructure Manager
+    depends_on:
+      - timestamp-converter-source-bucket
+
+  # Cloud Run service (2nd generation Cloud Function)
+  - name: timestamp-converter-function
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/${PROJECT_ID}
+      location: ${REGION}
+      # Cloud Run service configuration for the timestamp converter function
+      body:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: timestamp-converter
+          namespace: ${PROJECT_ID}
+          # Annotations for Cloud Functions 2nd gen integration
+          annotations:
+            run.googleapis.com/ingress: all
+            run.googleapis.com/execution-environment: gen2
+            run.googleapis.com/cpu-throttling: "false"
+          # Labels for resource organization and monitoring
+          labels:
+            cloud.googleapis.com/location: ${REGION}
+            environment: development
+            application: timestamp-converter
+        spec:
+          template:
+            metadata:
+              # Template annotations for function behavior
+              annotations:
+                # Allow unauthenticated requests for public API access
+                run.googleapis.com/invoker: public
+                # Set memory allocation for optimal performance
+                run.googleapis.com/memory: "256Mi"
+                # Configure request timeout for timestamp processing
+                run.googleapis.com/timeout: "60s"
+                # Set maximum instances to control costs and scaling
+                run.googleapis.com/max-instances: "10"
+                # Enable CPU allocation during request processing only
+                run.googleapis.com/cpu: "1000m"
+                # Configure autoscaling behavior
+                autoscaling.knative.dev/minScale: "0"
+                autoscaling.knative.dev/maxScale: "10"
+            spec:
+              # Service account for function execution
+              serviceAccountName: ${PROJECT_ID}@appspot.gserviceaccount.com
+              # Container configuration
+              containers:
+                - name: timestamp-converter
+                  # Container image will be built automatically from source
+                  image: gcr.io/${PROJECT_ID}/timestamp-converter:latest
+                  # Resource limits for cost optimization
+                  resources:
+                    limits:
+                      cpu: 1000m
+                      memory: 256Mi
+                  # Environment variables for function configuration
+                  env:
+                    - name: FUNCTION_TARGET
+                      value: timestamp_converter
+                    - name: FUNCTION_SOURCE
+                      value: main.py
+                  # Health check configuration
+                  livenessProbe:
+                    httpGet:
+                      path: /
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 10
+                  # Readiness probe for traffic routing
+                  readinessProbe:
+                    httpGet:
+                      path: /
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+              # Configure request concurrency for optimal performance
+              containerConcurrency: 100
+    depends_on:
+      - timestamp-converter-source-bucket
+      - function-source-archive
+
+  # IAM policy binding for public access to the Cloud Function
+  - name: function-public-access
+    type: gcp-types/run-v1:projects.locations.services/iam
+    properties:
+      resource: projects/${PROJECT_ID}/locations/${REGION}/services/timestamp-converter
+      # Grant public access for unauthenticated requests
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    depends_on:
+      - timestamp-converter-function
+
+  # Cloud Logging sink for function logs (optional but recommended)
+  - name: function-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/${PROJECT_ID}
+      # Configure log routing for Cloud Run function logs
+      body:
+        name: timestamp-converter-logs
+        description: "Log sink for timestamp converter function"
+        # Filter for Cloud Run function logs
+        filter: >
+          resource.type="cloud_run_revision"
+          resource.labels.service_name="timestamp-converter"
+        # Route logs to Cloud Logging for analysis and monitoring
+        destination: logging.googleapis.com/projects/${PROJECT_ID}/logs/timestamp-converter
+        # Include all log levels for comprehensive monitoring
+        includeChildren: true
+    depends_on:
+      - timestamp-converter-function
+
+# Template variables for customization
+variables:
+  # Project configuration
+  - name: PROJECT_ID
+    description: "Google Cloud Project ID for resource deployment"
+    type: string
+    default: timestamp-converter-demo
+    
+  # Regional deployment configuration  
+  - name: REGION
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: us-central1
+    validation:
+      # Ensure region supports Cloud Run and Cloud Functions
+      allowed_values:
+        - us-central1
+        - us-east1
+        - us-west1
+        - europe-west1
+        - europe-west3
+        - asia-east1
+        - asia-northeast1
+
+  # Unique identifier for global resource names
+  - name: RANDOM_SUFFIX
+    description: "Random suffix for globally unique resource names"
+    type: string
+    default: abc123
+    validation:
+      # Ensure suffix meets naming requirements
+      pattern: "^[a-z0-9]{6}$"
+
+  # Function configuration variables
+  - name: FUNCTION_MEMORY
+    description: "Memory allocation for the Cloud Function"
+    type: string
+    default: "256Mi"
+    validation:
+      allowed_values:
+        - "128Mi"
+        - "256Mi"
+        - "512Mi"
+        - "1Gi"
+
+  - name: FUNCTION_TIMEOUT
+    description: "Request timeout for the Cloud Function"
+    type: string
+    default: "60s"
+    validation:
+      # Timeout must be between 1 second and 15 minutes
+      pattern: "^[1-9][0-9]*[sm]$"
+
+  - name: MAX_INSTANCES
+    description: "Maximum number of function instances for autoscaling"
+    type: integer
+    default: 10
+    validation:
+      minimum: 1
+      maximum: 100
+
+# Template outputs for integration and verification
+outputs:
+  # Primary function endpoint for API access
+  - name: function_url
+    description: "HTTPS endpoint URL for the timestamp converter API"
+    value: $(ref.timestamp-converter-function.status.url)
+
+  # Storage bucket information for source code management
+  - name: source_bucket_name
+    description: "Cloud Storage bucket name for function source code"
+    value: $(ref.timestamp-converter-source-bucket.name)
+
+  # Storage bucket URL for direct access
+  - name: source_bucket_url
+    description: "Cloud Storage bucket URL for source code access"
+    value: gs://$(ref.timestamp-converter-source-bucket.name)
+
+  # Function service name for monitoring and management
+  - name: function_service_name
+    description: "Cloud Run service name for the timestamp converter function"
+    value: timestamp-converter
+
+  # Project information for resource identification
+  - name: deployment_project
+    description: "Google Cloud Project ID where resources are deployed"
+    value: ${PROJECT_ID}
+
+  # Regional deployment information
+  - name: deployment_region
+    description: "Google Cloud region where resources are deployed"
+    value: ${REGION}
+
+  # Example API usage for testing and documentation
+  - name: example_api_calls
+    description: "Example API calls for testing the timestamp converter"
+    value: |
+      # Convert current timestamp
+      curl "$(ref.timestamp-converter-function.status.url)/?timestamp=now&timezone=UTC&format=human"
+      
+      # Convert specific Unix timestamp
+      curl "$(ref.timestamp-converter-function.status.url)/?timestamp=1609459200&timezone=US/Eastern&format=iso"
+      
+      # POST request with JSON body
+      curl -X POST "$(ref.timestamp-converter-function.status.url)/" \
+           -H "Content-Type: application/json" \
+           -d '{"timestamp":"1609459200","timezone":"Europe/London","format":"human"}'
+
+# Metadata for Infrastructure Manager deployment tracking
+metadata:
+  version: "1.0"
+  description: "Serverless timestamp conversion API using Cloud Functions 2nd generation"
+  author: "Infrastructure Manager Generator"
+  created: "2025-01-12"
+  tags:
+    - serverless
+    - api
+    - timestamp
+    - cloud-functions
+    - cloud-run
+  
+  # Cost estimation for budget planning
+  estimated_monthly_cost:
+    description: "Estimated monthly cost for typical usage patterns"
+    cloud_run_requests: "$0.00 - $0.40 (2M requests covered by free tier)"
+    cloud_storage: "$0.02 - $0.05 (1GB storage)"
+    cloud_logging: "$0.00 - $0.01 (covered by free tier)"
+    total_estimated: "$0.02 - $0.46 per month"
+
+  # Security considerations and best practices
+  security_notes:
+    - "Function allows unauthenticated access for public API usage"
+    - "CORS headers configured for web browser compatibility"
+    - "Input validation implemented for all timestamp parameters"
+    - "Error handling prevents information disclosure"
+    - "Cloud Storage bucket uses IAM for access control"
+
+  # Performance and scaling characteristics
+  performance_notes:
+    - "Cloud Run 2nd generation provides improved cold start performance"
+    - "Concurrent request handling up to 100 requests per instance"
+    - "Automatic scaling from 0 to 10 instances based on traffic"
+    - "256Mi memory allocation optimized for Python datetime operations"
+    - "60-second timeout sufficient for all timestamp conversion operations"
+
+  # Monitoring and observability features
+  monitoring_features:
+    - "Cloud Logging integration for request and error tracking"
+    - "Built-in Cloud Run metrics for performance monitoring"
+    - "Request/response logging for debugging and analysis"
+    - "Error tracking with detailed error messages and HTTP status codes"
+    - "Resource utilization metrics for cost optimization"

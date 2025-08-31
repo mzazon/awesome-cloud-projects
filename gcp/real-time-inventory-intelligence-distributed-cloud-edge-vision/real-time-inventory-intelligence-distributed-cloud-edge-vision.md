@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Google Distributed Cloud Edge, Cloud Vision API, Cloud SQL, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: edge-computing, computer-vision, retail, inventory-management, real-time-analytics
 recipe-generator-version: 1.3
@@ -96,7 +96,7 @@ gcloud config set compute/zone ${ZONE}
 
 # Enable required APIs
 gcloud services enable vision.googleapis.com
-gcloud services enable sql-component.googleapis.com
+gcloud services enable sqladmin.googleapis.com
 gcloud services enable monitoring.googleapis.com
 gcloud services enable container.googleapis.com
 gcloud services enable cloudbuild.googleapis.com
@@ -147,7 +147,7 @@ echo "✅ Required APIs enabled"
        gs://${BUCKET_NAME}
    
    # Configure bucket for Vision API access
-   gsutil iam ch serviceAccount:vision@system.gserviceaccount.com:objectViewer \
+   gsutil iam ch serviceAccount:service-${PROJECT_ID}@gcp-sa-vision.iam.gserviceaccount.com:objectViewer \
        gs://${BUCKET_NAME}
    
    # Set lifecycle policy for cost optimization
@@ -246,10 +246,12 @@ echo "✅ Required APIs enabled"
            ports:
            - containerPort: 8080
          - name: cloud-sql-proxy
-           image: gcr.io/cloudsql-docker/gce-proxy:1.33.2
+           image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.18.0
            command:
-           - "/cloud_sql_proxy"
-           - "-instances=${PROJECT_ID}:${REGION}:${DB_INSTANCE_NAME}=tcp:5432"
+           - "/cloud-sql-proxy"
+           - "--address=0.0.0.0"
+           - "--port=5432"
+           - "${PROJECT_ID}:${REGION}:${DB_INSTANCE_NAME}"
            securityContext:
              runAsNonRoot: true
    EOF
@@ -273,27 +275,27 @@ echo "✅ Required APIs enabled"
    Cloud Vision API provides state-of-the-art computer vision capabilities powered by Google's machine learning expertise. The Product Search feature specifically addresses retail inventory use cases by identifying products, reading labels, and counting items on shelves. This integration enables accurate, automated inventory tracking without manual intervention.
 
    ```bash
-   # Create a Product Set for inventory items
-   gcloud ml vision product-sets create \
+   # Create a Product Set for inventory items using beta API
+   gcloud beta ml vision product-search product-sets create \
        --display-name="Retail Inventory Products" \
        --product-set-id="retail_inventory_set" \
        --location=${REGION}
    
    # Create sample product for demonstration
-   gcloud ml vision products create \
+   gcloud beta ml vision product-search products create \
        --display-name="Sample Product" \
        --product-category="packagedgoods" \
        --product-id="sample_product_001" \
        --location=${REGION}
    
    # Add product to product set
-   gcloud ml vision product-sets add-product \
+   gcloud beta ml vision product-search product-sets add-product \
        --product-set-id="retail_inventory_set" \
        --product-id="sample_product_001" \
        --location=${REGION}
    
-   # Create monitoring alert for inventory thresholds
-   cat > inventory-alert.yaml << EOF
+   # Create monitoring alert policy for inventory thresholds
+   cat > inventory-alert-policy.yaml << EOF
    displayName: "Low Inventory Alert"
    documentation:
      content: "Alert when inventory levels fall below threshold"
@@ -306,7 +308,8 @@ echo "✅ Required APIs enabled"
    notificationChannels: []
    EOF
    
-   gcloud alpha monitoring policies create --policy-from-file=inventory-alert.yaml
+   gcloud alpha monitoring policies create \
+       --policy-from-file=inventory-alert-policy.yaml
    
    echo "✅ Cloud Vision API configured for product recognition"
    ```
@@ -347,7 +350,8 @@ echo "✅ Required APIs enabled"
    }
    EOF
    
-   gcloud monitoring dashboards create --config-from-file=inventory-dashboard.json
+   gcloud monitoring dashboards create \
+       --config-from-file=inventory-dashboard.json
    
    # Set up notification channel for alerts
    gcloud alpha monitoring channels create \
@@ -370,7 +374,8 @@ echo "✅ Required APIs enabled"
    kubectl get pods -l app=inventory-processor
    
    # Verify service account permissions
-   kubectl auth can-i list pods --as=system:serviceaccount:default:inventory-edge-processor
+   kubectl auth can-i list pods \
+       --as=system:serviceaccount:default:inventory-edge-processor
    ```
 
    Expected output: All nodes should show "Ready" status and processor pods should be "Running"
@@ -385,7 +390,8 @@ echo "✅ Required APIs enabled"
    gcloud ml vision detect-objects gs://${BUCKET_NAME}/test/test-shelf-image.jpg
    
    # Verify product set configuration
-   gcloud ml vision product-sets list --location=${REGION}
+   gcloud beta ml vision product-search product-sets list \
+       --location=${REGION}
    ```
 
    Expected output: Vision API should return detected objects with confidence scores
@@ -407,7 +413,8 @@ echo "✅ Required APIs enabled"
 
    ```bash
    # Verify monitoring metrics collection
-   gcloud monitoring metrics list --filter="metric.type:custom.googleapis.com/inventory"
+   gcloud monitoring metrics list \
+       --filter="metric.type:custom.googleapis.com/inventory"
    
    # Check alert policy status
    gcloud alpha monitoring policies list
@@ -443,16 +450,16 @@ echo "✅ Required APIs enabled"
 
    ```bash
    # Remove product sets and products
-   gcloud ml vision product-sets remove-product \
+   gcloud beta ml vision product-search product-sets remove-product \
        --product-set-id="retail_inventory_set" \
        --product-id="sample_product_001" \
        --location=${REGION}
    
-   gcloud ml vision products delete \
+   gcloud beta ml vision product-search products delete \
        --product-id="sample_product_001" \
        --location=${REGION}
    
-   gcloud ml vision product-sets delete \
+   gcloud beta ml vision product-search product-sets delete \
        --product-set-id="retail_inventory_set" \
        --location=${REGION}
    
@@ -469,11 +476,12 @@ echo "✅ Required APIs enabled"
    gcloud monitoring dashboards list --format="value(name)" | \
        xargs -I {} gcloud monitoring dashboards delete {} --quiet
    
-   # Delete IAM service account
+   # Delete IAL service account
    gcloud iam service-accounts delete ${SERVICE_ACCOUNT_EMAIL} --quiet
    
    # Clean up local files
-   rm -f inventory-edge-key.json lifecycle.json inventory-*.yaml inventory-*.json
+   rm -f inventory-edge-key.json lifecycle.json \
+       inventory-*.yaml inventory-*.json
    
    echo "✅ All resources cleaned up successfully"
    ```

@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: glue, s3, athena, iam
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: analytics, etl, glue, data-catalog, data-pipeline
 recipe-generator-version: 1.3
@@ -385,7 +385,8 @@ echo "Processed bucket: ${S3_PROCESSED_BUCKET}"
        --role ${GLUE_ROLE_ARN} \
        --command '{
            "Name": "glueetl",
-           "ScriptLocation": "s3://'${S3_PROCESSED_BUCKET}'/scripts/etl-script.py"
+           "ScriptLocation": "s3://'${S3_PROCESSED_BUCKET}'/scripts/etl-script.py",
+           "PythonVersion": "3"
        }' \
        --default-arguments '{
            "--job-language": "python",
@@ -394,7 +395,9 @@ echo "Processed bucket: ${S3_PROCESSED_BUCKET}"
        }' \
        --max-retries 1 \
        --timeout 60 \
-       --glue-version "4.0"
+       --glue-version "4.0" \
+       --worker-type "G.1X" \
+       --number-of-workers 2
    
    # Start the ETL job
    JOB_RUN_ID=$(aws glue start-job-run \
@@ -468,9 +471,24 @@ echo "Processed bucket: ${S3_PROCESSED_BUCKET}"
     # Run the crawler
     aws glue start-crawler --name ${PROCESSED_CRAWLER_NAME}
     
-    # Wait for completion
+    # Wait for completion with proper monitoring
     echo "Crawling processed data..."
-    sleep 60
+    while true; do
+        PROCESSED_CRAWLER_STATE=$(aws glue get-crawler \
+            --name ${PROCESSED_CRAWLER_NAME} \
+            --query Crawler.State --output text)
+        
+        if [ "$PROCESSED_CRAWLER_STATE" = "READY" ]; then
+            echo "✅ Processed data crawler completed successfully"
+            break
+        elif [ "$PROCESSED_CRAWLER_STATE" = "STOPPING" ] || [ "$PROCESSED_CRAWLER_STATE" = "RUNNING" ]; then
+            echo "Processed crawler status: $PROCESSED_CRAWLER_STATE - waiting..."
+            sleep 30
+        else
+            echo "❌ Processed crawler failed with state: $PROCESSED_CRAWLER_STATE"
+            break
+        fi
+    done
     
     # Verify new table creation
     aws glue get-tables \
@@ -500,10 +518,13 @@ echo "Processed bucket: ${S3_PROCESSED_BUCKET}"
 
    ```bash
    # Create Athena query to test data access
-   aws athena start-query-execution \
+   QUERY_EXECUTION_ID=$(aws athena start-query-execution \
        --query-string "SELECT customer_id, product_name, total_amount FROM ${GLUE_DATABASE_NAME}.enriched_sales LIMIT 10" \
        --result-configuration OutputLocation=s3://${S3_PROCESSED_BUCKET}/athena-results/ \
-       --work-group primary
+       --work-group primary \
+       --query QueryExecutionId --output text)
+   
+   echo "✅ Athena query started with ID: ${QUERY_EXECUTION_ID}"
    ```
 
 3. **Verify ETL Job Logs**:
@@ -511,14 +532,16 @@ echo "Processed bucket: ${S3_PROCESSED_BUCKET}"
    ```bash
    # Check CloudWatch logs for job execution details
    aws logs describe-log-groups \
-       --log-group-name-prefix "/aws-glue/jobs/logs-v2"
+       --log-group-name-prefix "/aws-glue/jobs" \
+       --query 'logGroups[].logGroupName' --output table
    ```
 
 4. **Test Data Quality**:
 
    ```bash
    # Verify row counts match expected results
-   aws s3 ls s3://${S3_PROCESSED_BUCKET}/enriched-sales/ --recursive --summarize
+   aws s3 ls s3://${S3_PROCESSED_BUCKET}/enriched-sales/ \
+       --recursive --summarize
    ```
 
 ## Cleanup
@@ -582,7 +605,8 @@ echo "Processed bucket: ${S3_PROCESSED_BUCKET}"
    aws s3 rb s3://${S3_PROCESSED_BUCKET}
    
    # Clean up local files
-   rm -f glue-trust-policy.json glue-s3-policy.json etl-script.py sample-sales.csv sample-customers.json
+   rm -f glue-trust-policy.json glue-s3-policy.json \
+         etl-script.py sample-sales.csv sample-customers.json
    
    echo "✅ S3 buckets and local files deleted"
    ```
@@ -591,7 +615,7 @@ echo "Processed bucket: ${S3_PROCESSED_BUCKET}"
 
 AWS Glue provides a powerful serverless ETL platform that eliminates infrastructure management while enabling scalable data processing workflows. The [Data Catalog](https://docs.aws.amazon.com/glue/latest/dg/populate-catalog-methods.html) serves as a centralized metadata repository that democratizes data discovery and enables self-service analytics across organizations. By automatically inferring schemas and tracking data lineage, Glue reduces the operational overhead typically associated with traditional ETL solutions.
 
-The [crawler functionality](https://docs.aws.amazon.com/glue/latest/dg/add-crawler.html) represents a significant advancement in automated data discovery, continuously monitoring data sources and updating catalog information as schemas evolve. This automation ensures that downstream analytics tools always have access to current metadata without manual intervention. The visual ETL job development environment allows data engineers to build complex transformations using drag-and-drop interfaces while generating optimized Spark code behind the scenes.
+The [crawler functionality](https://docs.aws.amazon.com/glue/latest/dg/add-crawler.html) represents a significant advancement in automated data discovery, continuously monitoring data sources and updating catalog information as schemas evolve. This automation ensures that downstream analytics tools always have access to current metadata without manual intervention. The serverless architecture allows data engineers to focus on transformation logic rather than infrastructure provisioning and maintenance.
 
 Integration with the broader AWS analytics ecosystem provides seamless connectivity to services like Athena, QuickSight, and Redshift. This native integration enables organizations to build comprehensive data platforms without complex custom integrations. The [pay-per-use pricing model](https://docs.aws.amazon.com/glue/latest/dg/what-is-glue.html) makes Glue cost-effective for both small-scale and enterprise-level data processing requirements, scaling automatically based on workload demands.
 

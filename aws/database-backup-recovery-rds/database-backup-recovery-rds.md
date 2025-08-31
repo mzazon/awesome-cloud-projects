@@ -4,19 +4,18 @@ id: 8c4772ad
 category: database
 difficulty: 300
 subject: aws
-services: rds,aws,backup,kms,iam
+services: rds, backup, kms, iam
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: database,backup,disaster-recovery,rds,aws-backup,encryption
+tags: database, backup, disaster-recovery, rds, aws-backup, encryption
 recipe-generator-version: 1.3
 ---
 
 # Database Backup and Recovery with RDS
-
 
 ## Problem
 
@@ -180,7 +179,7 @@ echo "Backup Vault: $BACKUP_VAULT_NAME"
 
 3. **Create RDS database instance with automated backups enabled**:
 
-   Amazon RDS provides [automated backup capabilities](https://docs.aws.amazon.com/aws-backup/latest/devguide/rds-backup.html) that create point-in-time snapshots and transaction log backups, enabling recovery to any second within the retention period. This creates a comprehensive backup strategy that protects against both catastrophic failures and human errors. The automated backup window is strategically scheduled during low-traffic periods to minimize performance impact on production workloads.
+   Amazon RDS provides [automated backup capabilities](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_WorkingWithAutomatedBackups.html) that create point-in-time snapshots and transaction log backups, enabling recovery to any second within the retention period. This creates a comprehensive backup strategy that protects against both catastrophic failures and human errors. The automated backup window is strategically scheduled during low-traffic periods to minimize performance impact on production workloads.
 
    ```bash
    # Create RDS instance with backup configuration
@@ -566,9 +565,11 @@ echo "Backup Vault: $BACKUP_VAULT_NAME"
        --query 'RecoveryPoints[*].RecoveryPointArn' \
        --output text | \
    while read arn; do
-       aws backup delete-recovery-point \
-           --backup-vault-name "$BACKUP_VAULT_NAME" \
-           --recovery-point-arn "$arn" 2>/dev/null || true
+       if [ ! -z "$arn" ]; then
+           aws backup delete-recovery-point \
+               --backup-vault-name "$BACKUP_VAULT_NAME" \
+               --recovery-point-arn "$arn" 2>/dev/null || true
+       fi
    done
    
    # Delete backup vaults

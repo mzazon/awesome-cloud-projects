@@ -4,12 +4,12 @@ id: f3a7b6e1
 category: management-governance
 difficulty: 200
 subject: gcp
-services: Cloud Location Finder, Pub/Sub, Cloud Functions, Cloud Monitoring
+services: Cloud Location Finder, Pub/Sub, Cloud Functions, Cloud Storage
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: multi-cloud, resource-discovery, location-finder, pubsub, automation, cloud-functions
 recipe-generator-version: 1.3
@@ -98,15 +98,20 @@ export FUNCTION_NAME="process-locations-${RANDOM_SUFFIX}"
 export BUCKET_NAME="location-reports-${RANDOM_SUFFIX}"
 export SCHEDULER_JOB="location-sync-${RANDOM_SUFFIX}"
 
-# Set default project and region
+# Create and set the project
+gcloud projects create ${PROJECT_ID}
 gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
 gcloud config set compute/zone ${ZONE}
 
+# Enable billing for the project (manual step required)
+echo "Please enable billing for project ${PROJECT_ID} in the Google Cloud Console"
+echo "Press any key to continue after enabling billing..."
+read -n 1
+
 # Enable required APIs for multi-cloud location discovery
-gcloud services enable cloudlocationfinder.googleapis.com
+gcloud services enable cloudfuctions.googleapis.com
 gcloud services enable pubsub.googleapis.com
-gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable cloudscheduler.googleapis.com
 gcloud services enable storage.googleapis.com
 gcloud services enable monitoring.googleapis.com
@@ -173,11 +178,12 @@ echo "✅ Required APIs enabled for multi-cloud resource discovery"
    
    # Create requirements.txt for Python dependencies
    cat > requirements.txt << 'EOF'
-google-cloud-pubsub==2.18.4
+google-cloud-pubsub==2.23.0
 google-cloud-storage==2.10.0
 google-cloud-monitoring==2.16.0
 requests==2.31.0
-functions-framework==3.4.0
+functions-framework==3.5.0
+google-auth==2.25.0
 EOF
    
    # Create main function code
@@ -191,6 +197,8 @@ import requests
 from google.cloud import storage
 from google.cloud import monitoring_v3
 import functions_framework
+from google.auth import default
+from google.auth.transport.requests import Request
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -203,11 +211,19 @@ PROJECT_ID = os.environ.get('PROJECT_ID')
 def get_location_data() -> List[Dict[str, Any]]:
     """Fetch location data from Cloud Location Finder API"""
     try:
+        # Get authenticated credentials
+        credentials, _ = default()
+        credentials.refresh(Request())
+        
         # Cloud Location Finder API endpoint
         url = "https://cloudlocationfinder.googleapis.com/v1/locations"
+        headers = {
+            "Authorization": f"Bearer {credentials.token}",
+            "Content-Type": "application/json"
+        }
         
         # Make API request for multi-cloud location data
-        response = requests.get(url, timeout=30)
+        response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
         
         data = response.json()
@@ -244,8 +260,8 @@ def analyze_locations(locations: List[Dict[str, Any]]) -> Dict[str, Any]:
         if region not in analysis['regions_by_provider'][provider]:
             analysis['regions_by_provider'][provider].append(region)
         
-        # Identify low-carbon regions
-        if carbon_footprint.get('carbonIntensity', 1000) < 200:
+        # Identify low-carbon regions (Google Cloud data only)
+        if provider == 'GOOGLE_CLOUD' and carbon_footprint.get('carbonIntensity', 1000) < 200:
             analysis['low_carbon_regions'].append({
                 'provider': provider,
                 'region': region,
@@ -363,13 +379,14 @@ EOF
    
    # Deploy Cloud Function with environment variables
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python39 \
+       --runtime python311 \
        --trigger-topic ${TOPIC_NAME} \
        --source . \
        --entry-point process_location_data \
        --memory 512MB \
        --timeout 300s \
-       --set-env-vars BUCKET_NAME=${BUCKET_NAME},PROJECT_ID=${PROJECT_ID}
+       --set-env-vars BUCKET_NAME=${BUCKET_NAME},PROJECT_ID=${PROJECT_ID} \
+       --region ${REGION}
    
    echo "✅ Cloud Function deployed: ${FUNCTION_NAME}"
    echo "✅ Function configured with Pub/Sub trigger and environment variables"
@@ -388,10 +405,12 @@ EOF
        --topic=${TOPIC_NAME} \
        --message-body='{"trigger":"scheduled_discovery","timestamp":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' \
        --time-zone="UTC" \
-       --description="Automated multi-cloud location discovery"
+       --description="Automated multi-cloud location discovery" \
+       --location=${REGION}
    
    # Manually trigger the first execution
-   gcloud scheduler jobs run ${SCHEDULER_JOB}
+   gcloud scheduler jobs run ${SCHEDULER_JOB} \
+       --location=${REGION}
    
    echo "✅ Cloud Scheduler job created: ${SCHEDULER_JOB}"
    echo "✅ Scheduled for every 6 hours with manual trigger executed"
@@ -461,7 +480,8 @@ EOF
 EOF
    
    # Create the monitoring dashboard
-   gcloud monitoring dashboards create --config-from-file=dashboard-config.json
+   gcloud monitoring dashboards create \
+       --config-from-file=dashboard-config.json
    
    echo "✅ Cloud Monitoring dashboard created"
    echo "✅ Dashboard includes location metrics and function performance"
@@ -505,7 +525,8 @@ EOF
 EOF
    
    # Create the alert policy
-   gcloud alpha monitoring policies create --policy-from-file=alert-policy.json
+   gcloud alpha monitoring policies create \
+       --policy-from-file=alert-policy.json
    
    echo "✅ Alert policy created for function failure monitoring"
    echo "✅ Alerts configured with 5-minute threshold and auto-close"
@@ -521,6 +542,7 @@ EOF
    # Check if the Cloud Function processed location data
    gcloud functions logs read ${FUNCTION_NAME} \
        --limit=20 \
+       --region=${REGION} \
        --format="value(textPayload)"
    ```
 
@@ -537,6 +559,7 @@ EOF
    sleep 30
    gcloud functions logs read ${FUNCTION_NAME} \
        --limit=5 \
+       --region=${REGION} \
        --format="value(textPayload)"
    ```
 
@@ -576,7 +599,9 @@ EOF
 
    ```bash
    # Delete the scheduled job
-   gcloud scheduler jobs delete ${SCHEDULER_JOB} --quiet
+   gcloud scheduler jobs delete ${SCHEDULER_JOB} \
+       --location=${REGION} \
+       --quiet
    
    echo "✅ Cloud Scheduler job removed"
    ```
@@ -585,7 +610,9 @@ EOF
 
    ```bash
    # Delete Cloud Function
-   gcloud functions delete ${FUNCTION_NAME} --quiet
+   gcloud functions delete ${FUNCTION_NAME} \
+       --region=${REGION} \
+       --quiet
    
    # Remove Cloud Storage bucket and contents
    gsutil -m rm -r gs://${BUCKET_NAME}
@@ -643,7 +670,7 @@ Google Cloud Location Finder represents a significant advancement in multi-cloud
 
 The architecture pattern demonstrated in this recipe leverages several key Google Cloud strengths: serverless computing for cost-effective processing, managed messaging for reliable data flow, and comprehensive monitoring for operational visibility. The event-driven design ensures the system responds immediately to location data updates while maintaining high availability through Google Cloud's managed services. This approach significantly reduces operational overhead compared to traditional polling-based systems or manual location management processes.
 
-The solution provides actionable insights through automated analysis of carbon footprint data, regional capabilities, and provider distribution. These insights enable organizations to make data-driven decisions about workload placement, considering factors like sustainability goals, regulatory compliance, and performance requirements. The generated recommendations can integrate with infrastructure-as-code pipelines or deployment automation tools to enable truly intelligent multi-cloud resource orchestration.
+The solution provides actionable insights through automated analysis of carbon footprint data (for Google Cloud regions), regional capabilities, and provider distribution. These insights enable organizations to make data-driven decisions about workload placement, considering factors like sustainability goals, regulatory compliance, and performance requirements. The generated recommendations can integrate with infrastructure-as-code pipelines or deployment automation tools to enable truly intelligent multi-cloud resource orchestration.
 
 From a cost optimization perspective, this solution demonstrates Google Cloud's pay-per-use pricing model benefits. Cloud Functions only incur charges during execution, Pub/Sub charges based on message volume, and Cloud Storage provides cost-effective long-term retention of location intelligence data. Organizations can further optimize costs by adjusting the discovery frequency based on their deployment velocity and change tolerance.
 

@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure Confidential Computing, Azure Attestation, Azure Managed HSM, Azure Key Vault
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: confidential-computing, secure-enclaves, tee, attestation, hsm, data-protection
 recipe-generator-version: 1.3
@@ -67,7 +67,7 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with appropriate permissions to create Confidential VMs and Managed HSM
-2. Azure CLI v2.40.0 or later installed and configured (or use Azure CloudShell)
+2. Azure CLI v2.38.0 or later installed and configured (or use Azure CloudShell)
 3. Understanding of confidential computing concepts and TEE fundamentals
 4. Contributor or Owner role on the subscription
 5. Estimated cost: ~$500-800/month for basic setup (Confidential VM + Managed HSM)
@@ -142,10 +142,24 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    
    # Wait for HSM to be fully provisioned
    echo "⏳ Waiting for HSM provisioning (this takes ~20 minutes)..."
-   az keyvault show \
-       --hsm-name ${HSM_NAME} \
-       --query properties.provisioningState \
-       --output tsv
+   
+   # Poll HSM status until provisioned
+   while true; do
+       HSM_STATUS=$(az keyvault show \
+           --hsm-name ${HSM_NAME} \
+           --query properties.provisioningState \
+           --output tsv 2>/dev/null || echo "NotFound")
+       
+       if [ "$HSM_STATUS" = "Succeeded" ]; then
+           break
+       elif [ "$HSM_STATUS" = "Failed" ]; then
+           echo "❌ HSM provisioning failed"
+           exit 1
+       fi
+       
+       echo "HSM Status: $HSM_STATUS - waiting..."
+       sleep 60
+   done
    
    # Initialize the HSM security domain
    # Download security domain for backup
@@ -236,12 +250,6 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --https-only true \
        --allow-blob-public-access false
    
-   # Enable customer-managed keys (requires Key Vault setup)
-   STORAGE_ID=$(az storage account show \
-       --name ${STORAGE_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --query id --output tsv)
-   
    # Create managed identity for storage account
    az identity create \
        --name ${STORAGE_NAME}-identity \
@@ -302,7 +310,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --resource-group ${RESOURCE_GROUP} \
        --policy-format JWT \
        --policy "${POLICY_JWT}" \
-       --tee-type SevSnpVm
+       --attestation-type SevSnpVm
    
    echo "✅ Attestation policy configured"
    ```
@@ -349,7 +357,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    The confidential application demonstrates the complete workflow of attestation, key retrieval, and secure data processing within a TEE. This example shows how real-world applications can leverage Azure's confidential computing infrastructure to protect sensitive data throughout the processing lifecycle.
 
    ```bash
-   # SSH into the confidential VM
+   # Create deployment script for the confidential VM
    cat > deploy-app.sh << 'EOF'
    #!/bin/bash
    # Install required packages
@@ -445,7 +453,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
        --output table
    ```
 
-   Expected output: HSM should show as "Provisioned" with your encryption keys listed.
+   Expected output: HSM should show as "Succeeded" with your encryption keys listed.
 
 3. Test Confidential VM Attestation:
 

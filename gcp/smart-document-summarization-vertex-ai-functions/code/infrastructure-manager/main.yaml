@@ -1,0 +1,729 @@
+# Infrastructure Manager Configuration for Smart Document Summarization
+# This configuration deploys a complete document processing pipeline using:
+# - Cloud Storage bucket for document ingestion
+# - Cloud Functions for serverless processing orchestration  
+# - Vertex AI integration for Gemini-powered summarization
+# - IAM roles and permissions for secure service access
+# - Monitoring and logging capabilities
+
+# ==============================================================================
+# DEPLOYMENT VARIABLES
+# Configure these values for your specific deployment requirements
+# ==============================================================================
+
+inputs:
+  # Project Configuration
+  project_id:
+    description: "Google Cloud Project ID for deployment"
+    type: string
+    required: true
+
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+    required: false
+
+  # Resource Naming
+  bucket_name:
+    description: "Cloud Storage bucket name for document uploads (must be globally unique)"
+    type: string
+    required: true
+
+  function_name:
+    description: "Cloud Function name for document processing"
+    type: string
+    default: "summarize-document"
+    required: false
+
+  # Function Configuration
+  function_memory:
+    description: "Memory allocation for Cloud Function (e.g., 1Gi, 2Gi)"
+    type: string
+    default: "1Gi"
+    required: false
+
+  function_timeout:
+    description: "Timeout for Cloud Function in seconds (max 540s for gen2)"
+    type: string
+    default: "540s"
+    required: false
+
+  max_instances:
+    description: "Maximum number of function instances for scaling"
+    type: number
+    default: 10
+    required: false
+
+  # AI Model Configuration
+  vertex_ai_model:
+    description: "Vertex AI model for document summarization"
+    type: string
+    default: "gemini-1.5-pro"
+    required: false
+
+  # Monitoring and Labeling
+  environment:
+    description: "Environment label (dev, staging, prod)"
+    type: string
+    default: "dev"
+    required: false
+
+  owner:
+    description: "Owner or team responsible for this deployment"
+    type: string
+    default: "platform-team"
+    required: false
+
+# ==============================================================================
+# GOOGLE CLOUD API SERVICES
+# Enable required APIs for the document processing pipeline
+# ==============================================================================
+
+# Cloud Storage API - for bucket management and file operations
+resource "google_project_service" "storage_api":
+  type: google_project_service
+  name: storage-api
+  properties:
+    project: ${inputs.project_id}
+    service: storage.googleapis.com
+    disable_dependent_services: false
+    disable_on_destroy: false
+
+# Cloud Functions API - for serverless function deployment
+resource "google_project_service" "functions_api":
+  type: google_project_service
+  name: functions-api
+  properties:
+    project: ${inputs.project_id}
+    service: cloudfunctions.googleapis.com
+    disable_dependent_services: false
+    disable_on_destroy: false
+
+# Cloud Build API - required for function deployment and containerization
+resource "google_project_service" "build_api":
+  type: google_project_service
+  name: build-api
+  properties:
+    project: ${inputs.project_id}
+    service: cloudbuild.googleapis.com
+    disable_dependent_services: false
+    disable_on_destroy: false
+
+# Vertex AI API - for Gemini model access and AI services
+resource "google_project_service" "aiplatform_api":
+  type: google_project_service
+  name: aiplatform-api
+  properties:
+    project: ${inputs.project_id}
+    service: aiplatform.googleapis.com
+    disable_dependent_services: false
+    disable_on_destroy: false
+
+# Eventarc API - for Cloud Storage event triggers
+resource "google_project_service" "eventarc_api":
+  type: google_project_service
+  name: eventarc-api
+  properties:
+    project: ${inputs.project_id}
+    service: eventarc.googleapis.com
+    disable_dependent_services: false
+    disable_on_destroy: false
+
+# Cloud Logging API - for function logs and monitoring
+resource "google_project_service" "logging_api":
+  type: google_project_service
+  name: logging-api
+  properties:
+    project: ${inputs.project_id}
+    service: logging.googleapis.com
+    disable_dependent_services: false
+    disable_on_destroy: false
+
+# Cloud Monitoring API - for metrics and alerting
+resource "google_project_service" "monitoring_api":
+  type: google_project_service
+  name: monitoring-api
+  properties:
+    project: ${inputs.project_id}
+    service: monitoring.googleapis.com
+    disable_dependent_services: false
+    disable_on_destroy: false
+
+# ==============================================================================
+# CLOUD STORAGE BUCKET
+# Primary storage for document uploads and processed summaries
+# ==============================================================================
+
+# Main storage bucket for document processing pipeline
+resource "google_storage_bucket" "document_bucket":
+  type: google_storage_bucket
+  name: document-bucket
+  properties:
+    name: ${inputs.bucket_name}
+    project: ${inputs.project_id}
+    location: ${inputs.region}
+    storage_class: STANDARD
+    
+    # Enable versioning for document protection and audit trail
+    versioning:
+      enabled: true
+    
+    # Uniform bucket-level access for simplified IAM management
+    uniform_bucket_level_access: true
+    
+    # Public access prevention for security
+    public_access_prevention: "enforced"
+    
+    # Lifecycle management for cost optimization
+    lifecycle_rule:
+      - condition:
+          age: 90
+          matches_storage_class: 
+            - STANDARD
+        action:
+          type: SetStorageClass
+          storage_class: NEARLINE
+      - condition:
+          age: 365
+          matches_storage_class:
+            - NEARLINE
+        action:
+          type: SetStorageClass  
+          storage_class: COLDLINE
+      # Delete old processed summaries after 2 years
+      - condition:
+          age: 730
+          matches_prefix:
+            - "_summary.txt"
+        action:
+          type: Delete
+    
+    # CORS configuration for web uploads (if needed)
+    cors:
+      - origin: 
+          - "*"
+        method: 
+          - "GET"
+          - "HEAD"
+          - "PUT" 
+          - "POST"
+        header:
+          - "*"
+        max_age_seconds: 3600
+    
+    # Labels for resource management and cost tracking
+    labels:
+      environment: ${inputs.environment}
+      owner: ${inputs.owner}
+      purpose: "document-processing"
+      component: "storage"
+  
+  # Ensure APIs are enabled before creating bucket
+  depends_on:
+    - google_project_service.storage_api
+
+# Bucket notification configuration for Cloud Function triggers
+resource "google_storage_notification" "function_trigger":
+  type: google_storage_notification
+  name: function-trigger-notification
+  properties:
+    bucket: ${resource.google_storage_bucket.document_bucket.name}
+    topic: ${resource.google_pubsub_topic.function_trigger_topic.name}
+    payload_format: JSON_API_V1
+    
+    # Trigger on object creation (finalize) events
+    event_type:
+      - OBJECT_FINALIZE
+      
+    # Filter to avoid triggering on summary files
+    object_name_prefix: ""
+  
+  depends_on:
+    - google_storage_bucket.document_bucket
+    - google_pubsub_topic.function_trigger_topic
+
+# ==============================================================================
+# PUB/SUB TOPIC FOR FUNCTION TRIGGERS
+# Eventarc requires Pub/Sub for Cloud Storage event routing
+# ==============================================================================
+
+# Pub/Sub topic for Cloud Storage events
+resource "google_pubsub_topic" "function_trigger_topic":
+  type: google_pubsub_topic
+  name: function-trigger-topic
+  properties:
+    name: "${inputs.function_name}-trigger"
+    project: ${inputs.project_id}
+    
+    # Message retention for reliability
+    message_retention_duration: "86400s" # 24 hours
+    
+    labels:
+      environment: ${inputs.environment}
+      owner: ${inputs.owner}
+      purpose: "function-triggering"
+      component: "messaging"
+  
+  depends_on:
+    - google_project_service.eventarc_api
+
+# ==============================================================================
+# IAM SERVICE ACCOUNT
+# Dedicated service account for Cloud Function with minimal permissions
+# ==============================================================================
+
+# Service account for Cloud Function execution
+resource "google_service_account" "function_service_account":
+  type: google_service_account
+  name: function-service-account
+  properties:
+    account_id: "${inputs.function_name}-sa"
+    project: ${inputs.project_id}
+    display_name: "Document Summarization Function Service Account"
+    description: "Service account for document processing Cloud Function with Vertex AI access"
+  
+  depends_on:
+    - google_project_service.functions_api
+
+# Grant Vertex AI User role for model access
+resource "google_project_iam_member" "function_ai_user":
+  type: google_project_iam_member
+  name: function-ai-user-binding
+  properties:
+    project: ${inputs.project_id}
+    role: "roles/aiplatform.user"
+    member: "serviceAccount:${resource.google_service_account.function_service_account.email}"
+  
+  depends_on:
+    - google_service_account.function_service_account
+
+# Grant Cloud Storage Object Admin for bucket operations
+resource "google_project_iam_member" "function_storage_admin":
+  type: google_project_iam_member
+  name: function-storage-admin-binding
+  properties:
+    project: ${inputs.project_id}
+    role: "roles/storage.objectAdmin"
+    member: "serviceAccount:${resource.google_service_account.function_service_account.email}"
+  
+  depends_on:
+    - google_service_account.function_service_account
+
+# Grant Cloud Logging Writer for function logs
+resource "google_project_iam_member" "function_logging_writer":
+  type: google_project_iam_member
+  name: function-logging-writer-binding
+  properties:
+    project: ${inputs.project_id}
+    role: "roles/logging.logWriter"
+    member: "serviceAccount:${resource.google_service_account.function_service_account.email}"
+  
+  depends_on:
+    - google_service_account.function_service_account
+
+# Grant Cloud Monitoring Metric Writer for custom metrics
+resource "google_project_iam_member" "function_monitoring_writer":
+  type: google_project_iam_member
+  name: function-monitoring-writer-binding
+  properties:
+    project: ${inputs.project_id}
+    role: "roles/monitoring.metricWriter"
+    member: "serviceAccount:${resource.google_service_account.function_service_account.email}"
+  
+  depends_on:
+    - google_service_account.function_service_account
+
+# ==============================================================================
+# CLOUD FUNCTION ARCHIVE
+# Package function source code for deployment
+# ==============================================================================
+
+# Create archive of function source code
+resource "google_storage_bucket_object" "function_source":
+  type: google_storage_bucket_object
+  name: function-source-archive
+  properties:
+    bucket: ${resource.google_storage_bucket.document_bucket.name}
+    name: "function-source/source.zip"
+    
+    # Function source code content (base64 encoded)
+    # In production, this would be uploaded separately or pulled from a repository
+    content: |
+      # This is a placeholder for the function source code
+      # In actual deployment, you would:
+      # 1. Create a deployment bucket separate from the document bucket
+      # 2. Upload the function source code as a ZIP file
+      # 3. Reference that ZIP file in the Cloud Function resource
+      
+      # For this Infrastructure Manager configuration, the function code
+      # should be deployed using the gcloud CLI or other deployment method
+      # after the infrastructure is provisioned.
+    
+    content_type: "application/zip"
+    
+    metadata:
+      deployed_by: "infrastructure-manager"
+      function_name: ${inputs.function_name}
+      version: "1.0"
+    
+  depends_on:
+    - google_storage_bucket.document_bucket
+
+# ==============================================================================
+# CLOUD FUNCTION (2ND GENERATION)
+# Serverless function for document processing and AI summarization
+# ==============================================================================
+
+# Main Cloud Function for document processing
+resource "google_cloudfunctions2_function" "document_processor":
+  type: google_cloudfunctions2_function
+  name: document-processor-function
+  properties:
+    name: ${inputs.function_name}
+    project: ${inputs.project_id}
+    location: ${inputs.region}
+    description: "Serverless function for AI-powered document summarization using Vertex AI Gemini models"
+    
+    # Function configuration
+    build_config:
+      runtime: "python311"
+      entry_point: "summarize_document"
+      
+      # Source configuration - in production this would reference actual source
+      source:
+        storage_source:
+          bucket: ${resource.google_storage_bucket.document_bucket.name}
+          object: ${resource.google_storage_bucket_object.function_source.name}
+      
+      # Environment variables for build
+      environment_variables:
+        BUILD_CONFIG_TEST: "infrastructure-manager-deployment"
+    
+    # Service configuration
+    service_config:
+      # Resource allocation
+      available_memory: ${inputs.function_memory}
+      timeout_seconds: ${inputs.function_timeout}
+      max_instance_count: ${inputs.max_instances}
+      min_instance_count: 0
+      
+      # Runtime environment variables
+      environment_variables:
+        GCP_PROJECT: ${inputs.project_id}
+        VERTEX_AI_MODEL: ${inputs.vertex_ai_model}
+        BUCKET_NAME: ${inputs.bucket_name}
+        ENVIRONMENT: ${inputs.environment}
+      
+      # Service account for execution
+      service_account_email: ${resource.google_service_account.function_service_account.email}
+      
+      # Network configuration
+      ingress_settings: "ALLOW_INTERNAL_ONLY"
+      all_traffic_on_latest_revision: true
+      
+      # Security settings
+      available_cpu: "1"
+      
+    # Event trigger configuration
+    event_trigger:
+      trigger_region: ${inputs.region}
+      event_type: "google.cloud.storage.object.v1.finalized"
+      
+      event_filters:
+        - attribute: "bucket"
+          value: ${inputs.bucket_name}
+      
+      # Service account for trigger
+      service_account_email: ${resource.google_service_account.function_service_account.email}
+      
+      # Retry policy
+      retry_policy: "RETRY_POLICY_RETRY"
+    
+    # Labels for resource management
+    labels:
+      environment: ${inputs.environment}
+      owner: ${inputs.owner}
+      purpose: "document-processing"
+      component: "compute"
+      runtime: "python311"
+  
+  depends_on:
+    - google_project_service.functions_api
+    - google_project_service.build_api
+    - google_project_service.aiplatform_api
+    - google_service_account.function_service_account
+    - google_project_iam_member.function_ai_user
+    - google_project_iam_member.function_storage_admin
+    - google_storage_bucket.document_bucket
+
+# ==============================================================================
+# MONITORING AND ALERTING
+# Cloud Monitoring resources for operational visibility
+# ==============================================================================
+
+# Log-based metric for function errors
+resource "google_logging_metric" "function_error_metric":
+  type: google_logging_metric
+  name: function-error-metric
+  properties:
+    name: "document_processor_errors"
+    project: ${inputs.project_id}
+    description: "Count of errors in document processing function"
+    
+    # Filter for function errors
+    filter: |
+      resource.type="cloud_function"
+      resource.labels.function_name="${inputs.function_name}"
+      severity>=ERROR
+    
+    # Metric configuration
+    metric_descriptor:
+      metric_kind: "GAUGE"
+      value_type: "INT64"
+      display_name: "Document Processor Errors"
+    
+    # Label extractors for detailed metrics
+    label_extractors:
+      error_type: "EXTRACT(jsonPayload.error_type)"
+      function_version: "EXTRACT(resource.labels.revision_name)"
+  
+  depends_on:
+    - google_project_service.logging_api
+    - google_cloudfunctions2_function.document_processor
+
+# Log-based metric for successful processing
+resource "google_logging_metric" "function_success_metric":
+  type: google_logging_metric  
+  name: function-success-metric
+  properties:
+    name: "document_processor_success"
+    project: ${inputs.project_id}
+    description: "Count of successful document processing operations"
+    
+    # Filter for successful processing logs
+    filter: |
+      resource.type="cloud_function"
+      resource.labels.function_name="${inputs.function_name}"
+      jsonPayload.message:"Summary created"
+    
+    # Metric configuration
+    metric_descriptor:
+      metric_kind: "GAUGE"
+      value_type: "INT64"
+      display_name: "Document Processor Success"
+    
+    # Label extractors
+    label_extractors:
+      file_type: "EXTRACT(jsonPayload.file_type)"
+      processing_time: "EXTRACT(jsonPayload.processing_time)"
+  
+  depends_on:
+    - google_project_service.logging_api
+    - google_cloudfunctions2_function.document_processor
+
+# Alerting policy for function errors
+resource "google_monitoring_alert_policy" "function_error_alert":
+  type: google_monitoring_alert_policy
+  name: function-error-alert
+  properties:
+    display_name: "Document Processor Error Alert"
+    project: ${inputs.project_id}
+    
+    documentation:
+      content: |
+        This alert triggers when the document processing function encounters errors.
+        
+        Troubleshooting steps:
+        1. Check function logs for specific error messages
+        2. Verify Vertex AI API quotas and limits
+        3. Check IAM permissions for the function service account
+        4. Validate input document formats and sizes
+        
+        Dashboard: https://console.cloud.google.com/functions/details/${inputs.region}/${inputs.function_name}
+      mime_type: "text/markdown"
+    
+    # Combine multiple conditions
+    combiner: "OR"
+    
+    conditions:
+      - display_name: "Function error rate"
+        condition_threshold:
+          filter: |
+            resource.type="cloud_function"
+            resource.labels.function_name="${inputs.function_name}"
+            metric.type="cloudfunctions.googleapis.com/function/execution_count"
+            metric.labels.status!="ok"
+          
+          comparison: "COMPARISON_GT"
+          threshold_value: 5
+          duration: "300s"
+          
+          aggregations:
+            alignment_period: "300s"
+            per_series_aligner: "ALIGN_RATE"
+            cross_series_reducer: "REDUCE_SUM"
+    
+    # Notification channels would be configured separately
+    enabled: true
+    
+    alert_strategy:
+      auto_close: "1800s"  # Auto-close after 30 minutes
+  
+  depends_on:
+    - google_project_service.monitoring_api
+    - google_cloudfunctions2_function.document_processor
+
+# ==============================================================================
+# CLOUD LOGGING CONFIGURATION
+# Structured logging for the document processing pipeline
+# ==============================================================================
+
+# Log sink for function logs to BigQuery (optional)
+resource "google_logging_project_sink" "function_logs_sink":
+  type: google_logging_project_sink
+  name: function-logs-sink
+  properties:
+    name: "document-processor-logs"
+    project: ${inputs.project_id}
+    description: "Export document processor logs for analysis"
+    
+    # Destination - could be BigQuery, Cloud Storage, or Pub/Sub
+    destination: "storage.googleapis.com/${inputs.bucket_name}/logs"
+    
+    # Filter for function logs
+    filter: |
+      resource.type="cloud_function"
+      resource.labels.function_name="${inputs.function_name}"
+    
+    # Include children logs
+    include_children: true
+    
+    # Unique writer identity
+    unique_writer_identity: true
+  
+  depends_on:
+    - google_project_service.logging_api
+    - google_storage_bucket.document_bucket
+    - google_cloudfunctions2_function.document_processor
+
+# ==============================================================================
+# OUTPUTS
+# Export important resource information for external use
+# ==============================================================================
+
+outputs:
+  # Storage bucket information
+  bucket_name:
+    description: "Name of the Cloud Storage bucket for document uploads"
+    value: ${resource.google_storage_bucket.document_bucket.name}
+  
+  bucket_url:
+    description: "URL of the Cloud Storage bucket"
+    value: "gs://${resource.google_storage_bucket.document_bucket.name}"
+  
+  # Function information
+  function_name:
+    description: "Name of the deployed Cloud Function"
+    value: ${resource.google_cloudfunctions2_function.document_processor.name}
+  
+  function_url:
+    description: "URL of the Cloud Function"
+    value: ${resource.google_cloudfunctions2_function.document_processor.service_config.uri}
+  
+  function_trigger:
+    description: "Event trigger configuration"
+    value: "Storage bucket: ${inputs.bucket_name}"
+  
+  # Service account information
+  service_account_email:
+    description: "Email of the function service account"
+    value: ${resource.google_service_account.function_service_account.email}
+  
+  # Monitoring information
+  function_logs:
+    description: "Cloud Logging filter for function logs"
+    value: |
+      resource.type="cloud_function"
+      resource.labels.function_name="${inputs.function_name}"
+  
+  # Usage instructions
+  usage_instructions:
+    description: "Instructions for using the document processing pipeline"
+    value: |
+      1. Upload documents to: gs://${inputs.bucket_name}/
+      2. Summaries will be automatically generated as: {filename}_summary.txt
+      3. Monitor processing: https://console.cloud.google.com/functions/details/${inputs.region}/${inputs.function_name}
+      4. View logs: https://console.cloud.google.com/logs/query
+  
+  # Cost optimization tips
+  cost_optimization:
+    description: "Tips for optimizing costs"
+    value: |
+      - Monitor Vertex AI usage in the Cloud Console
+      - Set up budget alerts for AI Platform costs
+      - Use lifecycle policies on the storage bucket
+      - Monitor function execution time and memory usage
+      - Consider batch processing for high volumes
+  
+  # Security recommendations
+  security_notes:
+    description: "Security best practices"
+    value: |
+      - Bucket access is restricted to the function service account
+      - Function uses minimal IAM permissions
+      - All data is encrypted at rest and in transit
+      - Consider adding VPC-SC perimeter for additional security
+      - Regularly review and rotate service account keys if needed
+
+# ==============================================================================
+# DEPLOYMENT NOTES AND BEST PRACTICES
+# ==============================================================================
+
+# Important deployment considerations:
+#
+# 1. API Enablement:
+#    All required APIs are automatically enabled by this configuration.
+#    Allow 2-3 minutes for API enablement to propagate.
+#
+# 2. Function Source Code:
+#    This configuration creates the infrastructure but requires separate
+#    deployment of the actual function code. Use gcloud CLI:
+#    
+#    gcloud functions deploy ${inputs.function_name} \
+#      --gen2 \
+#      --runtime python311 \
+#      --source ./function-code/ \
+#      --entry-point summarize_document \
+#      --trigger-bucket ${inputs.bucket_name}
+#
+# 3. Vertex AI Quotas:
+#    Ensure your project has sufficient Vertex AI quotas for Gemini models.
+#    Check quotas in the Cloud Console under IAM & Admin > Quotas.
+#
+# 4. Cost Management:
+#    - Vertex AI charges per token processed
+#    - Cloud Functions charge per invocation and compute time
+#    - Cloud Storage charges for storage and operations
+#    - Set up billing alerts and budgets
+#
+# 5. Monitoring:
+#    - Use Cloud Monitoring for function metrics
+#    - Set up log-based alerts for error conditions
+#    - Monitor Vertex AI usage and costs
+#
+# 6. Security:
+#    - Function service account has minimal required permissions
+#    - Storage bucket has public access prevention enabled
+#    - Consider VPC-SC for additional network security
+#
+# 7. Performance:
+#    - Function timeout set to 540s for large documents
+#    - Memory allocation can be adjusted based on document sizes
+#    - Max instances prevent runaway costs
+#
+# 8. Maintenance:
+#    - Regularly update function dependencies
+#    - Monitor for new Vertex AI model versions
+#    - Review and update IAM permissions periodically
+#    - Test disaster recovery procedures

@@ -1,0 +1,666 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  End-to-End Encryption with VPC Lattice TLS Passthrough
+  This template creates a VPC Lattice service with TLS passthrough capabilities,
+  demonstrating true end-to-end encryption from client to target instances
+  without intermediate decryption points for compliance requirements.
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - SubnetCidr
+          - AvailabilityZone
+      - Label:
+          default: "Domain Configuration"
+        Parameters:
+          - CustomDomainName
+          - CertificateDomainName
+          - CreateHostedZone
+          - HostedZoneName
+      - Label:
+          default: "Instance Configuration"
+        Parameters:
+          - InstanceType
+          - LatestAmiId
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - EnvironmentName
+          - ResourcePrefix
+
+# Template Parameters
+Parameters:
+  # Network Configuration
+  VpcCidr:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: "CIDR block for the VPC"
+    AllowedPattern: "^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\\/(1[6-9]|2[0-8]))$"
+    ConstraintDescription: "Must be a valid CIDR range between /16 and /28"
+
+  SubnetCidr:
+    Type: String
+    Default: "10.0.1.0/24"
+    Description: "CIDR block for the target subnet"
+    AllowedPattern: "^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\\/(1[6-9]|2[0-9]|3[0-2]))$"
+    ConstraintDescription: "Must be a valid CIDR range between /16 and /32"
+
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: "Availability Zone for the target subnet"
+
+  # Domain Configuration
+  CustomDomainName:
+    Type: String
+    Default: "api-service.example.com"
+    Description: "Custom domain name for the VPC Lattice service (required for TLS passthrough)"
+    AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9\\-\\.]*[a-zA-Z0-9]$"
+    ConstraintDescription: "Must be a valid domain name"
+
+  CertificateDomainName:
+    Type: String
+    Default: "*.example.com"
+    Description: "Domain name for ACM certificate (can use wildcard)"
+    AllowedPattern: "^(\\*\\.)?[a-zA-Z0-9][a-zA-Z0-9\\-\\.]*[a-zA-Z0-9]$"
+    ConstraintDescription: "Must be a valid domain name (wildcards allowed)"
+
+  CreateHostedZone:
+    Type: String
+    Default: "false"
+    Description: "Whether to create a new Route 53 hosted zone"
+    AllowedValues: ["true", "false"]
+
+  HostedZoneName:
+    Type: String
+    Default: "example.com"
+    Description: "Name of the Route 53 hosted zone (only if CreateHostedZone is true)"
+    AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9\\-\\.]*[a-zA-Z0-9]$"
+    ConstraintDescription: "Must be a valid domain name"
+
+  # Instance Configuration
+  InstanceType:
+    Type: String
+    Default: "t3.micro"
+    Description: "EC2 instance type for target instances"
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - m5.large
+      - m5.xlarge
+      - c5.large
+      - c5.xlarge
+    ConstraintDescription: "Must be a valid EC2 instance type"
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64"
+    Description: "Latest Amazon Linux 2023 AMI ID (automatically retrieved)"
+
+  # Resource Naming
+  EnvironmentName:
+    Type: String
+    Default: "tls-passthrough-demo"
+    Description: "Environment name for resource tagging"
+    AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9\\-]*[a-zA-Z0-9]$"
+    ConstraintDescription: "Must contain only alphanumeric characters and hyphens"
+    MinLength: 3
+    MaxLength: 32
+
+  ResourcePrefix:
+    Type: String
+    Default: "lattice"
+    Description: "Prefix for resource names"
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9\\-]*[a-zA-Z0-9]$"
+    ConstraintDescription: "Must start with a letter and contain only alphanumeric characters and hyphens"
+    MinLength: 3
+    MaxLength: 16
+
+# Template Conditions
+Conditions:
+  ShouldCreateHostedZone: !Equals [!Ref CreateHostedZone, "true"]
+
+# Template Resources
+Resources:
+  # VPC Infrastructure
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-vpc"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: "VPC Lattice TLS Passthrough Demo"
+
+  # Internet Gateway for public access
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-igw"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Subnet for target instances
+  TargetSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone
+      CidrBlock: !Ref SubnetCidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-target-subnet"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Route Table for public access
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-public-rt"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref TargetSubnet
+
+  # Security Group for target instances
+  TargetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ResourcePrefix}-targets-sg"
+      GroupDescription: "Security group for VPC Lattice target instances"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "10.0.0.0/8"
+          Description: "HTTPS traffic from VPC Lattice service network range"
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: "0.0.0.0/0"
+          Description: "SSH access for management (restrict as needed)"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: "0.0.0.0/0"
+          Description: "All outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-targets-sg"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # IAM Role for EC2 instances
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-ec2-instance-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-ec2-instance-role"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ResourcePrefix}-ec2-instance-profile"
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ACM Certificate for custom domain
+  ACMCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref CertificateDomainName
+      SubjectAlternativeNames:
+        - !Ref CustomDomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref CertificateDomainName
+          HostedZoneId: !If
+            - ShouldCreateHostedZone
+            - !Ref Route53HostedZone
+            - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-tls-certificate"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: "VPC Lattice TLS Passthrough"
+
+  # EC2 Launch Template for target instances
+  TargetLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ResourcePrefix}-target-template"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref TargetSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Update system and install required packages
+            dnf update -y
+            dnf install -y httpd mod_ssl openssl
+
+            # Generate self-signed certificate for target
+            openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+                -keyout /etc/pki/tls/private/server.key \
+                -out /etc/pki/tls/certs/server.crt \
+                -subj "/C=US/ST=State/L=City/O=Organization/CN=${CustomDomainName}"
+
+            # Configure SSL virtual host
+            cat > /etc/httpd/conf.d/ssl.conf << 'SSLCONF'
+            LoadModule ssl_module modules/mod_ssl.so
+            Listen 443
+            <VirtualHost *:443>
+                ServerName ${CustomDomainName}
+                DocumentRoot /var/www/html
+                SSLEngine on
+                SSLCertificateFile /etc/pki/tls/certs/server.crt
+                SSLCertificateKeyFile /etc/pki/tls/private/server.key
+                SSLProtocol TLSv1.2 TLSv1.3
+                SSLCipherSuite ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS
+                SSLHonorCipherOrder on
+                Header always set Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+                Header always set X-Content-Type-Options nosniff
+                Header always set X-Frame-Options DENY
+            </VirtualHost>
+            SSLCONF
+
+            # Create simple HTTPS response with instance identification
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            cat > /var/www/html/index.html << EOF
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>TLS Passthrough Target Instance</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }
+                    .container { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                    .success { color: #28a745; }
+                    .info { color: #17a2b8; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1 class="success">✅ TLS Passthrough Success!</h1>
+                    <p>This response demonstrates end-to-end encryption through VPC Lattice TLS passthrough.</p>
+                    <hr>
+                    <h3>Instance Details:</h3>
+                    <ul>
+                        <li><strong>Instance ID:</strong> <span class="info">\${INSTANCE_ID}</span></li>
+                        <li><strong>Availability Zone:</strong> <span class="info">\${AZ}</span></li>
+                        <li><strong>Timestamp:</strong> <span class="info">$(date)</span></li>
+                        <li><strong>Environment:</strong> <span class="info">${EnvironmentName}</span></li>
+                    </ul>
+                    <hr>
+                    <p><small>Traffic encrypted end-to-end without intermediate decryption</small></p>
+                </div>
+            </body>
+            </html>
+            EOF
+
+            # Configure firewall (if needed)
+            # firewall-cmd --permanent --add-service=https
+            # firewall-cmd --reload
+
+            # Start and enable Apache
+            systemctl enable httpd
+            systemctl start httpd
+
+            # Signal CloudFormation that the instance is ready
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource TargetInstance1 --region ${AWS::Region}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ResourcePrefix}-target-instance"
+              - Key: Environment
+                Value: !Ref EnvironmentName
+              - Key: Purpose
+                Value: "VPC Lattice TLS Passthrough Target"
+
+  # Target EC2 Instances
+  TargetInstance1:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+        Count: 1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref TargetLaunchTemplate
+        Version: !GetAtt TargetLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref TargetSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-target-1"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  TargetInstance2:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+        Count: 1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref TargetLaunchTemplate
+        Version: !GetAtt TargetLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref TargetSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-target-2"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # VPC Lattice Service Network
+  VPCLatticeServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub "${ResourcePrefix}-service-network"
+      AuthType: NONE
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-service-network"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: "TLS Passthrough Service Network"
+
+  # VPC Association with Service Network
+  ServiceNetworkVPCAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref VPCLatticeServiceNetwork
+      VpcIdentifier: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-vpc-association"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # VPC Lattice Target Group
+  VPCLatticeTargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: !Sub "${ResourcePrefix}-target-group"
+      Type: INSTANCE
+      Protocol: TCP
+      Port: 443
+      VpcIdentifier: !Ref VPC
+      Config:
+        HealthCheck:
+          Enabled: true
+          Protocol: TCP
+          Port: 443
+          HealthyThresholdCount: 2
+          UnhealthyThresholdCount: 2
+          IntervalSeconds: 30
+          TimeoutSeconds: 5
+      Targets:
+        - Id: !Ref TargetInstance1
+          Port: 443
+        - Id: !Ref TargetInstance2
+          Port: 443
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-target-group"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # VPC Lattice Service
+  VPCLatticeService:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Sub "${ResourcePrefix}-service"
+      AuthType: NONE
+      CustomDomainName: !Ref CustomDomainName
+      CertificateArn: !Ref ACMCertificate
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-service"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: "TLS Passthrough Service"
+
+  # Service Network Service Association
+  ServiceNetworkServiceAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref VPCLatticeServiceNetwork
+      ServiceIdentifier: !Ref VPCLatticeService
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-service-association"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # VPC Lattice Listener with TLS Passthrough
+  VPCLatticeListener:
+    Type: AWS::VpcLattice::Listener
+    Properties:
+      ServiceIdentifier: !Ref VPCLatticeService
+      Name: !Sub "${ResourcePrefix}-tls-listener"
+      Protocol: TLS_PASSTHROUGH
+      Port: 443
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref VPCLatticeTargetGroup
+              Weight: 100
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-tls-listener"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Route 53 Hosted Zone (conditional)
+  Route53HostedZone:
+    Type: AWS::Route53::HostedZone
+    Condition: ShouldCreateHostedZone
+    Properties:
+      Name: !Ref HostedZoneName
+      HostedZoneConfig:
+        Comment: !Sub "VPC Lattice TLS Passthrough Demo - ${EnvironmentName}"
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-hosted-zone"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Route 53 DNS Record
+  Route53DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: ShouldCreateHostedZone
+    Properties:
+      HostedZoneId: !Ref Route53HostedZone
+      Name: !Ref CustomDomainName
+      Type: CNAME
+      TTL: 300
+      ResourceRecords:
+        - !GetAtt VPCLatticeService.DnsEntry.DomainName
+      Comment: "CNAME record pointing to VPC Lattice service"
+
+# Template Outputs
+Outputs:
+  # Network Information
+  VPCId:
+    Description: "ID of the created VPC"
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VPC-ID"
+
+  SubnetId:
+    Description: "ID of the target subnet"
+    Value: !Ref TargetSubnet
+    Export:
+      Name: !Sub "${AWS::StackName}-Subnet-ID"
+
+  SecurityGroupId:
+    Description: "ID of the target security group"
+    Value: !Ref TargetSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroup-ID"
+
+  # Certificate Information
+  CertificateArn:
+    Description: "ARN of the ACM certificate"
+    Value: !Ref ACMCertificate
+    Export:
+      Name: !Sub "${AWS::StackName}-Certificate-ARN"
+
+  # Instance Information
+  TargetInstance1Id:
+    Description: "Instance ID of the first target"
+    Value: !Ref TargetInstance1
+    Export:
+      Name: !Sub "${AWS::StackName}-Target1-ID"
+
+  TargetInstance2Id:
+    Description: "Instance ID of the second target"
+    Value: !Ref TargetInstance2
+    Export:
+      Name: !Sub "${AWS::StackName}-Target2-ID"
+
+  TargetInstance1PrivateIP:
+    Description: "Private IP address of the first target"
+    Value: !GetAtt TargetInstance1.PrivateIp
+
+  TargetInstance2PrivateIP:
+    Description: "Private IP address of the second target"
+    Value: !GetAtt TargetInstance2.PrivateIp
+
+  # VPC Lattice Information
+  ServiceNetworkId:
+    Description: "ID of the VPC Lattice service network"
+    Value: !Ref VPCLatticeServiceNetwork
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceNetwork-ID"
+
+  ServiceId:
+    Description: "ID of the VPC Lattice service"
+    Value: !Ref VPCLatticeService
+    Export:
+      Name: !Sub "${AWS::StackName}-Service-ID"
+
+  ServiceArn:
+    Description: "ARN of the VPC Lattice service"
+    Value: !Ref VPCLatticeService
+    Export:
+      Name: !Sub "${AWS::StackName}-Service-ARN"
+
+  ServiceDNSName:
+    Description: "DNS name of the VPC Lattice service"
+    Value: !GetAtt VPCLatticeService.DnsEntry.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-Service-DNS"
+
+  TargetGroupId:
+    Description: "ID of the VPC Lattice target group"
+    Value: !Ref VPCLatticeTargetGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetGroup-ID"
+
+  ListenerId:
+    Description: "ID of the VPC Lattice listener"
+    Value: !Ref VPCLatticeListener
+    Export:
+      Name: !Sub "${AWS::StackName}-Listener-ID"
+
+  # DNS Information
+  CustomDomain:
+    Description: "Custom domain name for the service"
+    Value: !Ref CustomDomainName
+
+  HostedZoneId:
+    Description: "ID of the Route 53 hosted zone (if created)"
+    Value: !If [ShouldCreateHostedZone, !Ref Route53HostedZone, "Not created"]
+    Condition: ShouldCreateHostedZone
+    Export:
+      Name: !Sub "${AWS::StackName}-HostedZone-ID"
+
+  # Testing Information
+  TestingInstructions:
+    Description: "Instructions for testing the TLS passthrough setup"
+    Value: !Sub |
+      1. Ensure ACM certificate is validated (check ACM console)
+      2. Wait 5-10 minutes for VPC Lattice service to become active
+      3. Test with: curl -k -v https://${CustomDomainName}
+      4. Verify TLS handshake: openssl s_client -connect ${CustomDomainName}:443 -servername ${CustomDomainName}
+
+  # Cost Estimation
+  EstimatedMonthlyCost:
+    Description: "Estimated monthly cost for running this infrastructure"
+    Value: !Sub |
+      EC2 instances (2x ${InstanceType}): ~$15-30/month
+      VPC Lattice service: ~$10-20/month
+      ACM certificate: Free
+      Route 53 hosted zone: $0.50/month (if created)
+      Data transfer: Variable based on usage
+      Total estimated: $25-50/month for light usage
+
+  # Security Notes
+  SecurityConsiderations:
+    Description: "Important security considerations for this setup"
+    Value: |
+      1. Target instances use self-signed certificates (replace with proper certs for production)
+      2. SSH access is open to 0.0.0.0/0 (restrict for production)
+      3. Implement proper certificate rotation automation
+      4. Monitor VPC Lattice access logs and CloudWatch metrics
+      5. Consider implementing VPC Lattice auth policies for fine-grained access control

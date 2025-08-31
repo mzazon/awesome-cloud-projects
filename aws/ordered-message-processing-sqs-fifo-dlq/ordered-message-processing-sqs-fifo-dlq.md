@@ -1,15 +1,15 @@
 ---
 title: Processing Ordered Messages with SQS FIFO and Dead Letter Queues
 id: fc81db75
-category: application integration
+category: application-integration
 difficulty: 300
 subject: aws
-services: sqs, lambda, cloudwatch
+services: sqs, lambda, cloudwatch, dynamodb
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: sqs, fifo, message-processing, dead-letter-queue, lambda, monitoring
 recipe-generator-version: 1.3
@@ -83,11 +83,11 @@ graph TB
 4. Knowledge of error handling patterns and dead letter queue strategies
 5. Estimated cost: $15-20 for testing resources (delete after completion)
 
-> **Note**: This recipe implements production-grade message processing patterns with comprehensive error handling and monitoring.
+> **Note**: This recipe implements production-grade message processing patterns with comprehensive error handling and monitoring, following AWS Well-Architected Framework principles.
 
 > **Warning**: FIFO queues have throughput limitations of 3,000 messages per second per message group. Design your message grouping strategy carefully to avoid bottlenecks in high-volume scenarios.
 
-> **Tip**: Monitor the `ApproximateAgeOfOldestMessage` metric to detect processing backlogs early. Consider implementing auto-scaling based on queue depth for production workloads.
+> **Tip**: Monitor the `ApproximateAgeOfOldestMessage` metric to detect processing backlogs early. Consider implementing auto-scaling based on queue depth for production workloads as described in the [SQS best practices documentation](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-best-practices.html).
 
 ## Preparation
 
@@ -150,7 +150,7 @@ echo "✅ Environment configured with project: ${PROJECT_NAME}"
 
    ```bash
    # Create S3 bucket for archiving poison messages
-   aws s3 mb s3://${ARCHIVE_BUCKET_NAME}
+   aws s3 mb s3://${ARCHIVE_BUCKET_NAME} --region ${AWS_REGION}
    
    # Configure lifecycle policy for cost optimization
    aws s3api put-bucket-lifecycle-configuration \
@@ -389,6 +389,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 import hashlib
 import random
+import os
 
 dynamodb = boto3.resource('dynamodb')
 cloudwatch = boto3.client('cloudwatch')
@@ -580,8 +581,6 @@ def should_simulate_failure():
     """
     # 10% chance of failure for demonstration
     return random.random() < 0.1
-
-import os
 EOF
    
    # Package and deploy message processor
@@ -593,7 +592,7 @@ EOF
    
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-message-processor" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${PROCESSOR_ROLE_ARN} \
        --handler message_processor.lambda_handler \
        --zip-file fileb://message_processor.zip \
@@ -618,6 +617,7 @@ import boto3
 import time
 from datetime import datetime
 import uuid
+import os
 
 s3 = boto3.client('s3')
 sns = boto3.client('sns')
@@ -851,8 +851,6 @@ def publish_poison_metrics(message_group_id, analysis):
         )
     except Exception as e:
         print(f"Error publishing poison metrics: {str(e)}")
-
-import os
 EOF
    
    # Package and deploy poison message handler
@@ -864,7 +862,7 @@ EOF
    
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-poison-handler" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${POISON_ROLE_ARN} \
        --handler poison_message_handler.lambda_handler \
        --zip-file fileb://poison_message_handler.zip \
@@ -961,6 +959,7 @@ import json
 import boto3
 from datetime import datetime, timedelta
 import uuid
+import os
 
 s3 = boto3.client('s3')
 sqs = boto3.client('sqs')
@@ -1155,8 +1154,6 @@ def replay_single_message(message_info):
             'success': False,
             'error': str(e)
         }
-
-import os
 EOF
     
     # Package and deploy message replay function
@@ -1164,7 +1161,7 @@ EOF
     
     aws lambda create-function \
         --function-name "${PROJECT_NAME}-message-replay" \
-        --runtime python3.9 \
+        --runtime python3.12 \
         --role ${POISON_ROLE_ARN} \
         --handler message_replay.lambda_handler \
         --zip-file fileb://message_replay.zip \
@@ -1401,29 +1398,29 @@ EOF
 
 ## Discussion
 
-This advanced implementation demonstrates sophisticated message processing patterns that address real-world challenges in high-volume, mission-critical systems. The use of SQS FIFO queues provides strict ordering guarantees within message groups while enabling horizontal scaling across different business domains. The deduplication scope set to `messageGroup` ensures optimal throughput by allowing parallel processing of different message groups while maintaining order within each group.
+This advanced implementation demonstrates sophisticated message processing patterns that address real-world challenges in high-volume, mission-critical systems. The use of SQS FIFO queues provides strict ordering guarantees within message groups while enabling horizontal scaling across different business domains. The deduplication scope set to `messageGroup` ensures optimal throughput by allowing parallel processing of different message groups while maintaining order within each group, as detailed in the [SQS message deduplication best practices](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/best-practices-message-deduplication.html).
 
-The dead letter queue strategy goes beyond simple message parking by implementing intelligent poison message analysis and automated recovery mechanisms. The poison message handler categorizes failures by severity and attempts automated remediation where possible, reducing operational overhead. Messages that cannot be automatically recovered are archived to S3 with comprehensive metadata for manual investigation, while critical issues trigger immediate alerts through SNS.
+The dead letter queue strategy goes beyond simple message parking by implementing intelligent poison message analysis and automated recovery mechanisms. The poison message handler categorizes failures by severity and attempts automated remediation where possible, reducing operational overhead. Messages that cannot be automatically recovered are archived to S3 with comprehensive metadata for manual investigation, while critical issues trigger immediate alerts through SNS. This approach follows AWS Well-Architected Framework principles for operational excellence by automating failure handling and providing comprehensive observability.
 
-The architecture incorporates comprehensive observability through CloudWatch metrics and alarms, enabling proactive monitoring of processing latency, failure rates, and poison message patterns. The custom metrics provide deep insights into message group performance and help identify problematic producers or business logic issues. The reserved concurrency on the message processor prevents overwhelming downstream systems during traffic spikes.
+The architecture incorporates comprehensive observability through CloudWatch metrics and alarms, enabling proactive monitoring of processing latency, failure rates, and poison message patterns. The custom metrics provide deep insights into message group performance and help identify problematic producers or business logic issues. The reserved concurrency on the message processor prevents overwhelming downstream systems during traffic spikes while ensuring predictable performance.
 
-The message replay capability provides operational flexibility for handling various scenarios such as code deployments with bugs, downstream system outages, or data corruption issues. The replay function includes intelligent filtering and dry-run capabilities, allowing operators to test recovery strategies before affecting production traffic. This feature is particularly valuable in financial systems where message loss or duplication can have significant business impact.
+The message replay capability provides operational flexibility for handling various scenarios such as code deployments with bugs, downstream system outages, or data corruption issues. The replay function includes intelligent filtering and dry-run capabilities, allowing operators to test recovery strategies before affecting production traffic. This feature is particularly valuable in financial systems where message loss or duplication can have significant business impact. All functions use Python 3.12 runtime for optimal performance and long-term support as specified in the [Lambda runtime documentation](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html).
 
-> **Warning**: In production environments, ensure proper IAM policies limit access to sensitive operations like message replay and poison message handling to authorized personnel only.
+> **Warning**: In production environments, ensure proper IAM policies limit access to sensitive operations like message replay and poison message handling to authorized personnel only, following AWS security best practices.
 
 ## Challenge
 
 Enhance this ordered message processing system with these advanced capabilities:
 
-1. **Implement Message Prioritization** - Add support for high-priority messages that can bypass normal ordering constraints while maintaining consistency within priority levels.
+1. **Implement Message Prioritization** - Add support for high-priority messages that can bypass normal ordering constraints while maintaining consistency within priority levels using separate FIFO queues.
 
 2. **Add Distributed Tracing** - Integrate AWS X-Ray to provide end-to-end visibility of message processing flows across all components and downstream systems.
 
-3. **Create Advanced Message Routing** - Implement content-based routing that can direct messages to different processing paths based on message content or metadata.
+3. **Create Advanced Message Routing** - Implement content-based routing that can direct messages to different processing paths based on message content or metadata using EventBridge rules.
 
-4. **Build Message Transformation Pipeline** - Add support for message schema evolution and transformation to handle version compatibility across producers and consumers.
+4. **Build Message Transformation Pipeline** - Add support for message schema evolution and transformation to handle version compatibility across producers and consumers using Step Functions.
 
-5. **Implement Backpressure Management** - Create dynamic throttling mechanisms that can adjust processing rates based on downstream system health and capacity.
+5. **Implement Backpressure Management** - Create dynamic throttling mechanisms that can adjust processing rates based on downstream system health and capacity using CloudWatch metrics and Lambda concurrency controls.
 
 ## Infrastructure Code
 

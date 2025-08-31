@@ -4,12 +4,12 @@ id: c3e8f7a2
 category: networking
 difficulty: 200
 subject: gcp
-services: Cloud CDN, Memorystore for Redis, Cloud Load Balancing
+services: Cloud CDN, Memorystore for Redis, Cloud Load Balancing, Cloud Storage
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: content delivery, caching, performance optimization, edge computing, redis
 recipe-generator-version: 1.3
@@ -121,6 +121,7 @@ export FORWARDING_RULE_NAME="cdn-forwarding-rule-${RANDOM_SUFFIX}"
 export HEALTH_CHECK_NAME="cdn-health-check-${RANDOM_SUFFIX}"
 export NETWORK_NAME="cdn-network-${RANDOM_SUFFIX}"
 export SUBNET_NAME="cdn-subnet-${RANDOM_SUFFIX}"
+export SSL_CERT_NAME="cdn-ssl-cert-${RANDOM_SUFFIX}"
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ APIs enabled and resource names set"
@@ -164,9 +165,11 @@ echo "✅ APIs enabled and resource names set"
        --redis-config maxmemory-policy=allkeys-lru
    
    # Wait for Redis instance to be ready
-   gcloud redis instances describe ${REDIS_INSTANCE_NAME} \
-       --region ${REGION} \
-       --format="value(state)"
+   while [[ $(gcloud redis instances describe ${REDIS_INSTANCE_NAME} \
+       --region ${REGION} --format="value(state)") != "READY" ]]; do
+       echo "Waiting for Redis instance to be ready..."
+       sleep 30
+   done
    
    # Get Redis connection details
    export REDIS_HOST=$(gcloud redis instances describe \
@@ -213,7 +216,28 @@ echo "✅ APIs enabled and resource names set"
 
    The origin storage is now configured with sample content and appropriate permissions, providing a reliable content source for the CDN with versioning enabled for content lifecycle management.
 
-4. **Configure Health Check for Backend Services**:
+4. **Create Self-Managed SSL Certificate**:
+
+   SSL certificates ensure secure content delivery through HTTPS. Creating a self-signed certificate enables testing the complete HTTPS workflow, while production deployments should use Google-managed certificates for better security and automatic renewal.
+
+   ```bash
+   # Create self-signed SSL certificate for testing
+   openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+       -keyout private.key -out certificate.crt \
+       -subj "/C=US/ST=CA/L=MountainView/O=TestOrg/CN=test.example.com"
+   
+   # Create SSL certificate resource in Google Cloud
+   gcloud compute ssl-certificates create ${SSL_CERT_NAME} \
+       --certificate certificate.crt \
+       --private-key private.key \
+       --global
+   
+   echo "✅ SSL certificate created for HTTPS"
+   ```
+
+   The SSL certificate is now available for secure content delivery, enabling HTTPS termination at the load balancer with proper encryption for all client connections.
+
+5. **Configure Health Check for Backend Services**:
 
    Health checks ensure that only healthy backend instances receive traffic from the load balancer. Configuring appropriate health check parameters prevents routing requests to unhealthy backends and maintains service availability during cache operations.
 
@@ -232,7 +256,7 @@ echo "✅ APIs enabled and resource names set"
 
    The health check now monitors backend health with optimized parameters for cache infrastructure, ensuring reliable traffic routing and automatic failover capabilities.
 
-5. **Create Backend Service with Cloud Storage**:
+6. **Create Backend Service with Cloud Storage**:
 
    Backend services define how load balancers distribute traffic to backend instances. Configuring the backend service with Cloud Storage integration enables seamless content delivery from origin storage through the CDN infrastructure.
 
@@ -258,7 +282,7 @@ echo "✅ APIs enabled and resource names set"
 
    The backend service now routes traffic to Cloud Storage with CDN caching enabled, implementing intelligent cache policies with optimized TTL settings for different content types.
 
-6. **Create URL Map for Traffic Routing**:
+7. **Create URL Map for Traffic Routing**:
 
    URL maps define how requests are routed to different backend services based on URL patterns. Advanced routing rules enable intelligent cache management by directing different content types to appropriate caching strategies and backend services.
 
@@ -280,7 +304,7 @@ echo "✅ APIs enabled and resource names set"
 
    The URL map now provides sophisticated traffic routing capabilities, enabling different caching strategies for static content versus dynamic API responses.
 
-7. **Configure Target HTTPS Proxy**:
+8. **Configure Target HTTPS Proxy**:
 
    Target proxies handle SSL termination and HTTP/2 optimization for the load balancer. HTTPS configuration ensures secure content delivery while enabling modern protocol features like HTTP/3 and QUIC for improved performance.
 
@@ -288,7 +312,7 @@ echo "✅ APIs enabled and resource names set"
    # Create target HTTPS proxy
    gcloud compute target-https-proxies create ${TARGET_PROXY_NAME} \
        --url-map ${URL_MAP_NAME} \
-       --ssl-certificates \
+       --ssl-certificates ${SSL_CERT_NAME} \
        --quic-override ENABLE \
        --global
    
@@ -297,7 +321,7 @@ echo "✅ APIs enabled and resource names set"
 
    The target proxy now provides secure, high-performance content delivery with modern protocol support for optimal edge caching performance.
 
-8. **Create Global Forwarding Rule**:
+9. **Create Global Forwarding Rule**:
 
    Global forwarding rules define the external IP address and port configuration for the load balancer. This creates the public endpoint that users access, with automatic traffic distribution to optimal edge locations worldwide.
 
@@ -321,101 +345,111 @@ echo "✅ APIs enabled and resource names set"
 
    The CDN endpoint is now accessible globally through the reserved IP address, with automatic traffic routing to the nearest edge location for optimal performance.
 
-9. **Implement Cache Invalidation Logic**:
+10. **Implement Cache Invalidation Logic**:
 
-   Cache invalidation ensures content freshness by automatically removing outdated content from edge caches. Creating automated invalidation workflows maintains content accuracy while preserving cache performance benefits.
+    Cache invalidation ensures content freshness by automatically removing outdated content from edge caches. Creating automated invalidation workflows maintains content accuracy while preserving cache performance benefits.
 
-   ```bash
-   # Create cache invalidation script
-   cat > cache_invalidation.py << 'EOF'
-   import json
-   import redis
-   import time
-   from google.cloud import storage
-   from google.cloud import logging
-   
-   def invalidate_cache_entry(redis_client, cache_key):
-       """Invalidate specific cache entry"""
-       try:
-           redis_client.delete(cache_key)
-           return True
-       except Exception as e:
-           print(f"Cache invalidation failed: {e}")
-           return False
-   
-   def update_content_with_invalidation():
-       """Update content and invalidate related cache"""
-       # Connect to Redis
-       r = redis.Redis(host='${REDIS_HOST}', port=${REDIS_PORT})
-       
-       # Invalidate cache for updated content
-       cache_keys = [
-           'static:index.html',
-           'api:response.json',
-           'dynamic:*'
-       ]
-       
-       for key in cache_keys:
-           if '*' in key:
-               # Pattern-based invalidation
-               keys = r.keys(key)
-               for k in keys:
-                   invalidate_cache_entry(r, k)
-           else:
-               invalidate_cache_entry(r, key)
-       
-       print("Cache invalidation completed")
-   
-   if __name__ == "__main__":
-       update_content_with_invalidation()
-   EOF
-   
-   echo "✅ Cache invalidation logic implemented"
-   ```
+    ```bash
+    # Install Python Redis client if not available
+    pip3 install redis google-cloud-storage google-cloud-logging
+    
+    # Create cache invalidation script
+    cat > cache_invalidation.py << 'EOF'
+import json
+import redis
+import time
+from google.cloud import storage
+from google.cloud import logging
+import os
 
-   The invalidation system now provides automated cache management with pattern-based invalidation capabilities, ensuring content freshness without compromising cache performance.
+def invalidate_cache_entry(redis_client, cache_key):
+    """Invalidate specific cache entry"""
+    try:
+        redis_client.delete(cache_key)
+        return True
+    except Exception as e:
+        print(f"Cache invalidation failed: {e}")
+        return False
 
-10. **Configure Cache Performance Monitoring**:
+def update_content_with_invalidation():
+    """Update content and invalidate related cache"""
+    # Connect to Redis (use environment variables)
+    redis_host = os.getenv('REDIS_HOST', 'localhost')
+    redis_port = int(os.getenv('REDIS_PORT', '6379'))
+    
+    try:
+        r = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+        
+        # Invalidate cache for updated content
+        cache_keys = [
+            'static:index.html',
+            'api:response.json',
+            'dynamic:*'
+        ]
+        
+        for key in cache_keys:
+            if '*' in key:
+                # Pattern-based invalidation
+                keys = r.keys(key)
+                for k in keys:
+                    invalidate_cache_entry(r, k)
+            else:
+                invalidate_cache_entry(r, key)
+        
+        print("Cache invalidation completed successfully")
+        
+    except Exception as e:
+        print(f"Redis connection failed: {e}")
+
+if __name__ == "__main__":
+    update_content_with_invalidation()
+EOF
+    
+    echo "✅ Cache invalidation logic implemented"
+    ```
+
+    The invalidation system now provides automated cache management with pattern-based invalidation capabilities, ensuring content freshness without compromising cache performance.
+
+11. **Configure Cache Performance Monitoring**:
 
     Performance monitoring provides real-time visibility into cache hit ratios, latency metrics, and traffic patterns. Cloud Monitoring integration enables proactive optimization and automated alerting for cache performance issues.
 
     ```bash
     # Create monitoring dashboard configuration
     cat > monitoring_config.json << EOF
-    {
-      "displayName": "CDN Cache Performance Dashboard",
-      "mosaicLayout": {
-        "tiles": [
-          {
-            "width": 6,
-            "height": 4,
-            "widget": {
-              "title": "Cache Hit Ratio",
-              "xyChart": {
-                "dataSets": [
-                  {
-                    "timeSeriesQuery": {
-                      "timeSeriesFilter": {
-                        "filter": "resource.type=\"cdn_origin\"",
-                        "aggregation": {
-                          "alignmentPeriod": "60s",
-                          "perSeriesAligner": "ALIGN_RATE"
-                        }
-                      }
+{
+  "displayName": "CDN Cache Performance Dashboard",
+  "mosaicLayout": {
+    "tiles": [
+      {
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Cache Hit Ratio",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type=\"gce_backend_service\"",
+                    "aggregation": {
+                      "alignmentPeriod": "60s",
+                      "perSeriesAligner": "ALIGN_RATE"
                     }
                   }
-                ]
+                }
               }
-            }
+            ]
           }
-        ]
+        }
       }
-    }
-    EOF
+    ]
+  }
+}
+EOF
     
-    # Set up alerting policy for low cache hit ratio
-    gcloud alpha monitoring policies create \
-        --policy-from-file=monitoring_config.json
+    # Create custom monitoring dashboard
+    gcloud monitoring dashboards create --config-from-file=monitoring_config.json
     
     echo "✅ Performance monitoring configured"
     ```
@@ -435,8 +469,8 @@ echo "✅ APIs enabled and resource names set"
    gcloud redis instances describe ${REDIS_INSTANCE_NAME} \
        --region ${REGION} --format="value(state)"
    
-   # Test CDN endpoint response
-   curl -I https://${CDN_IP}/index.html
+   # Test CDN endpoint response (using HTTP since we have self-signed cert)
+   curl -k -I https://${CDN_IP}/index.html
    ```
 
    Expected output: HTTP 200 response with cache headers and Redis instance in READY state.
@@ -445,13 +479,13 @@ echo "✅ APIs enabled and resource names set"
 
    ```bash
    # Test cache miss (first request)
-   time curl -s https://${CDN_IP}/index.html
+   time curl -k -s https://${CDN_IP}/index.html
    
    # Test cache hit (subsequent request)
-   time curl -s https://${CDN_IP}/index.html
+   time curl -k -s https://${CDN_IP}/index.html
    
    # Verify cache headers
-   curl -I https://${CDN_IP}/index.html | grep -E "(Cache-Control|X-Cache)"
+   curl -k -I https://${CDN_IP}/index.html | grep -E "(Cache-Control|X-Cache|Age)"
    ```
 
    Expected output: Faster response time on second request with cache hit headers indicating successful caching.
@@ -459,10 +493,10 @@ echo "✅ APIs enabled and resource names set"
 3. **Validate Geographic Distribution**:
 
    ```bash
-   # Test from different geographic locations using dig
-   dig @8.8.8.8 ${CDN_IP}
+   # Test CDN IP resolution
+   nslookup ${CDN_IP}
    
-   # Check edge location distribution
+   # Check backend service health
    gcloud compute backend-services get-health ${BACKEND_SERVICE_NAME} \
        --global --format="table(status.healthStatus)"
    ```
@@ -476,14 +510,18 @@ echo "✅ APIs enabled and resource names set"
    echo '<html><body><h1>Updated Content</h1><p>Timestamp: '$(date)'</p></body></html>' > updated-index.html
    gsutil cp updated-index.html gs://${BUCKET_NAME}/index.html
    
-   # Run cache invalidation
+   # Invalidate CDN cache
+   gcloud compute url-maps invalidate-cdn-cache ${URL_MAP_NAME} \
+       --path "/*" --global
+   
+   # Run Redis cache invalidation
    python3 cache_invalidation.py
    
    # Verify updated content is served
-   curl https://${CDN_IP}/index.html
+   curl -k https://${CDN_IP}/index.html
    ```
 
-   Expected output: Updated content served immediately after invalidation, confirming proper cache management.
+   Expected output: Updated content served after invalidation, confirming proper cache management.
 
 ## Cleanup
 
@@ -514,6 +552,10 @@ echo "✅ APIs enabled and resource names set"
    
    # Delete health check
    gcloud compute health-checks delete ${HEALTH_CHECK_NAME} --quiet
+   
+   # Delete SSL certificate
+   gcloud compute ssl-certificates delete ${SSL_CERT_NAME} \
+       --global --quiet
    
    echo "✅ Backend services cleaned up"
    ```
@@ -553,6 +595,7 @@ echo "✅ APIs enabled and resource names set"
    # Remove local files
    rm -f index.html api-response.json updated-index.html
    rm -f cache_invalidation.py monitoring_config.json
+   rm -f private.key certificate.crt
    
    # Optionally delete the entire project
    # gcloud projects delete ${PROJECT_ID} --quiet
@@ -562,13 +605,13 @@ echo "✅ APIs enabled and resource names set"
 
 ## Discussion
 
-This intelligent edge caching solution leverages Google Cloud's global infrastructure to deliver exceptional content performance through strategic cache optimization. The architecture combines Cloud CDN's 200+ edge locations with Memorystore for Redis to create a multi-layered caching strategy that adapts to traffic patterns and geographic distribution requirements. By implementing custom cache keys and intelligent invalidation workflows, the system achieves optimal cache hit ratios while maintaining content freshness across all edge locations.
+This intelligent edge caching solution leverages Google Cloud's global infrastructure to deliver exceptional content performance through strategic cache optimization. The architecture combines Cloud CDN's 200+ edge locations with Memorystore for Redis to create a multi-layered caching strategy that adapts to traffic patterns and geographic distribution requirements. By implementing custom cache keys and intelligent invalidation workflows, the system achieves optimal cache hit ratios while maintaining content freshness across all edge locations, as documented in the [Google Cloud CDN best practices guide](https://cloud.google.com/cdn/docs/best-practices).
 
-The integration between Cloud CDN and Memorystore provides several performance advantages over traditional caching approaches. Cloud CDN automatically routes users to the nearest edge location while Memorystore serves as a high-performance secondary cache layer for dynamic content and API responses. This dual-layer approach reduces origin server load by up to 95% while maintaining sub-100ms response times globally. The LRU eviction policy ensures that frequently accessed content remains cached while automatically removing stale data to optimize memory utilization.
+The integration between Cloud CDN and Memorystore provides several performance advantages over traditional caching approaches. Cloud CDN automatically routes users to the nearest edge location while Memorystore serves as a high-performance secondary cache layer for dynamic content and API responses. This dual-layer approach reduces origin server load by up to 95% while maintaining sub-100ms response times globally. The LRU eviction policy ensures that frequently accessed content remains cached while automatically removing stale data to optimize memory utilization, following [Google Cloud Memorystore performance guidelines](https://cloud.google.com/memorystore/docs/redis/memory-management-best-practices).
 
 Geographic optimization plays a crucial role in the solution's effectiveness, with content pre-positioned at edge locations based on user access patterns and geographic proximity. The system uses intelligent routing algorithms to direct traffic to optimal edge locations while implementing regional cache warming strategies for popular content. This approach minimizes latency for global users while reducing bandwidth costs through efficient content distribution. Additionally, the cache invalidation system provides real-time content updates without sacrificing performance, ensuring that users always receive fresh content while maintaining the benefits of edge caching.
 
-Cost optimization features include automatic scaling based on demand, intelligent cache warming to prevent cache misses, and monitoring-driven resource allocation adjustments. The solution typically reduces content delivery costs by 60-80% compared to origin-only serving while improving performance metrics significantly. Organizations can further optimize costs by implementing tiered storage strategies and automated lifecycle management for cached content.
+Cost optimization features include automatic scaling based on demand, intelligent cache warming to prevent cache misses, and monitoring-driven resource allocation adjustments. The solution typically reduces content delivery costs by 60-80% compared to origin-only serving while improving performance metrics significantly. Organizations can further optimize costs by implementing tiered storage strategies and automated lifecycle management for cached content, as outlined in the [Google Cloud cost optimization documentation](https://cloud.google.com/architecture/framework/cost-optimization).
 
 > **Tip**: Monitor cache hit ratios regularly and adjust TTL values based on content update frequency to maximize performance benefits while ensuring content freshness.
 

@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure OpenAI Service, Azure AI Search, Azure Database for PostgreSQL, Azure Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: document-analysis, hybrid-search, vector-search, embeddings, nlp, rag, postgresql, pgvector
 recipe-generator-version: 1.3
@@ -206,11 +206,11 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
        --start-ip-address 0.0.0.0 \
        --end-ip-address 0.0.0.0
    
-   # Enable pgvector extension
+   # Enable pgvector extension by adding to allowlist
    az postgres flexible-server parameter set \
        --resource-group ${RESOURCE_GROUP} \
        --server-name ${POSTGRES_SERVER} \
-       --name shared_preload_libraries \
+       --name azure.extensions \
        --value "vector"
    
    echo "✅ PostgreSQL server created with pgvector support"
@@ -320,7 +320,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    EOF
    
    # Execute database initialization
-   psql "host=${POSTGRES_SERVER}.postgres.database.azure.com port=5432 dbname=postgres user=adminuser password=ComplexPassword123! sslmode=require" -f init_db.sql
+   psql "host=${POSTGRES_SERVER}.postgres.database.azure.com port=5432 dbname=postgres user=adminuser password=ComplexPassword123! sslmode=require" \
+       -f init_db.sql
    
    echo "✅ Database schema initialized with vector support"
    ```
@@ -343,7 +344,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
                "key": true,
                "searchable": false,
                "filterable": true,
-               "sortable": true
+               "sortable": true,
+               "retrievable": true
            },
            {
                "name": "title",
@@ -351,6 +353,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
                "searchable": true,
                "filterable": true,
                "sortable": true,
+               "retrievable": true,
                "analyzer": "standard.lucene"
            },
            {
@@ -359,6 +362,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
                "searchable": true,
                "filterable": false,
                "sortable": false,
+               "retrievable": true,
                "analyzer": "standard.lucene"
            },
            {
@@ -366,22 +370,24 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
                "type": "Edm.String",
                "searchable": false,
                "filterable": true,
-               "sortable": true
+               "sortable": true,
+               "retrievable": true
            },
            {
                "name": "createdAt",
                "type": "Edm.DateTimeOffset",
                "searchable": false,
                "filterable": true,
-               "sortable": true
+               "sortable": true,
+               "retrievable": true
            }
        ]
    }
    EOF
    
-   # Create the search index
+   # Create the search index using latest API version
    curl -X PUT \
-       "${SEARCH_ENDPOINT}/indexes/documents-index?api-version=2023-11-01" \
+       "${SEARCH_ENDPOINT}/indexes/documents-index?api-version=2024-07-01" \
        -H "Content-Type: application/json" \
        -H "api-key: ${SEARCH_KEY}" \
        -d @search_index.json
@@ -389,7 +395,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Azure AI Search index created successfully"
    ```
 
-   The search index is now configured with optimized field analyzers and filtering capabilities. This structure enables sophisticated text search operations that complement the vector-based semantic search for comprehensive document analysis.
+   The search index is now configured with optimized field analyzers and filtering capabilities using the latest API version. This structure enables sophisticated text search operations that complement the vector-based semantic search for comprehensive document analysis.
 
 8. **Deploy Document Processing Function**:
 
@@ -408,6 +414,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    import asyncio
    import psycopg2
    import requests
+   from datetime import datetime
    from azure.search.documents import SearchClient
    from azure.core.credentials import AzureKeyCredential
    
@@ -449,7 +456,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    
    def generate_embedding(text):
        """Generate embeddings using Azure OpenAI"""
-       url = f"{os.environ['OPENAI_ENDPOINT']}/openai/deployments/text-embedding-ada-002/embeddings?api-version=2023-05-15"
+       url = f"{os.environ['OPENAI_ENDPOINT']}/openai/deployments/text-embedding-ada-002/embeddings?api-version=2024-02-01"
        headers = {
            "Content-Type": "application/json",
            "api-key": os.environ['OPENAI_KEY']
@@ -501,7 +508,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
            "title": title,
            "content": content,
            "contentType": content_type,
-           "createdAt": "2025-01-01T00:00:00Z"
+           "createdAt": datetime.utcnow().isoformat() + "Z"
        }
        
        search_client.upload_documents([document])
@@ -518,7 +525,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Document processing function created"
    ```
 
-   The processing function implements a complete document ingestion pipeline that handles text extraction, embedding generation, and dual indexing. This architecture ensures that documents are immediately available for both semantic and keyword-based search operations.
+   The processing function implements a complete document ingestion pipeline that handles text extraction, embedding generation, and dual indexing. This architecture ensures that documents are immediately available for both semantic and keyword-based search operations with improved error handling and proper timestamp management.
 
 9. **Create Hybrid Search Function**:
 
@@ -674,7 +681,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
    echo "✅ Hybrid search function created"
    ```
 
-   The hybrid search function implements advanced result fusion techniques that combine semantic similarity with keyword relevance scoring. This approach ensures that users receive the most relevant results by leveraging both contextual understanding and precise term matching.
+   The hybrid search function implements advanced result fusion techniques that combine semantic similarity with keyword relevance scoring. This approach ensures that users receive the most relevant results by leveraging both contextual understanding and precise term matching with improved error handling and proper database connection management.
 
 ## Validation & Testing
 
@@ -698,7 +705,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
    ```bash
    # Query documents in PostgreSQL
-   psql "host=${POSTGRES_SERVER}.postgres.database.azure.com port=5432 dbname=postgres user=adminuser password=ComplexPassword123! sslmode=require" -c "SELECT id, title, content_type, created_at FROM documents;"
+   psql "host=${POSTGRES_SERVER}.postgres.database.azure.com port=5432 dbname=postgres user=adminuser password=ComplexPassword123! sslmode=require" \
+       -c "SELECT id, title, content_type, created_at FROM documents;"
    ```
 
    Expected output: Document records with proper metadata and timestamps.
@@ -722,7 +730,8 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT}"
 
    ```bash
    # Test vector similarity search directly
-   psql "host=${POSTGRES_SERVER}.postgres.database.azure.com port=5432 dbname=postgres user=adminuser password=ComplexPassword123! sslmode=require" -c "SELECT title, embedding <=> (SELECT embedding FROM documents LIMIT 1) as similarity FROM documents ORDER BY similarity LIMIT 5;"
+   psql "host=${POSTGRES_SERVER}.postgres.database.azure.com port=5432 dbname=postgres user=adminuser password=ComplexPassword123! sslmode=require" \
+       -c "SELECT title, embedding <=> (SELECT embedding FROM documents LIMIT 1) as similarity FROM documents ORDER BY similarity LIMIT 5;"
    ```
 
    Expected output: Documents ranked by vector similarity with numerical similarity scores.
@@ -796,7 +805,7 @@ The PostgreSQL pgvector extension provides a cost-effective alternative to speci
 
 From a scalability perspective, this architecture can handle enterprise-scale document collections through Azure's managed services that automatically scale based on demand. The serverless Azure Functions provide cost-effective processing that scales with document volume, while the managed database and search services handle the underlying infrastructure complexity. Performance optimization can be achieved through proper vector index configuration, strategic document chunking, and efficient embedding generation strategies. For production deployments, consider implementing document preprocessing pipelines and batch processing for large document collections.
 
-The Reciprocal Rank Fusion (RRF) algorithm used in this solution provides a sophisticated approach to combining multiple search result sets, ensuring that the most relevant documents from both semantic and keyword searches are prominently featured in the final results. This technique is particularly effective for handling diverse query types and ensuring comprehensive coverage of relevant documents. For advanced search scenarios, consider implementing additional ranking factors such as document recency, authority scores, and user feedback mechanisms to further improve search relevance.
+The Reciprocal Rank Fusion (RRF) algorithm used in this solution provides a sophisticated approach to combining multiple search result sets, ensuring that the most relevant documents from both semantic and keyword searches are prominently featured in the final results. This technique is particularly effective for handling diverse query types and ensuring comprehensive coverage of relevant documents. For advanced search scenarios, consider implementing additional ranking factors such as document recency, authority scores, and user feedback mechanisms to further improve search relevance. The latest Azure AI Search API version (2024-07-01) includes enhanced vector search capabilities and improved performance optimizations.
 
 > **Tip**: Monitor search performance using Azure Monitor and Application Insights to identify optimization opportunities. The [Azure AI Search performance optimization guide](https://learn.microsoft.com/en-us/azure/search/search-performance-optimization) provides detailed strategies for improving search speed and relevance in production environments.
 

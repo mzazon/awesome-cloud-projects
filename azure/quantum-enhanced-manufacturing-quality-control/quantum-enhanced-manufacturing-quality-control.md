@@ -6,10 +6,10 @@ difficulty: 400
 subject: azure
 services: Azure Quantum, Azure Machine Learning, Azure IoT Hub, Azure Stream Analytics
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: quantum-computing, machine-learning, manufacturing, quality-control, iot, predictive-analytics
 recipe-generator-version: 1.3
@@ -112,19 +112,27 @@ graph TB
 
 ```bash
 # Set environment variables for Azure resources
-export RESOURCE_GROUP="rg-quantum-manufacturing-${RANDOM}"
+export RESOURCE_GROUP="rg-quantum-manufacturing-${RANDOM_SUFFIX}"
 export LOCATION="eastus"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
-export WORKSPACE_NAME="ws-quantum-ml-${RANDOM}"
-export IOT_HUB_NAME="iothub-manufacturing-${RANDOM}"
-export STORAGE_ACCOUNT="stquantum${RANDOM}"
-export QUANTUM_WORKSPACE="qw-manufacturing-${RANDOM}"
-export STREAM_ANALYTICS_JOB="sa-quality-control-${RANDOM}"
+export WORKSPACE_NAME="ws-quantum-ml-${RANDOM_SUFFIX}"
+export IOT_HUB_NAME="iothub-manufacturing-${RANDOM_SUFFIX}"
+export STORAGE_ACCOUNT="stquantum${RANDOM_SUFFIX}"
+export QUANTUM_WORKSPACE="qw-manufacturing-${RANDOM_SUFFIX}"
+export STREAM_ANALYTICS_JOB="sa-quality-control-${RANDOM_SUFFIX}"
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
 
-# Create resource group with appropriate tags
+# Update resource names with suffix
+export RESOURCE_GROUP="rg-quantum-manufacturing-${RANDOM_SUFFIX}"
+export WORKSPACE_NAME="ws-quantum-ml-${RANDOM_SUFFIX}"
+export IOT_HUB_NAME="iothub-manufacturing-${RANDOM_SUFFIX}"
+export STORAGE_ACCOUNT="stquantum${RANDOM_SUFFIX}"
+export QUANTUM_WORKSPACE="qw-manufacturing-${RANDOM_SUFFIX}"
+export STREAM_ANALYTICS_JOB="sa-quality-control-${RANDOM_SUFFIX}"
+
+# Create resource group following Azure Well-Architected Framework
 az group create \
     --name ${RESOURCE_GROUP} \
     --location ${LOCATION} \
@@ -141,7 +149,7 @@ az provider register --namespace Microsoft.StreamAnalytics
 
 echo "✅ Azure providers registered successfully"
 
-# Create storage account for data lake capabilities
+# Create storage account with Data Lake Gen2 capabilities
 az storage account create \
     --name ${STORAGE_ACCOUNT} \
     --resource-group ${RESOURCE_GROUP} \
@@ -161,7 +169,7 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
    Azure Machine Learning provides the foundation for building, training, and deploying predictive quality control models at enterprise scale. The workspace acts as a centralized hub for managing machine learning experiments, datasets, compute resources, and model deployments. This managed service eliminates infrastructure overhead while providing robust MLOps capabilities essential for production manufacturing environments.
 
    ```bash
-   # Create Azure Machine Learning workspace
+   # Create Azure Machine Learning workspace with v2 CLI
    az ml workspace create \
        --name ${WORKSPACE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
@@ -173,8 +181,7 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
    az ml workspace update \
        --name ${WORKSPACE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --public-network-access Enabled \
-       --allow-public-access-when-behind-vnet true
+       --public-network-access enabled
    
    echo "✅ Azure ML workspace configured for manufacturing analytics"
    ```
@@ -220,26 +227,15 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
    Azure Quantum provides access to quantum computing hardware and simulators specifically designed for solving complex optimization problems. Manufacturing quality control involves multi-dimensional parameter optimization that classical computers struggle to solve efficiently. Quantum algorithms can explore solution spaces exponentially faster, making them ideal for optimizing production parameters across hundreds of interconnected variables in real-time.
 
    ```bash
-   # Create Azure Quantum workspace with optimization providers
+   # Create Azure Quantum workspace with latest CLI syntax
    az quantum workspace create \
-       --name ${QUANTUM_WORKSPACE} \
        --resource-group ${RESOURCE_GROUP} \
+       --workspace-name ${QUANTUM_WORKSPACE} \
        --location ${LOCATION} \
        --storage-account ${STORAGE_ACCOUNT}
    
-   # Configure quantum providers for optimization workloads
-   az quantum workspace provider add \
-       --workspace-name ${QUANTUM_WORKSPACE} \
-       --resource-group ${RESOURCE_GROUP} \
-       --provider-id "microsoft" \
-       --provider-sku "DZZ-Free"
-   
-   # Add optimization-focused quantum provider
-   az quantum workspace provider add \
-       --workspace-name ${QUANTUM_WORKSPACE} \
-       --resource-group ${RESOURCE_GROUP} \
-       --provider-id "1qbit" \
-       --provider-sku "cplex"
+   # Wait for workspace creation to complete
+   sleep 30
    
    echo "✅ Quantum workspace configured for manufacturing optimization"
    ```
@@ -257,42 +253,85 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
        --compatibility-level "1.2" \
-       --events-out-of-order-policy "Adjust" \
-       --events-out-of-order-max-delay-in-seconds 10
+       --out-of-order-policy "Drop" \
+       --order-max-delay 5 \
+       --arrival-max-delay 16 \
+       --data-locale "en-US"
    
-   # Configure IoT Hub input for sensor data
+   # Get IoT Hub connection string for input configuration
+   IOT_CONNECTION_STRING=$(az iot hub connection-string show \
+       --hub-name ${IOT_HUB_NAME} \
+       --query connectionString \
+       --output tsv)
+   
+   # Create input configuration file
+   cat > stream-input.json << EOF
+   {
+     "type": "Stream",
+     "datasource": {
+       "type": "Microsoft.Devices/IotHubs",
+       "properties": {
+         "iotHubNamespace": "${IOT_HUB_NAME}",
+         "sharedAccessPolicyName": "iothubowner",
+         "sharedAccessPolicyKey": "$(echo ${IOT_CONNECTION_STRING} | grep -oP 'SharedAccessKey=\K[^;]*')",
+         "endpoint": "messages/events",
+         "consumerGroupName": "\$Default"
+       }
+     },
+     "serialization": {
+       "type": "Json",
+       "properties": {
+         "encoding": "UTF8"
+       }
+     }
+   }
+   EOF
+   
+   # Create Stream Analytics input
    az stream-analytics input create \
        --job-name ${STREAM_ANALYTICS_JOB} \
        --resource-group ${RESOURCE_GROUP} \
        --name "ManufacturingInput" \
-       --type "Stream" \
-       --datasource '{
-         "type": "Microsoft.ServiceBus/EventHub",
-         "properties": {
-           "iotHubNamespace": "'${IOT_HUB_NAME}'",
-           "sharedAccessPolicyName": "iothubowner",
-           "consumerGroupName": "$Default",
-           "endpoint": "messages/events"
-         }
-       }'
+       --properties @stream-input.json
    
-   # Create output to Azure ML for model inference
+   # Get storage account key for output configuration
+   STORAGE_KEY=$(az storage account keys list \
+       --resource-group ${RESOURCE_GROUP} \
+       --account-name ${STORAGE_ACCOUNT} \
+       --query '[0].value' \
+       --output tsv)
+   
+   # Create output configuration file
+   cat > stream-output.json << EOF
+   {
+     "datasource": {
+       "type": "Microsoft.Storage/Blob",
+       "properties": {
+         "storageAccounts": [{
+           "accountName": "${STORAGE_ACCOUNT}",
+           "accountKey": "${STORAGE_KEY}"
+         }],
+         "container": "ml-inference",
+         "pathPattern": "quality-control/{date}/{time}",
+         "dateFormat": "yyyy/MM/dd",
+         "timeFormat": "HH"
+       }
+     },
+     "serialization": {
+       "type": "Json",
+       "properties": {
+         "encoding": "UTF8"
+       }
+     }
+   }
+   EOF
+   
+   # Create Stream Analytics output
    az stream-analytics output create \
        --job-name ${STREAM_ANALYTICS_JOB} \
        --resource-group ${RESOURCE_GROUP} \
        --name "MLOutput" \
-       --datasource '{
-         "type": "Microsoft.Storage/Blob",
-         "properties": {
-           "storageAccounts": [{
-             "accountName": "'${STORAGE_ACCOUNT}'"
-           }],
-           "container": "ml-inference",
-           "pathPattern": "quality-control/{date}/{time}",
-           "dateFormat": "yyyy/MM/dd",
-           "timeFormat": "HH"
-         }
-       }'
+       --properties @stream-output.json
    
    echo "✅ Stream Analytics configured for real-time quality processing"
    ```
@@ -321,26 +360,32 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
        --type computeinstance \
        --workspace-name ${WORKSPACE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --size "Standard_DS3_v2" \
-       --enable-ssh true
+       --size "Standard_DS3_v2"
    
-   # Configure compute for quantum-classical hybrid algorithms
+   # Create environment definition file for quantum-classical hybrid algorithms
+   cat > quantum-environment.yml << EOF
+   name: quantum-ml-env
+   channels:
+     - conda-forge
+     - microsoft
+   dependencies:
+     - python=3.8
+     - pip
+     - pip:
+       - azure-quantum
+       - azure-ai-ml
+       - scikit-learn
+       - pandas
+       - numpy
+       - qsharp
+   EOF
+   
+   # Create ML environment
    az ml environment create \
        --name "quantum-ml-env" \
        --workspace-name ${WORKSPACE_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --conda-file '{
-         "channels": ["conda-forge", "microsoft"],
-         "dependencies": [
-           "python=3.8",
-           "azure-quantum",
-           "azure-ml-sdk",
-           "scikit-learn",
-           "pandas",
-           "numpy",
-           "qsharp"
-         ]
-       }'
+       --file quantum-environment.yml
    
    echo "✅ ML compute infrastructure ready for quantum-enhanced training"
    ```
@@ -361,7 +406,7 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
        --path "azureml://datastores/workspaceblobstore/paths/quality-data/" \
        --description "Manufacturing sensor and quality data for ML training"
    
-   # Submit training job for defect prediction model
+   # Create training job configuration
    cat > training-job.yml << EOF
    \$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
    command: python train_quality_model.py
@@ -380,26 +425,68 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
    cat > train_quality_model.py << 'EOF'
    import pandas as pd
    import numpy as np
+   import os
    from sklearn.ensemble import RandomForestClassifier
    from sklearn.model_selection import train_test_split
+   from sklearn.metrics import accuracy_score, classification_report
    from azure.quantum import Workspace
    import mlflow
    import mlflow.sklearn
    
-   # Load manufacturing data
-   data = pd.read_csv("manufacturing_data.csv")
+   # Load manufacturing data (synthetic data for demonstration)
+   np.random.seed(42)
+   n_samples = 1000
+   
+   # Generate synthetic manufacturing data
+   temperature = np.random.normal(185, 5, n_samples)
+   pressure = np.random.normal(2.8, 0.2, n_samples)
+   speed = np.random.normal(145, 10, n_samples)
+   humidity = np.random.normal(45, 5, n_samples)
+   
+   # Create defect probability based on parameter deviations
+   defect_prob = (
+       0.1 * np.abs(temperature - 185) / 5 +
+       0.15 * np.abs(pressure - 2.8) / 0.2 +
+       0.08 * np.abs(speed - 145) / 10 +
+       0.05 * np.abs(humidity - 45) / 5
+   )
+   
+   # Generate binary defect labels
+   defect_detected = (defect_prob + np.random.normal(0, 0.1, n_samples)) > 0.3
+   
+   # Create DataFrame
+   data = pd.DataFrame({
+       'temperature': temperature,
+       'pressure': pressure,
+       'speed': speed,
+       'humidity': humidity,
+       'defect_detected': defect_detected
+   })
+   
+   # Prepare features and target
    X = data.drop(['defect_detected'], axis=1)
    y = data['defect_detected']
    
    # Split data for training
-   X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+   X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
    
    # Train defect prediction model
    model = RandomForestClassifier(n_estimators=100, random_state=42)
    model.fit(X_train, y_train)
    
+   # Evaluate model
+   y_pred = model.predict(X_test)
+   accuracy = accuracy_score(y_test, y_pred)
+   
+   print(f"Model accuracy: {accuracy:.3f}")
+   print(f"Classification report:\n{classification_report(y_test, y_pred)}")
+   
    # Log model with MLflow
-   mlflow.sklearn.log_model(model, "quality_prediction_model")
+   with mlflow.start_run():
+       mlflow.log_param("n_estimators", 100)
+       mlflow.log_metric("accuracy", accuracy)
+       mlflow.sklearn.log_model(model, "quality_prediction_model")
+   
    print("✅ Quality prediction model trained and logged")
    EOF
    
@@ -420,18 +507,25 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
    ```bash
    # Create quantum optimization configuration
    cat > quantum_optimization.py << 'EOF'
+   import os
    from azure.quantum import Workspace
    from azure.quantum.optimization import Problem, ProblemType
    import numpy as np
    import json
    
-   # Connect to Azure Quantum workspace
-   workspace = Workspace(
-       subscription_id="'${SUBSCRIPTION_ID}'",
-       resource_group="'${RESOURCE_GROUP}'",
-       name="'${QUANTUM_WORKSPACE}'",
-       location="'${LOCATION}'"
-   )
+   def create_quantum_workspace():
+       """Create connection to Azure Quantum workspace"""
+       try:
+           workspace = Workspace(
+               subscription_id=os.environ['SUBSCRIPTION_ID'],
+               resource_group=os.environ['RESOURCE_GROUP'],
+               name=os.environ['QUANTUM_WORKSPACE'],
+               location=os.environ['LOCATION']
+           )
+           return workspace
+       except Exception as e:
+           print(f"Error connecting to quantum workspace: {e}")
+           return None
    
    def optimize_manufacturing_parameters(sensor_data, quality_targets):
        """
@@ -478,7 +572,9 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
    current_sensor_data = {
        'temp_defect_correlation_0': 0.15,
        'temp_defect_correlation_1': 0.12,
-       # ... more correlations
+       'temp_defect_correlation_2': 0.18,
+       'temp_defect_correlation_3': 0.11,
+       'temp_defect_correlation_4': 0.14
    }
    
    quality_targets = {
@@ -486,6 +582,7 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
        'min_throughput': 95.0
    }
    
+   # Create optimization problem
    optimization_problem = optimize_manufacturing_parameters(current_sensor_data, quality_targets)
    print("✅ Quantum optimization problem formulated for manufacturing parameters")
    EOF
@@ -494,24 +591,29 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
    cat > solve_quantum_optimization.py << 'EOF'
    from azure.quantum.optimization import SimulatedAnnealing
    import json
+   import os
    
    def solve_manufacturing_optimization(problem, workspace):
        """
        Solve manufacturing parameter optimization using quantum-inspired algorithms.
        """
        
-       # Use Simulated Annealing solver for optimization
-       solver = SimulatedAnnealing(workspace)
-       
-       # Configure solver parameters for manufacturing optimization
-       result = solver.optimize(
-           problem,
-           timeout=30,  # 30 second timeout for real-time optimization
-           sweeps=1000,  # Number of optimization sweeps
-           seed=42  # For reproducible results
-       )
-       
-       return result
+       try:
+           # Use Simulated Annealing solver for optimization
+           solver = SimulatedAnnealing(workspace)
+           
+           # Configure solver parameters for manufacturing optimization
+           result = solver.optimize(
+               problem,
+               timeout=30,  # 30 second timeout for real-time optimization
+               sweeps=1000,  # Number of optimization sweeps
+               seed=42  # For reproducible results
+           )
+           
+           return result
+       except Exception as e:
+           print(f"Error in quantum optimization: {e}")
+           return None
    
    print("✅ Quantum optimization solver configured for manufacturing")
    EOF
@@ -527,8 +629,10 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
 
    ```bash
    # Create Azure Cosmos DB for real-time dashboard data
+   COSMOS_ACCOUNT_NAME="cosmos-quality-dashboard-${RANDOM_SUFFIX}"
+   
    az cosmosdb create \
-       --name "cosmos-quality-dashboard-${RANDOM}" \
+       --name ${COSMOS_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --locations regionName=${LOCATION} \
        --default-consistency-level Session \
@@ -536,12 +640,12 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
    
    # Create database and container for quality metrics
    az cosmosdb sql database create \
-       --account-name "cosmos-quality-dashboard-${RANDOM}" \
+       --account-name ${COSMOS_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --name "QualityControlDB"
    
    az cosmosdb sql container create \
-       --account-name "cosmos-quality-dashboard-${RANDOM}" \
+       --account-name ${COSMOS_ACCOUNT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --database-name "QualityControlDB" \
        --name "QualityMetrics" \
@@ -549,20 +653,37 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
        --throughput 400
    
    # Deploy Function App for dashboard API
+   FUNCTION_APP_NAME="func-quality-dashboard-${RANDOM_SUFFIX}"
+   
    az functionapp create \
-       --name "func-quality-dashboard-${RANDOM}" \
+       --name ${FUNCTION_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --storage-account ${STORAGE_ACCOUNT} \
        --consumption-plan-location ${LOCATION} \
        --runtime python \
-       --runtime-version 3.9 \
+       --runtime-version 3.11 \
        --functions-version 4
    
-   # Configure dashboard data aggregation
+   # Get Cosmos DB connection string
+   COSMOS_CONNECTION_STRING=$(az cosmosdb keys list \
+       --name ${COSMOS_ACCOUNT_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --type connection-strings \
+       --query 'connectionStrings[0].connectionString' \
+       --output tsv)
+   
+   # Configure Function App settings
+   az functionapp config appsettings set \
+       --name ${FUNCTION_APP_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --settings "COSMOS_CONNECTION_STRING=${COSMOS_CONNECTION_STRING}"
+   
+   # Configure dashboard data aggregation function
    cat > dashboard_aggregator.py << 'EOF'
    import azure.functions as func
    import json
    import logging
+   import os
    from azure.cosmos import CosmosClient
    
    def main(req: func.HttpRequest) -> func.HttpResponse:
@@ -600,6 +721,13 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
                    {'timestamp': '2025-07-12T10:00:00Z', 'score': 98.2},
                    {'timestamp': '2025-07-12T10:15:00Z', 'score': 98.5},
                    {'timestamp': '2025-07-12T10:30:00Z', 'score': 98.7}
+               ],
+               'alerts': [
+                   {
+                       'severity': 'low',
+                       'message': 'Temperature variance detected on line 1',
+                       'timestamp': '2025-07-12T10:25:00Z'
+                   }
                ]
            }
            
@@ -613,7 +741,8 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
            logging.error(f"Dashboard aggregation error: {str(e)}")
            return func.HttpResponse(
                json.dumps({"error": "Internal server error"}),
-               status_code=500
+               status_code=500,
+               mimetype="application/json"
            )
    
    print("✅ Dashboard aggregation function configured")
@@ -631,18 +760,17 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
    ```bash
    # Test quantum workspace connectivity
    az quantum workspace show \
-       --name ${QUANTUM_WORKSPACE} \
        --resource-group ${RESOURCE_GROUP} \
+       --workspace-name ${QUANTUM_WORKSPACE} \
        --output table
    
-   # List available quantum providers
-   az quantum workspace provider list \
-       --workspace-name ${QUANTUM_WORKSPACE} \
-       --resource-group ${RESOURCE_GROUP} \
+   # List available quantum offerings
+   az quantum offerings list \
+       --location ${LOCATION} \
        --output table
    ```
 
-   Expected output: Quantum workspace details with active providers and optimization capabilities.
+   Expected output: Quantum workspace details showing active status and available quantum providers.
 
 2. **Test IoT Hub Data Ingestion**:
 
@@ -685,24 +813,33 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
    ```bash
    # Run quantum optimization test
    python3 -c "
+   import os
+   os.environ['SUBSCRIPTION_ID'] = '${SUBSCRIPTION_ID}'
+   os.environ['RESOURCE_GROUP'] = '${RESOURCE_GROUP}'
+   os.environ['QUANTUM_WORKSPACE'] = '${QUANTUM_WORKSPACE}'
+   os.environ['LOCATION'] = '${LOCATION}'
+   
    from azure.quantum import Workspace
    from azure.quantum.optimization import Problem, ProblemType
    
    # Test quantum workspace connection
-   workspace = Workspace(
-       subscription_id='${SUBSCRIPTION_ID}',
-       resource_group='${RESOURCE_GROUP}',
-       name='${QUANTUM_WORKSPACE}',
-       location='${LOCATION}'
-   )
-   
-   # Create simple optimization test
-   problem = Problem(name='Test Optimization', problem_type=ProblemType.ising)
-   x = problem.add_variable('x', 'binary')
-   y = problem.add_variable('y', 'binary')
-   problem.add_objective(x + y)
-   
-   print('✅ Quantum optimization test successful')
+   try:
+       workspace = Workspace(
+           subscription_id='${SUBSCRIPTION_ID}',
+           resource_group='${RESOURCE_GROUP}',
+           name='${QUANTUM_WORKSPACE}',
+           location='${LOCATION}'
+       )
+       
+       # Create simple optimization test
+       problem = Problem(name='Test Optimization', problem_type=ProblemType.ising)
+       x = problem.add_variable('x', 'binary')
+       y = problem.add_variable('y', 'binary')
+       problem.add_objective(x + y)
+       
+       print('✅ Quantum optimization test successful')
+   except Exception as e:
+       print(f'❌ Quantum optimization test failed: {e}')
    "
    ```
 
@@ -715,8 +852,8 @@ echo "✅ Data Lake Storage account created: ${STORAGE_ACCOUNT}"
    ```bash
    # Delete quantum workspace
    az quantum workspace delete \
-       --name ${QUANTUM_WORKSPACE} \
        --resource-group ${RESOURCE_GROUP} \
+       --workspace-name ${QUANTUM_WORKSPACE} \
        --yes
    
    echo "✅ Quantum workspace deleted"

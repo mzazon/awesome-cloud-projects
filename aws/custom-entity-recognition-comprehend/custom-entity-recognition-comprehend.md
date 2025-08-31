@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: comprehend,s3,lambda,stepfunctions
 estimated-time: 240 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: comprehend,nlp,machine-learning,entity-recognition,classification,custom-models
 recipe-generator-version: 1.3
@@ -133,6 +133,16 @@ export ROLE_NAME="ComprehendCustomRole-${RANDOM_SUFFIX}"
 # Create S3 bucket for training data and models
 aws s3 mb s3://${BUCKET_NAME} --region ${AWS_REGION}
 
+# Enable S3 bucket versioning and encryption
+aws s3api put-bucket-versioning \
+    --bucket ${BUCKET_NAME} \
+    --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption \
+    --bucket ${BUCKET_NAME} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
 # Create IAM role for Comprehend and Step Functions
 cat > trust-policy.json << EOF
 {
@@ -247,6 +257,8 @@ echo "✅ Created foundational resources"
    import json
    import boto3
    import csv
+   import os
+   import uuid
    from io import StringIO
    import re
    
@@ -367,10 +379,10 @@ echo "✅ Created foundational resources"
    # Create deployment package
    zip data_preprocessor.zip data_preprocessor.py
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-data-preprocessor" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler data_preprocessor.lambda_handler \
        --zip-file fileb://data_preprocessor.zip \
@@ -390,8 +402,9 @@ echo "✅ Created foundational resources"
    cat > model_trainer.py << 'EOF'
    import json
    import boto3
-   from datetime import datetime
+   import os
    import uuid
+   from datetime import datetime
    
    comprehend = boto3.client('comprehend')
    
@@ -478,10 +491,10 @@ echo "✅ Created foundational resources"
    # Create deployment package
    zip model_trainer.zip model_trainer.py
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-model-trainer" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler model_trainer.lambda_handler \
        --zip-file fileb://model_trainer.zip \
@@ -548,10 +561,10 @@ echo "✅ Created foundational resources"
    # Create deployment package
    zip status_checker.zip status_checker.py
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-status-checker" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler status_checker.lambda_handler \
        --zip-file fileb://status_checker.zip \
@@ -699,6 +712,8 @@ echo "✅ Created foundational resources"
    cat > inference_api.py << 'EOF'
    import json
    import boto3
+   import os
+   import uuid
    from datetime import datetime
    
    comprehend = boto3.client('comprehend')
@@ -776,10 +791,10 @@ echo "✅ Created foundational resources"
    # Create deployment package
    zip inference_api.zip inference_api.py
    
-   # Create Lambda function
+   # Create Lambda function with updated Python runtime
    aws lambda create-function \
        --function-name "${PROJECT_NAME}-inference-api" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler inference_api.lambda_handler \
        --zip-file fileb://inference_api.zip \
@@ -869,12 +884,12 @@ echo "✅ Created foundational resources"
        --query 'DocumentClassifierPropertiesList[0].DocumentClassifierArn' \
        --output text)
    
-   # Test entity recognition
+   # Test entity recognition with direct API call
    aws comprehend detect-entities \
        --text "Apple Inc. (AAPL) and the S&P 500 showed strong performance." \
        --endpoint-arn ${ENTITY_MODEL_ARN}
    
-   # Test classification
+   # Test classification with direct API call
    aws comprehend classify-document \
        --text "The company reported quarterly earnings with revenue growth of 15%." \
        --endpoint-arn ${CLASSIFIER_MODEL_ARN}
@@ -898,6 +913,17 @@ echo "✅ Created foundational resources"
 1. **Delete Comprehend Models**:
 
    ```bash
+   # Get model ARNs for cleanup
+   ENTITY_MODEL_ARN=$(aws comprehend list-entity-recognizers \
+       --filter "RecognizerName contains ${PROJECT_NAME}" \
+       --query 'EntityRecognizerPropertiesList[0].EntityRecognizerArn' \
+       --output text)
+   
+   CLASSIFIER_MODEL_ARN=$(aws comprehend list-document-classifiers \
+       --filter "DocumentClassifierName contains ${PROJECT_NAME}" \
+       --query 'DocumentClassifierPropertiesList[0].DocumentClassifierArn' \
+       --output text)
+   
    # Stop and delete entity recognizer
    aws comprehend stop-entity-recognizer \
        --entity-recognizer-arn ${ENTITY_MODEL_ARN}
@@ -977,13 +1003,13 @@ echo "✅ Created foundational resources"
 
 ## Discussion
 
-This comprehensive custom NLP solution demonstrates how Amazon Comprehend's custom models can be trained and deployed to extract domain-specific entities and classify documents according to organizational taxonomies. The solution addresses the critical gap between generic NLP services and enterprise requirements for precise, domain-aware text analysis by leveraging [Amazon Comprehend's custom entity recognition](https://docs.aws.amazon.com/comprehend/latest/dg/custom-entity-recognition.html) and [custom classification](https://docs.aws.amazon.com/comprehend/latest/dg/how-document-classification.html) capabilities.
+This comprehensive custom NLP solution demonstrates how Amazon Comprehend's custom models can be trained and deployed to extract domain-specific entities and classify documents according to organizational taxonomies. The solution addresses the critical gap between generic NLP services and enterprise requirements for precise, domain-aware text analysis by leveraging [Amazon Comprehend's custom entity recognition](https://docs.aws.amazon.com/comprehend/latest/dg/custom-entity-recognition.html) and [custom classification](https://docs.aws.amazon.com/comprehend/latest/dg/how-document-classification.html) capabilities. This approach follows the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles by implementing security best practices, cost optimization through serverless architecture, and operational excellence through automated workflows.
 
-The Step Functions orchestration provides a robust training pipeline that handles data validation, model training, and status monitoring, while the Lambda-based inference API enables real-time text analysis with custom models. Custom entity recognition is particularly valuable for financial services to extract specific instrument names, regulatory references, or proprietary product codes that standard models would miss. Custom classification helps organize documents into business-relevant categories for automated routing, compliance monitoring, and content management.
+The Step Functions orchestration provides a robust training pipeline that handles data validation, model training, and status monitoring, while the Lambda-based inference API enables real-time text analysis with custom models. Custom entity recognition is particularly valuable for financial services to extract specific instrument names, regulatory references, or proprietary product codes that standard models would miss. Custom classification helps organize documents into business-relevant categories for automated routing, compliance monitoring, and content management. The serverless architecture scales automatically based on demand while maintaining cost efficiency through pay-per-use pricing.
 
-For production implementations, consider implementing model versioning and A/B testing frameworks to compare custom model performance against baseline models. The solution can be extended with active learning capabilities where human reviewers validate model predictions to continuously improve accuracy. Integration with Amazon Augmented AI (A2I) can provide human review workflows for low-confidence predictions, ensuring high-quality results while reducing manual effort.
+For production implementations, consider implementing model versioning and A/B testing frameworks to compare custom model performance against baseline models. The solution can be extended with active learning capabilities where human reviewers validate model predictions to continuously improve accuracy. Integration with Amazon Augmented AI (A2I) can provide human review workflows for low-confidence predictions, ensuring high-quality results while reducing manual effort. Additionally, implementing [Amazon CloudWatch](https://docs.aws.amazon.com/cloudwatch/latest/monitoring/WhatIsCloudWatch.html) dashboards and alarms provides comprehensive monitoring of model performance and inference latency.
 
-> **Warning**: Custom model training costs can accumulate quickly, especially with large datasets or multiple training iterations. Monitor training costs closely and consider using smaller datasets for initial testing before scaling to production volumes.
+> **Warning**: Custom model training costs can accumulate quickly, especially with large datasets or multiple training iterations. Monitor training costs closely and consider using smaller datasets for initial testing before scaling to production volumes. Review the [AWS Cost Management documentation](https://docs.aws.amazon.com/cost-management/latest/userguide/what-is-costmanagement.html) for cost optimization strategies.
 
 > **Tip**: Use [Amazon SageMaker Ground Truth](https://docs.aws.amazon.com/sagemaker/latest/dg/sms-named-entity-recg.html) to create high-quality training datasets with human annotation workflows, and implement model performance monitoring to detect when retraining is needed due to data drift.
 

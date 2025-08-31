@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: rds,cloudwatch,lambda,sns
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: rds,performance,monitoring,database,insights
 recipe-generator-version: 1.3
 ---
 
 # Database Performance Monitoring with RDS Insights
-
 
 ## Problem
 
@@ -99,7 +98,7 @@ graph TB
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Advanced understanding of SQL performance tuning and database optimization
 4. Knowledge of CloudWatch custom metrics and Lambda function development
-5. Python 3.9+ for Lambda function development and API integration
+5. Python 3.11+ for Lambda function development and API integration
 6. Estimated cost: $0.02-$0.09 per vCPU per hour for Performance Insights, $0.20 per million Lambda requests, $0.02 per 1000 custom metrics
 
 > **Note**: Performance Insights is transitioning to CloudWatch Database Insights by November 30, 2025. This recipe demonstrates current Performance Insights functionality while preparing for future migration. See the [CloudWatch Database Insights documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Database-Insights.html) for transition guidance.
@@ -213,7 +212,7 @@ echo "✅ Please check your email and confirm the SNS subscription"
        --db-instance-identifier "${DB_INSTANCE_ID}" \
        --db-instance-class "db.t3.small" \
        --engine "mysql" \
-       --engine-version "8.0.35" \
+       --engine-version "8.0.39" \
        --master-username "admin" \
        --master-user-password "SecurePassword123!" \
        --allocated-storage 20 \
@@ -448,7 +447,7 @@ echo "✅ Please check your email and confirm the SNS subscription"
    # Create Lambda function
    aws lambda create-function \
        --function-name "${LAMBDA_FUNCTION_NAME}" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/performance-analyzer-role" \
        --handler performance_analyzer.lambda_handler \
        --zip-file fileb://lambda_function.zip \
@@ -532,8 +531,10 @@ echo "✅ Please check your email and confirm the SNS subscription"
        --dimensions "Name=DBInstanceIdentifier,Value=${DB_INSTANCE_ID}" \
        --stat "Average"
    
-   > **Tip**: Configure CloudWatch alarms with appropriate thresholds to balance between early warning and false positive alerts. See [CloudWatch Alarms documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html) for best practices on threshold selection and alarm configuration.
+   echo "✅ CloudWatch alarms and anomaly detection configured"
    ```
+
+   > **Tip**: Configure CloudWatch alarms with appropriate thresholds to balance between early warning and false positive alerts. See the [CloudWatch Alarms documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html) for best practices on threshold selection and alarm configuration.
 
 5. **Set up Automated Performance Analysis Trigger**:
 

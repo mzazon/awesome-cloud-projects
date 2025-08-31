@@ -1,0 +1,340 @@
+# Infrastructure Manager configuration for Smart Email Template Generation
+# This configuration deploys Vertex AI, Firestore, and Cloud Functions for AI-powered email template generation
+
+# Metadata for the Infrastructure Manager deployment
+metadata:
+  name: smart-email-template-generation
+  description: "Deploy AI-powered email template generation system using Gemini and Firestore"
+  labels:
+    category: serverless
+    difficulty: "200"
+    recipe-id: f4a7b2c9
+
+# Global variables for resource configuration
+vars:
+  # Project and location configuration
+  project_id: ${PROJECT_ID}
+  region: us-central1
+  zone: us-central1-a
+  
+  # Resource naming with random suffix for uniqueness
+  random_suffix: ${RANDOM_SUFFIX}
+  function_name: email-template-generator-${var.random_suffix}
+  database_id: email-templates-${var.random_suffix}
+  
+  # Service configuration
+  function_memory: 512Mi
+  function_timeout: 120s
+  max_instances: 10
+
+# Required APIs for the solution
+imports:
+  - path: apis.yaml
+
+# Resource definitions following Google Cloud best practices
+resources:
+  # Enable required Google Cloud APIs
+  - name: apis
+    type: apis.yaml
+    properties:
+      services:
+        - cloudfunctions.googleapis.com
+        - firestore.googleapis.com
+        - aiplatform.googleapis.com
+        - cloudbuild.googleapis.com
+
+  # Firestore database for storing templates and preferences
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/${var.project_id}
+      databaseId: ${var.database_id}
+      database:
+        type: FIRESTORE_NATIVE
+        locationId: ${var.region}
+        concurrencyMode: OPTIMISTIC
+        appEngineIntegrationMode: DISABLED
+    metadata:
+      dependsOn:
+        - apis
+
+  # IAM role for Cloud Function to access Firestore and Vertex AI
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      parent: projects/${var.project_id}
+      accountId: email-gen-function-sa-${var.random_suffix}
+      serviceAccount:
+        displayName: Email Template Generation Function Service Account
+        description: Service account for Cloud Function with Firestore and Vertex AI access
+
+  # IAM binding for Firestore access
+  - name: firestore-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/datastore.user
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # IAM binding for Vertex AI access
+  - name: aiplatform-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # Cloud Storage bucket for function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: ${var.project_id}-function-source-${var.random_suffix}
+      location: ${var.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              numNewerVersions: 3
+      uniformBucketLevelAccess:
+        enabled: true
+
+  # Cloud Function for email template generation
+  - name: email-template-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      functionId: ${var.function_name}
+      function:
+        buildConfig:
+          runtime: python311
+          entryPoint: generate_email_template
+          source:
+            storageSource:
+              bucket: $(ref.function-source-bucket.name)
+              object: function-source.zip
+          environmentVariables:
+            PROJECT_ID: ${var.project_id}
+            DATABASE_ID: ${var.database_id}
+        serviceConfig:
+          serviceAccountEmail: $(ref.function-service-account.email)
+          environmentVariables:
+            PROJECT_ID: ${var.project_id}
+            DATABASE_ID: ${var.database_id}
+          availableMemory: ${var.function_memory}
+          timeoutSeconds: ${var.function_timeout}
+          maxInstanceCount: ${var.max_instances}
+          ingressSettings: ALLOW_ALL
+          allTrafficOnLatestRevision: true
+        description: AI-powered email template generation using Gemini and Firestore
+        labels:
+          component: email-generation
+          environment: production
+    metadata:
+      dependsOn:
+        - function-source-bucket
+        - function-service-account
+        - firestore-database
+        - firestore-user-binding
+        - aiplatform-user-binding
+
+  # Cloud Function IAM policy for public access
+  - name: function-invoker-binding
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions.setIamPolicy
+    properties:
+      resource: $(ref.email-template-function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - email-template-function
+
+  # Firestore indexes for optimized queries
+  - name: firestore-composite-index-templates
+    type: gcp-types/firestore-v1:projects.databases.collectionGroups.indexes
+    properties:
+      parent: projects/${var.project_id}/databases/${var.database_id}/collectionGroups/generatedTemplates
+      index:
+        queryScope: COLLECTION
+        fields:
+          - fieldPath: campaign_type
+            order: ASCENDING
+          - fieldPath: generated_at
+            order: DESCENDING
+        state: READY
+    metadata:
+      dependsOn:
+        - firestore-database
+
+  # Firestore index for user preferences queries
+  - name: firestore-index-preferences
+    type: gcp-types/firestore-v1:projects.databases.collectionGroups.indexes
+    properties:
+      parent: projects/${var.project_id}/databases/${var.database_id}/collectionGroups/userPreferences
+      index:
+        queryScope: COLLECTION
+        fields:
+          - fieldPath: company
+            order: ASCENDING
+          - fieldPath: industry
+            order: ASCENDING
+        state: READY
+    metadata:
+      dependsOn:
+        - firestore-database
+
+  # Cloud Monitoring notification channel for function alerts
+  - name: monitoring-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: projects/${var.project_id}
+      notificationChannel:
+        type: email
+        displayName: Email Template Function Alerts
+        description: Notification channel for email template generation function alerts
+        labels:
+          email_address: admin@example.com
+        enabled: true
+
+  # Cloud Monitoring alert policy for function errors
+  - name: function-error-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${var.project_id}
+      alertPolicy:
+        displayName: Email Template Function Error Rate Alert
+        documentation:
+          content: Alert when email template generation function error rate exceeds threshold
+          mimeType: text/markdown
+        conditions:
+          - displayName: Function error rate
+            conditionThreshold:
+              filter: resource.type="cloud_function" AND resource.labels.function_name="${var.function_name}"
+              comparison: COMPARISON_GT
+              thresholdValue: 0.1
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.labels.function_name
+        notificationChannels:
+          - $(ref.monitoring-notification-channel.name)
+        enabled: true
+        combiner: OR
+    metadata:
+      dependsOn:
+        - email-template-function
+        - monitoring-notification-channel
+
+# Configuration outputs for integration and verification
+outputs:
+  # Function access information
+  - name: function_url
+    value: $(ref.email-template-function.serviceConfig.uri)
+    description: HTTPS URL for the email template generation function
+
+  - name: function_name
+    value: ${var.function_name}
+    description: Name of the deployed Cloud Function
+
+  # Database information
+  - name: database_id
+    value: ${var.database_id}
+    description: Firestore database identifier
+
+  - name: database_location
+    value: ${var.region}
+    description: Firestore database location
+
+  # Service account information
+  - name: service_account_email
+    value: $(ref.function-service-account.email)
+    description: Service account email for the function
+
+  # Storage information
+  - name: source_bucket
+    value: $(ref.function-source-bucket.name)
+    description: Cloud Storage bucket for function source code
+
+  # Monitoring information
+  - name: alert_policy_name
+    value: $(ref.function-error-alert.name)
+    description: Cloud Monitoring alert policy for function errors
+
+  # Connection information for testing
+  - name: test_command
+    value: |
+      curl -X POST "$(ref.email-template-function.serviceConfig.uri)" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "campaign_type": "newsletter",
+          "subject_theme": "quarterly updates",
+          "custom_context": "announcing new features"
+        }'
+    description: Example curl command to test the email template generation function
+
+# Security and compliance configurations
+security:
+  # Enable audit logging for resource access
+  - name: audit-logging
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/${var.project_id}
+      sinkId: email-template-audit-sink
+      sink:
+        name: email-template-audit-sink
+        destination: storage.googleapis.com/$(ref.function-source-bucket.name)/audit-logs
+        filter: |
+          resource.type="cloud_function"
+          AND resource.labels.function_name="${var.function_name}"
+          AND (protoPayload.methodName="google.cloud.functions.v1.CloudFunctionsService.CallFunction"
+               OR protoPayload.methodName="google.firestore.v1.Firestore.CreateDocument"
+               OR protoPayload.methodName="google.firestore.v1.Firestore.UpdateDocument")
+        description: Audit logs for email template generation system
+    metadata:
+      dependsOn:
+        - function-source-bucket
+        - email-template-function
+
+# Resource tags for cost management and organization
+tags:
+  environment: production
+  component: email-generation
+  cost-center: marketing
+  owner: devops-team
+  managed-by: infrastructure-manager
+
+# Deployment validation and health checks
+validation:
+  # Validate Firestore database is operational
+  - name: firestore-health-check
+    type: health-check
+    properties:
+      resource: $(ref.firestore-database.name)
+      validation_type: firestore_connectivity
+      timeout: 30s
+
+  # Validate Cloud Function deployment
+  - name: function-health-check
+    type: health-check
+    properties:
+      resource: $(ref.email-template-function.name)
+      validation_type: http_endpoint
+      endpoint: $(ref.email-template-function.serviceConfig.uri)
+      timeout: 60s
+      expected_status: 200

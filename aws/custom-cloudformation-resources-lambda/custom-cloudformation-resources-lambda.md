@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: cloudformation,lambda,iam,s3
 estimated-time: 180 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cloudformation,lambda,iam,s3
 recipe-generator-version: 1.3
@@ -381,7 +381,7 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda-function.zip \
@@ -771,7 +771,7 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
    ADVANCED_LAMBDA_NAME="advanced-custom-resource-${RANDOM_SUFFIX}"
    aws lambda create-function \
        --function-name ${ADVANCED_LAMBDA_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${ROLE_ARN} \
        --handler advanced_lambda_function.lambda_handler \
        --zip-file fileb://advanced-lambda-function.zip \
@@ -959,7 +959,7 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
         Type: AWS::Lambda::Function
         Properties:
           FunctionName: !Sub 'custom-resource-${Environment}-${AWS::Region}'
-          Runtime: python3.9
+          Runtime: python3.12
           Handler: index.lambda_handler
           Role: !GetAtt CustomResourceRole.Arn
           Timeout: 300
@@ -1229,13 +1229,13 @@ echo "S3 Bucket: ${S3_BUCKET_NAME}"
 
 ## Discussion
 
-Lambda-backed custom resources represent a powerful pattern for extending CloudFormation's capabilities while maintaining infrastructure-as-code principles. This approach enables organizations to integrate custom logic, third-party services, and specialized configurations into their CloudFormation templates without breaking the declarative model.
+Lambda-backed custom resources represent a powerful pattern for extending CloudFormation's capabilities while maintaining infrastructure-as-code principles. This approach enables organizations to integrate custom logic, third-party services, and specialized configurations into their CloudFormation templates without breaking the declarative model. The key architectural components include the Lambda function that implements the custom resource logic, the CloudFormation custom resource that triggers the Lambda function, and the response mechanism that uses S3 presigned URLs to communicate results back to CloudFormation.
 
-The key architectural components include the Lambda function that implements the custom resource logic, the CloudFormation custom resource that triggers the Lambda function, and the response mechanism that uses S3 presigned URLs to communicate results back to CloudFormation. The `cfn-response` module simplifies this communication by providing a standardized way to send SUCCESS or FAILED responses with associated data.
-
-Error handling is critical in custom resource implementations. Unlike standard CloudFormation resources, custom resources require explicit error management to prevent stack rollback issues. Proper logging, input validation, and graceful degradation ensure that failed operations don't leave stacks in inconsistent states. The physical resource ID management is also crucial for update operations, as CloudFormation uses this identifier to determine whether an update represents a modification or a replacement.
+The `cfn-response` module simplifies this communication by providing a standardized way to send SUCCESS or FAILED responses with associated data. Error handling is critical in custom resource implementations because, unlike standard CloudFormation resources, custom resources require explicit error management to prevent stack rollback issues. Proper logging, input validation, and graceful degradation ensure that failed operations don't leave stacks in inconsistent states. The physical resource ID management is also crucial for update operations, as CloudFormation uses this identifier to determine whether an update represents a modification or a replacement.
 
 Security considerations include following the principle of least privilege for Lambda execution roles, implementing proper input validation to prevent injection attacks, and ensuring that sensitive data is not exposed in CloudFormation outputs or logs. The NoEcho attribute should be used for sensitive outputs, and credentials should never be hardcoded in the Lambda function code. Security best practices are detailed in the [IAM security best practices documentation](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html).
+
+Custom resources excel in scenarios requiring third-party API integration, resource provisioning across multiple AWS accounts or regions, complex validation logic, or custom data transformations during stack deployment. The serverless architecture of Lambda functions ensures automatic scaling and high availability while keeping costs low for infrequent executions.
 
 > **Tip**: Use CloudFormation stack policies to protect critical custom resources from accidental updates or deletions during stack operations. Stack policies provide an additional layer of protection as described in the [stack policies documentation](https://docs.aws.amazon.com/prescriptive-guidance/latest/least-privilege-cloudformation/cloudformation-stack-policies.html).
 

@@ -4,14 +4,14 @@ id: 487cd39d
 category: networking
 difficulty: 300
 subject: aws
-services: 'vpc','cloudwatch','s3','athena'
+services: vpc, cloudwatch, s3, athena
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: 'networking','security','monitoring','vpc-flow-logs','cloudwatch','s3','athena'
+tags: networking, security, monitoring, vpc-flow-logs, cloudwatch, s3, athena
 recipe-generator-version: 1.3
 ---
 
@@ -120,16 +120,47 @@ echo "S3 Bucket: ${VPC_FLOW_LOGS_BUCKET}"
    Amazon S3 provides the foundational storage layer for our network monitoring solution, offering 99.999999999% (11 9's) durability and virtually unlimited scalability. S3 serves as the cost-effective long-term repository for VPC Flow Logs data, enabling historical analysis and compliance retention while supporting advanced analytics through Amazon Athena.
 
    ```bash
-   # Create S3 bucket for flow logs
-   aws s3api create-bucket \
-       --bucket ${VPC_FLOW_LOGS_BUCKET} \
-       --region ${AWS_REGION} \
-       --create-bucket-configuration LocationConstraint=${AWS_REGION}
+   # Create S3 bucket for flow logs (handle us-east-1 special case)
+   if [ "${AWS_REGION}" = "us-east-1" ]; then
+       aws s3api create-bucket --bucket ${VPC_FLOW_LOGS_BUCKET}
+   else
+       aws s3api create-bucket \
+           --bucket ${VPC_FLOW_LOGS_BUCKET} \
+           --region ${AWS_REGION} \
+           --create-bucket-configuration LocationConstraint=${AWS_REGION}
+   fi
    
    # Enable versioning for data protection
    aws s3api put-bucket-versioning \
        --bucket ${VPC_FLOW_LOGS_BUCKET} \
        --versioning-configuration Status=Enabled
+   
+   # Create lifecycle policy for cost optimization
+   cat > lifecycle-policy.json << EOF
+   {
+       "Rules": [
+           {
+               "ID": "VPCFlowLogsTransitions",
+               "Status": "Enabled",
+               "Filter": {"Prefix": "vpc-flow-logs/"},
+               "Transitions": [
+                   {
+                       "Days": 30,
+                       "StorageClass": "STANDARD_IA"
+                   },
+                   {
+                       "Days": 90,
+                       "StorageClass": "GLACIER"
+                   },
+                   {
+                       "Days": 365,
+                       "StorageClass": "DEEP_ARCHIVE"
+                   }
+               ]
+           }
+       ]
+   }
+   EOF
    
    # Configure lifecycle policy for cost optimization
    aws s3api put-bucket-lifecycle-configuration \
@@ -358,6 +389,7 @@ echo "S3 Bucket: ${VPC_FLOW_LOGS_BUCKET}"
    import boto3
    import gzip
    import base64
+   import os
    from datetime import datetime
    
    def lambda_handler(event, context):
@@ -421,7 +453,7 @@ echo "S3 Bucket: ${VPC_FLOW_LOGS_BUCKET}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${FLOW_LOGS_ROLE_NAME}" \
        --handler lambda-function.lambda_handler \
        --zip-file fileb://lambda-function.zip \
@@ -583,7 +615,7 @@ echo "S3 Bucket: ${VPC_FLOW_LOGS_BUCKET}"
        --query-string "
        SELECT srcaddr, dstaddr, sum(bytes) as total_bytes
        FROM vpc_flow_logs
-       WHERE year='2024' AND month='12' AND day='11'
+       WHERE year='2025' AND month='07' AND day='23'
        GROUP BY srcaddr, dstaddr
        ORDER BY total_bytes DESC
        LIMIT 10
@@ -711,6 +743,8 @@ Lambda functions add another layer of intelligence by performing real-time analy
 > **Security Tip**: Regularly review and tune your CloudWatch alarms to reduce false positives while ensuring important security events are not missed. Use CloudWatch Logs Insights to analyze patterns and refine your detection rules.
 
 For production environments, consider implementing additional security measures such as encrypting flow logs data at rest and in transit, using VPC endpoints to keep traffic within the AWS network, and implementing proper IAM policies with least privilege access. Regular monitoring of costs is essential, as VPC Flow Logs can generate significant data volumes in high-traffic environments.
+
+This solution follows AWS Well-Architected Framework principles across all five pillars. For comprehensive guidance on network security monitoring, see the [AWS VPC Flow Logs User Guide](https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html) and [CloudWatch Logs documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/).
 
 ## Challenge
 

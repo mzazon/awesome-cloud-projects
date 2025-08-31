@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: CloudWatch, Lambda, SNS, Cost Explorer
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cost-management, finops, anomaly-detection, automation, monitoring
 recipe-generator-version: 1.3
@@ -91,7 +91,7 @@ RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
 
 # Set resource names
 export MONITOR_NAME="cost-anomaly-monitor-${RANDOM_SUFFIX}"
-export DETECTOR_NAME="cost-anomaly-detector-${RANDOM_SUFFIX}"
+export SUBSCRIPTION_NAME="cost-anomaly-subscription-${RANDOM_SUFFIX}"
 export FUNCTION_NAME="cost-anomaly-processor-${RANDOM_SUFFIX}"
 export SNS_TOPIC="cost-anomaly-alerts-${RANDOM_SUFFIX}"
 export ROLE_NAME="CostAnomalyLambdaRole-${RANDOM_SUFFIX}"
@@ -449,7 +449,7 @@ echo "✅ Environment prepared with region: ${AWS_REGION}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda-deployment.zip \
@@ -528,15 +528,15 @@ echo "✅ Environment prepared with region: ${AWS_REGION}"
 
    The EventBridge integration is now active and ready to trigger Lambda processing for any detected cost anomalies. This event-driven architecture ensures immediate response to cost deviations with automated analysis and notification capabilities, creating a seamless flow from anomaly detection through intelligent processing to stakeholder notification.
 
-8. **Create Cost Anomaly Detector with SNS Integration**:
+8. **Create Cost Anomaly Subscription with SNS Integration**:
 
-   Cost Anomaly Detectors define the notification preferences and thresholds for anomaly alerts, enabling customizable sensitivity levels and notification channels. Detectors serve as the configuration layer that determines when anomalies trigger alerts, how notifications are delivered, and which stakeholders receive different types of cost alerts. This configuration establishes the monitoring parameters that balance sensitivity with practical alert management, reducing false positives while ensuring genuine cost deviations are promptly identified and communicated.
+   Cost Anomaly Subscriptions define the notification preferences and thresholds for anomaly alerts, enabling customizable sensitivity levels and notification channels. Subscriptions serve as the configuration layer that determines when anomalies trigger alerts, how notifications are delivered, and which stakeholders receive different types of cost alerts. This configuration establishes the monitoring parameters that balance sensitivity with practical alert management, reducing false positives while ensuring genuine cost deviations are promptly identified and communicated.
 
    ```bash
-   # Create Cost Anomaly Detector
-   aws ce create-anomaly-detector \
-       --anomaly-detector '{
-           "DetectorName": "'${DETECTOR_NAME}'",
+   # Create Cost Anomaly Subscription
+   aws ce create-anomaly-subscription \
+       --anomaly-subscription '{
+           "SubscriptionName": "'${SUBSCRIPTION_NAME}'",
            "MonitorArnList": ["'${MONITOR_ARN}'"],
            "Subscribers": [
                {
@@ -549,16 +549,16 @@ echo "✅ Environment prepared with region: ${AWS_REGION}"
            "Frequency": "IMMEDIATE"
        }'
    
-   # Store detector ARN
-   export DETECTOR_ARN=$(aws ce get-anomaly-detectors \
-       --detector-arn-list \
-       --query "AnomalyDetectors[?DetectorName=='${DETECTOR_NAME}'].DetectorArn" \
+   # Store subscription ARN
+   export SUBSCRIPTION_ARN=$(aws ce get-anomaly-subscriptions \
+       --subscription-arn-list \
+       --query "AnomalySubscriptions[?SubscriptionName=='${SUBSCRIPTION_NAME}'].SubscriptionArn" \
        --output text)
    
-   echo "✅ Cost Anomaly Detector created: ${DETECTOR_ARN}"
+   echo "✅ Cost Anomaly Subscription created: ${SUBSCRIPTION_ARN}"
    ```
 
-   The cost anomaly detector is now active with immediate notification capabilities configured for cost deviations exceeding the $10 threshold. This intelligent monitoring system will trigger alerts for significant cost deviations while learning normal spending patterns over time, providing increasingly accurate anomaly detection as historical data accumulates.
+   The cost anomaly subscription is now active with immediate notification capabilities configured for cost deviations exceeding the $10 threshold. This intelligent monitoring system will trigger alerts for significant cost deviations while learning normal spending patterns over time, providing increasingly accurate anomaly detection as historical data accumulates.
 
 9. **Create CloudWatch Dashboard for Cost Monitoring**:
 
@@ -633,13 +633,13 @@ echo "✅ Environment prepared with region: ${AWS_REGION}"
        --query "AnomalyMonitors[?MonitorName=='${MONITOR_NAME}']" \
        --output table
    
-   # Check anomaly detectors
-   aws ce get-anomaly-detectors \
-       --query "AnomalyDetectors[?DetectorName=='${DETECTOR_NAME}']" \
+   # Check anomaly subscriptions
+   aws ce get-anomaly-subscriptions \
+       --query "AnomalySubscriptions[?SubscriptionName=='${SUBSCRIPTION_NAME}']" \
        --output table
    ```
 
-   Expected output: Monitor and detector should show "ACTIVE" status with proper configuration.
+   Expected output: Monitor and subscription should show "ACTIVE" status with proper configuration.
 
 2. **Test Lambda Function**:
 
@@ -713,9 +713,9 @@ echo "✅ Environment prepared with region: ${AWS_REGION}"
 1. **Remove Cost Anomaly Detection Resources**:
 
    ```bash
-   # Delete anomaly detector
-   aws ce delete-anomaly-detector \
-       --detector-arn ${DETECTOR_ARN}
+   # Delete anomaly subscription
+   aws ce delete-anomaly-subscription \
+       --subscription-arn ${SUBSCRIPTION_ARN}
    
    # Delete anomaly monitor
    aws ce delete-anomaly-monitor \

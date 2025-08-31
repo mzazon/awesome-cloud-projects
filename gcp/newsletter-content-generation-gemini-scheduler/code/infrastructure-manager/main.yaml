@@ -1,0 +1,525 @@
+# Infrastructure Manager Configuration for Newsletter Content Generation
+# This deploys a complete automated newsletter generation system using Gemini AI
+
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+
+variables:
+  # Project Configuration
+  project_id:
+    type: string
+    description: "Google Cloud project ID where resources will be created"
+    validation:
+      condition: can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.project_id))
+      error_message: "Project ID must be a valid Google Cloud project identifier."
+
+  region:
+    type: string
+    description: "Google Cloud region for regional resources"
+    default: "us-central1"
+    validation:
+      condition: can(regex("^[a-z0-9-]+$", var.region))
+      error_message: "Region must be a valid Google Cloud region."
+
+  # Resource Naming Configuration
+  resource_prefix:
+    type: string
+    description: "Prefix for all resource names to ensure uniqueness"
+    default: "newsletter-gen"
+    validation:
+      condition: can(regex("^[a-z][a-z0-9-]{0,20}$", var.resource_prefix))
+      error_message: "Resource prefix must start with a letter and contain only lowercase letters, numbers, and hyphens."
+
+  # Scheduling Configuration
+  schedule_expression:
+    type: string
+    description: "Cron expression for newsletter generation schedule"
+    default: "0 9 * * 1"  # Every Monday at 9:00 AM
+
+  # Content Configuration
+  default_topic:
+    type: string
+    description: "Default topic for newsletter content generation"
+    default: "Weekly Marketing Insights"
+
+  # Function Configuration
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Function (e.g., 512Mi, 1Gi)"
+    default: "512Mi"
+    validation:
+      condition: can(regex("^[0-9]+(Mi|Gi)$", var.function_memory))
+      error_message: "Function memory must be specified in Mi or Gi (e.g., 512Mi, 1Gi)."
+
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Function execution"
+    default: "300s"
+
+  # Storage Configuration
+  storage_class:
+    type: string
+    description: "Storage class for Cloud Storage bucket"
+    default: "STANDARD"
+    validation:
+      condition: contains(["STANDARD", "NEARLINE", "COLDLINE", "ARCHIVE"], var.storage_class)
+      error_message: "Storage class must be one of: STANDARD, NEARLINE, COLDLINE, ARCHIVE."
+
+# Provider Configuration
+providers:
+  google:
+    project: ${var.project_id}
+    region: ${var.region}
+  google-beta:
+    project: ${var.project_id}
+    region: ${var.region}
+
+# Data Sources for existing resources
+data:
+  # Get current project information
+  google_project:
+    current:
+      project_id: ${var.project_id}
+
+  # Generate random suffix for unique resource names
+  google_compute_zones:
+    available:
+      region: ${var.region}
+
+# Local values for computed configurations
+locals:
+  # Generate unique suffix based on project number
+  random_suffix: substr(sha256(data.google_project.current.number), 0, 8)
+  
+  # Resource names with unique suffix
+  bucket_name: "${var.resource_prefix}-content-${local.random_suffix}"
+  function_name: "${var.resource_prefix}-generator-${local.random_suffix}"
+  job_name: "${var.resource_prefix}-schedule-${local.random_suffix}"
+  service_account_name: "${var.resource_prefix}-sa-${local.random_suffix}"
+  
+  # Common labels for all resources
+  common_labels:
+    project: "newsletter-automation"
+    component: "content-generation"
+    managed-by: "infrastructure-manager"
+    environment: "production"
+
+# Required APIs
+resource:
+  # Enable required Google Cloud APIs
+  google_project_service:
+    apis:
+      for_each:
+        - cloudfunctions.googleapis.com
+        - cloudscheduler.googleapis.com
+        - aiplatform.googleapis.com
+        - storage.googleapis.com
+        - cloudbuild.googleapis.com
+        - eventarc.googleapis.com
+        - run.googleapis.com
+        - artifactregistry.googleapis.com
+      project: ${var.project_id}
+      service: ${each.value}
+      disable_on_destroy: false
+
+  # Service Account for Cloud Function
+  google_service_account:
+    newsletter_function_sa:
+      account_id: ${local.service_account_name}
+      display_name: "Newsletter Generation Function Service Account"
+      description: "Service account for automated newsletter content generation"
+      project: ${var.project_id}
+      depends_on:
+        - google_project_service.apis
+
+  # IAM roles for the service account
+  google_project_iam_member:
+    # Storage access for reading templates and storing content
+    storage_admin:
+      project: ${var.project_id}
+      role: "roles/storage.admin"
+      member: "serviceAccount:${google_service_account.newsletter_function_sa.email}"
+
+    # Vertex AI access for Gemini API
+    aiplatform_user:
+      project: ${var.project_id}
+      role: "roles/aiplatform.user"
+      member: "serviceAccount:${google_service_account.newsletter_function_sa.email}"
+
+    # Cloud Functions invoker role
+    functions_invoker:
+      project: ${var.project_id}
+      role: "roles/cloudfunctions.invoker"
+      member: "serviceAccount:${google_service_account.newsletter_function_sa.email}"
+
+    # Logging permissions
+    logging_writer:
+      project: ${var.project_id}
+      role: "roles/logging.logWriter"
+      member: "serviceAccount:${google_service_account.newsletter_function_sa.email}"
+
+    # Monitoring permissions
+    monitoring_writer:
+      project: ${var.project_id}
+      role: "roles/monitoring.metricWriter"
+      member: "serviceAccount:${google_service_account.newsletter_function_sa.email}"
+
+  # Cloud Storage bucket for content storage
+  google_storage_bucket:
+    newsletter_content:
+      name: ${local.bucket_name}
+      location: ${var.region}
+      project: ${var.project_id}
+      storage_class: ${var.storage_class}
+      
+      # Enable versioning for content history
+      versioning:
+        enabled: true
+      
+      # Lifecycle management for cost optimization
+      lifecycle_rule:
+        - condition:
+            age: 90
+          action:
+            type: "SetStorageClass"
+            storage_class: "NEARLINE"
+        - condition:
+            age: 365
+          action:
+            type: "SetStorageClass"
+            storage_class: "COLDLINE"
+      
+      # Security and access controls
+      uniform_bucket_level_access: true
+      
+      # Labels for resource management
+      labels: ${local.common_labels}
+      
+      depends_on:
+        - google_project_service.apis
+
+  # Create folders in the bucket using storage bucket objects
+  google_storage_bucket_object:
+    # Folder for generated content
+    generated_content_folder:
+      name: "generated-content/.keep"
+      bucket: ${google_storage_bucket.newsletter_content.name}
+      content: "# Generated newsletter content will be stored here"
+      content_type: "text/plain"
+
+    # Folder for templates
+    templates_folder:
+      name: "templates/.keep"
+      bucket: ${google_storage_bucket.newsletter_content.name}
+      content: "# Newsletter templates will be stored here"
+      content_type: "text/plain"
+
+    # Default content template
+    default_template:
+      name: "templates/default-template.json"
+      bucket: ${google_storage_bucket.newsletter_content.name}
+      content: |
+        {
+          "newsletter_template": {
+            "subject_line": "Generate an engaging subject line about {topic}",
+            "intro": "Write a brief introduction paragraph about {topic} in a professional yet friendly tone",
+            "main_content": "Create 2-3 paragraphs of informative content about {topic}, including practical tips or insights",
+            "call_to_action": "Write a compelling call-to-action related to {topic}",
+            "tone": "professional, engaging, informative",
+            "target_audience": "business professionals and marketing teams",
+            "word_limit": 300
+          }
+        }
+      content_type: "application/json"
+
+  # Create source code archive for Cloud Function
+  data:
+    archive_file:
+      function_source:
+        type: "zip"
+        output_path: "/tmp/newsletter-function-source.zip"
+        source:
+          filename: "main.py"
+          content: |
+            import json
+            import os
+            from datetime import datetime
+            from google.cloud import storage
+            import vertexai
+            from vertexai.generative_models import GenerativeModel
+            import functions_framework
+            
+            def initialize_services():
+                """Initialize Google Cloud services"""
+                project_id = os.environ.get('GOOGLE_CLOUD_PROJECT')
+                bucket_name = os.environ.get('BUCKET_NAME')
+                
+                # Initialize Vertex AI
+                vertexai.init(project=project_id, location="us-central1")
+                
+                # Initialize storage client
+                storage_client = storage.Client()
+                bucket = storage_client.bucket(bucket_name)
+                
+                return bucket, project_id
+            
+            def load_template_from_storage(bucket, template_name='default-template.json'):
+                """Load newsletter template from Cloud Storage"""
+                try:
+                    blob = bucket.blob(f'templates/{template_name}')
+                    template_content = blob.download_as_text()
+                    return json.loads(template_content)['newsletter_template']
+                except Exception as e:
+                    print(f"Error loading template: {e}")
+                    # Fallback template
+                    return {
+                        "subject_line": "Generate an engaging subject line about {topic}",
+                        "intro": "Write a brief introduction paragraph about {topic} in a professional yet friendly tone",
+                        "main_content": "Create 2-3 paragraphs of informative content about {topic}, including practical tips or insights",
+                        "call_to_action": "Write a compelling call-to-action related to {topic}",
+                        "tone": "professional, engaging, informative",
+                        "target_audience": "business professionals and marketing teams",
+                        "word_limit": 300
+                    }
+            
+            def generate_newsletter_content(topic, template):
+                """Generate newsletter content using Gemini"""
+                try:
+                    model = GenerativeModel("gemini-1.5-flash")
+                    
+                    prompt = f"""
+                    Create newsletter content based on this template and topic:
+                    Topic: {topic}
+                    
+                    Template Requirements:
+                    - Subject Line: {template['subject_line'].replace('{topic}', topic)}
+                    - Introduction: {template['intro'].replace('{topic}', topic)}
+                    - Main Content: {template['main_content'].replace('{topic}', topic)}
+                    - Call to Action: {template['call_to_action'].replace('{topic}', topic)}
+                    
+                    Additional Guidelines:
+                    - Tone: {template['tone']}
+                    - Target Audience: {template['target_audience']}
+                    - Word Limit: {template['word_limit']} words
+                    
+                    Please provide the content in JSON format with keys: subject_line, intro, main_content, call_to_action
+                    """
+                    
+                    response = model.generate_content(prompt)
+                    return response.text
+                except Exception as e:
+                    print(f"Error generating content: {e}")
+                    raise
+            
+            @functions_framework.http
+            def generate_newsletter(request):
+                """HTTP Cloud Function to generate newsletter content"""
+                try:
+                    # Initialize services
+                    bucket, project_id = initialize_services()
+                    
+                    # Get request data
+                    request_json = request.get_json(silent=True)
+                    topic = request_json.get('topic', '${var.default_topic}') if request_json else '${var.default_topic}'
+                    template_name = request_json.get('template', 'default-template.json') if request_json else 'default-template.json'
+                    
+                    # Load template from Cloud Storage
+                    template = load_template_from_storage(bucket, template_name)
+                    
+                    # Generate content
+                    generated_content = generate_newsletter_content(topic, template)
+                    
+                    # Create timestamp for filename
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    safe_topic = topic.replace(' ', '_').replace('/', '_').lower()
+                    filename = f"newsletter_{safe_topic}_{timestamp}.json"
+                    
+                    # Store result in Cloud Storage
+                    blob = bucket.blob(f"generated-content/{filename}")
+                    result_data = {
+                        "topic": topic,
+                        "generated_at": timestamp,
+                        "content": generated_content,
+                        "template_used": template_name,
+                        "project_id": project_id
+                    }
+                    blob.upload_from_string(json.dumps(result_data, indent=2))
+                    
+                    return {
+                        "status": "success",
+                        "message": f"Newsletter content generated for topic: {topic}",
+                        "filename": filename,
+                        "storage_path": f"gs://{bucket.name}/generated-content/{filename}",
+                        "timestamp": timestamp
+                    }, 200
+                    
+                except Exception as e:
+                    print(f"Function execution error: {e}")
+                    return {"status": "error", "message": str(e)}, 500
+        source:
+          filename: "requirements.txt"
+          content: |
+            google-cloud-storage==2.18.0
+            google-cloud-aiplatform==1.102.0
+            functions-framework==3.8.1
+            vertexai==1.92.0
+
+  # Upload function source to Cloud Storage
+  google_storage_bucket_object:
+    function_source:
+      name: "function-source/source.zip"
+      bucket: ${google_storage_bucket.newsletter_content.name}
+      source: ${data.archive_file.function_source.output_path}
+      depends_on:
+        - google_storage_bucket.newsletter_content
+
+  # Cloud Function for newsletter generation
+  google_cloudfunctions2_function:
+    newsletter_generator:
+      name: ${local.function_name}
+      location: ${var.region}
+      project: ${var.project_id}
+      description: "Automated newsletter content generation using Gemini AI"
+      
+      build_config:
+        runtime: "python312"
+        entry_point: "generate_newsletter"
+        source:
+          storage_source:
+            bucket: ${google_storage_bucket.newsletter_content.name}
+            object: ${google_storage_bucket_object.function_source.name}
+      
+      service_config:
+        max_instance_count: 10
+        min_instance_count: 0
+        available_memory: ${var.function_memory}
+        timeout_seconds: replace(var.function_timeout, "s", "")
+        max_instance_request_concurrency: 1
+        available_cpu: "1"
+        
+        environment_variables:
+          BUCKET_NAME: ${google_storage_bucket.newsletter_content.name}
+          DEFAULT_TOPIC: ${var.default_topic}
+        
+        ingress_settings: "ALLOW_ALL"
+        all_traffic_on_latest_revision: true
+        service_account_email: ${google_service_account.newsletter_function_sa.email}
+      
+      labels: ${local.common_labels}
+      
+      depends_on:
+        - google_project_service.apis
+        - google_service_account.newsletter_function_sa
+        - google_storage_bucket_object.function_source
+
+  # Cloud Function IAM policy for public access
+  google_cloudfunctions2_function_iam_member:
+    public_access:
+      project: ${var.project_id}
+      location: ${var.region}
+      cloud_function: ${google_cloudfunctions2_function.newsletter_generator.name}
+      role: "roles/cloudfunctions.invoker"
+      member: "allUsers"
+
+  # Cloud Scheduler job for automated execution
+  google_cloud_scheduler_job:
+    newsletter_schedule:
+      name: ${local.job_name}
+      description: "Automated newsletter content generation schedule"
+      schedule: ${var.schedule_expression}
+      time_zone: "America/New_York"
+      region: ${var.region}
+      project: ${var.project_id}
+      
+      http_target:
+        uri: ${google_cloudfunctions2_function.newsletter_generator.service_config[0].uri}
+        http_method: "POST"
+        headers:
+          Content-Type: "application/json"
+        body: base64encode(jsonencode({
+          topic: var.default_topic
+          template: "default-template.json"
+        }))
+      
+      retry_config:
+        retry_count: 3
+        max_retry_duration: "600s"
+        min_backoff_duration: "5s"
+        max_backoff_duration: "3600s"
+        max_doublings: 5
+      
+      depends_on:
+        - google_cloudfunctions2_function.newsletter_generator
+        - google_project_service.apis
+
+# Output values for verification and integration
+outputs:
+  # Project Information
+  project_id:
+    description: "Google Cloud project ID"
+    value: ${var.project_id}
+
+  region:
+    description: "Google Cloud region"
+    value: ${var.region}
+
+  # Storage Resources
+  bucket_name:
+    description: "Cloud Storage bucket name for newsletter content"
+    value: ${google_storage_bucket.newsletter_content.name}
+
+  bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: ${google_storage_bucket.newsletter_content.url}
+
+  # Function Resources
+  function_name:
+    description: "Cloud Function name"
+    value: ${google_cloudfunctions2_function.newsletter_generator.name}
+
+  function_url:
+    description: "Cloud Function trigger URL"
+    value: ${google_cloudfunctions2_function.newsletter_generator.service_config[0].uri}
+
+  # Scheduler Resources
+  scheduler_job_name:
+    description: "Cloud Scheduler job name"
+    value: ${google_cloud_scheduler_job.newsletter_schedule.name}
+
+  schedule_expression:
+    description: "Cron expression for newsletter generation"
+    value: ${var.schedule_expression}
+
+  # Service Account
+  service_account_email:
+    description: "Service account email for the function"
+    value: ${google_service_account.newsletter_function_sa.email}
+
+  # Configuration Information
+  default_topic:
+    description: "Default topic for newsletter generation"
+    value: ${var.default_topic}
+
+  # Usage Instructions
+  manual_trigger_command:
+    description: "Command to manually trigger newsletter generation"
+    value: "gcloud scheduler jobs run ${local.job_name} --location=${var.region}"
+
+  test_function_command:
+    description: "Command to test the function directly"
+    value: "curl -X POST '${google_cloudfunctions2_function.newsletter_generator.service_config[0].uri}' -H 'Content-Type: application/json' -d '{\"topic\":\"Test Newsletter\"}'"
+
+  view_logs_command:
+    description: "Command to view function logs"
+    value: "gcloud functions logs read ${local.function_name} --region=${var.region}"
+
+  list_generated_content_command:
+    description: "Command to list generated newsletter content"
+    value: "gsutil ls gs://${google_storage_bucket.newsletter_content.name}/generated-content/"

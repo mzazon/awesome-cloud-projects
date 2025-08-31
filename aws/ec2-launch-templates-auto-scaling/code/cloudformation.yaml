@@ -1,0 +1,613 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EC2 Launch Templates with Auto Scaling - Creates a scalable web application infrastructure
+  using EC2 Launch Templates, Auto Scaling Groups, and CloudWatch-based scaling policies.
+  This template demonstrates modern AWS best practices for resilient, cost-effective infrastructure.
+
+# Template Parameters - Allow customization of key configuration values
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ec2-autoscaling-demo
+    Description: Name prefix for all resources created by this template
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+
+  Environment:
+    Type: String
+    Default: demo
+    Description: Environment name for resource tagging
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+      - demo
+    ConstraintDescription: Must be one of the allowed environment values
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: EC2 instance type for Auto Scaling group
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t3.micro
+      - t3.small
+      - t3.medium
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  MinSize:
+    Type: Number
+    Default: 1
+    Description: Minimum number of instances in Auto Scaling group
+    MinValue: 0
+    MaxValue: 10
+    ConstraintDescription: Must be between 0 and 10
+
+  MaxSize:
+    Type: Number
+    Default: 4
+    Description: Maximum number of instances in Auto Scaling group
+    MinValue: 1
+    MaxValue: 20
+    ConstraintDescription: Must be between 1 and 20
+
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    Description: Desired number of instances in Auto Scaling group
+    MinValue: 0
+    MaxValue: 10
+    ConstraintDescription: Must be between 0 and 10
+
+  CPUTargetValue:
+    Type: Number
+    Default: 70
+    Description: Target CPU utilization percentage for scaling policy
+    MinValue: 10
+    MaxValue: 90
+    ConstraintDescription: Must be between 10 and 90
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of existing EC2 key pair for SSH access to instances
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where resources will be created
+    ConstraintDescription: Must be a valid VPC ID
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs for Auto Scaling group (minimum 2 for high availability)
+    ConstraintDescription: Must be valid subnet IDs within the selected VPC
+
+  SSHAllowedCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR block allowed for SSH access (restrict for production use)
+    AllowedPattern: ^([0-9]{1,3}\.){3}[0-9]{1,3}\/[0-9]{1,2}$
+    ConstraintDescription: Must be a valid CIDR notation (e.g., 10.0.0.0/8)
+
+# Template Conditions - Control resource creation based on parameters
+Conditions:
+  # Create SSH access rule only if KeyPair is specified
+  EnableSSHAccess: !Not [!Equals [!Ref KeyPairName, '']]
+  
+  # Enable detailed monitoring for production environments
+  EnableDetailedMonitoring: !Equals [!Ref Environment, 'prod']
+
+# Template Mappings - Static data lookup tables
+Mappings:
+  # Latest Amazon Linux 2 AMI IDs by region (updated quarterly)
+  AWSRegionAMI:
+    us-east-1:
+      AMI: ami-0c02fb55956c7d316
+    us-east-2:
+      AMI: ami-0f924dc71d44d23e2
+    us-west-1:
+      AMI: ami-0d382e80be7ffdae5
+    us-west-2:
+      AMI: ami-0c2d3e23c84c69b8d
+    eu-west-1:
+      AMI: ami-0c9c942bd7bf113a2
+    eu-west-2:
+      AMI: ami-0e169fa5b2b2f88ae
+    eu-west-3:
+      AMI: ami-051ebe9615b416c15
+    eu-central-1:
+      AMI: ami-0e7e134863fac4946
+    ap-southeast-1:
+      AMI: ami-0c802847a7dd848c0
+    ap-southeast-2:
+      AMI: ami-0b7dcd6e6fd797935
+    ap-northeast-1:
+      AMI: ami-0ca38c7440de1749a
+    ap-northeast-2:
+      AMI: ami-0e4214f4be1e9462b
+
+# AWS Resources - Infrastructure components
+Resources:
+  
+  # Security Group - Controls network access to EC2 instances
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-web-sg'
+      GroupDescription: Security group for web servers in Auto Scaling group
+      VpcId: !Ref VPCId
+      
+      # Inbound rules - Allow HTTP and optional SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP traffic from anywhere
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS traffic from anywhere
+        - !If
+          - EnableSSHAccess
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: !Ref SSHAllowedCIDR
+            Description: Allow SSH access from specified CIDR
+          - !Ref AWS::NoValue
+      
+      # Outbound rules - Allow all outbound traffic (default)
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      
+      # Resource tags
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-web-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Description
+          Value: Security group for Auto Scaling web servers
+
+  # IAM Instance Profile - Allows EC2 instances to assume roles
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # IAM Role - Permissions for EC2 instances
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      
+      # Managed policies for basic EC2 operations and CloudWatch
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      
+      # Custom inline policy for additional permissions if needed
+      Policies:
+        - PolicyName: EC2BasicOperations
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeTags
+                  - cloudwatch:PutMetricData
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                Resource: '*'
+      
+      # Resource tags
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ec2-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Launch Template - Defines EC2 instance configuration
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-launch-template'
+      LaunchTemplateData:
+        # Instance configuration
+        ImageId: !FindInMap [AWSRegionAMI, !Ref 'AWS::Region', AMI]
+        InstanceType: !Ref InstanceType
+        KeyName: !If [EnableSSHAccess, !Ref KeyPairName, !Ref AWS::NoValue]
+        
+        # Security and networking
+        SecurityGroupIds:
+          - !Ref WebServerSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        
+        # Instance monitoring
+        Monitoring:
+          Enabled: !If [EnableDetailedMonitoring, true, false]
+        
+        # User data script - Installs and configures web server
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Update system packages
+            yum update -y
+            
+            # Install and configure Apache web server
+            yum install -y httpd
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Install CloudWatch agent for enhanced monitoring
+            yum install -y amazon-cloudwatch-agent
+            
+            # Create simple web page with instance information
+            cat > /var/www/html/index.html << 'EOF'
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Auto Scaling Demo</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }
+                    .container { background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                    .header { color: #FF9900; border-bottom: 2px solid #FF9900; padding-bottom: 10px; }
+                    .info { margin: 20px 0; }
+                    .label { font-weight: bold; color: #333; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1 class="header">🚀 Auto Scaling Demo</h1>
+                    <div class="info">
+                        <p><span class="label">Hostname:</span> $(hostname -f)</p>
+                        <p><span class="label">Instance ID:</span> $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</p>
+                        <p><span class="label">Availability Zone:</span> $(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)</p>
+                        <p><span class="label">Instance Type:</span> $(curl -s http://169.254.169.254/latest/meta-data/instance-type)</p>
+                        <p><span class="label">Launch Time:</span> $(date)</p>
+                        <p><span class="label">Environment:</span> ${Environment}</p>
+                    </div>
+                    <p style="margin-top: 30px; color: #666; font-size: 0.9em;">
+                        This instance was launched automatically by AWS Auto Scaling.
+                    </p>
+                </div>
+            </body>
+            </html>
+            EOF
+            
+            # Configure CloudWatch agent (basic configuration)
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+            {
+                "metrics": {
+                    "namespace": "CWAgent",
+                    "metrics_collected": {
+                        "cpu": {
+                            "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+                            "metrics_collection_interval": 60
+                        },
+                        "disk": {
+                            "measurement": ["used_percent"],
+                            "metrics_collection_interval": 60,
+                            "resources": ["*"]
+                        },
+                        "mem": {
+                            "measurement": ["mem_used_percent"],
+                            "metrics_collection_interval": 60
+                        }
+                    }
+                }
+            }
+            EOF
+            
+            # Start CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a start -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+            
+            # Signal CloudFormation that instance is ready
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+        
+        # Instance tags applied to launched instances
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-web-server'
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: LaunchedBy
+                Value: AutoScaling
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-web-server-volume'
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Project
+                Value: !Ref ProjectName
+
+      # Launch template tags
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: !Sub '${ProjectName}-launch-template'
+            - Key: Environment
+              Value: !Ref Environment
+            - Key: Project
+              Value: !Ref ProjectName
+
+  # Auto Scaling Group - Manages EC2 instance lifecycle
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${ProjectName}-asg'
+      
+      # Launch template configuration
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      
+      # Capacity configuration
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      
+      # Network configuration - Deploy across multiple AZs for high availability
+      VPCZoneIdentifier: !Ref SubnetIds
+      
+      # Health check configuration
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      
+      # Instance replacement policy
+      TerminationPolicies:
+        - OldestInstance
+      
+      # Enable metrics collection for monitoring
+      MetricsCollection:
+        - Granularity: 1Minute
+          Metrics:
+            - GroupMinSize
+            - GroupMaxSize
+            - GroupDesiredCapacity
+            - GroupInServiceInstances
+            - GroupTotalInstances
+            - GroupPendingInstances
+            - GroupStandbyInstances
+            - GroupTerminatingInstances
+      
+      # Auto Scaling group tags
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-asg'
+          PropagateAtLaunch: false
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref ProjectName
+          PropagateAtLaunch: true
+        - Key: ManagedBy
+          Value: CloudFormation
+          PropagateAtLaunch: false
+    
+    # Wait for instances to signal successful completion
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref DesiredCapacity
+        Timeout: PT10M
+    
+    # Handle updates gracefully
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: true
+
+  # Scaling Policy - CPU-based target tracking
+  CPUTargetTrackingScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-cpu-target-tracking'
+      PolicyType: TargetTrackingScaling
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      
+      # Target tracking configuration
+      TargetTrackingConfiguration:
+        TargetValue: !Ref CPUTargetValue
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        
+        # Cooldown periods to prevent flapping
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+        
+        # Don't scale in when the metric data is insufficient
+        DisableScaleIn: false
+
+  # CloudWatch Alarm - Monitor Auto Scaling group health
+  AutoScalingGroupHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-asg-health'
+      AlarmDescription: Monitor Auto Scaling group for unhealthy instances
+      MetricName: GroupTotalInstances
+      Namespace: AWS/AutoScaling
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref MinSize
+      ComparisonOperator: LessThanThreshold
+      
+      # Dimensions to identify the specific Auto Scaling group
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      
+      # Alarm actions (can be extended to include SNS notifications)
+      AlarmActions: []
+      OKActions: []
+      InsufficientDataActions: []
+
+# Template Outputs - Export values for other stacks or external use
+Outputs:
+  
+  # Auto Scaling Group Information
+  AutoScalingGroupName:
+    Description: Name of the Auto Scaling group
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ASG-Name'
+
+  AutoScalingGroupARN:
+    Description: ARN of the Auto Scaling group
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ASG-ARN'
+
+  # Launch Template Information
+  LaunchTemplateId:
+    Description: ID of the Launch Template
+    Value: !Ref WebServerLaunchTemplate
+    Export:
+      Name: !Sub '${AWS::StackName}-LaunchTemplate-ID'
+
+  LaunchTemplateName:
+    Description: Name of the Launch Template
+    Value: !Sub '${ProjectName}-launch-template'
+    Export:
+      Name: !Sub '${AWS::StackName}-LaunchTemplate-Name'
+
+  # Security Group Information
+  SecurityGroupId:
+    Description: ID of the web server security group
+    Value: !Ref WebServerSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroup-ID'
+
+  # Scaling Policy Information
+  ScalingPolicyARN:
+    Description: ARN of the CPU target tracking scaling policy
+    Value: !Ref CPUTargetTrackingScalingPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-ScalingPolicy-ARN'
+
+  # CloudWatch Alarm
+  HealthAlarmName:
+    Description: Name of the Auto Scaling group health alarm
+    Value: !Ref AutoScalingGroupHealthAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthAlarm-Name'
+
+  # Configuration Summary
+  ConfigurationSummary:
+    Description: Summary of Auto Scaling configuration
+    Value: !Sub 
+      - 'ASG: ${ASGName} | Min: ${MinSize} | Max: ${MaxSize} | Desired: ${DesiredCapacity} | CPU Target: ${CPUTargetValue}%'
+      - ASGName: !Ref AutoScalingGroup
+
+  # Deployment Information
+  StackRegion:
+    Description: AWS region where the stack is deployed
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  StackId:
+    Description: CloudFormation stack ID
+    Value: !Ref 'AWS::StackId'
+    Export:
+      Name: !Sub '${AWS::StackName}-StackId'
+
+  # Web Application Access (Note: individual instance IPs will vary)
+  WebApplicationInfo:
+    Description: Information about accessing the web application
+    Value: !Sub 
+      - 'Web servers are running behind Auto Scaling group "${ASGName}". Use Load Balancer or individual instance public IPs to access the application.'
+      - ASGName: !Ref AutoScalingGroup
+
+# Template Metadata - Additional information for AWS Console
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Instance Configuration"
+        Parameters:
+          - InstanceType
+          - KeyPairName
+      - Label:
+          default: "Auto Scaling Configuration"
+        Parameters:
+          - MinSize
+          - MaxSize
+          - DesiredCapacity
+          - CPUTargetValue
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VPCId
+          - SubnetIds
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - SSHAllowedCIDR
+    
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      InstanceType:
+        default: "Instance Type"
+      KeyPairName:
+        default: "EC2 Key Pair"
+      MinSize:
+        default: "Minimum Instances"
+      MaxSize:
+        default: "Maximum Instances"
+      DesiredCapacity:
+        default: "Desired Instances"
+      CPUTargetValue:
+        default: "CPU Target (%)"
+      VPCId:
+        default: "VPC ID"
+      SubnetIds:
+        default: "Subnet IDs"
+      SSHAllowedCIDR:
+        default: "SSH Allowed CIDR"
+
+  # Template version and description
+  AWS::CloudFormation::Designer:
+    Version: "1.0"
+    Description: "EC2 Auto Scaling with Launch Templates - Production-ready template following AWS best practices"

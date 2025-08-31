@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: Config, Lambda, SNS, CloudWatch
 estimated-time: 85 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: aws-config, compliance, monitoring, security, governance
 recipe-generator-version: 1.3
 ---
 
 # Compliance Monitoring with AWS Config
-
 
 ## Problem
 
@@ -390,7 +389,7 @@ echo "✅ Created Config service role: ${CONFIG_ROLE_ARN}"
    # Create Lambda function
    LAMBDA_ARN=$(aws lambda create-function \
        --function-name ConfigSecurityGroupRule-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/ConfigLambdaRole-${RANDOM_SUFFIX} \
        --handler sg-rule-function.lambda_handler \
        --zip-file fileb://sg-rule-function.zip \
@@ -553,7 +552,7 @@ echo "✅ Created Config service role: ${CONFIG_ROLE_ARN}"
    # Create remediation Lambda function
    REMEDIATION_LAMBDA_ARN=$(aws lambda create-function \
        --function-name ConfigRemediation-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${REMEDIATION_ROLE_NAME} \
        --handler remediation-function.lambda_handler \
        --zip-file fileb://remediation-function.zip \
@@ -724,9 +723,18 @@ echo "✅ Created Config service role: ${CONFIG_ROLE_ARN}"
     Effective compliance testing includes both positive and negative test cases, verifying that compliant resources are correctly identified as such while non-compliant resources trigger appropriate evaluation and remediation actions. This comprehensive approach ensures that your compliance system provides accurate and reliable results across all scenarios.
 
     ```bash
+    # Get the latest Amazon Linux 2023 AMI ID
+    LATEST_AMI=$(aws ec2 describe-images \
+        --owners amazon \
+        --filters "Name=name,Values=al2023-ami-*" \
+        "Name=architecture,Values=x86_64" \
+        "Name=state,Values=available" \
+        --query 'Images|sort_by(@, &CreationDate)[-1].ImageId' \
+        --output text)
+    
     # Create a test EC2 instance without required tags
     TEST_INSTANCE_ID=$(aws ec2 run-instances \
-        --image-id ami-0abcdef1234567890 \
+        --image-id ${LATEST_AMI} \
         --instance-type t2.micro \
         --output text --query 'Instances[0].InstanceId')
     

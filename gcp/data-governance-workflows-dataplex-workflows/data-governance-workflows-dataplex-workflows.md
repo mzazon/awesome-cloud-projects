@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Dataplex, Cloud Workflows, Cloud DLP, BigQuery
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: data-governance, automation, data-quality, compliance, orchestration
 recipe-generator-version: 1.3
@@ -104,6 +104,7 @@ gcloud services enable bigquery.googleapis.com
 gcloud services enable cloudasset.googleapis.com
 gcloud services enable monitoring.googleapis.com
 gcloud services enable logging.googleapis.com
+gcloud services enable cloudfunctions.googleapis.com
 
 # Create foundational storage bucket for data lake
 export BUCKET_NAME="governance-data-lake-${RANDOM_SUFFIX}"
@@ -282,6 +283,7 @@ echo "✅ BigQuery dataset created: ${DATASET_NAME}"
    from google.cloud import dataplex_v1
    import json
    import datetime
+   import os
    
    @functions_framework.http
    def assess_data_quality(request):
@@ -292,8 +294,8 @@ echo "✅ BigQuery dataset created: ${DATASET_NAME}"
            
            # Get request parameters
            request_json = request.get_json(silent=True)
-           asset_name = request_json.get('asset_name', 'unknown')
-           zone = request_json.get('zone', 'unknown')
+           asset_name = request_json.get('asset_name', 'unknown') if request_json else 'unknown'
+           zone = request_json.get('zone', 'unknown') if request_json else 'unknown'
            
            # Simulate quality assessment (replace with actual logic)
            quality_metrics = {
@@ -308,7 +310,8 @@ echo "✅ BigQuery dataset created: ${DATASET_NAME}"
            issues_found = sum(1 for score in quality_metrics.values() if score < 0.9)
            
            # Insert results into BigQuery
-           table_id = f"{client.project}.DATASET_NAME.data_quality_metrics"
+           dataset_name = os.environ.get('DATASET_NAME', 'governance_analytics')
+           table_id = f"{client.project}.{dataset_name}.data_quality_metrics"
            rows_to_insert = [{
                'timestamp': datetime.datetime.utcnow().isoformat(),
                'asset_name': asset_name,
@@ -339,19 +342,18 @@ echo "✅ BigQuery dataset created: ${DATASET_NAME}"
    google-cloud-dataplex==1.*
    EOF
    
-   # Replace dataset placeholder
-   sed -i "s/DATASET_NAME/${DATASET_NAME}/g" main.py
-   
-   # Deploy the Cloud Function
+   # Deploy the Cloud Function (Gen 2)
    gcloud functions deploy data-quality-assessor \
-       --runtime python311 \
+       --gen2 \
+       --runtime python39 \
        --trigger-http \
        --allow-unauthenticated \
        --source . \
        --entry-point assess_data_quality \
        --memory 512MB \
        --timeout 300s \
-       --set-env-vars PROJECT_ID=${PROJECT_ID}
+       --region ${REGION} \
+       --set-env-vars PROJECT_ID=${PROJECT_ID},DATASET_NAME=${DATASET_NAME}
    
    cd ../..
    
@@ -719,6 +721,7 @@ echo "✅ BigQuery dataset created: ${DATASET_NAME}"
    # Delete Cloud Function
    gcloud functions delete data-quality-assessor \
        --region=${REGION} \
+       --gen2 \
        --quiet
    
    echo "✅ Workflows and functions deleted"

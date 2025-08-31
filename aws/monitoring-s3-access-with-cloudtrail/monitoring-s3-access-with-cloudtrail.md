@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: s3,cloudtrail,cloudwatch,eventbridge
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: s3,cloudtrail,cloudwatch,eventbridge,security,monitoring
 recipe-generator-version: 1.3
@@ -219,7 +219,12 @@ echo "✅ Created foundational S3 buckets"
                    "Service": "cloudtrail.amazonaws.com"
                },
                "Action": "s3:GetBucketAcl",
-               "Resource": "arn:aws:s3:::${CLOUDTRAIL_BUCKET}"
+               "Resource": "arn:aws:s3:::${CLOUDTRAIL_BUCKET}",
+               "Condition": {
+                   "StringEquals": {
+                       "aws:SourceArn": "arn:aws:cloudtrail:${AWS_REGION}:${AWS_ACCOUNT_ID}:trail/s3-security-monitoring-trail"
+                   }
+               }
            },
            {
                "Sid": "AWSCloudTrailWrite",
@@ -231,7 +236,8 @@ echo "✅ Created foundational S3 buckets"
                "Resource": "arn:aws:s3:::${CLOUDTRAIL_BUCKET}/*",
                "Condition": {
                    "StringEquals": {
-                       "s3:x-amz-acl": "bucket-owner-full-control"
+                       "s3:x-amz-acl": "bucket-owner-full-control",
+                       "aws:SourceArn": "arn:aws:cloudtrail:${AWS_REGION}:${AWS_ACCOUNT_ID}:trail/s3-security-monitoring-trail"
                    }
                }
            }
@@ -247,7 +253,7 @@ echo "✅ Created foundational S3 buckets"
    echo "✅ Applied CloudTrail bucket policy"
    ```
 
-   The CloudTrail bucket is now configured with appropriate permissions, enabling secure storage of API event logs. This establishes the infrastructure foundation for comprehensive control plane monitoring of your S3 environment.
+   The CloudTrail bucket is now configured with appropriate permissions and security conditions, enabling secure storage of API event logs. This establishes the infrastructure foundation for comprehensive control plane monitoring of your S3 environment.
 
 4. **Create CloudTrail with S3 Data Events**:
 
@@ -407,20 +413,76 @@ echo "✅ Created foundational S3 buckets"
 
    > **Warning**: Replace the email address with your actual security team's email to receive real security alerts. Test the notification system before relying on it for production security monitoring.
 
-8. **Create Security Monitoring Lambda Function**:
+8. **Create Lambda Execution Role and Security Monitoring Function**:
 
    Lambda functions provide advanced security analysis capabilities beyond simple pattern matching, enabling sophisticated threat detection using custom logic, machine learning models, or integration with external security tools. This serverless approach scales automatically with event volume and provides cost-effective security monitoring. The function can correlate multiple events, maintain state across invocations, and implement complex security rules.
 
    ```bash
+   # Create IAM role for Lambda function
+   cat > lambda-execution-role-policy.json << EOF
+   {
+       "Version": "2012-10-17",
+       "Statement": [
+           {
+               "Effect": "Allow",
+               "Principal": {
+                   "Service": "lambda.amazonaws.com"
+               },
+               "Action": "sts:AssumeRole"
+           }
+       ]
+   }
+   EOF
+   
+   # Create Lambda execution role
+   aws iam create-role \
+       --role-name LambdaS3SecurityMonitorRole \
+       --assume-role-policy-document file://lambda-execution-role-policy.json
+   
+   # Create policy for Lambda permissions
+   cat > lambda-permissions.json << EOF
+   {
+       "Version": "2012-10-17",
+       "Statement": [
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "logs:CreateLogGroup",
+                   "logs:CreateLogStream",
+                   "logs:PutLogEvents"
+               ],
+               "Resource": "arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:*"
+           },
+           {
+               "Effect": "Allow",
+               "Action": [
+                   "sns:Publish"
+               ],
+               "Resource": "${SNS_TOPIC_ARN}"
+           }
+       ]
+   }
+   EOF
+   
+   # Attach policy to Lambda role
+   aws iam put-role-policy \
+       --role-name LambdaS3SecurityMonitorRole \
+       --policy-name LambdaS3SecurityMonitorPolicy \
+       --policy-document file://lambda-permissions.json
+   
    # Create Lambda function for advanced security analysis
    cat > security-monitor.py << 'EOF'
    import json
    import boto3
    import logging
    from datetime import datetime
+   import os
 
    logger = logging.getLogger()
    logger.setLevel(logging.INFO)
+
+   sns = boto3.client('sns')
+   SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
 
    def lambda_handler(event, context):
        try:
@@ -462,16 +524,17 @@ echo "✅ Created foundational S3 buckets"
        return False
 
    def send_alert(event):
-       sns = boto3.client('sns')
-       topic_arn = 'arn:aws:sns:us-east-1:123456789012:s3-security-alerts'
-       
+       if not SNS_TOPIC_ARN:
+           logger.error("SNS_TOPIC_ARN environment variable not set")
+           return
+           
        message = f"Security Alert: Suspicious S3 activity detected\n"
        message += f"Event: {event.get('eventName', 'Unknown')}\n"
        message += f"Source IP: {event.get('sourceIPAddress', 'Unknown')}\n"
        message += f"Time: {event.get('eventTime', 'Unknown')}"
        
        sns.publish(
-           TopicArn=topic_arn,
+           TopicArn=SNS_TOPIC_ARN,
            Message=message,
            Subject='S3 Security Alert'
        )
@@ -480,14 +543,18 @@ echo "✅ Created foundational S3 buckets"
    # Create Lambda deployment package
    zip security-monitor.zip security-monitor.py
    
+   # Wait for role to propagate
+   sleep 10
+   
    # Create Lambda function
    aws lambda create-function \
        --function-name s3-security-monitor \
        --runtime python3.9 \
-       --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/lambda-execution-role" \
+       --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/LambdaS3SecurityMonitorRole" \
        --handler security-monitor.lambda_handler \
        --zip-file fileb://security-monitor.zip \
-       --timeout 30
+       --timeout 30 \
+       --environment Variables="{SNS_TOPIC_ARN=${SNS_TOPIC_ARN}}"
    
    echo "✅ Created Lambda function for security monitoring"
    ```
@@ -672,17 +739,26 @@ echo "✅ Created foundational S3 buckets"
    echo "✅ Deleted EventBridge and SNS resources"
    ```
 
-4. **Remove Lambda function**:
+4. **Remove Lambda function and role**:
 
    ```bash
    # Delete Lambda function
    aws lambda delete-function \
        --function-name s3-security-monitor
    
-   echo "✅ Deleted Lambda function"
+   # Delete Lambda IAM role policy
+   aws iam delete-role-policy \
+       --role-name LambdaS3SecurityMonitorRole \
+       --policy-name LambdaS3SecurityMonitorPolicy
+   
+   # Delete Lambda IAM role
+   aws iam delete-role \
+       --role-name LambdaS3SecurityMonitorRole
+   
+   echo "✅ Deleted Lambda function and role"
    ```
 
-5. **Remove IAM role and policies**:
+5. **Remove CloudTrail IAM role and policies**:
 
    ```bash
    # Delete IAM role policy
@@ -694,7 +770,7 @@ echo "✅ Created foundational S3 buckets"
    aws iam delete-role \
        --role-name CloudTrailLogsRole
    
-   echo "✅ Deleted IAM resources"
+   echo "✅ Deleted CloudTrail IAM resources"
    ```
 
 6. **Remove S3 buckets and contents**:
@@ -715,35 +791,36 @@ echo "✅ Created foundational S3 buckets"
    rm -f cloudtrail-policy.json cloudtrail-logs-role-policy.json
    rm -f cloudtrail-logs-permissions.json security-monitor.py
    rm -f security-monitor.zip dashboard-config.json security-queries.txt
+   rm -f lambda-execution-role-policy.json lambda-permissions.json
    
    echo "✅ Deleted all S3 buckets and local files"
    ```
 
 ## Discussion
 
-This comprehensive S3 access logging and security monitoring solution addresses critical compliance and security requirements by combining multiple AWS services for complete visibility. S3 Server Access Logging provides detailed records of all bucket access requests, including source IP addresses, request types, and response codes, which is essential for compliance auditing and forensic analysis.
+This comprehensive S3 access logging and security monitoring solution addresses critical compliance and security requirements by combining multiple AWS services for complete visibility. S3 Server Access Logging provides detailed records of all bucket access requests, including source IP addresses, request types, and response codes, which is essential for compliance auditing and forensic analysis as outlined in the [AWS S3 Server Access Logging documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/ServerLogs.html).
 
-The integration with CloudTrail adds API-level monitoring that captures control plane operations like bucket policy changes, access control modifications, and administrative actions. This dual-layer approach ensures that both data plane operations (actual file access) and control plane operations (configuration changes) are thoroughly logged and monitored.
+The integration with CloudTrail adds API-level monitoring that captures control plane operations like bucket policy changes, access control modifications, and administrative actions. This dual-layer approach ensures that both data plane operations (actual file access) and control plane operations (configuration changes) are thoroughly logged and monitored, following AWS Well-Architected Framework security principles.
 
-The real-time alerting system using EventBridge and SNS enables immediate response to security incidents, while the CloudWatch dashboard provides operational visibility for security teams. The date-based partitioning of access logs optimizes storage costs and query performance, making it practical for organizations with high-volume S3 usage.
+The real-time alerting system using EventBridge and SNS enables immediate response to security incidents, while the CloudWatch dashboard provides operational visibility for security teams. The date-based partitioning of access logs optimizes storage costs and query performance, making it practical for organizations with high-volume S3 usage. According to the [AWS CloudTrail best practices](https://docs.aws.amazon.com/awscloudtrail/latest/userguide/best-practices-security.html), implementing proper S3 bucket policies and CloudWatch integration are essential for maintaining audit trail integrity.
 
-For compliance frameworks like SOX, HIPAA, and PCI-DSS, this solution provides the necessary audit trails and controls to demonstrate data access governance. The automated monitoring reduces manual oversight burden while ensuring that security incidents are quickly identified and escalated.
+For compliance frameworks like SOX, HIPAA, and PCI-DSS, this solution provides the necessary audit trails and controls to demonstrate data access governance. The automated monitoring reduces manual oversight burden while ensuring that security incidents are quickly identified and escalated. The implementation follows the AWS Well-Architected Framework's security pillar by implementing defense in depth, least privilege access, and comprehensive logging.
 
-> **Tip**: Use CloudWatch Insights queries to analyze access patterns and identify anomalies. Regular analysis of access logs can reveal unauthorized access attempts and help optimize security policies.
+> **Tip**: Use CloudWatch Insights queries to analyze access patterns and identify anomalies. Regular analysis of access logs can reveal unauthorized access attempts and help optimize security policies according to AWS security best practices.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Advanced Threat Detection**: Integrate with Amazon GuardDuty to correlate S3 access patterns with known threat intelligence and detect sophisticated attacks using machine learning.
+1. **Advanced Threat Detection**: Integrate with Amazon GuardDuty to correlate S3 access patterns with known threat intelligence and detect sophisticated attacks using machine learning capabilities.
 
-2. **Automated Response**: Create Lambda functions that automatically respond to security events by temporarily blocking suspicious IP addresses or revoking access tokens.
+2. **Automated Response**: Create Lambda functions that automatically respond to security events by temporarily blocking suspicious IP addresses using AWS WAF or revoking access tokens through IAM.
 
-3. **Cross-Account Monitoring**: Extend the monitoring to cover S3 buckets across multiple AWS accounts using AWS Organizations and centralized logging.
+3. **Cross-Account Monitoring**: Extend the monitoring to cover S3 buckets across multiple AWS accounts using AWS Organizations and centralized logging with cross-account role assumptions.
 
-4. **Compliance Reporting**: Build automated compliance reports using Amazon QuickSight that aggregate access logs and present them in formats required by auditors.
+4. **Compliance Reporting**: Build automated compliance reports using Amazon QuickSight that aggregate access logs and present them in formats required by auditors for SOX, HIPAA, and PCI-DSS compliance.
 
-5. **Data Loss Prevention**: Implement real-time scanning of uploaded files using Amazon Macie to detect sensitive data and trigger alerts for potential compliance violations.
+5. **Data Loss Prevention**: Implement real-time scanning of uploaded files using Amazon Macie to detect sensitive data and trigger alerts for potential compliance violations or data exfiltration attempts.
 
 ## Infrastructure Code
 

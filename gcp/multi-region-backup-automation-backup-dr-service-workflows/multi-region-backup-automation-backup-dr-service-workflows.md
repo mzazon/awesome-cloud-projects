@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Backup and DR Service, Cloud Workflows, Cloud Scheduler, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: backup, disaster-recovery, multi-region, automation, workflows, monitoring
 recipe-generator-version: 1.3
@@ -134,6 +134,15 @@ echo "✅ Secondary region: ${SECONDARY_REGION}"
        --member="serviceAccount:${SA_EMAIL}" \
        --role="roles/workflows.invoker"
    
+   # Additional permissions for cross-region operations
+   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+       --member="serviceAccount:${SA_EMAIL}" \
+       --role="roles/compute.viewer"
+   
+   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+       --member="serviceAccount:${SA_EMAIL}" \
+       --role="roles/monitoring.metricWriter"
+   
    echo "✅ Service account created with backup permissions"
    ```
 
@@ -147,14 +156,16 @@ echo "✅ Secondary region: ${SECONDARY_REGION}"
    # Create backup vault in primary region
    gcloud backup-dr backup-vaults create ${BACKUP_VAULT_PRIMARY} \
        --location=${PRIMARY_REGION} \
-       --backup-minimum-enforced-retention-duration=30d \
-       --description="Primary backup vault for multi-region automation"
+       --backup-min-enforced-retention=30d \
+       --description="Primary backup vault for multi-region automation" \
+       --access-restriction=within-org
    
    # Create backup vault in secondary region
    gcloud backup-dr backup-vaults create ${BACKUP_VAULT_SECONDARY} \
        --location=${SECONDARY_REGION} \
-       --backup-minimum-enforced-retention-duration=30d \
-       --description="Secondary backup vault for disaster recovery"
+       --backup-min-enforced-retention=30d \
+       --description="Secondary backup vault for disaster recovery" \
+       --access-restriction=within-org
    
    # Verify backup vaults are created
    gcloud backup-dr backup-vaults list \
@@ -197,7 +208,30 @@ echo "✅ Secondary region: ${SECONDARY_REGION}"
 
    The test infrastructure is now ready with properly labeled resources that support automated backup policies. This setup represents real-world scenarios where enterprises need to protect various types of compute and storage resources across their Google Cloud environment.
 
-4. **Create Cloud Workflow for Backup Orchestration**:
+4. **Create Backup Plans for Automated Protection**:
+
+   Backup plans define the protection policies and schedules for your resources. Google Cloud's Backup and DR Service uses backup plans to automatically protect compute instances and persistent disks according to your business requirements. These plans include retention policies, backup frequency, and cross-region replication settings.
+
+   ```bash
+   # Create backup plan for the test instance
+   gcloud backup-dr backup-plans create instance-backup-plan \
+       --location=${PRIMARY_REGION} \
+       --backup-vault=projects/${PROJECT_ID}/locations/${PRIMARY_REGION}/backupVaults/${BACKUP_VAULT_PRIMARY} \
+       --resource-type=compute.googleapis.com/Instance \
+       --description="Automated backup plan for compute instances"
+   
+   # Create backup plan association to link instance with plan
+   gcloud backup-dr backup-plan-associations create \
+       --backup-plan=projects/${PROJECT_ID}/locations/${PRIMARY_REGION}/backupPlans/instance-backup-plan \
+       --location=${PRIMARY_REGION} \
+       --resource=projects/${PROJECT_ID}/zones/${PRIMARY_REGION}-a/instances/backup-test-instance
+   
+   echo "✅ Backup plans configured for test resources"
+   ```
+
+   Backup plans are now established to automatically protect your compute resources. These plans provide consistent protection policies and enable automated backup execution without manual intervention.
+
+5. **Create Cloud Workflow for Backup Orchestration**:
 
    Cloud Workflows provides serverless orchestration capabilities that enable complex backup operations across multiple regions. The workflow definition includes error handling, retry logic, and conditional branching to ensure reliable backup execution. This approach allows for sophisticated backup strategies while maintaining visibility into the entire process.
 
@@ -215,80 +249,45 @@ main:
           - backup_vault_primary: "backup-vault-primary"
           - backup_vault_secondary: "backup-vault-secondary"
     
-    - create_primary_backup:
-        call: create_backup
+    - list_backup_plans:
+        call: http.get
         args:
-          project_id: ${project_id}
-          region: ${primary_region}
-          backup_vault: ${backup_vault_primary}
-          instance_name: "backup-test-instance"
-        result: primary_backup_result
+          url: ${"https://backupdr.googleapis.com/v1/projects/" + project_id + "/locations/" + primary_region + "/backupPlans"}
+          auth:
+            type: OAuth2
+        result: backup_plans
     
-    - create_secondary_backup:
-        call: create_cross_region_backup
-        args:
-          project_id: ${project_id}
-          source_region: ${primary_region}
-          target_region: ${secondary_region}
-          backup_vault: ${backup_vault_secondary}
-          source_backup: ${primary_backup_result.backup_id}
-        result: secondary_backup_result
+    - trigger_backups:
+        for:
+          value: plan
+          in: ${backup_plans.body.backup_plans}
+          steps:
+            - create_backup:
+                call: http.post
+                args:
+                  url: ${"https://backupdr.googleapis.com/v1/projects/" + project_id + "/locations/" + primary_region + "/backups"}
+                  auth:
+                    type: OAuth2
+                  headers:
+                    Content-Type: "application/json"
+                  body:
+                    parent: ${plan.backup_vault}
+                    backup_id: ${"backup-" + string(int(sys.now()))}
+                    backup:
+                      description: "Automated backup via Cloud Workflows"
+                      backup_plan: ${plan.name}
+                result: primary_backup
     
     - log_results:
         call: sys.log
         args:
-          data: ${"Primary backup: " + primary_backup_result.backup_id + ", Secondary backup: " + secondary_backup_result.backup_id}
+          data: ${"Backup workflow completed successfully"}
           severity: "INFO"
     
     - return_results:
         return:
-          primary_backup: ${primary_backup_result}
-          secondary_backup: ${secondary_backup_result}
           status: "SUCCESS"
-
-create_backup:
-  params: [project_id, region, backup_vault, instance_name]
-  steps:
-    - create_backup_plan:
-        call: http.post
-        args:
-          url: ${"https://backupdr.googleapis.com/v1/projects/" + project_id + "/locations/" + region + "/backupPlans"}
-          auth:
-            type: OAuth2
-          headers:
-            Content-Type: "application/json"
-          body:
-            backupPlanId: ${"plan-" + instance_name + "-" + string(int(sys.now()))}
-            backupPlan:
-              description: "Automated backup plan for instance"
-              backupVault: ${"projects/" + project_id + "/locations/" + region + "/backupVaults/" + backup_vault}
-              resourceType: "compute.googleapis.com/Instance"
-        result: backup_plan_response
-    
-    - return_backup_info:
-        return:
-          backup_id: ${backup_plan_response.body.name}
-          status: "CREATED"
-
-create_cross_region_backup:
-  params: [project_id, source_region, target_region, backup_vault, source_backup]
-  steps:
-    - copy_backup:
-        call: http.post
-        args:
-          url: ${"https://backupdr.googleapis.com/v1/" + source_backup + ":copy"}
-          auth:
-            type: OAuth2
-          headers:
-            Content-Type: "application/json"
-          body:
-            destinationBackupVault: ${"projects/" + project_id + "/locations/" + target_region + "/backupVaults/" + backup_vault}
-        result: copy_response
-    
-    - return_copy_info:
-        return:
-          backup_id: ${copy_response.body.name}
-          status: "COPIED"
+          timestamp: ${sys.now()}
 EOF
    
    # Deploy the workflow
@@ -302,7 +301,7 @@ EOF
 
    The workflow is now deployed and ready to orchestrate multi-region backup operations. This serverless solution provides reliable automation with built-in error handling and monitoring capabilities, ensuring consistent backup execution across your infrastructure.
 
-5. **Create Cloud Scheduler Job for Automated Execution**:
+6. **Create Cloud Scheduler Job for Automated Execution**:
 
    Cloud Scheduler provides reliable, managed cron job functionality that triggers backup workflows at specified intervals. This managed service ensures backup operations execute consistently without requiring dedicated infrastructure. The scheduler integrates seamlessly with Cloud Workflows and provides detailed execution logs for monitoring and troubleshooting.
 
@@ -336,7 +335,7 @@ EOF
 
    Automated backup scheduling is now active with both daily backup operations and weekly validation runs. This ensures consistent data protection while providing regular verification that your backup and recovery processes remain functional and reliable.
 
-6. **Configure Cloud Monitoring and Alerting**:
+7. **Configure Cloud Monitoring and Alerting**:
 
    Cloud Monitoring provides comprehensive observability for your backup automation system, tracking backup success rates, execution times, and storage utilization across regions. Proper monitoring ensures early detection of issues and enables proactive management of your backup infrastructure. Alert policies notify administrators of critical events requiring immediate attention.
 
@@ -417,7 +416,7 @@ EOF
 
    Comprehensive monitoring is now in place to track backup operations across both regions. The dashboard provides visual insights into backup performance while alert policies ensure immediate notification of any issues requiring attention.
 
-7. **Test Manual Workflow Execution**:
+8. **Test Manual Workflow Execution**:
 
    Before relying on automated scheduling, it's essential to validate the entire backup workflow through manual execution. This testing phase verifies that all components work together correctly and helps identify any configuration issues before production deployment. Manual testing also provides baseline performance metrics for monitoring purposes.
 
@@ -462,7 +461,23 @@ EOF
 
    Expected output: Both vaults should show `state: READY` with valid creation timestamps.
 
-2. Test workflow execution and verify results:
+2. Verify backup plans and associations:
+
+   ```bash
+   # List backup plans
+   gcloud backup-dr backup-plans list \
+       --location=${PRIMARY_REGION} \
+       --format="table(name,state,createTime)"
+   
+   # List backup plan associations
+   gcloud backup-dr backup-plan-associations list \
+       --location=${PRIMARY_REGION} \
+       --format="table(name,resource,state)"
+   ```
+
+   Expected output: Plans should show `state: READY` and associations should be `state: READY`.
+
+3. Test workflow execution and verify results:
 
    ```bash
    # List recent workflow executions
@@ -479,7 +494,7 @@ EOF
 
    Expected output: Executions should show `state: SUCCEEDED` and scheduler should be `state: ENABLED`.
 
-3. Validate monitoring setup and alert policies:
+4. Validate monitoring setup and alert policies:
 
    ```bash
    # List monitoring policies
@@ -497,7 +512,24 @@ EOF
 
 ## Cleanup
 
-1. Delete scheduler jobs and workflow:
+1. Delete backup plan associations and plans:
+
+   ```bash
+   # Delete backup plan associations
+   gcloud backup-dr backup-plan-associations delete \
+       --backup-plan=projects/${PROJECT_ID}/locations/${PRIMARY_REGION}/backupPlans/instance-backup-plan \
+       --location=${PRIMARY_REGION} \
+       --quiet
+   
+   # Delete backup plans
+   gcloud backup-dr backup-plans delete instance-backup-plan \
+       --location=${PRIMARY_REGION} \
+       --quiet
+   
+   echo "✅ Backup plans and associations removed"
+   ```
+
+2. Delete scheduler jobs and workflow:
 
    ```bash
    # Delete scheduler jobs
@@ -517,7 +549,7 @@ EOF
    echo "✅ Automation components removed"
    ```
 
-2. Remove backup vaults and test resources:
+3. Remove backup vaults and test resources:
 
    ```bash
    # Delete backup vaults (this may take several minutes)
@@ -541,7 +573,7 @@ EOF
    echo "✅ Test resources and backup vaults removed"
    ```
 
-3. Clean up monitoring and IAM resources:
+4. Clean up monitoring and IAM resources:
 
    ```bash
    # Delete monitoring dashboard and alert policies
@@ -552,6 +584,15 @@ EOF
    if [ ! -z "$DASHBOARD_ID" ]; then
        gcloud monitoring dashboards delete ${DASHBOARD_ID} --quiet
    fi
+   
+   # Delete alert policies
+   POLICY_IDS=$(gcloud alpha monitoring policies list \
+       --filter="displayName:Backup*" \
+       --format="value(name)")
+   
+   for POLICY_ID in $POLICY_IDS; do
+       gcloud alpha monitoring policies delete ${POLICY_ID} --quiet
+   done
    
    # Delete service account
    gcloud iam service-accounts delete ${SA_EMAIL} --quiet

@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud CDN, Compute Engine, Cloud Load Balancing, Cloud DNS
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: 2025-07-17
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: edge-computing, cdn, distributed-architecture, low-latency, global-network
 recipe-generator-version: 1.3
@@ -205,7 +205,8 @@ echo "✅ APIs enabled for global edge computing"
        ZONE=${ZONES[$i]}
        
        # Create instance template with regional subnet
-       gcloud compute instance-templates create edge-template-${REGION}-${RANDOM_SUFFIX} \
+       gcloud compute instance-templates create \
+           edge-template-${REGION}-${RANDOM_SUFFIX} \
            --machine-type=e2-standard-2 \
            --network-interface=network=${NETWORK_NAME},subnet=${NETWORK_NAME}-${REGION},no-address \
            --image-family=ubuntu-2404-lts \
@@ -241,7 +242,8 @@ echo "✅ APIs enabled for global edge computing"
            --zone=${ZONE}
        
        # Configure autoscaling for dynamic load handling
-       gcloud compute instance-groups managed set-autoscaling edge-group-${REGION} \
+       gcloud compute instance-groups managed set-autoscaling \
+           edge-group-${REGION} \
            --zone=${ZONE} \
            --max-num-replicas=5 \
            --min-num-replicas=2 \
@@ -549,11 +551,11 @@ echo "✅ APIs enabled for global edge computing"
 
 This edge computing architecture leverages Google Cloud's global infrastructure to create a sophisticated content delivery and processing network that automatically optimizes performance based on user location and traffic patterns. The solution combines the caching capabilities of Cloud CDN with the computational power of strategically distributed Compute Engine clusters, creating a hybrid approach that serves both static and dynamic content with minimal latency.
 
-The global load balancer acts as the intelligent traffic director, using Google's advanced routing algorithms to select the optimal backend based on real-time network conditions, geographic proximity, and backend health. This ensures that users always connect to the fastest available resources while providing automatic failover protection against regional outages or performance degradation.
+The global load balancer acts as the intelligent traffic director, using Google's advanced routing algorithms to select the optimal backend based on real-time network conditions, geographic proximity, and backend health. This ensures that users always connect to the fastest available resources while providing automatic failover protection against regional outages or performance degradation. Google's anycast IP technology enables automatic routing to the nearest healthy backend, significantly reducing connection establishment time.
 
 Cloud CDN's integration provides substantial performance benefits by caching content at over 100 edge locations worldwide. The caching policies configured in this recipe optimize for different content types while maintaining freshness requirements. Static assets benefit from extended cache times, while dynamic content can be cached for shorter periods to balance performance and data consistency. For more information about CDN optimization strategies, see the [Cloud CDN best practices guide](https://cloud.google.com/cdn/docs/best-practices).
 
-The distributed compute clusters enable processing capabilities at the network edge, supporting use cases like real-time data processing, AI inference, content transformation, and API services. Auto-scaling ensures that compute capacity matches demand while controlling costs during low-traffic periods. This architecture pattern is particularly effective for applications requiring sub-100ms response times, such as gaming, financial trading, IoT processing, and interactive media applications. Google's [edge computing architecture documentation](https://cloud.google.com/architecture/edge-computing) provides additional guidance on optimizing edge deployments.
+The distributed compute clusters enable processing capabilities at the network edge, supporting use cases like real-time data processing, AI inference, content transformation, and API services. Auto-scaling ensures that compute capacity matches demand while controlling costs during low-traffic periods. This architecture pattern is particularly effective for applications requiring sub-100ms response times, such as gaming, financial trading, IoT processing, and interactive media applications. Google's [edge computing architecture documentation](https://cloud.google.com/architecture/edge-computing) provides additional guidance on optimizing edge deployments for specific workloads and geographic requirements.
 
 > **Tip**: Monitor CDN cache hit ratios and backend response times using Cloud Monitoring to identify optimization opportunities. Consider implementing cache warming strategies for frequently accessed content and evaluate additional edge services like Edge TPU for AI workloads.
 

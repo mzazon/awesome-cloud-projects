@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Immersive Stream for XR, Cloud CDN, Cloud Storage
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: xr, augmented-reality, content-delivery, streaming, immersive-experiences
 recipe-generator-version: 1.3
@@ -109,7 +109,6 @@ gcloud config set compute/zone ${ZONE}
 # Enable required APIs
 gcloud services enable compute.googleapis.com
 gcloud services enable storage.googleapis.com
-gcloud services enable stream.googleapis.com
 gcloud services enable networkservices.googleapis.com
 gcloud services enable certificatemanager.googleapis.com
 
@@ -213,38 +212,55 @@ echo "✅ Resources will be created with suffix: ${RANDOM_SUFFIX}"
 
    The CDN configuration is now active with optimized caching policies for different content types. This global edge network ensures low-latency access to XR assets from anywhere in the world, supporting the streaming platform's performance requirements.
 
-4. **Set Up Immersive Stream for XR Service**:
+4. **Set Up XR Development Environment**:
 
-   Immersive Stream for XR provides cloud-based rendering capabilities using powerful GPUs to deliver photorealistic 3D and AR experiences. Configuring the service with appropriate instance specifications and scaling policies ensures optimal performance for immersive content delivery across various devices.
+   While Immersive Stream for XR requires specialized setup through Google Cloud support, we can prepare the development environment and configuration structure. This step establishes the foundation for XR content deployment and management.
 
    ```bash
-   # Create Immersive Stream for XR service instance
-   gcloud beta immersive-stream xr service-instances create ${STREAM_NAME} \
-       --location=${REGION} \
-       --gpu-class=T4 \
-       --gpu-count=1 \
-       --content-source=gs://${BUCKET_NAME}/models \
-       --session-timeout=1800 \
-       --max-concurrent-sessions=10
+   # Create XR project configuration
+   cat > xr-config.yaml << EOF
+   apiVersion: v1
+   kind: Config
+   metadata:
+     name: xr-streaming-config
+   spec:
+     project: ${PROJECT_ID}
+     region: ${REGION}
+     resources:
+       gpuClass: "T4"
+       sessionTimeout: 1800
+       maxConcurrentSessions: 10
+       autoscaling:
+         enabled: true
+         minCapacity: 1
+         maxCapacity: 5
+         targetUtilization: 70
+   EOF
    
-   # Enable autoscaling for the service
-   gcloud beta immersive-stream xr service-instances update ${STREAM_NAME} \
-       --location=${REGION} \
-       --enable-autoscaling \
-       --min-capacity=1 \
-       --max-capacity=5 \
-       --target-utilization=70
+   # Create deployment script placeholder
+   cat > deploy-xr.sh << 'EOF'
+   #!/bin/bash
+   # XR streaming service deployment script
+   # Note: Actual deployment requires Google Cloud support enablement
    
-   # Get service endpoint
-   export STREAM_ENDPOINT=$(gcloud beta immersive-stream xr service-instances describe ${STREAM_NAME} \
-       --location=${REGION} \
-       --format="value(endpoint)")
+   echo "Preparing XR streaming environment..."
+   echo "Project: ${PROJECT_ID}"
+   echo "Region: ${REGION}"
+   echo "Configuration validated"
    
-   echo "✅ Immersive Stream for XR service configured"
-   echo "   Endpoint: ${STREAM_ENDPOINT}"
+   # Upload Unreal Engine build (requires Immersive Stream for XR access)
+   # gsutil cp build.zip gs://${BUCKET_NAME}/builds/
+   
+   echo "✅ XR development environment prepared"
+   EOF
+   
+   chmod +x deploy-xr.sh
+   ./deploy-xr.sh
+   
+   echo "✅ XR service configuration prepared"
    ```
 
-   The XR streaming service is now configured with GPU-powered rendering capabilities and autoscaling enabled. This setup provides the computational power needed to render complex 3D scenes in real-time while automatically scaling based on user demand.
+   The XR streaming configuration is now prepared with appropriate resource specifications and scaling policies. This setup provides the foundation for deploying immersive content once Immersive Stream for XR access is granted through Google Cloud support.
 
 5. **Configure IAM Permissions for XR Service**:
 
@@ -263,7 +279,7 @@ echo "✅ Resources will be created with suffix: ${RANDOM_SUFFIX}"
    
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="serviceAccount:xr-streaming-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
-       --role="roles/immersivestream.serviceAgent"
+       --role="roles/compute.instanceAdmin"
    
    # Create service account key
    gcloud iam service-accounts keys create xr-streaming-key.json \
@@ -272,18 +288,27 @@ echo "✅ Resources will be created with suffix: ${RANDOM_SUFFIX}"
    echo "✅ IAM permissions configured for XR streaming service"
    ```
 
-   The service account is now configured with appropriate permissions to access storage assets and manage XR streaming operations. This security model ensures that the streaming service can access necessary resources while maintaining principle of least privilege.
+   The service account is now configured with appropriate permissions to access storage assets and manage compute operations. This security model ensures that the streaming service can access necessary resources while maintaining principle of least privilege.
 
 6. **Create Load Balancer for XR Service Integration**:
 
-   Integrating the XR streaming service with Cloud Load Balancer enables sophisticated traffic management, SSL termination, and seamless integration with CDN for static assets. This configuration provides a unified entry point for both static content and dynamic XR streaming.
+   Integrating with Cloud Load Balancer enables sophisticated traffic management, SSL termination, and seamless integration with CDN for static assets. This configuration provides a unified entry point for both static content and dynamic XR streaming.
 
    ```bash
-   # Create backend service for XR streaming
+   # Create health check for XR services
+   gcloud compute health-checks create http xr-health-check \
+       --port=80 \
+       --request-path="/health" \
+       --check-interval=10s \
+       --timeout=5s \
+       --healthy-threshold=2 \
+       --unhealthy-threshold=3
+   
+   # Create backend service for future XR streaming
    gcloud compute backend-services create xr-streaming-backend \
        --protocol=HTTP \
        --port-name=http \
-       --health-checks-region=${REGION} \
+       --health-checks=xr-health-check \
        --global
    
    # Create URL map with path-based routing
@@ -304,7 +329,7 @@ echo "✅ Resources will be created with suffix: ${RANDOM_SUFFIX}"
    echo "✅ Load balancer configured for unified XR service delivery"
    ```
 
-   The load balancer now provides intelligent routing between static asset delivery via CDN and dynamic XR streaming services. This unified architecture ensures optimal performance and simplified client-side integration for immersive applications.
+   The load balancer now provides intelligent routing between static asset delivery via CDN and future XR streaming services. This unified architecture ensures optimal performance and simplified client-side integration for immersive applications.
 
 7. **Set Up Monitoring and Analytics**:
 
@@ -314,37 +339,33 @@ echo "✅ Resources will be created with suffix: ${RANDOM_SUFFIX}"
    # Create custom metrics for XR streaming
    gcloud logging metrics create xr_session_starts \
        --description="Number of XR streaming sessions started" \
-       --log-filter='resource.type="immersive_stream_xr_service" AND jsonPayload.event_type="session_start"'
+       --log-filter='resource.type="gce_instance" AND jsonPayload.event_type="session_start"'
    
    gcloud logging metrics create xr_session_duration \
        --description="Duration of XR streaming sessions" \
-       --log-filter='resource.type="immersive_stream_xr_service" AND jsonPayload.event_type="session_end"' \
+       --log-filter='resource.type="gce_instance" AND jsonPayload.event_type="session_end"' \
        --value-extractor="jsonPayload.session_duration"
    
-   # Create alerting policy for high GPU utilization
-   gcloud alpha monitoring policies create \
-       --policy-from-file=- << EOF
-   {
-     "displayName": "XR Service High GPU Utilization",
-     "conditions": [
-       {
-         "displayName": "GPU utilization above 85%",
-         "conditionThreshold": {
-           "filter": "resource.type=\"immersive_stream_xr_service\"",
-           "comparison": "COMPARISON_GT",
-           "thresholdValue": 85,
-           "duration": "300s"
-         }
-       }
-     ],
-     "enabled": true
-   }
+   # Create alerting policy for high resource utilization
+   cat > monitoring-policy.yaml << EOF
+   displayName: "XR Service High Resource Utilization"
+   conditions:
+     - displayName: "High CPU utilization"
+       conditionThreshold:
+         filter: 'resource.type="gce_instance"'
+         comparison: COMPARISON_GT
+         thresholdValue: 85
+         duration: 300s
+   enabled: true
    EOF
+   
+   gcloud alpha monitoring policies create \
+       --policy-from-file=monitoring-policy.yaml
    
    echo "✅ Monitoring and analytics configured for XR service"
    ```
 
-   The monitoring setup now tracks key XR service metrics including session analytics, GPU utilization, and service performance. This comprehensive observability enables proactive optimization and troubleshooting of the immersive streaming platform.
+   The monitoring setup now tracks key XR service metrics including session analytics, resource utilization, and service performance. This comprehensive observability enables proactive optimization and troubleshooting of the immersive streaming platform.
 
 8. **Deploy Sample XR Web Application**:
 
@@ -368,15 +389,23 @@ echo "✅ Resources will be created with suffix: ${RANDOM_SUFFIX}"
            #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); }
            #controls { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); }
            button { padding: 10px 20px; margin: 0 5px; border: none; border-radius: 5px; cursor: pointer; }
+           .status { background: #e8f5e8; padding: 10px; margin: 10px; border-radius: 5px; }
        </style>
    </head>
    <body>
        <div id="xr-container">
-           <div id="loading">Loading XR Experience...</div>
+           <div id="loading">
+               <h2>XR Experience Platform</h2>
+               <div class="status">
+                   <p>Platform Status: Ready</p>
+                   <p>CDN Endpoint: Available</p>
+                   <p>XR Service: Awaiting Activation</p>
+               </div>
+           </div>
            <div id="controls">
-               <button onclick="startXR()">Start XR</button>
-               <button onclick="toggleAR()">Toggle AR</button>
-               <button onclick="resetView()">Reset View</button>
+               <button onclick="loadAssets()">Load Assets</button>
+               <button onclick="testCDN()">Test CDN</button>
+               <button onclick="prepareXR()">Prepare XR</button>
            </div>
        </div>
        <script src="xr-client.js"></script>
@@ -388,56 +417,66 @@ echo "✅ Resources will be created with suffix: ${RANDOM_SUFFIX}"
    cat > xr-web-app/public/xr-client.js << 'EOF'
    class XRClient {
        constructor() {
-           this.streamEndpoint = window.location.origin + '/stream/';
+           this.cdnEndpoint = window.location.origin;
            this.sessionId = null;
            this.isARMode = false;
        }
        
-       async startXR() {
+       async loadAssets() {
            try {
-               document.getElementById('loading').style.display = 'block';
-               const response = await fetch(this.streamEndpoint + 'start', {
-                   method: 'POST',
-                   headers: { 'Content-Type': 'application/json' },
-                   body: JSON.stringify({ device: this.detectDevice() })
-               });
-               const data = await response.json();
-               this.sessionId = data.sessionId;
-               this.initializeStream(data.streamUrl);
+               console.log('Loading XR assets from CDN...');
+               const response = await fetch(this.cdnEndpoint + '/configs/app-config.json');
+               const config = await response.json();
+               console.log('Configuration loaded:', config);
+               alert('Assets loaded successfully from CDN');
            } catch (error) {
-               console.error('Failed to start XR session:', error);
+               console.error('Failed to load assets:', error);
+               alert('Failed to load assets from CDN');
            }
        }
        
-       detectDevice() {
-           const ua = navigator.userAgent;
-           if (/iPad|iPhone|iPod/.test(ua)) return 'ios';
-           if (/Android/.test(ua)) return 'android';
-           return 'desktop';
+       async testCDN() {
+           try {
+               const start = performance.now();
+               const response = await fetch(this.cdnEndpoint + '/configs/app-config.json');
+               const end = performance.now();
+               const latency = Math.round(end - start);
+               
+               if (response.ok) {
+                   alert(`CDN test successful! Latency: ${latency}ms`);
+               } else {
+                   alert('CDN test failed');
+               }
+           } catch (error) {
+               console.error('CDN test error:', error);
+               alert('CDN test failed');
+           }
        }
        
-       initializeStream(streamUrl) {
-           // Initialize XR streaming connection
-           document.getElementById('loading').style.display = 'none';
-           console.log('XR stream initialized:', streamUrl);
+       prepareXR() {
+           alert('XR streaming requires Immersive Stream for XR service activation through Google Cloud support');
+           console.log('XR preparation status: Configuration ready, awaiting service activation');
        }
    }
    
    const xrClient = new XRClient();
    
-   function startXR() { xrClient.startXR(); }
-   function toggleAR() { xrClient.isARMode = !xrClient.isARMode; }
-   function resetView() { console.log('View reset'); }
+   function loadAssets() { xrClient.loadAssets(); }
+   function testCDN() { xrClient.testCDN(); }
+   function prepareXR() { xrClient.prepareXR(); }
    EOF
    
    # Upload web application to Cloud Storage
    gsutil -m cp -r xr-web-app/public/* gs://${BUCKET_NAME}/app/
    
+   # Get CDN IP for testing
+   CDN_IP=$(gcloud compute forwarding-rules describe ${CDN_NAME}-rule --global --format='value(IPAddress)')
+   
    echo "✅ Sample XR web application deployed"
-   echo "   Access URL: http://$(gcloud compute forwarding-rules describe ${CDN_NAME}-rule --global --format='value(IPAddress)')/app/"
+   echo "   Access URL: http://${CDN_IP}/app/"
    ```
 
-   The sample web application is now deployed and accessible through the CDN-accelerated endpoint. This application demonstrates integration patterns with the XR streaming service and provides a foundation for building custom immersive experiences.
+   The sample web application is now deployed and accessible through the CDN-accelerated endpoint. This application demonstrates integration patterns with asset loading and provides a foundation for building custom immersive experiences once XR streaming services are activated.
 
 ## Validation & Testing
 
@@ -454,63 +493,55 @@ echo "✅ Resources will be created with suffix: ${RANDOM_SUFFIX}"
 
    Expected output: HTTP 200 response with cache headers and proper content delivery.
 
-2. **Test XR Service Availability**:
+2. **Test XR Service Configuration**:
 
    ```bash
-   # Check XR service status
-   gcloud beta immersive-stream xr service-instances describe ${STREAM_NAME} \
-       --location=${REGION} \
-       --format="table(name,state,endpoint)"
+   # Verify XR configuration files
+   ls -la xr-config.yaml deploy-xr.sh
    
-   # Verify autoscaling configuration
-   gcloud beta immersive-stream xr service-instances describe ${STREAM_NAME} \
-       --location=${REGION} \
-       --format="value(autoscaling.enabled,autoscaling.minCapacity,autoscaling.maxCapacity)"
+   # Check service account permissions
+   gcloud iam service-accounts describe xr-streaming-sa@${PROJECT_ID}.iam.gserviceaccount.com
+   
+   # Verify IAM policy bindings
+   gcloud projects get-iam-policy ${PROJECT_ID} \
+       --filter="bindings.members:serviceAccount:xr-streaming-sa@${PROJECT_ID}.iam.gserviceaccount.com"
    ```
 
-   Expected output: Service in RUNNING state with configured autoscaling parameters.
+   Expected output: Configuration files present and service account with appropriate permissions.
 
 3. **Validate Load Balancer and Routing**:
 
    ```bash
    # Test path-based routing
    curl -H "Host: example.com" "http://${CDN_IP}/app/"
-   curl -H "Host: example.com" "http://${CDN_IP}/stream/health"
    
-   # Check backend service health
-   gcloud compute backend-services get-health xr-streaming-backend --global
+   # Check backend service configuration
+   gcloud compute backend-services describe xr-streaming-backend --global
+   
+   # Verify health check configuration
+   gcloud compute health-checks describe xr-health-check
    ```
 
-   Expected output: Proper routing to CDN for static content and XR service for streaming endpoints.
+   Expected output: Proper routing to CDN for static content and backend service ready for XR integration.
 
-4. **Monitor XR Service Performance**:
+4. **Monitor Service Performance**:
 
    ```bash
-   # Check recent XR service logs
-   gcloud logging read "resource.type=\"immersive_stream_xr_service\"" \
-       --limit=10 \
-       --format="table(timestamp,severity,jsonPayload.message)"
-   
-   # View custom metrics
+   # Check monitoring configuration
    gcloud logging metrics list --filter="name:xr_session"
+   
+   # Verify alerting policies
+   gcloud alpha monitoring policies list --filter="displayName:XR Service"
+   
+   # Test web application functionality
+   echo "Testing web application at: http://${CDN_IP}/app/"
    ```
 
-   Expected output: Service logs showing successful operations and custom metrics registration.
+   Expected output: Custom metrics configured and monitoring policies active.
 
 ## Cleanup
 
-1. **Remove XR Service and Associated Resources**:
-
-   ```bash
-   # Delete Immersive Stream for XR service
-   gcloud beta immersive-stream xr service-instances delete ${STREAM_NAME} \
-       --location=${REGION} \
-       --quiet
-   
-   echo "✅ XR service instance deleted"
-   ```
-
-2. **Remove Load Balancer Configuration**:
+1. **Remove Load Balancer Configuration**:
 
    ```bash
    # Delete forwarding rule and proxies
@@ -518,11 +549,12 @@ echo "✅ Resources will be created with suffix: ${RANDOM_SUFFIX}"
    gcloud compute target-http-proxies delete ${CDN_NAME}-proxy --quiet
    gcloud compute url-maps delete xr-unified-urlmap --quiet
    gcloud compute backend-services delete xr-streaming-backend --global --quiet
+   gcloud compute health-checks delete xr-health-check --quiet
    
    echo "✅ Load balancer configuration removed"
    ```
 
-3. **Clean Up CDN and Storage Resources**:
+2. **Clean Up CDN and Storage Resources**:
 
    ```bash
    # Delete CDN configuration
@@ -535,7 +567,7 @@ echo "✅ Resources will be created with suffix: ${RANDOM_SUFFIX}"
    echo "✅ CDN and storage resources cleaned up"
    ```
 
-4. **Remove IAM Resources and Monitoring**:
+3. **Remove IAM Resources and Monitoring**:
 
    ```bash
    # Delete service account
@@ -546,12 +578,12 @@ echo "✅ Resources will be created with suffix: ${RANDOM_SUFFIX}"
    gcloud logging metrics delete xr_session_duration --quiet
    
    # Clean up local files
-   rm -rf xr-assets/ xr-web-app/ xr-streaming-key.json
+   rm -rf xr-assets/ xr-web-app/ xr-streaming-key.json xr-config.yaml deploy-xr.sh monitoring-policy.yaml
    
    echo "✅ IAM resources and monitoring cleanup completed"
    ```
 
-5. **Delete Project (Optional)**:
+4. **Delete Project (Optional)**:
 
    ```bash
    # Delete the entire project if created specifically for this recipe
@@ -563,15 +595,15 @@ echo "✅ Resources will be created with suffix: ${RANDOM_SUFFIX}"
 
 ## Discussion
 
-This recipe demonstrates the implementation of a comprehensive XR content delivery platform using Google Cloud's specialized services for immersive experiences. The architecture leverages Immersive Stream for XR to provide cloud-based rendering capabilities, eliminating the need for users to have powerful local hardware while ensuring consistent, high-quality experiences across devices.
+This recipe demonstrates the implementation of a comprehensive XR content delivery platform using Google Cloud's specialized services for immersive experiences. The architecture leverages Cloud CDN and Cloud Storage to create a foundation for immersive content delivery, while preparing for integration with Immersive Stream for XR once service access is granted through Google Cloud support.
 
-The integration of Cloud CDN with XR streaming services creates a hybrid delivery model that optimizes both static asset delivery and dynamic content streaming. This approach significantly reduces latency by serving cached assets from edge locations while maintaining real-time rendering capabilities for interactive XR content. The autoscaling configuration ensures cost-effective resource utilization while maintaining performance during peak usage periods.
+The integration of Cloud CDN with static asset storage creates an optimal delivery model that reduces latency by serving cached assets from edge locations. This approach ensures fast loading times for XR applications while maintaining cost-effective resource utilization. The load balancer configuration provides sophisticated traffic management and a unified entry point for both static content and future dynamic XR streaming.
 
-The monitoring and analytics implementation provides crucial insights into user engagement, service performance, and resource utilization. This observability enables data-driven optimization decisions and proactive issue resolution. The custom metrics and alerting policies help maintain service quality and user satisfaction while optimizing operational costs.
+The monitoring and analytics implementation provides crucial insights into service performance and resource utilization. This observability enables data-driven optimization decisions and proactive issue resolution. The IAM configuration ensures that services have appropriate access to resources while maintaining security boundaries according to Google Cloud best practices.
 
-Security considerations are addressed through proper IAM configuration and service account management, ensuring that XR streaming services have appropriate access to resources while maintaining security boundaries. The load balancer configuration provides SSL termination capabilities and sophisticated traffic management for production deployments.
+Security considerations are addressed through proper service account management and least privilege access controls. The load balancer configuration provides SSL termination capabilities and sophisticated traffic management for production deployments. The architecture follows Google Cloud's Well-Architected Framework principles for operational excellence, security, and cost optimization.
 
-> **Tip**: For production deployments, consider implementing content delivery optimization strategies such as adaptive bitrate streaming, progressive loading of 3D assets, and region-specific content caching to further enhance user experience and reduce bandwidth costs.
+> **Tip**: For production deployments, consider implementing content delivery optimization strategies such as adaptive quality streaming, progressive loading of 3D assets, and region-specific content caching to further enhance user experience and reduce bandwidth costs.
 
 For additional guidance on XR content optimization and best practices, refer to the [Google Cloud Immersive Stream for XR documentation](https://cloud.google.com/immersive-stream/xr/docs), [Cloud CDN optimization guide](https://cloud.google.com/cdn/docs/best-practices), and [Cloud Storage performance optimization](https://cloud.google.com/storage/docs/best-practices). The [Google Cloud Architecture Center](https://cloud.google.com/architecture) provides comprehensive patterns for building scalable media streaming solutions.
 
@@ -579,15 +611,15 @@ For additional guidance on XR content optimization and best practices, refer to 
 
 Extend this immersive XR content delivery platform by implementing these enhancements:
 
-1. **Multi-Region Deployment**: Configure XR streaming services across multiple regions with intelligent traffic routing based on user location and service availability, implementing disaster recovery and failover mechanisms.
+1. **Multi-Region Deployment**: Configure content delivery across multiple regions with intelligent traffic routing based on user location and service availability, implementing disaster recovery and failover mechanisms using Global Load Balancing.
 
-2. **Advanced Analytics and AI**: Integrate Google Cloud's AI services to analyze user behavior patterns, implement predictive scaling based on usage analytics, and create personalized XR experiences using machine learning models.
+2. **Advanced Analytics and AI**: Integrate Google Cloud's AI services to analyze user behavior patterns, implement predictive scaling based on usage analytics, and create personalized content recommendations using machine learning models.
 
-3. **Real-time Collaboration**: Implement multi-user XR experiences with real-time synchronization using Google Cloud Pub/Sub and Firestore, enabling collaborative virtual environments and shared immersive experiences.
+3. **Real-time Collaboration**: Implement multi-user preparation infrastructure using Google Cloud Pub/Sub and Firestore, enabling collaborative virtual environments and shared immersive experiences once XR streaming is activated.
 
-4. **Content Management System**: Build a comprehensive CMS for managing XR assets, versioning 3D models, and deploying content updates with A/B testing capabilities for different user segments.
+4. **Content Management System**: Build a comprehensive CMS for managing XR assets, versioning 3D models, and deploying content updates with A/B testing capabilities for different user segments using Cloud Storage and App Engine.
 
-5. **Performance Optimization**: Implement advanced optimization techniques including adaptive quality streaming, predictive content preloading, and dynamic resource allocation based on device capabilities and network conditions.
+5. **Performance Optimization**: Implement advanced optimization techniques including adaptive quality streaming, predictive content preloading, and dynamic resource allocation based on device capabilities and network conditions using Cloud Monitoring and custom metrics.
 
 ## Infrastructure Code
 

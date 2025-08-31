@@ -1,0 +1,506 @@
+# Infrastructure Manager configuration for Simple Habit Tracker
+# This configuration deploys a serverless habit tracking system using
+# Cloud Functions and Firestore following Google Cloud best practices
+
+metadata:
+  version: "1.0"
+  description: "Simple Habit Tracker with Cloud Functions and Firestore"
+  author: "Cloud Recipe Generator"
+
+# Import required resource types for serverless infrastructure
+imports:
+  - path: https://www.googleapis.com/compute/v1/
+    type: gcp-types/compute-v1
+  - path: https://www.googleapis.com/cloudfunctions/v1/
+    type: gcp-types/cloudfunctions-v1
+  - path: https://www.googleapis.com/firestore/v1/
+    type: gcp-types/firestore-v1
+  - path: https://www.googleapis.com/serviceusage/v1/
+    type: gcp-types/serviceusage-v1
+
+# Input parameters for customizable deployment
+inputs:
+  - name: project_id
+    type: string
+    description: "Google Cloud Project ID for resource deployment"
+    required: true
+  
+  - name: region
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    required: false
+  
+  - name: function_name
+    type: string
+    description: "Name of the Cloud Function"
+    default: "habit-tracker"
+    required: false
+  
+  - name: database_location
+    type: string
+    description: "Firestore database location (region)"
+    default: "us-central1"
+    required: false
+  
+  - name: environment_labels
+    type: object
+    description: "Labels to apply to all resources"
+    default:
+      environment: "development"
+      application: "habit-tracker"
+      managed-by: "infrastructure-manager"
+    required: false
+
+# Resource definitions for the serverless habit tracker
+resources:
+  # Enable required Google Cloud APIs for the serverless infrastructure
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudfunctions.googleapis.com
+      consumerId: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: enable-firestore-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/firestore.googleapis.com
+      consumerId: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudbuild.googleapis.com
+      consumerId: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Project resource reference for API operations
+  - name: project_id
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(inputs.project_id)
+
+  # Create Firestore database in Native mode for real-time capabilities
+  # Native mode provides ACID transactions, real-time updates, and subcollections
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/$(inputs.project_id)
+      databaseId: "(default)"
+      database:
+        type: FIRESTORE_NATIVE
+        locationId: $(inputs.database_location)
+        concurrencyMode: OPTIMISTIC
+        appEngineIntegrationMode: DISABLED
+      labels: $(inputs.environment_labels)
+    metadata:
+      dependsOn:
+        - enable-firestore-api
+        - project_id
+
+  # Cloud Function for serverless REST API endpoints
+  # Handles all CRUD operations for habit tracking with automatic scaling
+  - name: habit-tracker-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(inputs.project_id)/locations/$(inputs.region)
+      function:
+        name: projects/$(inputs.project_id)/locations/$(inputs.region)/functions/$(inputs.function_name)
+        description: "Serverless REST API for habit tracking with Firestore backend"
+        
+        # Source code configuration - supports inline code or Cloud Source Repository
+        sourceArchiveUrl: gs://$(inputs.project_id)-function-source/habit-tracker-source.zip
+        
+        # Runtime environment configuration
+        runtime: python312
+        entryPoint: habit_tracker
+        
+        # Resource allocation for optimal performance and cost
+        availableMemoryMb: 256
+        timeout: 60s
+        maxInstances: 100
+        minInstances: 0
+        
+        # HTTP trigger configuration for REST API access
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+          
+        # Environment variables for application configuration
+        environmentVariables:
+          FIRESTORE_PROJECT_ID: $(inputs.project_id)
+          FIRESTORE_COLLECTION: "habits"
+          FUNCTION_TARGET: "habit_tracker"
+          PYTHON_VERSION: "3.12"
+        
+        # IAM bindings for Firestore access
+        serviceAccountEmail: $(ref.function-service-account.email)
+        
+        # Labels for resource organization and cost tracking
+        labels: $(inputs.environment_labels)
+        
+        # Ingress settings for security
+        ingressSettings: ALLOW_ALL
+        
+        # VPC connector settings (optional for advanced networking)
+        # vpcConnector: projects/$(inputs.project_id)/locations/$(inputs.region)/connectors/habit-tracker-connector
+        
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - firestore-database
+        - function-service-account
+        - function-source-bucket
+
+  # Dedicated service account for Cloud Function with minimal required permissions
+  # Follows principle of least privilege for security best practices
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      name: projects/$(inputs.project_id)
+      accountId: habit-tracker-function-sa
+      serviceAccount:
+        displayName: "Habit Tracker Function Service Account"
+        description: "Service account for Cloud Function with Firestore access"
+        disabled: false
+    metadata:
+      dependsOn:
+        - project_id
+
+  # IAM binding for Firestore access - grants datastore user role
+  # Provides read/write access to Firestore collections and documents
+  - name: function-firestore-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(inputs.project_id)
+      policy:
+        bindings:
+          - role: roles/datastore.user
+            members:
+              - serviceAccount:$(ref.function-service-account.email)
+          - role: roles/logging.logWriter
+            members:
+              - serviceAccount:$(ref.function-service-account.email)
+          - role: roles/monitoring.metricWriter
+            members:
+              - serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # Cloud Storage bucket for function source code deployment
+  # Stores the zipped source code for Cloud Functions deployment
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(inputs.project_id)-function-source
+      project: $(inputs.project_id)
+      location: $(inputs.region)
+      
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              
+      # Versioning disabled for simplicity (enable for production)
+      versioning:
+        enabled: false
+        
+      # Uniform bucket-level access for simplified IAM
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+          
+      # Labels for resource organization
+      labels: $(inputs.environment_labels)
+      
+      # Storage class for cost optimization
+      storageClass: STANDARD
+      
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Cloud Storage bucket IAM binding for function deployment
+  # Allows Cloud Functions service to access source code
+  - name: bucket-function-access
+    type: gcp-types/storage-v1:buckets.iamPolicy
+    properties:
+      bucket: $(ref.function-source-bucket.name)
+      policy:
+        bindings:
+          - role: roles/storage.objectViewer
+            members:
+              - serviceAccount:$(ref.function-service-account.email)
+              - serviceAccount:$(inputs.project_id)@cloudbuild.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - function-source-bucket
+        - function-service-account
+
+  # Cloud Monitoring alert policy for function errors (optional)
+  # Provides proactive monitoring for production deployments
+  - name: function-error-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      name: projects/$(inputs.project_id)
+      alertPolicy:
+        displayName: "Habit Tracker Function Errors"
+        documentation:
+          content: "Alert when habit tracker function has high error rate"
+          mimeType: "text/markdown"
+        
+        # Condition for triggering alerts
+        conditions:
+          - displayName: "Cloud Function Error Rate"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.label.function_name="$(inputs.function_name)"'
+              comparison: COMPARISON_GT
+              thresholdValue:
+                doubleValue: 0.1
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.label.function_name
+        
+        # Notification channels (configure externally)
+        # notificationChannels: []
+        
+        # Alert policy settings
+        enabled: true
+        combiner: OR
+        
+    metadata:
+      dependsOn:
+        - habit-tracker-function
+
+# Output values for verification and integration
+outputs:
+  - name: function_url
+    description: "HTTPS URL for the deployed Cloud Function API"
+    value: $(ref.habit-tracker-function.httpsTrigger.url)
+  
+  - name: function_name
+    description: "Full name of the deployed Cloud Function"
+    value: $(ref.habit-tracker-function.name)
+  
+  - name: firestore_database
+    description: "Firestore database name and location"
+    value: $(ref.firestore-database.name)
+  
+  - name: service_account_email
+    description: "Email of the function's service account"
+    value: $(ref.function-service-account.email)
+  
+  - name: source_bucket_name
+    description: "Cloud Storage bucket for function source code"
+    value: $(ref.function-source-bucket.name)
+  
+  - name: project_id
+    description: "Google Cloud Project ID used for deployment"
+    value: $(inputs.project_id)
+  
+  - name: region
+    description: "Deployed region for all resources"
+    value: $(inputs.region)
+
+# Deployment configuration and best practices
+deploymentConfig:
+  # Deployment strategy for zero-downtime updates
+  preview: true
+  
+  # Resource update policies
+  updatePolicy:
+    type: PROACTIVE
+    
+  # Rollback configuration
+  rollbackConfig:
+    enabled: true
+    
+  # Resource deletion protection for production
+  deletionProtection:
+    - firestore-database
+    - function-source-bucket
+
+# Security and compliance configurations
+securityConfig:
+  # Enable audit logging for compliance
+  auditLogs:
+    - service: cloudfunctions.googleapis.com
+      auditLogConfigs:
+        - logType: ADMIN_READ
+        - logType: DATA_READ
+        - logType: DATA_WRITE
+    
+    - service: firestore.googleapis.com
+      auditLogConfigs:
+        - logType: ADMIN_READ
+        - logType: DATA_READ
+        - logType: DATA_WRITE
+  
+  # VPC Service Controls (configure externally for production)
+  # vpcServiceControls:
+  #   enabled: true
+  #   perimeter: "projects/$(inputs.project_id)/accessPolicies/YOUR_POLICY_ID/servicePerimeters/YOUR_PERIMETER_NAME"
+
+# Cost optimization and resource management
+costOptimization:
+  # Automatic scaling configuration
+  autoScaling:
+    enabled: true
+    minInstances: 0
+    maxInstances: 100
+  
+  # Resource scheduling (for batch workloads)
+  scheduling:
+    preemptible: false  # Set to true for development environments
+  
+  # Budget alerts (configure externally)
+  budgetAlerts:
+    enabled: false
+    threshold: 50.0  # USD monthly budget threshold
+
+# Monitoring and observability configuration
+monitoring:
+  # Enable detailed monitoring
+  enableDetailedMonitoring: true
+  
+  # Custom metrics (configure in function code)
+  customMetrics:
+    - name: "habit_completions"
+      description: "Number of habits marked as completed"
+      type: "COUNTER"
+    
+    - name: "api_request_duration"
+      description: "Duration of API requests in milliseconds"
+      type: "HISTOGRAM"
+  
+  # Log retention policy
+  logRetentionDays: 30
+  
+  # Tracing configuration
+  tracing:
+    enabled: true
+    samplingRate: 0.1  # 10% sampling for performance
+
+# Disaster recovery and backup configuration
+disasterRecovery:
+  # Firestore backup configuration
+  firestoreBackup:
+    enabled: true
+    schedule: "0 2 * * *"  # Daily at 2 AM UTC
+    retentionDays: 7
+  
+  # Multi-region deployment (for production)
+  multiRegion:
+    enabled: false
+    regions:
+      - us-central1
+      - us-east1
+  
+  # Point-in-time recovery
+  pointInTimeRecovery:
+    enabled: true
+    retentionDays: 7
+
+# Development and testing configurations
+development:
+  # Local development support
+  localDevelopment:
+    emulatorSupport: true
+    testDataSeeding: true
+  
+  # CI/CD integration
+  cicd:
+    provider: "Cloud Build"
+    triggerOnCommit: true
+    runTests: true
+    deploymentApproval: false  # Set to true for production
+  
+  # Feature flags (implement in application code)
+  featureFlags:
+    enabled: true
+    provider: "Firebase Remote Config"
+
+# Documentation and metadata
+documentation:
+  readme: |
+    # Simple Habit Tracker Infrastructure
+    
+    This Infrastructure Manager configuration deploys a serverless habit tracking
+    system using Google Cloud Functions and Firestore.
+    
+    ## Architecture
+    - Cloud Functions: REST API endpoints for CRUD operations
+    - Firestore: NoSQL database for habit data storage
+    - Cloud Storage: Source code storage for function deployment
+    - IAM: Service accounts and permissions for security
+    
+    ## Deployment
+    ```bash
+    gcloud infra-manager deployments apply habit-tracker-deployment \
+        --location=us-central1 \
+        --source=. \
+        --input-values=project_id=YOUR_PROJECT_ID
+    ```
+    
+    ## API Endpoints
+    - POST /: Create new habit
+    - GET /: List all habits or get specific habit by ID
+    - PUT /?id={id}: Update existing habit
+    - DELETE /?id={id}: Delete habit
+    
+    ## Security Features
+    - Least privilege IAM roles
+    - HTTPS-only communication
+    - Service account isolation
+    - Audit logging enabled
+    
+    ## Cost Optimization
+    - Automatic scaling (0 to 100 instances)
+    - Pay-per-use pricing model
+    - Resource lifecycle management
+    - Storage class optimization
+    
+    ## Monitoring
+    - Error rate alerting
+    - Custom metrics collection
+    - Distributed tracing
+    - Centralized logging
+  
+  # API documentation
+  apiDocumentation:
+    format: "OpenAPI 3.0"
+    location: "gs://$(inputs.project_id)-function-source/api-docs.yaml"
+  
+  # Architecture diagram
+  architectureDiagram:
+    format: "mermaid"
+    location: "gs://$(inputs.project_id)-function-source/architecture.md"
+
+# Version and compatibility information
+compatibility:
+  infrastructureManagerVersion: "1.0+"
+  googleCloudApiVersions:
+    cloudfunctions: "v1"
+    firestore: "v1"
+    storage: "v1"
+    iam: "v1"
+    monitoring: "v1"
+  
+  # Terraform equivalency (for migration reference)
+  terraformCompatible: true
+  terraformVersion: "1.0+"

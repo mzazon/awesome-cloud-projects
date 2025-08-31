@@ -6,16 +6,16 @@ difficulty: 300
 subject: aws
 services: amazon-lex, aws-lambda, dynamodb, amazon-connect
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: chatbot, natural-language-processing, customer-service, conversational-ai
 recipe-generator-version: 1.3
 ---
 
-# Customer Service Chatbots with Lex
+# Customer Service Chatbots with Amazon Lex
 
 ## Problem
 
@@ -386,10 +386,10 @@ EOF
    # Wait for IAM role to propagate
    sleep 15
    
-   # Create Lambda function
+   # Create Lambda function with Python 3.12 runtime
    aws lambda create-function \
        --function-name "$LAMBDA_FUNCTION_NAME" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "$LAMBDA_ROLE_ARN" \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda_function.zip \
@@ -404,7 +404,7 @@ EOF
    echo "✅ Lambda function deployed: $LAMBDA_FUNCTION_ARN"
    ```
 
-   The Lambda function is now deployed and ready for integration with Amazon Lex. The function ARN is stored for later use in configuring the chatbot's fulfillment capabilities, enabling real-time processing of customer service requests.
+   The Lambda function is now deployed with the latest Python 3.12 runtime and ready for integration with Amazon Lex. The function ARN is stored for later use in configuring the chatbot's fulfillment capabilities, enabling real-time processing of customer service requests.
 
 5. **Create Amazon Lex Bot**:
 
@@ -439,8 +439,7 @@ EOF
        --locale-id "en_US" \
        --description "English US locale for customer service bot" \
        --nlu-intent-confidence-threshold 0.40 \
-       --voice-settings voiceId=Joanna \
-       --region "$AWS_REGION"
+       --voice-settings voiceId=Joanna
    
    # Wait for locale creation
    sleep 10
@@ -521,12 +520,6 @@ EOF
            {"utterance": "Track my order {CustomerId}"},
            {"utterance": "Order status for {CustomerId}"},
            {"utterance": "My customer ID is {CustomerId}"}
-       ]' \
-       --slot-priorities '[
-           {
-               "priority": 1,
-               "slotId": "CustomerId"
-           }
        ]'
    
    # Wait between intent creations
@@ -546,12 +539,6 @@ EOF
            {"utterance": "Billing information for {CustomerId}"},
            {"utterance": "Account balance for customer {CustomerId}"},
            {"utterance": "My balance please"}
-       ]' \
-       --slot-priorities '[
-           {
-               "priority": 1,
-               "slotId": "CustomerId"
-           }
        ]'
    
    sleep 5
@@ -569,12 +556,6 @@ EOF
            {"utterance": "What can you tell me about {ProductName}"},
            {"utterance": "I want to know about {ProductName}"},
            {"utterance": "Details about your {ProductName}"}
-       ]' \
-       --slot-priorities '[
-           {
-               "priority": 1,
-               "slotId": "ProductName"
-           }
        ]'
    
    echo "✅ Bot intents created"

@@ -1,0 +1,358 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Budget Monitoring with AWS Budgets and SNS
+  Creates a comprehensive budget monitoring system with automated cost alerts
+  and notifications through Amazon SNS email delivery
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Budget Configuration
+        Parameters:
+          - BudgetName
+          - BudgetAmount
+          - BudgetCurrency
+          - TimeUnit
+      - Label:
+          default: Notification Settings
+        Parameters:
+          - NotificationEmail
+          - SNSTopicName
+          - ActualThreshold1
+          - ActualThreshold2
+          - ForecastThreshold
+      - Label:
+          default: Advanced Budget Settings
+        Parameters:
+          - IncludeCredit
+          - IncludeDiscount
+          - IncludeSupport
+          - IncludeTax
+    ParameterLabels:
+      BudgetName:
+        default: Budget Name
+      BudgetAmount:
+        default: Monthly Budget Limit
+      NotificationEmail:
+        default: Email Address for Alerts
+      SNSTopicName:
+        default: SNS Topic Name
+
+# Input Parameters
+Parameters:
+  BudgetName:
+    Type: String
+    Description: Name for the AWS Budget (must be unique within account)
+    Default: monthly-cost-budget
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: ^[a-zA-Z0-9_\-\.]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, underscores, and periods
+
+  BudgetAmount:
+    Type: Number
+    Description: Monthly budget limit in USD
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000000
+    ConstraintDescription: Must be between $1 and $1,000,000
+
+  BudgetCurrency:
+    Type: String
+    Description: Currency for budget amount
+    Default: USD
+    AllowedValues:
+      - USD
+      - EUR
+      - GBP
+      - JPY
+      - AUD
+      - CAD
+      - CHF
+      - CNY
+      - SEK
+      - NZD
+
+  TimeUnit:
+    Type: String
+    Description: Time unit for budget period
+    Default: MONTHLY
+    AllowedValues:
+      - DAILY
+      - MONTHLY
+      - QUARTERLY
+      - ANNUALLY
+
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive budget notifications
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+    ConstraintDescription: Must be a valid email address
+
+  SNSTopicName:
+    Type: String
+    Description: Name for the SNS topic that will deliver budget alerts
+    Default: budget-alerts
+    MinLength: 1
+    MaxLength: 256
+    AllowedPattern: ^[a-zA-Z0-9_\-]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+
+  ActualThreshold1:
+    Type: Number
+    Description: First actual spending threshold (percentage)
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+
+  ActualThreshold2:
+    Type: Number
+    Description: Second actual spending threshold (percentage)
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+    ConstraintDescription: Must be between 1 and 1000
+
+  ForecastThreshold:
+    Type: Number
+    Description: Forecasted spending threshold (percentage)
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+
+  # Advanced Budget Settings
+  IncludeCredit:
+    Type: String
+    Description: Include credits in budget calculations
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  IncludeDiscount:
+    Type: String
+    Description: Include discounts in budget calculations
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  IncludeSupport:
+    Type: String
+    Description: Include support charges in budget calculations
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  IncludeTax:
+    Type: String
+    Description: Include tax in budget calculations
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+# Conditions for conditional resource creation
+Conditions:
+  # Condition to check if we should create email subscription
+  CreateEmailSubscription: !Not [!Equals [!Ref NotificationEmail, '']]
+  
+  # Condition for quarterly or annual budgets (different time period handling)
+  IsLongTermBudget: !Or
+    - !Equals [!Ref TimeUnit, QUARTERLY]
+    - !Equals [!Ref TimeUnit, ANNUALLY]
+
+# AWS Resources
+Resources:
+  # SNS Topic for Budget Notifications
+  BudgetAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref SNSTopicName
+      DisplayName: !Sub '${BudgetName} Budget Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Purpose
+          Value: BudgetMonitoring
+        - Key: BudgetName
+          Value: !Ref BudgetName
+        - Key: CreatedBy
+          Value: CloudFormation
+
+  # SNS Topic Policy to allow AWS Budgets to publish messages
+  BudgetAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref BudgetAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: BudgetAlertsTopicPolicy
+        Statement:
+          - Sid: AllowBudgetsToPublish
+            Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action:
+              - SNS:Publish
+            Resource: !Ref BudgetAlertsTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # Email Subscription to SNS Topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailSubscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref BudgetAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # AWS Budget with Multiple Notification Thresholds
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Ref BudgetName
+        BudgetLimit:
+          Amount: !Ref BudgetAmount
+          Unit: !Ref BudgetCurrency
+        TimeUnit: !Ref TimeUnit
+        BudgetType: COST
+        CostFilters: {}
+        TimePeriod:
+          Start: !Sub
+            - '${Year}-${Month}-01'
+            - Year: !Select [0, !Split ['-', !Sub '${AWS::Region}']]
+              Month: !Select [1, !Split ['-', !Sub '${AWS::Region}']]
+        CostTypes:
+          IncludeCredit: !Ref IncludeCredit
+          IncludeDiscount: !Ref IncludeDiscount
+          IncludeOtherSubscription: true
+          IncludeRecurring: true
+          IncludeRefund: true
+          IncludeSubscription: true
+          IncludeSupport: !Ref IncludeSupport
+          IncludeTax: !Ref IncludeTax
+          IncludeUpfront: true
+          UseBlended: false
+          UseAmortized: false
+      NotificationsWithSubscribers:
+        # 80% Actual Spending Alert
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: !Ref ActualThreshold1
+            ThresholdType: PERCENTAGE
+            NotificationState: ALARM
+          Subscribers:
+            - Address: !Ref BudgetAlertsTopic
+              SubscriptionType: SNS
+        # 100% Actual Spending Alert
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: !Ref ActualThreshold2
+            ThresholdType: PERCENTAGE
+            NotificationState: ALARM
+          Subscribers:
+            - Address: !Ref BudgetAlertsTopic
+              SubscriptionType: SNS
+        # 80% Forecasted Spending Alert
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: FORECASTED
+            Threshold: !Ref ForecastThreshold
+            ThresholdType: PERCENTAGE
+            NotificationState: ALARM
+          Subscribers:
+            - Address: !Ref BudgetAlertsTopic
+              SubscriptionType: SNS
+
+  # CloudWatch Alarm for Budget Monitoring (Optional Enhancement)
+  BudgetMonitoringAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${BudgetName}-monitoring-alarm'
+      AlarmDescription: !Sub 'Monitors the health of budget ${BudgetName} notification system'
+      MetricName: NumberOfMessagesPublished
+      Namespace: AWS/SNS
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TopicName
+          Value: !GetAtt BudgetAlertsTopic.TopicName
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BudgetAlertsTopic
+
+# Stack Outputs
+Outputs:
+  BudgetName:
+    Description: Name of the created budget
+    Value: !Ref BudgetName
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetName'
+
+  BudgetAmount:
+    Description: Budget limit amount
+    Value: !Sub '${BudgetAmount} ${BudgetCurrency}'
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetAmount'
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for budget alerts
+    Value: !Ref BudgetAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  SNSTopicName:
+    Description: Name of the SNS topic for budget alerts
+    Value: !GetAtt BudgetAlertsTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicName'
+
+  EmailSubscriptionArn:
+    Description: ARN of the email subscription (if created)
+    Value: !If [CreateEmailSubscription, !Ref EmailSubscription, 'No email subscription created']
+    Export:
+      Name: !Sub '${AWS::StackName}-EmailSubscriptionArn'
+
+  NotificationThresholds:
+    Description: Configured notification thresholds
+    Value: !Sub 'Actual: ${ActualThreshold1}%, ${ActualThreshold2}% | Forecast: ${ForecastThreshold}%'
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationThresholds'
+
+  BudgetTimeUnit:
+    Description: Time unit for the budget period
+    Value: !Ref TimeUnit
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetTimeUnit'
+
+  CloudWatchAlarmName:
+    Description: Name of the CloudWatch alarm monitoring the SNS topic
+    Value: !Ref BudgetMonitoringAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchAlarmName'
+
+  DeploymentInstructions:
+    Description: Instructions for completing the setup
+    Value: 'Check your email for SNS subscription confirmation. Budget monitoring is active once subscription is confirmed.'
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentInstructions'
+
+  CostEstimate:
+    Description: Estimated monthly cost for this solution
+    Value: 'Free for first 2 budgets per account, then $0.02/day per additional budget. SNS charges apply based on message volume.'
+    Export:
+      Name: !Sub '${AWS::StackName}-CostEstimate'

@@ -5,11 +5,11 @@ category: analytics
 difficulty: 300
 subject: aws
 services: kinesis-firehose,lambda,s3,cloudwatch
-estimated-time: 60 minutes
-recipe-version: 1.2
+estimated-time: 90 minutes
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: kinesis-firehose,lambda,s3,cloudwatch,streaming-etl
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ E-commerce companies need to process millions of real-time clickstream events da
 
 ## Solution
 
-Amazon Kinesis Data Firehose provides a fully managed streaming ETL solution that automatically scales to handle high-throughput data streams. By combining Firehose with Lambda transformation functions, you can clean, enrich, and format data in real-time before storing it in S3 as Parquet files. This serverless architecture eliminates infrastructure management while providing millisecond-level data processing latency. For comprehensive details about Firehose capabilities and features, see the [What is Amazon Data Firehose?](https://docs.aws.amazon.com/firehose/latest/dev/what-is-this-service.html) documentation.
+Amazon Kinesis Data Firehose provides a fully managed streaming ETL solution that automatically scales to handle high-throughput data streams. By combining Firehose with Lambda transformation functions, you can clean, enrich, and format data in real-time before storing it in S3 as Parquet files. This serverless architecture eliminates infrastructure management while providing millisecond-level data processing latency.
 
 ## Architecture Diagram
 
@@ -42,7 +42,6 @@ graph TB
     end
     
     subgraph "Storage & Analytics"
-        S3RAW[S3 Raw Data Bucket]
         S3PROCESSED[S3 Processed Data Bucket]
         ATHENA[Amazon Athena]
         QUICKSIGHT[QuickSight Dashboard]
@@ -79,7 +78,8 @@ graph TB
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of streaming data processing concepts
 4. Familiarity with Lambda functions and JSON data formats
-5. Estimated cost: $10-20 for resources created during this recipe
+5. jq command-line tool for JSON processing
+6. Estimated cost: $15-25 for resources created during this recipe
 
 > **Note**: Kinesis Data Firehose charges based on data volume ingested. This recipe uses minimal test data to keep costs low. For detailed pricing information, see the [Amazon Data Firehose pricing page](https://aws.amazon.com/firehose/pricing/).
 
@@ -103,10 +103,19 @@ export S3_BUCKET_NAME="streaming-etl-data-${RANDOM_SUFFIX}"
 export IAM_ROLE_NAME="FirehoseDeliveryRole-${RANDOM_SUFFIX}"
 export LAMBDA_ROLE_NAME="FirehoseLambdaRole-${RANDOM_SUFFIX}"
 
-# Create S3 bucket for data storage
+# Create S3 bucket for data storage with versioning and encryption
 aws s3 mb s3://${S3_BUCKET_NAME} --region ${AWS_REGION}
 
-echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
+aws s3api put-bucket-versioning \
+    --bucket ${S3_BUCKET_NAME} \
+    --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-encryption \
+    --bucket ${S3_BUCKET_NAME} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
+echo "✅ S3 bucket created with security features: s3://${S3_BUCKET_NAME}"
 ```
 
 ## Steps
@@ -164,7 +173,8 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
            "s3:GetObject",
            "s3:ListBucket",
            "s3:ListBucketMultipartUploads",
-           "s3:PutObject"
+           "s3:PutObject",
+           "s3:PutObjectAcl"
          ],
          "Resource": [
            "arn:aws:s3:::${S3_BUCKET_NAME}",
@@ -244,11 +254,11 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
        output = []
        
        for record in event['records']:
-           # Decode the data
-           compressed_payload = base64.b64decode(record['data'])
-           uncompressed_payload = compressed_payload.decode('utf-8')
-           
            try:
+               # Decode the data
+               compressed_payload = base64.b64decode(record['data'])
+               uncompressed_payload = compressed_payload.decode('utf-8')
+               
                # Parse JSON data
                data = json.loads(uncompressed_payload)
                
@@ -262,7 +272,8 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
                    'referrer': data.get('referrer', ''),
                    'user_agent': data.get('user_agent', ''),
                    'ip_address': data.get('ip_address', ''),
-                   'processed_by': 'lambda-firehose-transform'
+                   'processed_by': 'lambda-firehose-transform',
+                   'processing_timestamp': datetime.utcnow().timestamp()
                }
                
                # Convert back to JSON and encode
@@ -270,12 +281,12 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
                    'recordId': record['recordId'],
                    'result': 'Ok',
                    'data': base64.b64encode(
-                       json.dumps(transformed_data).encode('utf-8')
+                       (json.dumps(transformed_data) + '\n').encode('utf-8')
                    ).decode('utf-8')
                }
                
            except Exception as e:
-               print(f"Error processing record: {e}")
+               print(f"Error processing record {record['recordId']}: {str(e)}")
                # Mark as processing failed
                output_record = {
                    'recordId': record['recordId'],
@@ -284,6 +295,7 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
            
            output.append(output_record)
        
+       print(f"Successfully processed {len([r for r in output if r['result'] == 'Ok'])} out of {len(output)} records")
        return {'records': output}
    EOF
    
@@ -293,22 +305,27 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
    echo "✅ Lambda function code created and packaged"
    ```
 
-   Your transformation logic is now packaged and ready for deployment. The function handles common real-world scenarios like adding timestamps, enriching with metadata, and gracefully handling malformed records. Note that the output format includes required parameters such as `recordId`, `result`, and `data` - for complete details, see the [Required parameters for data transformation](https://docs.aws.amazon.com/firehose/latest/dev/data-transformation-status-model.html) documentation.
+   Your transformation logic is now packaged and ready for deployment. The function handles common real-world scenarios like adding timestamps, enriching with metadata, and gracefully handling malformed records. The newline character added to each record ensures proper delimiting for downstream processing.
 
 5. **Deploy Lambda Function**:
 
-   Deploying the Lambda function creates the compute resource that will process your streaming data. The function configuration includes appropriate timeouts and memory allocation to handle the expected data transformation workload efficiently.
+   Deploying the Lambda function creates the compute resource that will process your streaming data. The function configuration includes appropriate timeouts and memory allocation to handle the expected data transformation workload efficiently. We're using Python 3.12 as it's the current recommended runtime version.
 
    ```bash
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://lambda-function.zip \
        --timeout 300 \
-       --memory-size 128
+       --memory-size 256 \
+       --description "Firehose data transformation function"
+   
+   # Wait for function to be active
+   aws lambda wait function-active \
+       --function-name ${LAMBDA_FUNCTION_NAME}
    
    # Get Lambda function ARN
    export LAMBDA_FUNCTION_ARN=$(aws lambda get-function \
@@ -356,7 +373,7 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
 
 7. **Create Kinesis Data Firehose Delivery Stream**:
 
-   The delivery stream configuration defines how data flows through your pipeline, including buffering settings, compression, partitioning strategy, and format conversion. This configuration balances performance, cost, and data organization requirements. The Parquet format conversion feature is particularly valuable for analytics workloads - for more details, see the [Convert input data format in Amazon Data Firehose](https://docs.aws.amazon.com/firehose/latest/dev/record-format-conversion.html) documentation.
+   The delivery stream configuration defines how data flows through your pipeline, including buffering settings, compression, partitioning strategy, and format conversion. This configuration balances performance, cost, and data organization requirements. The Parquet format conversion feature is particularly valuable for analytics workloads.
 
    ```bash
    # Create Firehose delivery stream configuration
@@ -364,7 +381,7 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
    {
      "DeliveryStreamName": "${FIREHOSE_STREAM_NAME}",
      "DeliveryStreamType": "DirectPut",
-     "S3DestinationConfiguration": {
+     "ExtendedS3DestinationConfiguration": {
        "RoleARN": "${FIREHOSE_ROLE_ARN}",
        "BucketARN": "arn:aws:s3:::${S3_BUCKET_NAME}",
        "Prefix": "processed-data/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/",
@@ -408,6 +425,10 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
            "TableName": "streaming_etl_data",
            "RoleARN": "${FIREHOSE_ROLE_ARN}"
          }
+       },
+       "CloudWatchLoggingOptions": {
+         "Enabled": true,
+         "LogGroupName": "/aws/kinesisfirehose/${FIREHOSE_STREAM_NAME}"
        }
      }
    }
@@ -429,16 +450,22 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
    ```bash
    # Wait for stream to be active
    echo "Waiting for Firehose stream to be active..."
-   aws firehose wait delivery-stream-exists \
-       --delivery-stream-name ${FIREHOSE_STREAM_NAME}
    
-   # Check stream status
-   aws firehose describe-delivery-stream \
-       --delivery-stream-name ${FIREHOSE_STREAM_NAME} \
-       --query 'DeliveryStreamDescription.DeliveryStreamStatus' \
-       --output text
-   
-   echo "✅ Firehose stream is active and ready"
+   # Check stream status periodically
+   while true; do
+     STATUS=$(aws firehose describe-delivery-stream \
+         --delivery-stream-name ${FIREHOSE_STREAM_NAME} \
+         --query 'DeliveryStreamDescription.DeliveryStreamStatus' \
+         --output text)
+     
+     if [ "$STATUS" = "ACTIVE" ]; then
+       echo "✅ Firehose stream is active and ready"
+       break
+     fi
+     
+     echo "Stream status: $STATUS - waiting..."
+     sleep 10
+   done
    ```
 
    The delivery stream is now operational and can accept incoming data records. All components are properly configured and validated, ready for production data processing.
@@ -457,7 +484,7 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
        "session_id": "session456",
        "page_url": "https://example.com/products",
        "referrer": "https://google.com",
-       "user_agent": "Mozilla/5.0",
+       "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
        "ip_address": "192.168.1.1"
      },
      {
@@ -466,7 +493,7 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
        "session_id": "session789",
        "page_url": "https://example.com/checkout",
        "referrer": "https://example.com/cart",
-       "user_agent": "Mozilla/5.0",
+       "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
        "ip_address": "192.168.1.2"
      },
      {
@@ -475,7 +502,7 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
        "session_id": "session101",
        "page_url": "https://example.com/success",
        "referrer": "https://example.com/checkout",
-       "user_agent": "Mozilla/5.0",
+       "user_agent": "Mozilla/5.0 (X11; Linux x86_64)",
        "ip_address": "192.168.1.3"
      }
    ]
@@ -487,6 +514,7 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
          --delivery-stream-name ${FIREHOSE_STREAM_NAME} \
          --record "{\"Data\":\"$(echo $record | base64 -w 0)\"}"
      echo "Record sent: $record"
+     sleep 1
    done
    
    echo "✅ Test data sent to Firehose stream"
@@ -499,14 +527,20 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
     Comprehensive monitoring is essential for production streaming pipelines. CloudWatch integration provides visibility into delivery success rates, transformation errors, and overall pipeline health, enabling proactive operational management. For detailed monitoring configuration, see the [Monitor Amazon Data Firehose Using CloudWatch Logs](https://docs.aws.amazon.com/firehose/latest/dev/monitoring-with-cloudwatch-logs.html) documentation.
 
     ```bash
-    # Enable CloudWatch logging for Firehose
+    # Enable CloudWatch logging for Firehose (already enabled in stream config)
     aws iam attach-role-policy \
         --role-name ${IAM_ROLE_NAME} \
         --policy-arn arn:aws:iam::aws:policy/service-role/AWSKinesisFirehoseServiceRolePolicy
     
-    # Create CloudWatch log group for Lambda
+    # Create CloudWatch log group for Lambda (auto-created but ensure exists)
     aws logs create-log-group \
-        --log-group-name /aws/lambda/${LAMBDA_FUNCTION_NAME}
+        --log-group-name /aws/lambda/${LAMBDA_FUNCTION_NAME} \
+        --retention-in-days 14 || echo "Log group already exists"
+    
+    # Create CloudWatch log group for Firehose
+    aws logs create-log-group \
+        --log-group-name /aws/kinesisfirehose/${FIREHOSE_STREAM_NAME} \
+        --retention-in-days 14 || echo "Log group already exists"
     
     echo "✅ CloudWatch monitoring configured"
     ```
@@ -530,44 +564,58 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
 2. **Check Lambda Function Execution**:
 
    ```bash
-   # Check Lambda function logs
+   # Check Lambda function logs (wait a moment for logs to appear)
+   sleep 30
+   
    aws logs describe-log-streams \
        --log-group-name /aws/lambda/${LAMBDA_FUNCTION_NAME} \
-       --order-by LastEventTime --descending
+       --order-by LastEventTime --descending \
+       --max-items 1
    
-   # Get recent log events
+   # Get recent log events if streams exist
    LATEST_STREAM=$(aws logs describe-log-streams \
        --log-group-name /aws/lambda/${LAMBDA_FUNCTION_NAME} \
        --order-by LastEventTime --descending \
-       --max-items 1 --query 'logStreams[0].logStreamName' --output text)
+       --max-items 1 --query 'logStreams[0].logStreamName' \
+       --output text 2>/dev/null)
    
-   aws logs get-log-events \
-       --log-group-name /aws/lambda/${LAMBDA_FUNCTION_NAME} \
-       --log-stream-name ${LATEST_STREAM} \
-       --limit 10
+   if [ "$LATEST_STREAM" != "None" ] && [ "$LATEST_STREAM" != "" ]; then
+     aws logs get-log-events \
+         --log-group-name /aws/lambda/${LAMBDA_FUNCTION_NAME} \
+         --log-stream-name ${LATEST_STREAM} \
+         --limit 10
+   fi
    ```
 
 3. **Verify Data Processing and Storage**:
 
    ```bash
-   # Wait for data to be processed (5-10 minutes)
+   # Wait for data to be processed (5-10 minutes for buffering)
    echo "Waiting for data processing... (this may take 5-10 minutes)"
    sleep 300
    
    # Check if processed data exists in S3
+   echo "Checking for processed data in S3..."
    aws s3 ls s3://${S3_BUCKET_NAME}/processed-data/ --recursive
    
    # Check for any error data
+   echo "Checking for error data..."
    aws s3 ls s3://${S3_BUCKET_NAME}/error-data/ --recursive
+   
+   # Check Firehose CloudWatch logs
+   aws logs describe-log-streams \
+       --log-group-name /aws/kinesisfirehose/${FIREHOSE_STREAM_NAME} \
+       --order-by LastEventTime --descending --max-items 3
    ```
 
 4. **Test Error Handling**:
 
    ```bash
    # Send malformed data to test error handling
+   echo "Testing error handling with malformed data..."
    aws firehose put-record \
        --delivery-stream-name ${FIREHOSE_STREAM_NAME} \
-       --record '{"Data":"invalid-json-data"}'
+       --record '{"Data":"aW52YWxpZC1qc29uLWRhdGE="}'
    
    echo "✅ Error handling test data sent"
    ```
@@ -600,6 +648,10 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
    # Delete Lambda log group
    aws logs delete-log-group \
        --log-group-name /aws/lambda/${LAMBDA_FUNCTION_NAME}
+   
+   # Delete Firehose log group
+   aws logs delete-log-group \
+       --log-group-name /aws/kinesisfirehose/${FIREHOSE_STREAM_NAME}
    
    echo "✅ CloudWatch log groups deleted"
    ```
@@ -666,25 +718,27 @@ echo "✅ S3 bucket created: s3://${S3_BUCKET_NAME}"
 
 Amazon Kinesis Data Firehose with Lambda transformations provides a powerful serverless streaming ETL solution that automatically scales to handle varying data volumes. The architecture separates concerns effectively: Firehose handles the streaming infrastructure and delivery reliability, while Lambda focuses on data transformation logic. This separation allows for independent scaling and maintenance of each component. For an overview of Firehose capabilities, see the [What is Amazon Data Firehose?](https://docs.aws.amazon.com/firehose/latest/dev/what-is-this-service.html) documentation.
 
-The Lambda transformation function in this recipe demonstrates several key patterns for streaming ETL. First, it shows proper error handling by catching exceptions and marking failed records appropriately rather than causing the entire batch to fail. For details on error handling strategies, see the [Handle failure in data transformation](https://docs.aws.amazon.com/firehose/latest/dev/data-transformation-failure-handling.html) documentation. Second, it enriches data by adding timestamps and processing metadata, which is common in real-world scenarios. The base64 encoding/decoding pattern is essential for working with Firehose's binary data format.
+The Lambda transformation function in this recipe demonstrates several key patterns for streaming ETL. First, it shows proper error handling by catching exceptions and marking failed records appropriately rather than causing the entire batch to fail. For details on error handling strategies, see the [Handle failure in data transformation](https://docs.aws.amazon.com/firehose/latest/dev/data-transformation-failure-handling.html) documentation. Second, it enriches data by adding timestamps and processing metadata, which is common in real-world scenarios. The base64 encoding/decoding pattern is essential for working with Firehose's binary data format, and the newline delimiter ensures proper record separation in the output files.
 
 Data format conversion to Parquet provides significant benefits for analytics workloads. Parquet's columnar storage format reduces query costs and improves performance when using services like Amazon Athena or Amazon Redshift Spectrum. The partitioning strategy using timestamp-based prefixes (year/month/day/hour) enables efficient data pruning during queries, further reducing costs and improving performance. For more information about S3 object naming and partitioning strategies, see the [Configure Amazon S3 object name format](https://docs.aws.amazon.com/firehose/latest/dev/s3-object-name.html) documentation.
 
-> **Tip**: Use Firehose's buffering configuration to balance between latency and cost. Larger buffers reduce the number of S3 objects created but increase latency. For most analytics use cases, 5-minute buffering provides a good balance.
+The buffering configuration balances between latency and cost efficiency. Firehose's Lambda buffering (1MB/60 seconds) processes data in smaller batches for transformation, while the S3 buffering (5MB/300 seconds) optimizes object size for cost-effective storage. This two-tier buffering approach maximizes both processing efficiency and storage optimization.
+
+> **Tip**: Use Firehose's buffering configuration to balance between latency and cost. Larger buffers reduce the number of S3 objects created but increase latency. For most analytics use cases, 5-minute buffering provides a good balance between real-time processing and cost optimization.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Add data validation and schema enforcement** using Amazon Glue Schema Registry to validate incoming data against predefined schemas and reject invalid records.
+1. **Add data validation and schema enforcement** using Amazon Glue Schema Registry to validate incoming data against predefined schemas and reject invalid records before transformation.
 
-2. **Implement dynamic routing** by modifying the Lambda function to route different event types to separate S3 prefixes or even different destinations based on content.
+2. **Implement dynamic routing** by modifying the Lambda function to route different event types to separate S3 prefixes or even different destinations based on content, enabling more granular data organization.
 
-3. **Add real-time alerting** using CloudWatch alarms on Firehose delivery failures and Lambda error rates, with SNS notifications for operational teams.
+3. **Add real-time alerting** using CloudWatch alarms on Firehose delivery failures and Lambda error rates, with SNS notifications for operational teams and automated remediation workflows.
 
-4. **Create a complete analytics pipeline** by adding AWS Glue crawlers to automatically discover the schema, Amazon Athena for ad-hoc queries, and Amazon QuickSight for visualization dashboards.
+4. **Create a complete analytics pipeline** by adding AWS Glue crawlers to automatically discover the schema, Amazon Athena for ad-hoc queries, and Amazon QuickSight for visualization dashboards with automated refresh.
 
-5. **Implement cross-region replication** for disaster recovery by setting up a secondary Firehose stream in another region with S3 cross-region replication.
+5. **Implement cross-region replication** for disaster recovery by setting up a secondary Firehose stream in another region with S3 cross-region replication and automated failover capabilities.
 
 ## Infrastructure Code
 

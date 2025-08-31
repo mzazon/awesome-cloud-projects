@@ -6,17 +6,16 @@ difficulty: 300
 subject: aws
 services: api-gateway, sqs, lambda, dynamodb
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: webhooks, api-gateway, sqs, lambda, asynchronous-processing, message-queuing
 recipe-generator-version: 1.3
 ---
 
 # Scalable Webhook Processing with SQS
-
 
 ## Problem
 
@@ -281,10 +280,10 @@ echo "API Name: ${WEBHOOK_API_NAME}"
                
                # Extract webhook metadata
                source_ip = webhook_body.get('source_ip', 'unknown')
-               webhook_type = webhook_body.get('type', 'unknown')
+               webhook_type = webhook_body.get('body', {}).get('type', 'unknown')
                
                # Process the webhook (customize based on your needs)
-               processed_data = process_webhook(webhook_body)
+               processed_data = process_webhook(webhook_body.get('body', {}))
                
                # Store in DynamoDB
                table.put_item(
@@ -397,7 +396,7 @@ echo "API Name: ${WEBHOOK_API_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${WEBHOOK_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler webhook-processor.lambda_handler \
        --zip-file fileb://webhook-processor.zip \
@@ -408,7 +407,7 @@ echo "API Name: ${WEBHOOK_API_NAME}"
    echo "✅ Lambda function created: ${WEBHOOK_FUNCTION_NAME}"
    ```
 
-   The Lambda function is now deployed with appropriate memory allocation and timeout settings for webhook processing workloads. The function includes comprehensive error handling and logging to support operational monitoring and troubleshooting. This establishes the core processing engine that transforms webhook events into business logic while maintaining audit trails in DynamoDB.
+   The Lambda function is now deployed with the current Python 3.12 runtime and appropriate memory allocation and timeout settings for webhook processing workloads. The function includes comprehensive error handling and logging to support operational monitoring and troubleshooting. This establishes the core processing engine that transforms webhook events into business logic while maintaining audit trails in DynamoDB.
 
 6. **Create SQS Event Source Mapping for Lambda**:
 
@@ -731,25 +730,25 @@ echo "API Name: ${WEBHOOK_API_NAME}"
 
 ## Discussion
 
-This webhook processing architecture demonstrates several key patterns for building resilient, scalable message processing systems in AWS. The combination of API Gateway, SQS, and Lambda provides a fully managed, serverless solution that can handle webhook traffic spikes while maintaining delivery guarantees through dead letter queues and retry mechanisms.
+This webhook processing architecture demonstrates several key patterns for building resilient, scalable message processing systems in AWS, following [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles. The combination of API Gateway, SQS, and Lambda provides a fully managed, serverless solution that can handle webhook traffic spikes while maintaining delivery guarantees through dead letter queues and retry mechanisms.
 
-The architecture leverages SQS's built-in durability and visibility timeout features to ensure messages aren't lost even if processing fails temporarily. The dead letter queue captures messages that fail processing after multiple attempts, allowing for manual inspection and reprocessing. This is particularly valuable for webhook scenarios where losing notifications could mean missing payments, security alerts, or other critical business events.
+The architecture leverages SQS's built-in durability and visibility timeout features to ensure messages aren't lost even if processing fails temporarily. The dead letter queue captures messages that fail processing after multiple attempts (following the [maxReceiveCount redrive policy](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html)), allowing for manual inspection and reprocessing. This is particularly valuable for webhook scenarios where losing notifications could mean missing payments, security alerts, or other critical business events.
 
-API Gateway's integration with SQS eliminates the need for Lambda to handle the initial webhook ingestion, reducing cold start latency and improving overall system reliability. The mapping template transforms incoming webhook payloads into properly formatted SQS messages, including metadata like source IP and timestamp for audit trails. This approach also provides natural rate limiting and throttling capabilities to protect downstream systems.
+API Gateway's integration with SQS eliminates the need for Lambda to handle the initial webhook ingestion, reducing cold start latency and improving overall system reliability. The mapping template transforms incoming webhook payloads into properly formatted SQS messages, including metadata like source IP and timestamp for audit trails. This approach also provides natural rate limiting and throttling capabilities to protect downstream systems while following [AWS security best practices](https://docs.aws.amazon.com/security/latest/userguide/security-pillar.html).
 
-The DynamoDB integration provides searchable webhook history, enabling compliance auditing and troubleshooting. Consider implementing time-based partitioning for high-volume scenarios to optimize query performance and manage costs effectively.
+The DynamoDB integration provides searchable webhook history, enabling compliance auditing and troubleshooting. Consider implementing time-based partitioning for high-volume scenarios to optimize query performance and manage costs effectively through DynamoDB's [cost optimization features](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-cost-optimization.html).
 
-> **Tip**: Use SQS message attributes to implement webhook routing based on payload content, allowing multiple Lambda functions to process different webhook types from the same queue.
+> **Tip**: Use SQS message attributes to implement webhook routing based on payload content, allowing multiple Lambda functions to process different webhook types from the same queue, as detailed in the [SQS Developer Guide](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-message-metadata.html).
 
 ## Challenge
 
 Extend this webhook processing system with these enhancements:
 
-1. **Implement webhook signature verification** using HMAC-SHA256 to validate webhook authenticity before processing, storing shared secrets in AWS Secrets Manager
-2. **Add webhook filtering and routing** using SQS message attributes to route different webhook types to specialized Lambda functions for processing
-3. **Create a webhook replay mechanism** that allows reprocessing of failed or missing webhooks by reading from DynamoDB history and re-queuing messages
-4. **Implement webhook deduplication** using SQS FIFO queues or DynamoDB conditional writes to handle duplicate webhook deliveries from unreliable senders
-5. **Add comprehensive monitoring dashboard** using CloudWatch custom metrics, SNS notifications for dead letter queue alerts, and API Gateway access logging for compliance requirements
+1. **Implement webhook signature verification** using HMAC-SHA256 to validate webhook authenticity before processing, storing shared secrets in AWS Secrets Manager for secure credential management
+2. **Add webhook filtering and routing** using SQS message attributes to route different webhook types to specialized Lambda functions for processing, enabling microservices patterns
+3. **Create a webhook replay mechanism** that allows reprocessing of failed or missing webhooks by reading from DynamoDB history and re-queuing messages through an administrative interface
+4. **Implement webhook deduplication** using SQS FIFO queues or DynamoDB conditional writes to handle duplicate webhook deliveries from unreliable senders, ensuring exactly-once processing
+5. **Add comprehensive monitoring dashboard** using CloudWatch custom metrics, SNS notifications for dead letter queue alerts, and API Gateway access logging for compliance requirements and operational visibility
 
 ## Infrastructure Code
 

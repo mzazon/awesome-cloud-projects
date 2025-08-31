@@ -1,0 +1,593 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Weather Alert Notifications System with Lambda and SNS
+  
+  This template creates a serverless weather monitoring system that periodically checks
+  weather conditions via a public API and sends SNS notifications when thresholds are exceeded.
+  Components include Lambda function, SNS topic, EventBridge rule, and necessary IAM roles.
+
+# Template metadata for AWS Console
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Weather Monitoring Configuration"
+        Parameters:
+          - WeatherApiKey
+          - City
+          - TemperatureThreshold
+          - WindThreshold
+          - ScheduleExpression
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - NotificationPhone
+          - EnableSmsNotifications
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaMemorySize
+          - LambdaTimeout
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+    ParameterLabels:
+      WeatherApiKey:
+        default: "OpenWeatherMap API Key"
+      City:
+        default: "City to Monitor"
+      TemperatureThreshold:
+        default: "Temperature Alert Threshold (°F)"
+      WindThreshold:
+        default: "Wind Speed Alert Threshold (mph)"
+      NotificationEmail:
+        default: "Email Address for Notifications"
+      NotificationPhone:
+        default: "Phone Number for SMS (optional)"
+      EnableSmsNotifications:
+        default: "Enable SMS Notifications"
+      ScheduleExpression:
+        default: "EventBridge Schedule Expression"
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+
+# Template parameters with validation and defaults
+Parameters:
+  WeatherApiKey:
+    Type: String
+    Description: >
+      OpenWeatherMap API key for weather data retrieval. 
+      Get your free API key at https://openweathermap.org/api
+      Leave as 'demo_key' to use mock data for testing.
+    Default: 'demo_key'
+    NoEcho: true
+    MinLength: 3
+    MaxLength: 100
+
+  City:
+    Type: String
+    Description: City name to monitor for weather conditions
+    Default: 'Seattle'
+    MinLength: 2
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z\s,.-]+$'
+    ConstraintDescription: City name must contain only letters, spaces, commas, periods, and hyphens
+
+  TemperatureThreshold:
+    Type: Number
+    Description: Temperature threshold in Fahrenheit - alerts triggered when temperature is at or below this value
+    Default: 32
+    MinValue: -50
+    MaxValue: 150
+    ConstraintDescription: Temperature must be between -50°F and 150°F
+
+  WindThreshold:
+    Type: Number
+    Description: Wind speed threshold in mph - alerts triggered when wind speed is at or above this value
+    Default: 25
+    MinValue: 0
+    MaxValue: 200
+    ConstraintDescription: Wind speed must be between 0 and 200 mph
+
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive weather alert notifications
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: Must be a valid email address format
+
+  NotificationPhone:
+    Type: String
+    Description: Phone number for SMS notifications (format +1234567890, optional)
+    Default: ''
+    AllowedPattern: '^(\+[1-9]\d{1,14})?$'
+    ConstraintDescription: Must be in international format (+1234567890) or empty
+
+  EnableSmsNotifications:
+    Type: String
+    Description: Enable SMS notifications in addition to email
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+  ScheduleExpression:
+    Type: String
+    Description: EventBridge schedule expression for weather checks
+    Default: 'rate(1 hour)'
+    AllowedPattern: '^(rate\(\d+\s+(minute|minutes|hour|hours|day|days)\)|cron\(.+\))$'
+    ConstraintDescription: Must be a valid EventBridge schedule expression (rate or cron format)
+
+  LambdaRuntime:
+    Type: String
+    Description: Python runtime version for Lambda function
+    Default: 'python3.12'
+    AllowedValues: 
+      - 'python3.9'
+      - 'python3.10'
+      - 'python3.11'
+      - 'python3.12'
+
+  LambdaMemorySize:
+    Type: Number
+    Description: Memory allocation for Lambda function in MB
+    Default: 128
+    MinValue: 128
+    MaxValue: 10240
+    ConstraintDescription: Memory must be between 128 MB and 10,240 MB
+
+  LambdaTimeout:
+    Type: Number
+    Description: Lambda function timeout in seconds
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    ConstraintDescription: Timeout must be between 3 and 900 seconds
+
+  ResourcePrefix:
+    Type: String
+    Description: Prefix for all resource names to ensure uniqueness
+    Default: 'weather-alerts'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+# Conditional resource creation based on parameters
+Conditions:
+  HasWeatherApiKey: !Not [!Equals [!Ref WeatherApiKey, 'demo_key']]
+  EnableSms: !And
+    - !Equals [!Ref EnableSmsNotifications, 'true']
+    - !Not [!Equals [!Ref NotificationPhone, '']]
+
+# AWS resources for the weather monitoring system
+Resources:
+  # SNS Topic for weather alert notifications
+  WeatherAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-notifications'
+      DisplayName: Weather Alert Notifications
+      Description: SNS topic for distributing weather alert notifications via email and SMS
+      KmsMasterKeyId: alias/aws/sns  # Use AWS managed key for encryption
+      Tags:
+        - Key: Application
+          Value: WeatherAlerts
+        - Key: Environment
+          Value: Production
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Email subscription to SNS topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref WeatherAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Optional SMS subscription (created only if phone number provided and SMS enabled)
+  SmsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableSms
+    Properties:
+      TopicArn: !Ref WeatherAlertsTopic
+      Protocol: sms
+      Endpoint: !Ref NotificationPhone
+
+  # IAM role for Lambda function execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-lambda-role'
+      Description: Execution role for weather monitoring Lambda function
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref WeatherAlertsTopic
+      Tags:
+        - Key: Application
+          Value: WeatherAlerts
+        - Key: Environment
+          Value: Production
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Lambda function for weather monitoring
+  WeatherMonitoringFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-function'
+      Description: Serverless function to monitor weather conditions and send alerts
+      Runtime: !Ref LambdaRuntime
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrencyLimit: 5  # Limit concurrent executions to control costs
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref WeatherAlertsTopic
+          CITY: !Ref City
+          TEMP_THRESHOLD: !Ref TemperatureThreshold
+          WIND_THRESHOLD: !Ref WindThreshold
+          WEATHER_API_KEY: !Ref WeatherApiKey
+      Code:
+        ZipFile: |
+          import json
+          import urllib3
+          import boto3
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              """
+              AWS Lambda function to monitor weather conditions and send alerts.
+              
+              This function fetches weather data from OpenWeatherMap API, evaluates conditions
+              against configured thresholds, and sends SNS notifications when alerts are triggered.
+              Uses urllib3 instead of requests to avoid external dependencies.
+              """
+              
+              # Initialize AWS clients
+              sns = boto3.client('sns')
+              http = urllib3.PoolManager()
+              
+              # Get configuration from environment variables
+              api_key = os.environ.get('WEATHER_API_KEY', 'demo_key')
+              city = os.environ.get('CITY', 'Seattle')
+              temp_threshold = float(os.environ.get('TEMP_THRESHOLD', '32'))  # Fahrenheit
+              wind_threshold = float(os.environ.get('WIND_THRESHOLD', '25'))  # mph
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              
+              try:
+                  # Fetch weather data or use demo data
+                  if api_key == 'demo_key':
+                      print("Using demo weather data for testing")
+                      # Mock weather data for demonstration
+                      weather_data = {
+                          'main': {'temp': 28.5, 'feels_like': 25.0},
+                          'wind': {'speed': 30.2},
+                          'weather': [{'main': 'Snow', 'description': 'heavy snow'}],
+                          'name': city
+                      }
+                  else:
+                      # Make API request to OpenWeatherMap
+                      url = f'https://api.openweathermap.org/data/2.5/weather'
+                      params = {
+                          'q': city,
+                          'appid': api_key,
+                          'units': 'imperial'
+                      }
+                      
+                      # Build query string manually for urllib3
+                      query_string = '&'.join([f'{k}={v}' for k, v in params.items()])
+                      full_url = f'{url}?{query_string}'
+                      
+                      response = http.request('GET', full_url, timeout=10.0)
+                      
+                      if response.status != 200:
+                          raise Exception(f'API request failed with status {response.status}')
+                      
+                      weather_data = json.loads(response.data.decode('utf-8'))
+                  
+                  # Extract weather information
+                  temperature = weather_data['main']['temp']
+                  feels_like = weather_data['main']['feels_like']
+                  wind_speed = weather_data['wind']['speed']
+                  weather_desc = weather_data['weather'][0]['description']
+                  city_name = weather_data['name']
+                  
+                  print(f"Weather check for {city_name}: {temperature}°F, {weather_desc}, {wind_speed} mph wind")
+                  
+                  # Check alert conditions
+                  alerts = []
+                  
+                  if temperature <= temp_threshold:
+                      alerts.append(f"🥶 Temperature alert: {temperature}°F (feels like {feels_like}°F)")
+                  
+                  if wind_speed >= wind_threshold:
+                      alerts.append(f"💨 Wind alert: {wind_speed} mph")
+                  
+                  # Send alerts if conditions are met
+                  if alerts:
+                      timestamp = datetime.now().strftime('%Y-%m-%d %I:%M %p')
+                      message = f"""⚠️ WEATHER ALERT for {city_name} ⚠️
+          Time: {timestamp}
+          
+          Current Conditions:
+          🌡️ Temperature: {temperature}°F (feels like {feels_like}°F)
+          💨 Wind Speed: {wind_speed} mph
+          🌤️ Conditions: {weather_desc.title()}
+          
+          Active Alerts:
+          """ + '\n'.join(f"• {alert}" for alert in alerts) + """
+          
+          Stay safe and take appropriate precautions!
+          
+          This alert was generated by your automated weather monitoring system.
+          """
+                      
+                      # Send SNS notification
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=f"Weather Alert - {city_name}",
+                          Message=message
+                      )
+                      
+                      print(f"Alert sent: {len(alerts)} conditions triggered")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': 'Weather alert sent',
+                              'alerts': alerts,
+                              'city': city_name,
+                              'temperature': temperature,
+                              'wind_speed': wind_speed
+                          })
+                      }
+                  else:
+                      print("No alerts triggered - weather conditions normal")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': 'Weather normal - no alerts',
+                              'city': city_name,
+                              'temperature': temperature,
+                              'wind_speed': wind_speed
+                          })
+                      }
+              
+              except Exception as e:
+                  error_msg = str(e)
+                  print(f"Error in weather monitoring: {error_msg}")
+                  
+                  # Send error notification
+                  error_message = f"""❌ Weather Monitoring System Error
+          Time: {datetime.now().strftime('%Y-%m-%d %I:%M %p')}
+          
+          Error: {error_msg}
+          
+          Please check the system configuration and API connectivity.
+          
+          This error notification was generated by your weather monitoring system.
+          """
+                  
+                  try:
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject="Weather System Error",
+                          Message=error_message
+                      )
+                  except Exception as sns_error:
+                      print(f"Failed to send error notification: {sns_error}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': error_msg})
+                  }
+      Tags:
+        - Key: Application
+          Value: WeatherAlerts
+        - Key: Environment
+          Value: Production
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Log Group for Lambda function (explicit creation for better control)
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${WeatherMonitoringFunction}'
+      RetentionInDays: 14  # Keep logs for 2 weeks to control costs
+      Tags:
+        - Key: Application
+          Value: WeatherAlerts
+        - Key: Environment
+          Value: Production
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # EventBridge rule for scheduled weather monitoring
+  WeatherMonitoringSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-schedule'
+      Description: Scheduled trigger for weather monitoring Lambda function
+      State: ENABLED
+      ScheduleExpression: !Ref ScheduleExpression
+      Targets:
+        - Arn: !GetAtt WeatherMonitoringFunction.Arn
+          Id: WeatherMonitoringTarget
+          Input: !Sub |
+            {
+              "source": "eventbridge.schedule",
+              "detail-type": "Scheduled Weather Check",
+              "detail": {
+                "city": "${City}",
+                "temperature_threshold": ${TemperatureThreshold},
+                "wind_threshold": ${WindThreshold}
+              }
+            }
+
+  # Permission for EventBridge to invoke Lambda function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WeatherMonitoringFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeatherMonitoringSchedule.Arn
+
+  # CloudWatch Alarm for Lambda function errors (operational monitoring)
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-lambda-errors'
+      AlarmDescription: Monitor Lambda function errors for weather monitoring system
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 300
+      Statistic: Sum
+      Threshold: 0
+      TreatMissingData: notBreaching
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref WeatherAlertsTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WeatherMonitoringFunction
+      Tags:
+        - Key: Application
+          Value: WeatherAlerts
+        - Key: Environment
+          Value: Production
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Alarm for Lambda function duration (performance monitoring)
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-lambda-duration'
+      AlarmDescription: Monitor Lambda function duration for performance issues
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 3
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Period: 300
+      Statistic: Average
+      Threshold: 20000  # 20 seconds (2/3 of the default 30-second timeout)
+      TreatMissingData: notBreaching
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref WeatherAlertsTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WeatherMonitoringFunction
+      Tags:
+        - Key: Application
+          Value: WeatherAlerts
+        - Key: Environment
+          Value: Production
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# Template outputs for integration and verification
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the weather monitoring Lambda function
+    Value: !GetAtt WeatherMonitoringFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaFunctionName:
+    Description: Name of the weather monitoring Lambda function
+    Value: !Ref WeatherMonitoringFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for weather alerts
+    Value: !Ref WeatherAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  SNSTopicName:
+    Description: Name of the SNS topic for weather alerts
+    Value: !GetAtt WeatherAlertsTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicName'
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule for scheduled monitoring
+    Value: !GetAtt WeatherMonitoringSchedule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleArn'
+
+  EventBridgeRuleName:
+    Description: Name of the EventBridge rule for scheduled monitoring
+    Value: !Ref WeatherMonitoringSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleName'
+
+  IAMRoleArn:
+    Description: ARN of the Lambda execution IAM role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group for Lambda function logs
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  TestCommand:
+    Description: AWS CLI command to test the Lambda function manually
+    Value: !Sub |
+      aws lambda invoke --function-name ${WeatherMonitoringFunction} --payload '{}' response.json && cat response.json
+
+  ConfigurationSummary:
+    Description: Summary of the weather monitoring configuration
+    Value: !Sub |
+      City: ${City}, Temp Threshold: ${TemperatureThreshold}°F, Wind Threshold: ${WindThreshold}mph, Schedule: ${ScheduleExpression}
+
+  NotificationEndpoints:
+    Description: Configured notification endpoints
+    Value: !Sub 
+      - 'Email: ${Email}${SmsInfo}'
+      - Email: !Ref NotificationEmail
+        SmsInfo: !If 
+          - EnableSms
+          - !Sub ', SMS: ${NotificationPhone}'
+          - ''
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for low-volume usage (USD)
+    Value: '$0.05 - $0.20 (Lambda: ~$0.02, SNS: ~$0.01-0.10, EventBridge: ~$0.02)'
+
+  NextSteps:
+    Description: Recommended next steps after deployment
+    Value: >
+      1. Confirm email subscription in your inbox
+      2. Test the function manually using the TestCommand
+      3. Monitor CloudWatch logs for execution details
+      4. Update WeatherApiKey parameter with real API key for production use
+      5. Adjust thresholds and schedule as needed

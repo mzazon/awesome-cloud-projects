@@ -1,0 +1,1111 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Interactive Business Process Automation with Bedrock Agents and EventBridge - Complete serverless solution for AI-powered document processing workflows'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'biz-automation'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must start with a letter, contain only lowercase letters, numbers, and hyphens'
+    
+  BedrockFoundationModel:
+    Type: String
+    Default: 'anthropic.claude-3-sonnet-20240229-v1:0'
+    Description: 'Bedrock foundation model for the agent'
+    AllowedValues:
+      - 'anthropic.claude-3-sonnet-20240229-v1:0'
+      - 'anthropic.claude-3-haiku-20240307-v1:0'
+      - 'anthropic.claude-instant-v1'
+    
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name for resource tagging'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    
+  EnableNotifications:
+    Type: String
+    Default: 'true'
+    Description: 'Enable SNS notifications for high priority events'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: 'Memory allocation for Lambda functions (MB)'
+    MinValue: 128
+    MaxValue: 3008
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: 'Timeout for Lambda functions (seconds)'
+    MinValue: 3
+    MaxValue: 900
+
+Conditions:
+  CreateNotifications: !Equals [!Ref EnableNotifications, 'true']
+
+Resources:
+  # =================================================================
+  # S3 BUCKET FOR DOCUMENT STORAGE
+  # =================================================================
+  
+  DocumentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-documents-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'DocumentRetention'
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years for business documents
+            NoncurrentVersionExpirationInDays: 90
+          - Id: 'IntelligentTiering'
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt DocumentProcessingTrigger.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'incoming/'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'Business Document Storage'
+  
+  # Lambda permission for S3 bucket notifications
+  S3BucketNotificationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DocumentProcessingTrigger
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub '${DocumentBucket}/*'
+
+  # =================================================================
+  # EVENTBRIDGE CUSTOM EVENT BUS
+  # =================================================================
+  
+  BusinessEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-events'
+      Description: 'Custom event bus for business process automation events'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'Event Orchestration'
+
+  # =================================================================
+  # IAM ROLES AND POLICIES
+  # =================================================================
+  
+  # IAM Role for Bedrock Agent
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-bedrock-agent-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+      Policies:
+        - PolicyName: 'S3DocumentAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt DocumentBucket.Arn
+                  - !Sub '${DocumentBucket.Arn}/*'
+        - PolicyName: 'EventBridgePublish'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'events:PutEvents'
+                Resource: !GetAtt BusinessEventBus.Arn
+        - PolicyName: 'LambdaInvoke'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !GetAtt AgentActionHandler.Arn
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: 'EventBridgeAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'events:PutEvents'
+                Resource: !GetAtt BusinessEventBus.Arn
+        - PolicyName: 'S3Access'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt DocumentBucket.Arn
+                  - !Sub '${DocumentBucket.Arn}/*'
+        - PolicyName: 'DynamoDBAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource: !GetAtt ProcessingResultsTable.Arn
+        - PolicyName: 'SNSPublish'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !If
+                  - CreateNotifications
+                  - !Ref AlertTopic
+                  - !Ref AWS::NoValue
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+
+  # =================================================================
+  # DYNAMODB TABLE FOR PROCESSING RESULTS
+  # =================================================================
+  
+  ProcessingResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-processing-results'
+      AttributeDefinitions:
+        - AttributeName: 'process_id'
+          AttributeType: 'S'
+        - AttributeName: 'timestamp'
+          AttributeType: 'S'
+        - AttributeName: 'document_name'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'process_id'
+          KeyType: 'HASH'
+      GlobalSecondaryIndexes:
+        - IndexName: 'DocumentIndex'
+          KeySchema:
+            - AttributeName: 'document_name'
+              KeyType: 'HASH'
+            - AttributeName: 'timestamp'
+              KeyType: 'RANGE'
+          Projection:
+            ProjectionType: 'ALL'
+          BillingMode: 'PAY_PER_REQUEST'
+      BillingMode: 'PAY_PER_REQUEST'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'Processing Results Storage'
+
+  # =================================================================
+  # SNS TOPIC FOR NOTIFICATIONS (CONDITIONAL)
+  # =================================================================
+  
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotifications
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      DisplayName: 'Business Process Automation Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+
+  # =================================================================
+  # LAMBDA FUNCTIONS
+  # =================================================================
+  
+  # Document Processing Trigger Function
+  DocumentProcessingTrigger:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-document-trigger'
+      Runtime: 'python3.12'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          AGENT_ID: !Ref BedrockAgent
+          AGENT_ALIAS_ID: !Ref BedrockAgentAlias
+          EVENT_BUS_NAME: !Ref BusinessEventBus
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          
+          bedrock_agent = boto3.client('bedrock-agent-runtime')
+          events_client = boto3.client('events')
+          
+          def lambda_handler(event, context):
+              print(f"S3 trigger event: {json.dumps(event)}")
+              
+              # Extract S3 event details
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  
+                  # Skip non-document files
+                  if not any(key.lower().endswith(ext) for ext in ['.pdf', '.txt', '.doc', '.docx']):
+                      continue
+                  
+                  # Determine document type from filename or path
+                  document_type = 'unknown'
+                  if 'invoice' in key.lower():
+                      document_type = 'invoice'
+                  elif 'contract' in key.lower():
+                      document_type = 'contract'
+                  elif 'compliance' in key.lower():
+                      document_type = 'compliance'
+                  
+                  # Invoke Bedrock Agent
+                  try:
+                      session_id = f"session-{str(uuid.uuid4())[:8]}"
+                      input_text = f"Please analyze the {document_type} document at s3://{bucket}/{key} and process it according to business rules"
+                      
+                      response = bedrock_agent.invoke_agent(
+                          agentId=os.environ['AGENT_ID'],
+                          agentAliasId=os.environ['AGENT_ALIAS_ID'],
+                          sessionId=session_id,
+                          inputText=input_text
+                      )
+                      
+                      print(f"Agent invoked successfully for {key}")
+                      
+                      # Publish initial processing event
+                      events_client.put_events(
+                          Entries=[
+                              {
+                                  'Source': 'document.trigger',
+                                  'DetailType': 'Document Processing Started',
+                                  'Detail': json.dumps({
+                                      'document_name': key,
+                                      'document_type': document_type,
+                                      'bucket': bucket,
+                                      'session_id': session_id,
+                                      'timestamp': datetime.utcnow().isoformat()
+                                  }),
+                                  'EventBusName': os.environ['EVENT_BUS_NAME']
+                              }
+                          ]
+                      )
+                      
+                  except Exception as e:
+                      print(f"Error processing {key}: {str(e)}")
+                      # Publish error event
+                      events_client.put_events(
+                          Entries=[
+                              {
+                                  'Source': 'document.trigger',
+                                  'DetailType': 'Document Processing Error',
+                                  'Detail': json.dumps({
+                                      'document_name': key,
+                                      'error': str(e),
+                                      'timestamp': datetime.utcnow().isoformat()
+                                  }),
+                                  'EventBusName': os.environ['EVENT_BUS_NAME']
+                              }
+                          ]
+                      )
+              
+              return {'statusCode': 200, 'body': 'Processing initiated'}
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+
+  # Agent Action Handler Function
+  AgentActionHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-agent-action'
+      Runtime: 'python3.12'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref BusinessEventBus
+          RESULTS_TABLE: !Ref ProcessingResultsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import re
+          import uuid
+          import os
+          from datetime import datetime
+          
+          s3_client = boto3.client('s3')
+          events_client = boto3.client('events')
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              print(f"Agent action request: {json.dumps(event)}")
+              
+              # Parse agent request
+              action_request = event.get('actionRequest', {})
+              api_path = action_request.get('apiPath', '')
+              parameters = action_request.get('parameters', [])
+              
+              # Extract parameters
+              document_path = None
+              document_type = None
+              
+              for param in parameters:
+                  if param['name'] == 'document_path':
+                      document_path = param['value']
+                  elif param['name'] == 'document_type':
+                      document_type = param['value']
+              
+              if api_path == '/analyze-document':
+                  result = analyze_document(document_path, document_type)
+                  
+                  # Store result in DynamoDB
+                  store_result(result, document_path)
+                  
+                  # Publish event to EventBridge
+                  publish_event(result, document_path)
+                  
+                  return {
+                      'response': {
+                          'actionResponse': {
+                              'responseBody': result
+                          }
+                      }
+                  }
+              
+              return {
+                  'response': {
+                      'actionResponse': {
+                          'responseBody': {'error': 'Unknown action'}
+                      }
+                  }
+              }
+          
+          def analyze_document(document_path, document_type):
+              # Enhanced document analysis simulation
+              analysis_results = {
+                  'invoice': {
+                      'recommendation': 'APPROVE',
+                      'confidence_score': 0.92,
+                      'extracted_data': {
+                          'amount': 1250.00,
+                          'vendor': 'TechSupplies Inc',
+                          'due_date': '2024-01-15',
+                          'invoice_number': 'INV-2024-001'
+                      },
+                      'alert_type': 'medium_priority',
+                      'business_rules_applied': ['auto_approval_threshold', 'vendor_verification']
+                  },
+                  'contract': {
+                      'recommendation': 'REVIEW',
+                      'confidence_score': 0.75,
+                      'extracted_data': {
+                          'contract_value': 50000.00,
+                          'term_length': '12 months',
+                          'party': 'Global Services LLC',
+                          'effective_date': '2024-02-01'
+                      },
+                      'alert_type': 'high_priority',
+                      'business_rules_applied': ['value_threshold_review', 'legal_approval_required']
+                  },
+                  'compliance': {
+                      'recommendation': 'APPROVE',
+                      'confidence_score': 0.88,
+                      'extracted_data': {
+                          'regulation': 'SOX',
+                          'compliance_score': 95,
+                          'review_date': '2024-01-01',
+                          'auditor': 'Internal Audit Team'
+                      },
+                      'alert_type': 'low_priority',
+                      'business_rules_applied': ['compliance_threshold', 'audit_verification']
+                  }
+              }
+              
+              return analysis_results.get(document_type, {
+                  'recommendation': 'REVIEW',
+                  'confidence_score': 0.5,
+                  'extracted_data': {},
+                  'alert_type': 'medium_priority',
+                  'business_rules_applied': ['default_review_required']
+              })
+          
+          def store_result(analysis_result, document_path):
+              table = dynamodb.Table(os.environ['RESULTS_TABLE'])
+              
+              item = {
+                  'process_id': str(uuid.uuid4()),
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'document_name': document_path.split('/')[-1] if document_path else 'unknown',
+                  'document_path': document_path,
+                  'analysis_result': analysis_result,
+                  'status': 'processed'
+              }
+              
+              table.put_item(Item=item)
+              print(f"Stored result in DynamoDB: {item['process_id']}")
+          
+          def publish_event(analysis_result, document_path):
+              document_name = document_path.split('/')[-1] if document_path else 'unknown'
+              
+              event_detail = {
+                  'document_name': document_name,
+                  'document_path': document_path,
+                  'document_type': 'invoice',  # This would be determined from analysis
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'message': f"Document {document_name} processed with {analysis_result.get('recommendation', 'UNKNOWN')} recommendation",
+                  **analysis_result
+              }
+              
+              events_client.put_events(
+                  Entries=[
+                      {
+                          'Source': 'bedrock.agent',
+                          'DetailType': 'Document Analysis Complete',
+                          'Detail': json.dumps(event_detail),
+                          'EventBusName': os.environ['EVENT_BUS_NAME']
+                      }
+                  ]
+              )
+              print(f"Published event for {document_name}")
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+
+  # Approval Handler Function
+  ApprovalHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-approval'
+      Runtime: 'python3.12'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          RESULTS_TABLE: !Ref ProcessingResultsTable
+          SNS_TOPIC_ARN: !If
+            - CreateNotifications
+            - !Ref AlertTopic
+            - ''
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              print(f"Processing approval event: {json.dumps(event)}")
+              
+              # Extract document details from EventBridge event
+              detail = event['detail']
+              document_name = detail['document_name']
+              confidence_score = detail['confidence_score']
+              recommendation = detail['recommendation']
+              extracted_data = detail.get('extracted_data', {})
+              
+              # Enhanced approval logic
+              if confidence_score > 0.85 and recommendation == 'APPROVE':
+                  status = 'AUTO_APPROVED'
+                  action = 'Document automatically approved based on AI confidence'
+                  
+                  # Additional checks for high-value items
+                  if 'amount' in extracted_data and extracted_data['amount'] > 5000:
+                      status = 'PENDING_MANAGER_REVIEW'
+                      action = 'High-value document requires manager approval'
+                  
+              elif confidence_score > 0.70:
+                  status = 'PENDING_REVIEW'
+                  action = 'Document requires human review due to moderate confidence'
+              else:
+                  status = 'REJECTED'
+                  action = 'Document rejected due to low AI confidence score'
+              
+              # Store approval decision
+              result = store_approval_decision(document_name, status, action, confidence_score, extracted_data)
+              
+              # Send notification if high priority
+              if status in ['PENDING_MANAGER_REVIEW', 'REJECTED'] and os.environ.get('SNS_TOPIC_ARN'):
+                  send_notification(document_name, status, action)
+              
+              print(f"Approval result: {json.dumps(result)}")
+              return {'statusCode': 200, 'body': json.dumps(result)}
+          
+          def store_approval_decision(document_name, status, action, confidence_score, extracted_data):
+              table = dynamodb.Table(os.environ['RESULTS_TABLE'])
+              
+              result = {
+                  'process_id': str(uuid.uuid4()),
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'document_name': document_name,
+                  'process_type': 'approval',
+                  'status': status,
+                  'action': action,
+                  'confidence_score': confidence_score,
+                  'extracted_data': extracted_data
+              }
+              
+              table.put_item(Item=result)
+              return result
+          
+          def send_notification(document_name, status, action):
+              try:
+                  message = f"Document Alert: {document_name}\nStatus: {status}\nAction: {action}"
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=message,
+                      Subject=f"Business Process Alert - {status}"
+                  )
+                  print(f"Notification sent for {document_name}")
+              except Exception as e:
+                  print(f"Failed to send notification: {str(e)}")
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+
+  # Processing Handler Function
+  ProcessingHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-processing'
+      Runtime: 'python3.12'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          RESULTS_TABLE: !Ref ProcessingResultsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              print(f"Processing automation event: {json.dumps(event)}")
+              
+              detail = event['detail']
+              document_name = detail['document_name']
+              document_type = detail['document_type']
+              extracted_data = detail.get('extracted_data', {})
+              
+              # Enhanced processing based on document type
+              processing_actions = {
+                  'invoice': {
+                      'action': 'Initiated payment processing workflow',
+                      'next_steps': ['vendor_verification', 'payment_scheduling', 'accounting_entry'],
+                      'priority': 'high'
+                  },
+                  'contract': {
+                      'action': 'Routed to legal team for final review',
+                      'next_steps': ['legal_review', 'signature_collection', 'contract_storage'],
+                      'priority': 'medium'
+                  },
+                  'compliance': {
+                      'action': 'Submitted to regulatory reporting system',
+                      'next_steps': ['compliance_verification', 'audit_trail_creation', 'regulatory_filing'],
+                      'priority': 'high'
+                  }
+              }
+              
+              processing_info = processing_actions.get(document_type, {
+                  'action': 'Archived for future reference',
+                  'next_steps': ['document_classification', 'archive_storage'],
+                  'priority': 'low'
+              })
+              
+              # Store processing result
+              result = store_processing_result(document_name, document_type, processing_info, extracted_data)
+              
+              print(f"Processing result: {json.dumps(result)}")
+              return {'statusCode': 200, 'body': json.dumps(result)}
+          
+          def store_processing_result(document_name, document_type, processing_info, extracted_data):
+              table = dynamodb.Table(os.environ['RESULTS_TABLE'])
+              
+              result = {
+                  'process_id': str(uuid.uuid4()),
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'document_name': document_name,
+                  'document_type': document_type,
+                  'process_type': 'automated_processing',
+                  'action': processing_info['action'],
+                  'next_steps': processing_info['next_steps'],
+                  'priority': processing_info['priority'],
+                  'data_extracted': len(extracted_data) > 0,
+                  'extracted_data': extracted_data,
+                  'status': 'completed'
+              }
+              
+              table.put_item(Item=result)
+              return result
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+
+  # Notification Handler Function
+  NotificationHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-notification'
+      Runtime: 'python3.12'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          RESULTS_TABLE: !Ref ProcessingResultsTable
+          SNS_TOPIC_ARN: !If
+            - CreateNotifications
+            - !Ref AlertTopic
+            - ''
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              print(f"Processing notification event: {json.dumps(event)}")
+              
+              detail = event['detail']
+              document_name = detail['document_name']
+              alert_type = detail['alert_type']
+              message = detail['message']
+              
+              # Determine notification channels based on priority
+              notification_channels = {
+                  'high_priority': ['email', 'slack', 'sms'],
+                  'medium_priority': ['email', 'slack'],
+                  'low_priority': ['email'],
+                  'compliance_issue': ['email', 'slack', 'sms', 'audit_log'],
+                  'error': ['email', 'slack']
+              }
+              
+              channels = notification_channels.get(alert_type, ['email'])
+              
+              # Store notification record
+              result = store_notification_result(document_name, alert_type, message, channels)
+              
+              # Send actual notification if SNS is configured
+              if os.environ.get('SNS_TOPIC_ARN') and alert_type in ['high_priority', 'compliance_issue', 'error']:
+                  send_sns_notification(document_name, alert_type, message)
+              
+              print(f"Notification result: {json.dumps(result)}")
+              return {'statusCode': 200, 'body': json.dumps(result)}
+          
+          def store_notification_result(document_name, alert_type, message, channels):
+              table = dynamodb.Table(os.environ['RESULTS_TABLE'])
+              
+              result = {
+                  'process_id': str(uuid.uuid4()),
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'document_name': document_name,
+                  'process_type': 'notification',
+                  'alert_type': alert_type,
+                  'message': message,
+                  'channels': channels,
+                  'status': 'sent'
+              }
+              
+              table.put_item(Item=result)
+              return result
+          
+          def send_sns_notification(document_name, alert_type, message):
+              try:
+                  sns_message = f"Business Process Notification\n\nDocument: {document_name}\nAlert Type: {alert_type}\nMessage: {message}\nTimestamp: {datetime.utcnow().isoformat()}"
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=sns_message,
+                      Subject=f"Business Process Alert - {alert_type.upper()}"
+                  )
+                  print(f"SNS notification sent for {document_name}")
+              except Exception as e:
+                  print(f"Failed to send SNS notification: {str(e)}")
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+
+  # =================================================================
+  # LAMBDA PERMISSIONS FOR EVENTBRIDGE
+  # =================================================================
+  
+  # Permission for EventBridge to invoke Approval Handler
+  ApprovalHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApprovalHandler
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ApprovalRule.Arn
+
+  # Permission for EventBridge to invoke Processing Handler
+  ProcessingHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessingHandler
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ProcessingRule.Arn
+
+  # Permission for EventBridge to invoke Notification Handler
+  NotificationHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotificationHandler
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlertRule.Arn
+
+  # Permission for Bedrock Agent to invoke Action Handler
+  AgentActionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AgentActionHandler
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # =================================================================
+  # EVENTBRIDGE RULES
+  # =================================================================
+  
+  # Rule for high-confidence document approval
+  ApprovalRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-approval-rule'
+      Description: 'Route high-confidence approvals to approval handler'
+      EventBusName: !Ref BusinessEventBus
+      EventPattern:
+        source: ['bedrock.agent']
+        detail-type: ['Document Analysis Complete']
+        detail:
+          recommendation: ['APPROVE']
+          confidence_score:
+            - numeric: ['>=', 0.8]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ApprovalHandler.Arn
+          Id: 'ApprovalTarget'
+
+  # Rule for document processing automation
+  ProcessingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-processing-rule'
+      Description: 'Route documents for automated processing'
+      EventBusName: !Ref BusinessEventBus
+      EventPattern:
+        source: ['bedrock.agent']
+        detail-type: ['Document Analysis Complete']
+        detail:
+          document_type: ['invoice', 'contract', 'compliance']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ProcessingHandler.Arn
+          Id: 'ProcessingTarget'
+
+  # Rule for alerts and notifications
+  AlertRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-alert-rule'
+      Description: 'Route alerts and notifications'
+      EventBusName: !Ref BusinessEventBus
+      EventPattern:
+        source: ['bedrock.agent']
+        detail-type: ['Document Analysis Complete']
+        detail:
+          alert_type: ['high_priority', 'compliance_issue', 'error']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt NotificationHandler.Arn
+          Id: 'NotificationTarget'
+
+  # =================================================================
+  # BEDROCK AGENT RESOURCES
+  # =================================================================
+  
+  # Note: Bedrock Agent creation requires the agent action schema to be uploaded to S3 first
+  # This is handled by the AgentActionSchema resource below
+  
+  AgentActionSchema:
+    Type: AWS::S3::Object
+    Properties:
+      Bucket: !Ref DocumentBucket
+      Key: 'schemas/action-schema.json'
+      Body: |
+        {
+          "openAPIVersion": "3.0.0",
+          "info": {
+            "title": "Business Process Automation API",
+            "version": "1.0.0",
+            "description": "API for AI agent business process automation"
+          },
+          "paths": {
+            "/analyze-document": {
+              "post": {
+                "description": "Analyze business document and trigger appropriate workflows",
+                "parameters": [
+                  {
+                    "name": "document_path",
+                    "in": "query",
+                    "description": "S3 path to the document",
+                    "required": true,
+                    "schema": {"type": "string"}
+                  },
+                  {
+                    "name": "document_type",
+                    "in": "query",
+                    "description": "Type of document (invoice, contract, compliance)",
+                    "required": true,
+                    "schema": {"type": "string"}
+                  }
+                ],
+                "responses": {
+                  "200": {
+                    "description": "Document analysis completed",
+                    "content": {
+                      "application/json": {
+                        "schema": {
+                          "type": "object",
+                          "properties": {
+                            "recommendation": {"type": "string"},
+                            "confidence_score": {"type": "number"},
+                            "extracted_data": {"type": "object"},
+                            "next_actions": {"type": "array"}
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ContentType: 'application/json'
+
+  # Bedrock Agent (Note: This is a simplified representation - actual agent creation may require custom resource)
+  BedrockAgent:
+    Type: AWS::Bedrock::Agent
+    DependsOn: AgentActionSchema
+    Properties:
+      AgentName: !Sub '${ProjectName}-agent'
+      AgentResourceRoleArn: !GetAtt BedrockAgentRole.Arn
+      FoundationModel: !Ref BedrockFoundationModel
+      Instruction: 'You are a business process automation agent. Analyze documents uploaded to S3, extract key information, make recommendations for approval or processing, and trigger appropriate business workflows through EventBridge events. Focus on accuracy, compliance, and efficient processing.'
+      Description: 'AI agent for intelligent business process automation'
+      ActionGroups:
+        - ActionGroupName: 'DocumentProcessing'
+          ActionGroupExecutor:
+            Lambda: !GetAtt AgentActionHandler.Arn
+          ApiSchema:
+            S3:
+              S3BucketName: !Ref DocumentBucket
+              S3ObjectKey: 'schemas/action-schema.json'
+          Description: 'Action group for business document processing and workflow automation'
+
+  # Bedrock Agent Alias
+  BedrockAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentId: !Ref BedrockAgent
+      AgentAliasName: 'production'
+      Description: 'Production alias for business automation agent'
+
+Outputs:
+  ProjectName:
+    Description: 'Project name used for resource naming'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+  
+  DocumentBucketName:
+    Description: 'S3 bucket for document storage'
+    Value: !Ref DocumentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DocumentBucket'
+  
+  EventBusName:
+    Description: 'EventBridge custom event bus name'
+    Value: !Ref BusinessEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBus'
+  
+  BedrockAgentId:
+    Description: 'Bedrock Agent ID'
+    Value: !Ref BedrockAgent
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockAgentId'
+  
+  BedrockAgentAliasId:
+    Description: 'Bedrock Agent Alias ID'
+    Value: !Ref BedrockAgentAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockAgentAliasId'
+  
+  ProcessingResultsTableName:
+    Description: 'DynamoDB table for processing results'
+    Value: !Ref ProcessingResultsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessingResultsTable'
+  
+  AlertTopicArn:
+    Condition: CreateNotifications
+    Description: 'SNS topic ARN for alerts'
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopic'
+  
+  LambdaFunctions:
+    Description: 'Created Lambda function names'
+    Value: !Sub '${ProjectName}-approval, ${ProjectName}-processing, ${ProjectName}-notification, ${ProjectName}-agent-action, ${ProjectName}-document-trigger'
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctions'
+  
+  EventBridgeRules:
+    Description: 'Created EventBridge rule names'
+    Value: !Sub '${ProjectName}-approval-rule, ${ProjectName}-processing-rule, ${ProjectName}-alert-rule'
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRules'
+  
+  DeploymentInstructions:
+    Description: 'Instructions for deploying and testing the solution'
+    Value: 'Upload documents to the incoming/ folder in the S3 bucket to trigger processing. Monitor CloudWatch logs and DynamoDB table for results.'
+  
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for moderate usage (500 documents/month)'
+    Value: '$15-50 USD (varies by document size, model usage, and processing complexity)'
+  
+  SecurityFeatures:
+    Description: 'Implemented security features'
+    Value: 'S3 encryption, IAM least privilege, VPC isolation ready, EventBridge secure event routing, DynamoDB encryption'

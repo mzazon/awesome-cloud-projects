@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Database Migration Service, Cloud SQL, Cloud Monitoring, Cloud Logging
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database-migration, zero-downtime, cloud-sql, mysql, continuous-replication, rollback
 recipe-generator-version: 1.3
@@ -79,7 +79,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud project with appropriate permissions for Database Migration Service, Cloud SQL, and monitoring services
-2. Google Cloud CLI (gcloud) v2.0+ installed and authenticated
+2. Google Cloud CLI (gcloud) installed and authenticated (version 2.0+)
 3. On-premises MySQL database (5.6, 5.7, or 8.0) with binary logging enabled
 4. Network connectivity between on-premises environment and Google Cloud (VPN or private connectivity recommended)
 5. Understanding of MySQL replication concepts and database migration strategies
@@ -133,7 +133,7 @@ echo "✅ Cloud SQL instance ID: ${CLOUDSQL_INSTANCE_ID}"
 
    ```bash
    # Create connection profile for source MySQL database
-   gcloud datamigration connection-profiles create mysql \
+   gcloud database-migration connection-profiles create mysql \
        ${SOURCE_PROFILE_ID} \
        --region=${REGION} \
        --host=YOUR_MYSQL_HOST \
@@ -143,7 +143,7 @@ echo "✅ Cloud SQL instance ID: ${CLOUDSQL_INSTANCE_ID}"
        --display-name="Source MySQL Database"
    
    # Verify connection profile creation
-   gcloud datamigration connection-profiles describe \
+   gcloud database-migration connection-profiles describe \
        ${SOURCE_PROFILE_ID} \
        --region=${REGION}
    
@@ -194,7 +194,7 @@ echo "✅ Cloud SQL instance ID: ${CLOUDSQL_INSTANCE_ID}"
 
    ```bash
    # Create migration job for MySQL to Cloud SQL
-   gcloud datamigration migration-jobs create ${MIGRATION_JOB_ID} \
+   gcloud database-migration migration-jobs create ${MIGRATION_JOB_ID} \
        --region=${REGION} \
        --type=CONTINUOUS \
        --source=${SOURCE_PROFILE_ID} \
@@ -204,7 +204,7 @@ echo "✅ Cloud SQL instance ID: ${CLOUDSQL_INSTANCE_ID}"
        --vpc-peering-connectivity
    
    # Verify migration job configuration
-   gcloud datamigration migration-jobs describe \
+   gcloud database-migration migration-jobs describe \
        ${MIGRATION_JOB_ID} \
        --region=${REGION}
    
@@ -219,22 +219,22 @@ echo "✅ Cloud SQL instance ID: ${CLOUDSQL_INSTANCE_ID}"
 
    ```bash
    # Start the migration job
-   gcloud datamigration migration-jobs start ${MIGRATION_JOB_ID} \
+   gcloud database-migration migration-jobs start ${MIGRATION_JOB_ID} \
        --region=${REGION}
    
    # Monitor migration job status
-   gcloud datamigration migration-jobs describe \
+   gcloud database-migration migration-jobs describe \
        ${MIGRATION_JOB_ID} \
        --region=${REGION} \
        --format="value(state,phase)"
    
    # Wait for migration to reach RUNNING state
    echo "⏳ Waiting for migration to reach RUNNING state..."
-   while [[ $(gcloud datamigration migration-jobs describe \
+   while [[ $(gcloud database-migration migration-jobs describe \
        ${MIGRATION_JOB_ID} --region=${REGION} \
        --format="value(state)") != "RUNNING" ]]; do
      sleep 30
-     echo "Current state: $(gcloud datamigration migration-jobs describe \
+     echo "Current state: $(gcloud database-migration migration-jobs describe \
          ${MIGRATION_JOB_ID} --region=${REGION} \
          --format="value(state)")"
    done
@@ -252,9 +252,7 @@ echo "✅ Cloud SQL instance ID: ${CLOUDSQL_INSTANCE_ID}"
    # Create log-based metric for migration errors
    gcloud logging metrics create migration_errors \
        --description="Count of migration errors" \
-       --log-filter='resource.type="gce_instance" AND 
-                     jsonPayload.message:"ERROR"' \
-       --value-extractor='EXTRACT(jsonPayload.error_count)'
+       --log-filter='resource.type="datamigration.googleapis.com/MigrationJob" AND severity>=ERROR'
    
    # Create alert policy for migration monitoring
    cat > alert-policy.json << EOF
@@ -265,8 +263,8 @@ echo "✅ Cloud SQL instance ID: ${CLOUDSQL_INSTANCE_ID}"
          "displayName": "Migration job failure",
          "conditionThreshold": {
            "filter": "resource.type=\"datamigration.googleapis.com/MigrationJob\"",
-           "comparison": "COMPARISON_EQUAL",
-           "thresholdValue": 1,
+           "comparison": "COMPARISON_GREATER_THAN",
+           "thresholdValue": 0,
            "duration": "60s",
            "aggregations": [
              {
@@ -284,7 +282,8 @@ echo "✅ Cloud SQL instance ID: ${CLOUDSQL_INSTANCE_ID}"
    }
    EOF
    
-   gcloud alpha monitoring policies create --policy-from-file=alert-policy.json
+   gcloud alpha monitoring policies create \
+       --policy-from-file=alert-policy.json
    
    echo "✅ Monitoring and alerting configured"
    ```
@@ -334,7 +333,7 @@ echo "✅ Cloud SQL instance ID: ${CLOUDSQL_INSTANCE_ID}"
 
    ```bash
    # Verify replication lag before cutover
-   REPLICATION_LAG=$(gcloud datamigration migration-jobs describe \
+   REPLICATION_LAG=$(gcloud database-migration migration-jobs describe \
        ${MIGRATION_JOB_ID} --region=${REGION} \
        --format="value(status.replicationLag)")
    
@@ -346,7 +345,7 @@ echo "✅ Cloud SQL instance ID: ${CLOUDSQL_INSTANCE_ID}"
    sleep 30
    
    # Promote Cloud SQL to be the primary database
-   gcloud datamigration migration-jobs promote ${MIGRATION_JOB_ID} \
+   gcloud database-migration migration-jobs promote ${MIGRATION_JOB_ID} \
        --region=${REGION}
    
    # Update application connection strings to point to Cloud SQL
@@ -370,7 +369,7 @@ echo "✅ Cloud SQL instance ID: ${CLOUDSQL_INSTANCE_ID}"
 
    ```bash
    # Check migration job status
-   gcloud datamigration migration-jobs describe \
+   gcloud database-migration migration-jobs describe \
        ${MIGRATION_JOB_ID} \
        --region=${REGION} \
        --format="table(state,phase,createTime,updateTime)"
@@ -418,12 +417,12 @@ echo "✅ Cloud SQL instance ID: ${CLOUDSQL_INSTANCE_ID}"
 
    ```bash
    # Delete migration job
-   gcloud datamigration migration-jobs delete ${MIGRATION_JOB_ID} \
+   gcloud database-migration migration-jobs delete ${MIGRATION_JOB_ID} \
        --region=${REGION} \
        --quiet
    
    # Delete source connection profile
-   gcloud datamigration connection-profiles delete ${SOURCE_PROFILE_ID} \
+   gcloud database-migration connection-profiles delete ${SOURCE_PROFILE_ID} \
        --region=${REGION} \
        --quiet
    

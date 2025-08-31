@@ -1,21 +1,21 @@
 ---
-title: Implementing Real-Time Chat Applications with AppSync and GraphQLexisting_folder_name
+title: Implementing Real-Time Chat Applications with AppSync and GraphQL
 id: 5020dd75
 category: serverless
 difficulty: 300
 subject: aws
-services: appsync,dynamodb,cognito,lambda
+services: appsync,dynamodb,cognito
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: aws,appsync,dynamodb,cognito,lambda
+tags: aws,appsync,dynamodb,cognito,realtime,graphql
 recipe-generator-version: 1.3
 ---
 
-# Implementing Real-Time Chat Applications with AppSync and GraphQLexisting_folder_name
+# Implementing Real-Time Chat Applications with AppSync and GraphQL
 
 ## Problem
 
@@ -23,7 +23,7 @@ Modern businesses need real-time communication capabilities to enhance customer 
 
 ## Solution
 
-AWS AppSync provides a fully managed GraphQL service that enables real-time chat applications through WebSocket-based subscriptions with automatic connection management and scaling. The solution leverages GraphQL subscriptions triggered by mutations, eliminating the need for custom WebSocket infrastructure. DynamoDB serves as the message store with efficient queries and automatic scaling, while Cognito provides secure user authentication and authorization. Lambda functions handle message processing and notifications, creating a complete serverless chat platform that scales automatically with demand.
+AWS AppSync provides a fully managed GraphQL service that enables real-time chat applications through WebSocket-based subscriptions with automatic connection management and scaling. The solution leverages GraphQL subscriptions triggered by mutations, eliminating the need for custom WebSocket infrastructure. DynamoDB serves as the message store with efficient queries and automatic scaling, while Cognito provides secure user authentication and authorization. This serverless architecture creates a complete chat platform that scales automatically with demand and follows AWS Well-Architected Framework principles.
 
 ## Architecture Diagram
 
@@ -43,11 +43,6 @@ graph TB
         COGNITO[Amazon Cognito<br/>User Pools]
     end
     
-    subgraph "Processing Layer"
-        LAMBDA[AWS Lambda<br/>Message Processing]
-        LAMBDA2[AWS Lambda<br/>User Presence]
-    end
-    
     subgraph "Data Storage"
         DDB[DynamoDB<br/>Messages Table]
         DDB2[DynamoDB<br/>Conversations Table]
@@ -63,27 +58,20 @@ graph TB
     DESKTOP --> APPSYNC
     
     APPSYNC --> COGNITO
-    APPSYNC --> LAMBDA
-    APPSYNC --> LAMBDA2
     APPSYNC --> DDB
     APPSYNC --> DDB2
     APPSYNC --> DDB3
     
-    LAMBDA --> DDB
-    LAMBDA2 --> DDB3
-    
     APPSYNC --> CW
-    LAMBDA --> CW
     
     style APPSYNC fill:#FF9900
     style COGNITO fill:#FF9900
     style DDB fill:#3F8624
-    style LAMBDA fill:#FF9900
 ```
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for AppSync, DynamoDB, Cognito, and Lambda
+1. AWS account with appropriate permissions for AppSync, DynamoDB, Cognito, and IAM
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic knowledge of GraphQL schema design and subscription patterns
 4. Understanding of real-time application architecture patterns
@@ -800,13 +788,13 @@ echo "✅ Environment prepared with suffix: ${RANDOM_SUFFIX}"
 
 ## Discussion
 
-AWS AppSync provides a powerful foundation for building real-time chat applications by abstracting away the complexity of WebSocket management and subscription handling. The service automatically manages connection lifecycles, handles reconnections, and provides built-in authorization through integration with Amazon Cognito. GraphQL subscriptions offer a declarative approach to real-time updates, where clients can specify exactly what data they need when messages are sent or user presence changes.
+AWS AppSync provides a powerful foundation for building real-time chat applications by abstracting away the complexity of WebSocket management and subscription handling. The service automatically manages connection lifecycles, handles reconnections, and provides built-in authorization through integration with Amazon Cognito. GraphQL subscriptions offer a declarative approach to real-time updates, where clients can specify exactly what data they need when messages are sent or user presence changes, following AWS Well-Architected Framework principles for operational excellence and reliability.
 
-The architecture leverages DynamoDB's single-table design principles with carefully crafted Global Secondary Indexes to support efficient queries across different access patterns. The MessagesByTime index enables chronological message retrieval, while the UserConversations index allows users to quickly find their active conversations. DynamoDB Streams can be enabled to trigger additional processing, such as push notifications or message analytics, making the system highly extensible.
+The architecture leverages DynamoDB's single-table design principles with carefully crafted Global Secondary Indexes to support efficient queries across different access patterns. The MessagesByTime index enables chronological message retrieval, while the UserConversations index allows users to quickly find their active conversations. DynamoDB Streams can be enabled to trigger additional processing, such as push notifications or message analytics, making the system highly extensible and supporting the sustainability pillar through efficient resource utilization.
 
-VTL (Velocity Template Language) resolvers provide direct integration between GraphQL operations and DynamoDB without requiring Lambda functions, reducing latency and costs. The resolvers handle input validation, data transformation, and response formatting while maintaining security through automatic injection of user identity context. This approach enables sub-100ms response times for message operations while supporting millions of concurrent connections.
+VTL (Velocity Template Language) resolvers provide direct integration between GraphQL operations and DynamoDB without requiring Lambda functions, reducing latency and costs while improving performance efficiency. The resolvers handle input validation, data transformation, and response formatting while maintaining security through automatic injection of user identity context. This approach enables sub-100ms response times for message operations while supporting millions of concurrent connections, demonstrating the scalability benefits of serverless architecture patterns on AWS.
 
-> **Tip**: Use DynamoDB's TTL feature to automatically clean up old messages and implement message retention policies without additional infrastructure.
+> **Tip**: Use DynamoDB's TTL feature to automatically clean up old messages and implement message retention policies without additional infrastructure. See the [DynamoDB TTL documentation](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html) for implementation guidance.
 
 ## Challenge
 

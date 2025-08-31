@@ -4,12 +4,12 @@ id: a4f8e3d2
 category: iot
 difficulty: 400
 subject: azure
-services: Azure IoT Hub, Azure Digital Twins, Azure Time Series Insights, Azure Machine Learning
+services: Azure IoT Hub, Azure Digital Twins, Azure Data Explorer, Azure Machine Learning
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: iot, digital-twins, manufacturing, predictive-analytics, machine-learning
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ Manufacturing enterprises struggle with fragmented operational visibility across
 
 ## Solution
 
-Implement a comprehensive digital twin ecosystem using Azure IoT Hub for real-time sensor data ingestion and Azure Digital Twins to create virtual representations of manufacturing equipment with contextual relationships. This solution leverages Azure Time Series Insights for historical trend analysis and Azure Machine Learning for predictive maintenance algorithms, enabling proactive decision-making and optimized production workflows through intelligent automation and data-driven insights.
+Implement a comprehensive digital twin ecosystem using Azure IoT Hub for real-time sensor data ingestion and Azure Digital Twins to create virtual representations of manufacturing equipment with contextual relationships. This solution leverages Azure Data Explorer for historical trend analysis and Azure Machine Learning for predictive maintenance algorithms, enabling proactive decision-making and optimized production workflows through intelligent automation and data-driven insights.
 
 ## Architecture Diagram
 
@@ -48,7 +48,7 @@ graph TB
     end
     
     subgraph "Analytics Platform"
-        TSI[Time Series Insights]
+        ADX[Azure Data Explorer]
         ML[Azure Machine Learning]
         PREDICT[Predictive Models]
     end
@@ -64,34 +64,34 @@ graph TB
     EQUIP3-->IOTHUB
     
     IOTHUB-->ADT
-    IOTHUB-->TSI
+    IOTHUB-->ADX
     
     ADT-->MODELS
     ADT-->TWINS
     ADT-->ML
     
-    TSI-->ML
+    ADX-->ML
     ML-->PREDICT
     
     ADT-->DASHBOARD
-    TSI-->DASHBOARD
+    ADX-->DASHBOARD
     ML-->ALERTS
     
     style ADT fill:#FF9900
     style IOTHUB fill:#3F8624
     style ML fill:#FF6B6B
-    style TSI fill:#4ECDC4
+    style ADX fill:#4ECDC4
 ```
 
 ## Prerequisites
 
-1. Azure subscription with Azure Digital Twins, IoT Hub, Time Series Insights, and Machine Learning permissions
+1. Azure subscription with Azure Digital Twins, IoT Hub, Data Explorer, and Machine Learning permissions
 2. Azure CLI v2.50+ installed and configured (or Azure CloudShell)
 3. Understanding of IoT device simulation, DTDL modeling, and machine learning concepts
 4. Basic knowledge of JSON, time series data analysis, and manufacturing processes
-5. Estimated cost: $150-300 for initial 24-hour testing period with simulated devices
+5. Estimated cost: $200-400 for initial 24-hour testing period with simulated devices
 
-> **Note**: This recipe uses simulated IoT devices to demonstrate the architecture. Production implementations would require physical sensor integration following Azure IoT security best practices.
+> **Note**: This recipe uses simulated IoT devices to demonstrate the architecture. Production implementations would require physical sensor integration following Azure IoT security best practices and Azure Well-Architected Framework principles.
 
 ## Preparation
 
@@ -115,13 +115,16 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 # Set up service-specific naming conventions
 export IOT_HUB_NAME="iothub-manufacturing-${RANDOM_SUFFIX}"
 export DIGITAL_TWINS_NAME="dt-manufacturing-${RANDOM_SUFFIX}"
-export TSI_ENVIRONMENT_NAME="tsi-manufacturing-${RANDOM_SUFFIX}"
+export ADX_CLUSTER_NAME="adx-manufacturing-${RANDOM_SUFFIX}"
 export ML_WORKSPACE_NAME="mlws-manufacturing-${RANDOM_SUFFIX}"
 export STORAGE_ACCOUNT_NAME="stmanufacturing${RANDOM_SUFFIX}"
+export EVENT_HUB_NAMESPACE="eh-manufacturing-${RANDOM_SUFFIX}"
+export EVENT_HUB_NAME="manufacturing-telemetry"
 
 # Install required Azure CLI extensions
 az extension add --name azure-iot
 az extension add --name dt
+az extension add --name ml
 ```
 
 ## Steps
@@ -150,52 +153,72 @@ az extension add --name dt
 
    The IoT Hub is now configured with multiple partitions for scalable message processing. This foundational component enables secure device authentication, message routing, and telemetry collection from manufacturing equipment while supporting thousands of concurrent device connections.
 
-2. **Create Storage Account for Time Series Insights**:
+2. **Create Event Hub for Data Streaming**:
 
-   Azure Storage provides the warm and cold storage capabilities required by Time Series Insights for both real-time analytics and long-term historical data retention. The hierarchical namespace feature enables efficient data organization for time-series analytics workloads while maintaining cost-effective storage tiers for different data access patterns.
-
-   ```bash
-   # Create storage account with hierarchical namespace for TSI
-   az storage account create \
-       --name ${STORAGE_ACCOUNT_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --sku Standard_LRS \
-       --kind StorageV2 \
-       --hierarchical-namespace true \
-       --tags purpose=timeseries-storage
-
-   # Get storage account key for TSI configuration
-   STORAGE_KEY=$(az storage account keys list \
-       --account-name ${STORAGE_ACCOUNT_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --query '[0].value' --output tsv)
-
-   echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
-   ```
-
-   The storage account provides the foundation for Time Series Insights data persistence, enabling both real-time analytics and historical trend analysis essential for manufacturing intelligence and predictive maintenance scenarios.
-
-3. **Create Time Series Insights Environment**:
-
-   Azure Time Series Insights provides purpose-built analytics for IoT time-series data with automatic data modeling, query optimization, and visualization capabilities. This managed service enables manufacturing teams to analyze historical trends, identify patterns, and correlate equipment performance with production outcomes through an intuitive query interface.
+   Azure Event Hubs provides high-throughput data streaming capabilities required for manufacturing telemetry ingestion at scale. Event Hubs enables reliable, real-time data collection from IoT devices and serves as the bridge between IoT Hub and analytical services like Azure Data Explorer for comprehensive manufacturing intelligence.
 
    ```bash
-   # Create Time Series Insights Gen2 environment
-   az tsi environment gen2 create \
-       --environment-name ${TSI_ENVIRONMENT_NAME} \
+   # Create Event Hub namespace for telemetry streaming
+   az eventhubs namespace create \
+       --name ${EVENT_HUB_NAMESPACE} \
        --resource-group ${RESOURCE_GROUP} \
        --location ${LOCATION} \
-       --sku name=L1 capacity=1 \
-       --time-series-id-properties deviceId \
-       --warm-store-configuration data-retention=P7D \
-       --storage-configuration account-name=${STORAGE_ACCOUNT_NAME} \
-           management-key=${STORAGE_KEY}
+       --sku Standard \
+       --tags purpose=telemetry-streaming
 
-   echo "✅ Time Series Insights environment created: ${TSI_ENVIRONMENT_NAME}"
+   # Create Event Hub for manufacturing telemetry
+   az eventhubs eventhub create \
+       --name ${EVENT_HUB_NAME} \
+       --namespace-name ${EVENT_HUB_NAMESPACE} \
+       --resource-group ${RESOURCE_GROUP} \
+       --partition-count 4 \
+       --message-retention 1
+
+   # Get Event Hub connection string
+   EVENT_HUB_CONNECTION=$(az eventhubs namespace \
+       authorization-rule keys list \
+       --namespace-name ${EVENT_HUB_NAMESPACE} \
+       --resource-group ${RESOURCE_GROUP} \
+       --name RootManageSharedAccessKey \
+       --query primaryConnectionString --output tsv)
+
+   echo "✅ Event Hub created: ${EVENT_HUB_NAME}"
    ```
 
-   Time Series Insights is now configured to receive and store manufacturing telemetry data with 7-day warm storage for real-time analytics and unlimited cold storage for historical analysis. This enables comprehensive equipment performance tracking and trend identification.
+   The Event Hub infrastructure provides scalable telemetry ingestion with partitioned streaming, enabling real-time data processing and historical analysis essential for manufacturing intelligence and predictive maintenance scenarios.
+
+3. **Create Azure Data Explorer Cluster**:
+
+   Azure Data Explorer provides purpose-built analytics for IoT time-series data with automatic data modeling, query optimization, and visualization capabilities. This managed service enables manufacturing teams to analyze historical trends, identify patterns, and correlate equipment performance with production outcomes through KQL queries and real-time dashboards.
+
+   ```bash
+   # Create Azure Data Explorer cluster
+   az kusto cluster create \
+       --cluster-name ${ADX_CLUSTER_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --location ${LOCATION} \
+       --sku-name Standard_D11_v2 \
+       --sku-tier Standard \
+       --tags purpose=manufacturing-analytics
+
+   # Wait for cluster deployment to complete
+   az kusto cluster wait \
+       --cluster-name ${ADX_CLUSTER_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --created
+
+   # Create database in ADX cluster
+   az kusto database create \
+       --cluster-name ${ADX_CLUSTER_NAME} \
+       --database-name "ManufacturingData" \
+       --resource-group ${RESOURCE_GROUP} \
+       --soft-delete-period P365D \
+       --hot-cache-period P7D
+
+   echo "✅ Azure Data Explorer cluster created: ${ADX_CLUSTER_NAME}"
+   ```
+
+   Azure Data Explorer is now configured to receive and store manufacturing telemetry data with 7-day hot cache for real-time analytics and long-term retention for historical analysis. This enables comprehensive equipment performance tracking and trend identification using KQL queries.
 
 4. **Create Azure Digital Twins Instance**:
 
@@ -429,33 +452,55 @@ az extension add --name dt
 
    The Machine Learning workspace provides the foundation for developing predictive analytics models that will analyze equipment telemetry patterns to identify maintenance needs, optimize production schedules, and improve overall equipment effectiveness.
 
-9. **Configure Event Routing and Data Processing**:
+9. **Configure IoT Hub Message Routing**:
 
-   Event routing enables automated data flow from IoT Hub to multiple destinations including Digital Twins for real-time updates and Time Series Insights for analytical processing. This configuration ensures comprehensive data coverage for both operational monitoring and historical analysis essential for manufacturing intelligence.
+   Message routing enables automated data flow from IoT Hub to multiple destinations including Event Hubs for real-time stream processing and Azure Data Explorer for analytical processing. This configuration ensures comprehensive data coverage for both operational monitoring and historical analysis essential for manufacturing intelligence.
 
    ```bash
-   # Create event endpoint for Digital Twins integration
-   az iot hub routing-endpoint create \
+   # Create Event Hub endpoint for message routing
+   az iot hub message-endpoint create eventhub \
        --hub-name ${IOT_HUB_NAME} \
-       --endpoint-name "digital-twins-endpoint" \
-       --endpoint-type eventhub \
-       --endpoint-resource-group ${RESOURCE_GROUP} \
-       --connection-string ${IOT_HUB_CONNECTION}
+       --endpoint-name "manufacturing-telemetry-endpoint" \
+       --connection-string "${EVENT_HUB_CONNECTION};EntityPath=${EVENT_HUB_NAME}" \
+       --endpoint-resource-group ${RESOURCE_GROUP}
 
    # Create routing rule for telemetry data
-   az iot hub route create \
+   az iot hub message-route create \
        --hub-name ${IOT_HUB_NAME} \
-       --route-name "telemetry-to-twins" \
-       --endpoint-name "digital-twins-endpoint" \
-       --source-type devicemessages \
-       --query "true"
+       --route-name "telemetry-to-eventhub" \
+       --endpoint-name "manufacturing-telemetry-endpoint" \
+       --source devicemessages \
+       --condition "true"
 
-   echo "✅ Event routing configured for data processing"
+   echo "✅ Message routing configured for data processing"
    ```
 
-   Data routing infrastructure now automatically forwards manufacturing telemetry to appropriate Azure services, enabling real-time digital twin updates and comprehensive analytical processing for operational insights and predictive maintenance capabilities.
+   Data routing infrastructure now automatically forwards manufacturing telemetry to Event Hubs, enabling real-time stream processing and comprehensive analytical processing for operational insights and predictive maintenance capabilities.
 
-10. **Simulate Manufacturing Telemetry Data**:
+10. **Configure Data Connection to Azure Data Explorer**:
+
+    Data connections enable automatic ingestion of streaming telemetry data from Event Hubs into Azure Data Explorer for analytical processing. This configuration establishes the foundation for time-series analysis, pattern recognition, and predictive analytics using KQL queries and machine learning integration.
+
+    ```bash
+    # Create data connection from Event Hub to ADX
+    az kusto data-connection event-hub create \
+        --cluster-name ${ADX_CLUSTER_NAME} \
+        --database-name "ManufacturingData" \
+        --data-connection-name "TelemetryIngestion" \
+        --resource-group ${RESOURCE_GROUP} \
+        --location ${LOCATION} \
+        --event-hub-resource-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.EventHub/namespaces/${EVENT_HUB_NAMESPACE}/eventhubs/${EVENT_HUB_NAME}" \
+        --consumer-group '$Default' \
+        --table-name "EquipmentTelemetry" \
+        --mapping-rule-name "TelemetryMapping" \
+        --data-format JSON
+
+    echo "✅ Data connection to Azure Data Explorer configured"
+    ```
+
+    Azure Data Explorer is now configured to automatically ingest manufacturing telemetry data from Event Hubs, enabling real-time analytics and historical trend analysis for comprehensive equipment performance monitoring and predictive maintenance insights.
+
+11. **Simulate Manufacturing Telemetry Data**:
 
     Telemetry simulation generates realistic manufacturing data patterns including temperature variations, vibration signatures, and pressure readings that represent normal operations and potential failure conditions. This simulation enables testing of the complete digital twin ecosystem and predictive analytics pipeline without requiring physical equipment.
 
@@ -578,16 +623,22 @@ az extension add --name dt
 
    Expected output: JSON representation of digital twins with current property values and relationship data.
 
-3. **Test Time Series Insights data availability**:
+3. **Test Azure Data Explorer data availability**:
 
    ```bash
-   # Verify TSI environment is receiving data
-   az tsi environment show \
-       --environment-name ${TSI_ENVIRONMENT_NAME} \
+   # Verify ADX cluster is receiving data
+   az kusto cluster show \
+       --cluster-name ${ADX_CLUSTER_NAME} \
+       --resource-group ${RESOURCE_GROUP}
+   
+   # Check database status
+   az kusto database show \
+       --cluster-name ${ADX_CLUSTER_NAME} \
+       --database-name "ManufacturingData" \
        --resource-group ${RESOURCE_GROUP}
    ```
 
-   Expected output: TSI environment status showing active data ingestion and warm store configuration.
+   Expected output: ADX cluster status showing active data ingestion and database configuration ready for KQL queries.
 
 4. **Validate machine learning workspace readiness**:
 
@@ -651,29 +702,29 @@ az extension add --name dt
 
 ## Discussion
 
-Azure Digital Twins combined with IoT Hub creates a powerful foundation for smart manufacturing by providing comprehensive visibility into production operations through real-time digital representations. This architecture enables manufacturers to move beyond traditional reactive maintenance approaches toward predictive, data-driven decision making that optimizes equipment utilization and minimizes unplanned downtime. The semantic modeling capabilities of Digital Twins Definition Language (DTDL) allow for complex hierarchical relationships that mirror real manufacturing environments, as detailed in the [Azure Digital Twins documentation](https://docs.microsoft.com/en-us/azure/digital-twins/overview).
+Azure Digital Twins combined with IoT Hub creates a powerful foundation for smart manufacturing by providing comprehensive visibility into production operations through real-time digital representations. This architecture enables manufacturers to move beyond traditional reactive maintenance approaches toward predictive, data-driven decision making that optimizes equipment utilization and minimizes unplanned downtime. The semantic modeling capabilities of Digital Twins Definition Language (DTDL) allow for complex hierarchical relationships that mirror real manufacturing environments, following Azure Well-Architected Framework principles as detailed in the [Azure Digital Twins documentation](https://docs.microsoft.com/en-us/azure/digital-twins/overview).
 
-The integration with Time Series Insights provides the analytical foundation for understanding equipment performance patterns and identifying optimization opportunities. TSI's automatic data modeling and query optimization capabilities enable manufacturing teams to quickly identify correlations between operational parameters and production outcomes without requiring deep analytics expertise. For comprehensive guidance on time series analytics in manufacturing, see the [Time Series Insights best practices](https://docs.microsoft.com/en-us/azure/time-series-insights/concepts-query-data-csharp).
+The integration with Azure Data Explorer provides the analytical foundation for understanding equipment performance patterns and identifying optimization opportunities. ADX's KQL query capabilities and automatic data modeling enable manufacturing teams to quickly identify correlations between operational parameters and production outcomes without requiring deep analytics expertise. This modern replacement for the deprecated Time Series Insights service offers superior performance and scalability for manufacturing telemetry analysis, as outlined in the [Azure Data Explorer documentation](https://docs.microsoft.com/en-us/azure/data-explorer/data-explorer-overview).
 
-From a scalability perspective, this architecture supports thousands of connected devices through IoT Hub's partitioned message processing and can accommodate complex facility hierarchies through Digital Twins' graph-based data model. The serverless nature of many Azure services ensures cost-effective scaling based on actual usage patterns rather than peak capacity planning. For detailed scaling considerations, review the [Azure IoT Hub quotas and throttling](https://docs.microsoft.com/en-us/azure/iot-hub/iot-hub-devguide-quotas-throttling) documentation.
+From a scalability perspective, this architecture supports thousands of connected devices through IoT Hub's partitioned message processing and can accommodate complex facility hierarchies through Digital Twins' graph-based data model. The combination of Event Hubs for stream processing and Azure Data Explorer for analytics ensures cost-effective scaling based on actual usage patterns rather than peak capacity planning. For detailed scaling considerations, review the [Azure IoT Hub quotas and throttling](https://docs.microsoft.com/en-us/azure/iot-hub/iot-hub-devguide-quotas-throttling) documentation.
 
-Machine Learning integration enables the development of sophisticated predictive maintenance models that analyze equipment telemetry patterns to identify failure signatures before they result in downtime. This proactive approach can reduce maintenance costs by 10-20% while improving overall equipment effectiveness through optimized maintenance scheduling and resource allocation, following the principles outlined in the [Azure Machine Learning for IoT](https://docs.microsoft.com/en-us/azure/machine-learning/concept-iot-edge) guidance.
+Machine Learning integration enables the development of sophisticated predictive maintenance models that analyze equipment telemetry patterns to identify failure signatures before they result in downtime. This proactive approach can reduce maintenance costs by 10-20% while improving overall equipment effectiveness through optimized maintenance scheduling and resource allocation, following the principles outlined in the [Azure Machine Learning for IoT](https://docs.microsoft.com/en-us/azure/machine-learning/concept-iot-edge) guidance and Azure security best practices.
 
-> **Tip**: Implement gradual rollout strategies when deploying digital twin solutions in production environments. Start with a single production line or equipment type to validate the model accuracy and operational workflows before expanding to the entire facility. Use Azure Monitor and Application Insights to track system performance and user adoption metrics during deployment phases.
+> **Tip**: Implement gradual rollout strategies when deploying digital twin solutions in production environments. Start with a single production line or equipment type to validate the model accuracy and operational workflows before expanding to the entire facility. Use Azure Monitor and Application Insights to track system performance and user adoption metrics during deployment phases, following Azure Well-Architected Framework operational excellence principles.
 
 ## Challenge
 
 Extend this smart manufacturing digital twin solution by implementing these advanced capabilities:
 
-1. **Real-time Anomaly Detection**: Integrate Azure Stream Analytics with custom machine learning models to detect equipment anomalies in real-time and trigger automated responses through Digital Twins command capabilities.
+1. **Real-time Anomaly Detection**: Integrate Azure Stream Analytics with custom machine learning models to detect equipment anomalies in real-time and trigger automated responses through Digital Twins command capabilities using KQL queries in Azure Data Explorer.
 
-2. **Predictive Quality Control**: Develop machine learning models that correlate equipment performance telemetry with product quality metrics to predict and prevent quality issues before they occur.
+2. **Predictive Quality Control**: Develop machine learning models that correlate equipment performance telemetry with product quality metrics to predict and prevent quality issues before they occur, leveraging Azure Data Explorer's time-series analytics capabilities.
 
-3. **Energy Optimization**: Add energy consumption monitoring to digital twins and use Azure Machine Learning to optimize production schedules for energy efficiency while maintaining production targets.
+3. **Energy Optimization**: Add energy consumption monitoring to digital twins and use Azure Machine Learning to optimize production schedules for energy efficiency while maintaining production targets, incorporating sustainability metrics tracking.
 
-4. **Supply Chain Integration**: Extend digital twins to include supplier and inventory relationships, enabling end-to-end visibility from raw materials to finished products with predictive supply chain analytics.
+4. **Supply Chain Integration**: Extend digital twins to include supplier and inventory relationships, enabling end-to-end visibility from raw materials to finished products with predictive supply chain analytics using Azure Data Explorer's cross-database queries.
 
-5. **Mixed Reality Visualization**: Integrate with Azure Spatial Anchors and HoloLens to provide augmented reality overlays of digital twin data directly on physical equipment for enhanced maintenance and training experiences.
+5. **Mixed Reality Visualization**: Integrate with Azure Spatial Anchors and HoloLens to provide augmented reality overlays of digital twin data directly on physical equipment for enhanced maintenance and training experiences, following Azure security and compliance standards.
 
 ## Infrastructure Code
 

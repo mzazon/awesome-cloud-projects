@@ -4,12 +4,12 @@ id: a7b3c9d2
 category: sustainability
 difficulty: 100
 subject: azure
-services: Azure Sustainability Manager, Power BI, Azure Monitor
+services: Microsoft Sustainability Manager, Power BI, Azure Monitor, Logic Apps
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: sustainability, environmental, carbon-tracking, power-bi, dashboards, emissions
 recipe-generator-version: 1.3
@@ -125,7 +125,7 @@ echo "✅ Log Analytics workspace created: ${LOG_WORKSPACE}"
    Microsoft Cloud for Sustainability provides the foundation for enterprise-scale environmental data management. This configuration establishes the core data model and organizational structure needed for comprehensive sustainability tracking. The system automatically applies industry-standard emissions factors and calculation methodologies, ensuring accurate and consistent carbon accounting across all operational activities.
 
    ```bash
-   # Note: Microsoft Cloud for Sustainability requires manual setup through M365 admin center
+   # Note: Microsoft Cloud for Sustainability requires manual setup through Microsoft 365 admin center
    # This cannot be automated via Azure CLI
    
    # Create storage account for sustainability data
@@ -230,30 +230,31 @@ echo "✅ Log Analytics workspace created: ${LOG_WORKSPACE}"
    ```bash
    # Create Logic App for automated data refresh
    export LOGIC_APP="la-sustainability-${RANDOM_SUFFIX}"
+   
+   # Create the Logic App workflow
    az logic workflow create \
        --resource-group ${RESOURCE_GROUP} \
        --name ${LOGIC_APP} \
        --location ${LOCATION} \
        --definition '{
-           "definition": {
-               "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-               "triggers": {
-                   "Recurrence": {
-                       "type": "Recurrence",
-                       "recurrence": {
-                           "frequency": "Day",
-                           "interval": 1,
-                           "startTime": "2024-01-01T06:00:00Z"
-                       }
+           "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+           "contentVersion": "1.0.0.0",
+           "triggers": {
+               "Recurrence": {
+                   "type": "Recurrence",
+                   "recurrence": {
+                       "frequency": "Day",
+                       "interval": 1,
+                       "startTime": "2025-01-01T06:00:00Z"
                    }
-               },
-               "actions": {
-                   "RefreshDataset": {
-                       "type": "Http",
-                       "inputs": {
-                           "method": "POST",
-                           "uri": "https://api.powerbi.com/v1.0/myorg/datasets/refresh"
-                       }
+               }
+           },
+           "actions": {
+               "RefreshDataset": {
+                   "type": "Http",
+                   "inputs": {
+                       "method": "POST",
+                       "uri": "https://api.powerbi.com/v1.0/myorg/datasets/refresh"
                    }
                }
            }
@@ -414,15 +415,15 @@ echo "✅ Log Analytics workspace created: ${LOG_WORKSPACE}"
 
 ## Discussion
 
-Microsoft Cloud for Sustainability and Power BI create a powerful combination for environmental impact tracking that addresses the growing need for comprehensive ESG reporting. This solution enables organizations to move beyond manual spreadsheet-based tracking to automated, real-time monitoring of their carbon footprint and environmental performance. The integration supports both operational efficiency and regulatory compliance, making it ideal for companies beginning their sustainability journey or looking to enhance existing environmental programs. For detailed implementation guidance, see the [Microsoft Cloud for Sustainability documentation](https://docs.microsoft.com/en-us/industry/sustainability/) and [Power BI sustainability templates](https://docs.microsoft.com/en-us/power-bi/connect-data/service-connect-to-sustainability).
+Microsoft Cloud for Sustainability and Power BI create a powerful combination for environmental impact tracking that addresses the growing need for comprehensive ESG reporting. This solution enables organizations to move beyond manual spreadsheet-based tracking to automated, real-time monitoring of their carbon footprint and environmental performance. The integration supports both operational efficiency and regulatory compliance, making it ideal for companies beginning their sustainability journey or looking to enhance existing environmental programs. For detailed implementation guidance, see the [Microsoft Cloud for Sustainability documentation](https://learn.microsoft.com/en-us/industry/sustainability/) and [Power BI sustainability templates](https://learn.microsoft.com/en-us/power-bi/connect-data/service-connect-to-sustainability).
 
-The architecture follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) sustainability pillar, emphasizing efficient resource utilization and minimal environmental impact. By leveraging serverless computing and managed services, the solution automatically scales based on demand while optimizing energy consumption. The centralized data model ensures consistency across all sustainability metrics, enabling accurate benchmarking and progress tracking against environmental targets.
+The architecture follows the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) sustainability pillar, emphasizing efficient resource utilization and minimal environmental impact. By leveraging serverless computing and managed services, the solution automatically scales based on demand while optimizing energy consumption. The centralized data model ensures consistency across all sustainability metrics, enabling accurate benchmarking and progress tracking against environmental targets. Power BI's [service principal automation](https://learn.microsoft.com/en-us/power-bi/enterprise/service-premium-service-principal) enables unattended operations for data refresh and report generation.
 
-From a cost perspective, the consumption-based pricing model for Azure Functions and Logic Apps ensures you only pay for actual data processing activities. Power BI's flexible licensing options allow organizations to start with basic reporting and scale to advanced analytics as their sustainability program matures. The solution's ability to integrate with existing business systems reduces implementation complexity and accelerates time-to-value for sustainability initiatives. For cost optimization strategies, review the [Azure sustainability cost management guide](https://docs.microsoft.com/en-us/azure/cost-management-billing/cost-management-billing-overview).
+From a cost perspective, the consumption-based pricing model for Azure Functions and Logic Apps ensures you only pay for actual data processing activities. Power BI's flexible licensing options allow organizations to start with basic reporting and scale to advanced analytics as their sustainability program matures. The solution's ability to integrate with existing business systems reduces implementation complexity and accelerates time-to-value for sustainability initiatives. For cost optimization strategies, review the [Azure sustainability cost management guide](https://learn.microsoft.com/en-us/azure/cost-management-billing/cost-management-billing-overview).
 
 The dashboard capabilities enable stakeholders across the organization to access relevant sustainability insights, from executive summaries for leadership to detailed operational metrics for facility managers. Power BI's collaboration features support cross-functional sustainability teams by providing shared workspaces and automated report distribution. This comprehensive approach to environmental data management positions organizations to meet increasing stakeholder expectations for transparency and accountability in sustainability performance.
 
-> **Tip**: Use Azure Monitor and Application Insights to track data quality metrics and identify optimization opportunities. The [monitoring best practices guide](https://docs.microsoft.com/en-us/azure/azure-monitor/best-practices) provides comprehensive guidance on setting up effective alerting and performance tracking for sustainability data pipelines.
+> **Tip**: Use Azure Monitor and Application Insights to track data quality metrics and identify optimization opportunities. The [monitoring best practices guide](https://learn.microsoft.com/en-us/azure/azure-monitor/best-practices) provides comprehensive guidance on setting up effective alerting and performance tracking for sustainability data pipelines.
 
 ## Challenge
 
@@ -432,7 +433,7 @@ Extend this solution by implementing these enhancements:
 
 2. **Supply Chain Emissions Tracking**: Integrate with supplier APIs and third-party data sources to track Scope 3 emissions across the entire value chain, providing comprehensive carbon footprint visibility.
 
-3. **Regulatory Reporting Automation**: Build automated report generation for specific regulatory frameworks (CDP, TCFD, EU Taxonomy) with templated outputs and submission workflows.
+3. **Regulatory Reporting Automation**: Build automated report generation for specific regulatory frameworks (CDP, TCFD, EU Taxonomy) with templated outputs and submission workflows using Power Automate.
 
 4. **Real-time Facility Monitoring**: Connect IoT sensors and smart building systems to provide real-time energy consumption and environmental impact data for immediate optimization opportunities.
 

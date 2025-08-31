@@ -1,0 +1,657 @@
+# Infrastructure Manager Configuration for Interview Practice Assistant
+# This configuration deploys an intelligent interview practice platform using 
+# Google Cloud's AI services including Vertex AI Gemini, Speech-to-Text,
+# Cloud Functions, and Cloud Storage.
+
+apiVersion: config.cloud.google.com/v1beta1
+kind: ConfigController
+metadata:
+  name: interview-practice-assistant
+  labels:
+    app: interview-practice
+    environment: production
+    version: "1.1"
+
+# Project Configuration
+spec:
+  projectId: ${PROJECT_ID}
+  location: ${REGION}
+
+# Service Account for Interview Assistant Functions
+---
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMServiceAccount
+metadata:
+  name: interview-assistant-sa
+  namespace: ${PROJECT_ID}
+  annotations:
+    cnrm.cloud.google.com/project-id: ${PROJECT_ID}
+spec:
+  displayName: "Interview Assistant Service Account"
+  description: "Service account for interview practice functions with least privilege access"
+
+# IAM Policy Bindings for Service Account
+---
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: interview-assistant-speech-client
+  namespace: ${PROJECT_ID}
+spec:
+  member: serviceAccount:interview-assistant-sa@${PROJECT_ID}.iam.gserviceaccount.com
+  role: roles/speech.client
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: ${PROJECT_ID}
+
+---
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: interview-assistant-aiplatform-user
+  namespace: ${PROJECT_ID}
+spec:
+  member: serviceAccount:interview-assistant-sa@${PROJECT_ID}.iam.gserviceaccount.com
+  role: roles/aiplatform.user
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: ${PROJECT_ID}
+
+---
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: interview-assistant-storage-admin
+  namespace: ${PROJECT_ID}
+spec:
+  member: serviceAccount:interview-assistant-sa@${PROJECT_ID}.iam.gserviceaccount.com
+  role: roles/storage.objectAdmin
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: ${PROJECT_ID}
+
+# Cloud Storage Bucket for Audio Files
+---
+apiVersion: storage.cnrm.cloud.google.com/v1beta1
+kind: StorageBucket
+metadata:
+  name: interview-audio-bucket
+  namespace: ${PROJECT_ID}
+  annotations:
+    cnrm.cloud.google.com/project-id: ${PROJECT_ID}
+spec:
+  bucketPolicyOnly: true
+  location: ${REGION}
+  storageClass: STANDARD
+  uniformBucketLevelAccess: true
+  # Lifecycle management for cost optimization
+  lifecycle:
+    rule:
+    - action:
+        type: Delete
+      condition:
+        age: 30
+        withState: ANY
+  # Versioning for data protection
+  versioning:
+    enabled: true
+  # Encryption configuration
+  encryption:
+    defaultKmsKeyName: projects/${PROJECT_ID}/locations/${REGION}/keyRings/interview-assistant-keyring/cryptoKeys/audio-encryption-key
+  # Logging configuration
+  logging:
+    logBucket: interview-audit-logs-bucket
+    logObjectPrefix: audio-access/
+  # CORS configuration for web access
+  cors:
+  - origin: ["https://*.${PROJECT_ID}.appspot.com", "https://localhost:*"]
+    method: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    responseHeader: ["Content-Type", "Authorization"]
+    maxAgeSeconds: 3600
+
+# Cloud Storage Bucket for Audit Logs
+---
+apiVersion: storage.cnrm.cloud.google.com/v1beta1
+kind: StorageBucket
+metadata:
+  name: interview-audit-logs-bucket
+  namespace: ${PROJECT_ID}
+  annotations:
+    cnrm.cloud.google.com/project-id: ${PROJECT_ID}
+spec:
+  bucketPolicyOnly: true
+  location: ${REGION}
+  storageClass: COLDLINE
+  uniformBucketLevelAccess: true
+  lifecycle:
+    rule:
+    - action:
+        type: Delete
+      condition:
+        age: 90
+        withState: ANY
+
+# Cloud KMS Key Ring for Encryption
+---
+apiVersion: kms.cnrm.cloud.google.com/v1beta1
+kind: KMSKeyRing
+metadata:
+  name: interview-assistant-keyring
+  namespace: ${PROJECT_ID}
+spec:
+  location: ${REGION}
+
+# Cloud KMS Crypto Key for Audio Encryption
+---
+apiVersion: kms.cnrm.cloud.google.com/v1beta1
+kind: KMSCryptoKey
+metadata:
+  name: audio-encryption-key
+  namespace: ${PROJECT_ID}
+spec:
+  keyRingRef:
+    name: interview-assistant-keyring
+  purpose: ENCRYPT_DECRYPT
+  rotationPeriod: 7776000s  # 90 days
+  versionTemplate:
+    algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+    protectionLevel: SOFTWARE
+
+# Speech-to-Text Cloud Function
+---
+apiVersion: cloudfunctions.cnrm.cloud.google.com/v1beta1
+kind: CloudFunctionsFunction
+metadata:
+  name: interview-assistant-speech
+  namespace: ${PROJECT_ID}
+  annotations:
+    cnrm.cloud.google.com/project-id: ${PROJECT_ID}
+spec:
+  region: ${REGION}
+  runtime: python311
+  entryPoint: transcribe_audio
+  timeout: 120s
+  availableMemoryMb: 512
+  maxInstances: 100
+  minInstances: 0
+  # Service account configuration
+  serviceAccountRef:
+    name: interview-assistant-sa
+  # Environment variables
+  environmentVariables:
+    GCP_PROJECT: ${PROJECT_ID}
+    REGION: ${REGION}
+    BUCKET_NAME: interview-audio-bucket
+  # HTTP trigger configuration
+  httpsTrigger:
+    securityLevel: SECURE_ALWAYS
+  # Source code archive
+  sourceArchiveUrl: gs://interview-deployment-artifacts/speech-function.zip
+  # Labels for resource management
+  labels:
+    function-type: speech-processing
+    component: transcription
+    version: "1.1"
+
+# Gemini Analysis Cloud Function
+---
+apiVersion: cloudfunctions.cnrm.cloud.google.com/v1beta1
+kind: CloudFunctionsFunction
+metadata:
+  name: interview-assistant-analysis
+  namespace: ${PROJECT_ID}
+  annotations:
+    cnrm.cloud.google.com/project-id: ${PROJECT_ID}
+spec:
+  region: ${REGION}
+  runtime: python311
+  entryPoint: analyze_interview_response
+  timeout: 120s
+  availableMemoryMb: 1024
+  maxInstances: 50
+  minInstances: 0
+  # Service account configuration
+  serviceAccountRef:
+    name: interview-assistant-sa
+  # Environment variables
+  environmentVariables:
+    GCP_PROJECT: ${PROJECT_ID}
+    REGION: ${REGION}
+    VERTEX_AI_LOCATION: ${REGION}
+  # HTTP trigger configuration
+  httpsTrigger:
+    securityLevel: SECURE_ALWAYS
+  # Source code archive
+  sourceArchiveUrl: gs://interview-deployment-artifacts/analysis-function.zip
+  # Labels for resource management
+  labels:
+    function-type: ai-analysis
+    component: gemini-processing
+    version: "1.1"
+
+# Orchestration Cloud Function
+---
+apiVersion: cloudfunctions.cnrm.cloud.google.com/v1beta1
+kind: CloudFunctionsFunction
+metadata:
+  name: interview-assistant-orchestrate
+  namespace: ${PROJECT_ID}
+  annotations:
+    cnrm.cloud.google.com/project-id: ${PROJECT_ID}
+spec:
+  region: ${REGION}
+  runtime: python311
+  entryPoint: orchestrate_interview_analysis
+  timeout: 300s
+  availableMemoryMb: 256
+  maxInstances: 20
+  minInstances: 1  # Keep warm for better performance
+  # Service account configuration
+  serviceAccountRef:
+    name: interview-assistant-sa
+  # Environment variables
+  environmentVariables:
+    GCP_PROJECT: ${PROJECT_ID}
+    GCLOUD_PROJECT: ${PROJECT_ID}
+    GCLOUD_REGION: ${REGION}
+    BUCKET_NAME: interview-audio-bucket
+  # HTTP trigger configuration
+  httpsTrigger:
+    securityLevel: SECURE_ALWAYS
+  # Source code archive
+  sourceArchiveUrl: gs://interview-deployment-artifacts/orchestration-function.zip
+  # Labels for resource management
+  labels:
+    function-type: orchestration
+    component: workflow-coordinator
+    version: "1.1"
+
+# Cloud Function IAM Policy for Public Access
+---
+apiVersion: cloudfunctions.cnrm.cloud.google.com/v1beta1
+kind: CloudFunctionsCloudFunctionIamPolicy
+metadata:
+  name: speech-function-public-access
+  namespace: ${PROJECT_ID}
+spec:
+  resourceRef:
+    name: interview-assistant-speech
+  bindings:
+  - role: roles/cloudfunctions.invoker
+    members:
+    - allUsers
+
+---
+apiVersion: cloudfunctions.cnrm.cloud.google.com/v1beta1
+kind: CloudFunctionsCloudFunctionIamPolicy
+metadata:
+  name: analysis-function-public-access
+  namespace: ${PROJECT_ID}
+spec:
+  resourceRef:
+    name: interview-assistant-analysis
+  bindings:
+  - role: roles/cloudfunctions.invoker
+    members:
+    - allUsers
+
+---
+apiVersion: cloudfunctions.cnrm.cloud.google.com/v1beta1
+kind: CloudFunctionsCloudFunctionIamPolicy
+metadata:
+  name: orchestrate-function-public-access
+  namespace: ${PROJECT_ID}
+spec:
+  resourceRef:
+    name: interview-assistant-orchestrate
+  bindings:
+  - role: roles/cloudfunctions.invoker
+    members:
+    - allUsers
+
+# Cloud Monitoring Alert Policy for Function Errors
+---
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringAlertPolicy
+metadata:
+  name: interview-function-error-alerts
+  namespace: ${PROJECT_ID}
+spec:
+  displayName: "Interview Assistant Function Errors"
+  combiner: OR
+  enabled: true
+  conditions:
+  - displayName: "High Error Rate"
+    conditionThreshold:
+      filter: 'resource.type="cloud_function" AND resource.labels.function_name=~"interview-assistant-.*"'
+      comparison: COMPARISON_GREATER_THAN
+      thresholdValue: 5
+      duration: 300s
+      aggregations:
+      - alignmentPeriod: 60s
+        perSeriesAligner: ALIGN_RATE
+        crossSeriesReducer: REDUCE_SUM
+        groupByFields:
+        - resource.labels.function_name
+  notificationChannels:
+  - projects/${PROJECT_ID}/notificationChannels/${NOTIFICATION_CHANNEL_ID}
+  alertStrategy:
+    autoClose: 86400s  # 24 hours
+
+# Cloud Monitoring Dashboard
+---
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringDashboard
+metadata:
+  name: interview-assistant-dashboard
+  namespace: ${PROJECT_ID}
+spec:
+  displayName: "Interview Practice Assistant Monitoring"
+  mosaicLayout:
+    tiles:
+    - width: 6
+      height: 4
+      widget:
+        title: "Function Invocation Count"
+        xyChart:
+          dataSets:
+          - timeSeriesQuery:
+              timeSeriesFilter:
+                filter: 'resource.type="cloud_function" AND resource.labels.function_name=~"interview-assistant-.*"'
+                aggregation:
+                  alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+                  groupByFields:
+                  - resource.labels.function_name
+          timeshiftDuration: 0s
+          yAxis:
+            label: "Invocations/sec"
+            scale: LINEAR
+    - width: 6
+      height: 4
+      widget:
+        title: "Function Execution Times"
+        xyChart:
+          dataSets:
+          - timeSeriesQuery:
+              timeSeriesFilter:
+                filter: 'resource.type="cloud_function" AND resource.labels.function_name=~"interview-assistant-.*" AND metric.type="cloudfunctions.googleapis.com/function/execution_time"'
+                aggregation:
+                  alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_MEAN
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                  - resource.labels.function_name
+          timeshiftDuration: 0s
+          yAxis:
+            label: "Execution Time (ms)"
+            scale: LINEAR
+    - width: 12
+      height: 4
+      widget:
+        title: "Storage Bucket Usage"
+        xyChart:
+          dataSets:
+          - timeSeriesQuery:
+              timeSeriesFilter:
+                filter: 'resource.type="gcs_bucket" AND resource.labels.bucket_name="interview-audio-bucket"'
+                aggregation:
+                  alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_MEAN
+                  crossSeriesReducer: REDUCE_SUM
+          timeshiftDuration: 0s
+          yAxis:
+            label: "Storage Usage (bytes)"
+            scale: LINEAR
+
+# Secret Manager Secret for API Keys (if needed)
+---
+apiVersion: secretmanager.cnrm.cloud.google.com/v1beta1
+kind: SecretManagerSecret
+metadata:
+  name: interview-assistant-config
+  namespace: ${PROJECT_ID}
+spec:
+  secretId: interview-assistant-config
+  replication:
+    automatic: true
+  labels:
+    component: configuration
+    environment: production
+
+# VPC Connector for Private Network Access (Optional)
+---
+apiVersion: vpcaccess.cnrm.cloud.google.com/v1beta1
+kind: VPCAccessConnector
+metadata:
+  name: interview-assistant-connector
+  namespace: ${PROJECT_ID}
+spec:
+  region: ${REGION}
+  ipCidrRange: "10.8.0.0/28"
+  minThroughput: 200
+  maxThroughput: 1000
+  network: projects/${PROJECT_ID}/global/networks/default
+  machineType: e2-micro
+
+# Deployment Artifacts Storage Bucket
+---
+apiVersion: storage.cnrm.cloud.google.com/v1beta1
+kind: StorageBucket
+metadata:
+  name: interview-deployment-artifacts
+  namespace: ${PROJECT_ID}
+  annotations:
+    cnrm.cloud.google.com/project-id: ${PROJECT_ID}
+spec:
+  bucketPolicyOnly: true
+  location: ${REGION}
+  storageClass: STANDARD
+  uniformBucketLevelAccess: true
+  lifecycle:
+    rule:
+    - action:
+        type: Delete
+      condition:
+        age: 90
+        withState: ANY
+  versioning:
+    enabled: true
+
+# Cloud Logging Sink for Audit Trail
+---
+apiVersion: logging.cnrm.cloud.google.com/v1beta1
+kind: LoggingLogSink
+metadata:
+  name: interview-assistant-audit-sink
+  namespace: ${PROJECT_ID}
+spec:
+  destination: storage.googleapis.com/interview-audit-logs-bucket
+  filter: 'resource.type="cloud_function" AND resource.labels.function_name=~"interview-assistant-.*" AND (severity="ERROR" OR severity="WARNING" OR protoPayload.methodName="google.cloud.functions.v1.CloudFunctionsService.CreateFunction")'
+  includeChildren: true
+  uniqueWriterIdentity: true
+
+# Budget Alert for Cost Management
+---
+apiVersion: billing.cnrm.cloud.google.com/v1beta1
+kind: BillingBudget
+metadata:
+  name: interview-assistant-budget
+  namespace: ${PROJECT_ID}
+spec:
+  billingAccount: ${BILLING_ACCOUNT_ID}
+  displayName: "Interview Assistant Budget"
+  budgetFilter:
+    projects:
+    - projects/${PROJECT_ID}
+    services:
+    - services/cloudfunctions.googleapis.com
+    - services/speech.googleapis.com
+    - services/aiplatform.googleapis.com
+    - services/storage.googleapis.com
+  amount:
+    specifiedAmount:
+      currencyCode: USD
+      units: "50"  # $50 monthly budget
+  thresholdRules:
+  - thresholdPercent: 0.5  # 50% alert
+    spendBasis: CURRENT_SPEND
+  - thresholdPercent: 0.8  # 80% alert
+    spendBasis: CURRENT_SPEND
+  - thresholdPercent: 1.0  # 100% alert
+    spendBasis: CURRENT_SPEND
+  allUpdatesRule:
+    monitoringNotificationChannels:
+    - projects/${PROJECT_ID}/notificationChannels/${NOTIFICATION_CHANNEL_ID}
+    pubsubTopic: projects/${PROJECT_ID}/topics/budget-alerts
+
+# Output Configuration for Resource Information
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: interview-assistant-outputs
+  namespace: ${PROJECT_ID}
+data:
+  project_id: ${PROJECT_ID}
+  region: ${REGION}
+  bucket_name: interview-audio-bucket
+  service_account_email: interview-assistant-sa@${PROJECT_ID}.iam.gserviceaccount.com
+  speech_function_url: https://${REGION}-${PROJECT_ID}.cloudfunctions.net/interview-assistant-speech
+  analysis_function_url: https://${REGION}-${PROJECT_ID}.cloudfunctions.net/interview-assistant-analysis
+  orchestrate_function_url: https://${REGION}-${PROJECT_ID}.cloudfunctions.net/interview-assistant-orchestrate
+  kms_key_name: projects/${PROJECT_ID}/locations/${REGION}/keyRings/interview-assistant-keyring/cryptoKeys/audio-encryption-key
+  deployment_notes: |
+    This Infrastructure Manager configuration deploys a complete Interview Practice Assistant
+    platform using Google Cloud AI services. The deployment includes:
+    
+    - Three Cloud Functions for speech processing, AI analysis, and orchestration
+    - Cloud Storage buckets with lifecycle management and encryption
+    - IAM service accounts with least privilege permissions
+    - KMS encryption keys for data security
+    - Monitoring and alerting infrastructure
+    - Budget controls for cost management
+    
+    Post-deployment steps:
+    1. Upload function source code to the deployment artifacts bucket
+    2. Configure notification channels for monitoring alerts
+    3. Set up budget billing account reference
+    4. Test the complete workflow with sample audio files
+    
+    The solution follows Google Cloud best practices for security, scalability,
+    and cost optimization while providing enterprise-grade monitoring and governance.
+
+# Pre-deployment Service Enablement
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: cloudfunctions-service
+  namespace: ${PROJECT_ID}
+spec:
+  projectRef:
+    external: ${PROJECT_ID}
+  serviceId: cloudfunctions.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: speech-service
+  namespace: ${PROJECT_ID}
+spec:
+  projectRef:
+    external: ${PROJECT_ID}
+  serviceId: speech.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: aiplatform-service
+  namespace: ${PROJECT_ID}
+spec:
+  projectRef:
+    external: ${PROJECT_ID}
+  serviceId: aiplatform.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: storage-service
+  namespace: ${PROJECT_ID}
+spec:
+  projectRef:
+    external: ${PROJECT_ID}
+  serviceId: storage.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: run-service
+  namespace: ${PROJECT_ID}
+spec:
+  projectRef:
+    external: ${PROJECT_ID}
+  serviceId: run.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: kms-service
+  namespace: ${PROJECT_ID}
+spec:
+  projectRef:
+    external: ${PROJECT_ID}
+  serviceId: cloudkms.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: monitoring-service
+  namespace: ${PROJECT_ID}
+spec:
+  projectRef:
+    external: ${PROJECT_ID}
+  serviceId: monitoring.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: logging-service
+  namespace: ${PROJECT_ID}
+spec:
+  projectRef:
+    external: ${PROJECT_ID}
+  serviceId: logging.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: secretmanager-service
+  namespace: ${PROJECT_ID}
+spec:
+  projectRef:
+    external: ${PROJECT_ID}
+  serviceId: secretmanager.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: vpcaccess-service
+  namespace: ${PROJECT_ID}
+spec:
+  projectRef:
+    external: ${PROJECT_ID}
+  serviceId: vpcaccess.googleapis.com

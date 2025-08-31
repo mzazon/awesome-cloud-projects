@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Application Load Balancer, Service Extensions, BigQuery, Cloud Run
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: load-balancing, traffic-routing, ai-analytics, service-extensions, bigquery-data-canvas
 recipe-generator-version: 1.3
@@ -91,7 +91,7 @@ graph TB
 4. Familiarity with BigQuery and natural language processing concepts
 5. Estimated cost: $25-50 for running this recipe (includes compute, storage, and AI services)
 
-> **Note**: Service Extensions for Application Load Balancer is currently in Preview. Ensure your project has access to preview features through the Google Cloud Console.
+> **Note**: Service Extensions for Application Load Balancer is available in Preview. Ensure your project has access to preview features through the Google Cloud Console and the necessary APIs are enabled.
 
 ## Preparation
 
@@ -118,8 +118,9 @@ gcloud services enable run.googleapis.com
 gcloud services enable bigquery.googleapis.com
 gcloud services enable logging.googleapis.com
 gcloud services enable monitoring.googleapis.com
-gcloud services enable serviceextensions.googleapis.com
+gcloud services enable networkservices.googleapis.com
 gcloud services enable workflows.googleapis.com
+gcloud services enable cloudfunctions.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Region set to: ${REGION}"
@@ -241,7 +242,7 @@ echo "✅ Required APIs enabled"
    # Create health check for Cloud Run services
    gcloud compute health-checks create http cr-health-check-${RANDOM_SUFFIX} \
        --port=8080 \
-       --request-path="/health" \
+       --request-path="/" \
        --check-interval=30s \
        --timeout=10s \
        --healthy-threshold=2 \
@@ -293,28 +294,38 @@ echo "✅ Required APIs enabled"
 
 5. **Create Traffic Extension Plugin for Intelligent Routing**:
 
-   Service Extensions enable custom logic at the load balancer layer, allowing us to implement intelligent routing decisions based on real-time analytics. The traffic extension will capture request metadata, analyze patterns, and make routing decisions using AI insights from BigQuery Data Canvas, transforming static load balancing into dynamic, learning-based traffic management.
+   Service Extensions enable custom logic at the load balancer layer through callouts to external services. The traffic extension will capture request metadata, analyze patterns, and make routing decisions using AI insights from BigQuery Data Canvas, transforming static load balancing into dynamic, learning-based traffic management.
 
    ```bash
    # Create Cloud Function for traffic routing logic
    cat > traffic-router-function.py << 'EOF'
+import functions_framework
 import json
 import logging
 from google.cloud import bigquery
-from google.cloud import monitoring_v3
 import datetime
+import os
 
+@functions_framework.http
 def route_traffic(request):
     """Intelligent traffic routing based on real-time analytics"""
     
-    # Extract request metadata
-    request_data = request.get_json()
-    source_ip = request_data.get('source_ip')
-    user_agent = request_data.get('user_agent', '')
+    # Extract request metadata from Service Extensions callout
+    if request.method == 'POST':
+        request_data = request.get_json() or {}
+    else:
+        request_data = {}
+    
+    # Get project and dataset from environment
+    project_id = os.environ.get('PROJECT_ID')
+    dataset_name = os.environ.get('DATASET_NAME')
+    
+    source_ip = request_data.get('source_ip', '0.0.0.0')
+    user_agent = request_data.get('user_agent', 'unknown')
     request_size = request_data.get('request_size', 0)
     
     # Initialize BigQuery client
-    client = bigquery.Client()
+    client = bigquery.Client(project=project_id)
     
     # Query recent performance metrics
     query = f"""
@@ -323,10 +334,11 @@ def route_traffic(request):
         AVG(response_time) as avg_response_time,
         COUNT(*) as request_count,
         AVG(status_code) as avg_status
-    FROM `{PROJECT_ID}.{DATASET_NAME}.lb_metrics`
+    FROM `{project_id}.{dataset_name}.lb_metrics`
     WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 5 MINUTE)
     GROUP BY target_service
     ORDER BY avg_response_time ASC
+    LIMIT 1
     """
     
     try:
@@ -334,7 +346,7 @@ def route_traffic(request):
         results = list(query_job)
         
         # Select optimal service based on performance
-        if results:
+        if results and len(results) > 0:
             best_service = results[0].target_service
             confidence = 0.9
         else:
@@ -353,38 +365,63 @@ def route_traffic(request):
         }
         
         # Insert routing decision into BigQuery
-        table_id = f"{PROJECT_ID}.{DATASET_NAME}.routing_decisions"
+        table_id = f"{project_id}.{dataset_name}.routing_decisions"
         table = client.get_table(table_id)
         client.insert_rows_json(table, [decision_data])
         
+        # Return response in format expected by Service Extensions
         return {
-            'target_service': best_service,
-            'confidence': confidence,
-            'routing_metadata': decision_data
+            'statusCode': 200,
+            'headers': {
+                'x-routing-decision': best_service,
+                'x-confidence-score': str(confidence)
+            },
+            'body': json.dumps({
+                'target_service': best_service,
+                'confidence': confidence,
+                'routing_metadata': decision_data
+            })
         }
         
     except Exception as e:
         logging.error(f"Routing error: {e}")
         return {
-            'target_service': 'service-a',
-            'confidence': 0.3,
-            'error': str(e)
+            'statusCode': 200,
+            'headers': {
+                'x-routing-decision': 'service-a',
+                'x-confidence-score': '0.3'
+            },
+            'body': json.dumps({
+                'target_service': 'service-a',
+                'confidence': 0.3,
+                'error': str(e)
+            })
         }
+EOF
+   
+   # Create requirements.txt for the function
+   cat > requirements.txt << 'EOF'
+functions-framework==3.*
+google-cloud-bigquery==3.*
+google-cloud-logging==3.*
 EOF
    
    # Deploy the traffic routing function
    gcloud functions deploy traffic-router-${RANDOM_SUFFIX} \
-       --runtime=python39 \
+       --gen2 \
+       --runtime=python311 \
        --trigger=http \
        --entry-point=route_traffic \
        --source=. \
        --region=${REGION} \
        --allow-unauthenticated \
-       --set-env-vars="PROJECT_ID=${PROJECT_ID},DATASET_NAME=${DATASET_NAME}"
+       --set-env-vars="PROJECT_ID=${PROJECT_ID},DATASET_NAME=${DATASET_NAME}" \
+       --memory=512MB \
+       --timeout=30s
    
    # Get function URL
    FUNCTION_URL=$(gcloud functions describe traffic-router-${RANDOM_SUFFIX} \
-       --region=${REGION} --format="value(httpsTrigger.url)")
+       --region=${REGION} --format="value(serviceConfig.uri)")
    
    echo "✅ Traffic routing function deployed: ${FUNCTION_URL}"
    ```
@@ -393,17 +430,15 @@ EOF
 
 6. **Configure Service Extensions for the Load Balancer**:
 
-   Service Extensions configuration connects our intelligent routing logic to the Application Load Balancer's traffic processing pipeline. By implementing traffic extensions at the request processing stage, we enable real-time routing decisions that can dynamically adjust traffic distribution based on AI insights and performance analytics from BigQuery Data Canvas.
+   Service Extensions configuration connects our intelligent routing logic to the Application Load Balancer's traffic processing pipeline. By implementing traffic callout extensions, we enable real-time routing decisions that can dynamically adjust traffic distribution based on AI insights and performance analytics from BigQuery Data Canvas.
 
    ```bash
-   # Create the Service Extension resource
-   gcloud service-extensions extensions create ${EXTENSION_NAME} \
+   # Create the Service Extension resource using network services API
+   gcloud network-services lb-traffic-extensions create ${EXTENSION_NAME} \
        --location=${REGION} \
        --description="Intelligent traffic routing with BigQuery analytics" \
-       --extension-type=TRAFFIC_EXTENSION \
-       --config-type=CALLOUT \
-       --callout-service-uri=${FUNCTION_URL} \
-       --callout-timeout=30s
+       --forwarding-rules=intelligent-lb-rule-${RANDOM_SUFFIX} \
+       --extension-chains=name=traffic-chain,match-conditions=host=*,extensions=name=traffic-ext,service=${FUNCTION_URL},timeout=30s
    
    # Wait for extension to be ready
    echo "Waiting for Service Extension to be ready..."
@@ -429,7 +464,7 @@ EOF
        --default-backend-service=service-a-backend-${RANDOM_SUFFIX} \
        --backend-service-path-rules="/api/fast/*=service-a-backend-${RANDOM_SUFFIX},/api/standard/*=service-b-backend-${RANDOM_SUFFIX},/api/intensive/*=service-c-backend-${RANDOM_SUFFIX}"
    
-   # Create HTTP(S) proxy with Service Extensions
+   # Create HTTP(S) proxy
    gcloud compute target-http-proxies create intelligent-proxy-${RANDOM_SUFFIX} \
        --url-map=intelligent-lb-${RANDOM_SUFFIX}
    
@@ -468,7 +503,7 @@ end_time=$((SECONDS + DURATION))
 
 while [ $SECONDS -lt $end_time ]; do
     # Generate varied traffic patterns
-    PATHS=("/api/fast/test" "/api/standard/process" "/api/intensive/compute" "/health" "/")
+    PATHS=("/api/fast/test" "/api/standard/process" "/api/intensive/compute" "/" "/health")
     PATH=${PATHS[$RANDOM % ${#PATHS[@]}]}
     
     # Simulate different user agents and request sizes
@@ -484,7 +519,7 @@ while [ $SECONDS -lt $end_time ]; do
     # Parse response metrics
     IFS=',' read -r RESPONSE_TIME STATUS_CODE RESPONSE_SIZE <<< "${RESPONSE}"
     
-    # Insert metrics into BigQuery (simulated with Cloud Logging)
+    # Insert metrics into BigQuery via Cloud Logging
     gcloud logging write traffic-metrics \
         "{\"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \
           \"request_id\": \"req_$(date +%s)_${REQUEST_COUNT}\", \
@@ -500,7 +535,7 @@ while [ $SECONDS -lt $end_time ]; do
     REQUEST_COUNT=$((REQUEST_COUNT + 1))
     
     # Random delay between requests
-    sleep $(echo "scale=2; $RANDOM/32767 * 2" | bc -l)
+    sleep $(awk "BEGIN {print $RANDOM/32767 * 2}")
 done
 
 echo "Generated ${REQUEST_COUNT} requests over ${DURATION} seconds"
@@ -530,7 +565,7 @@ EOF
    # Create a log sink to export traffic logs to BigQuery
    gcloud logging sinks create traffic-analytics-sink \
        bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/${DATASET_NAME} \
-       --log-filter='resource.type="gce_instance" OR jsonPayload.source_ip!=""'
+       --log-filter='resource.type="cloud_function" OR jsonPayload.source_ip!=""'
    
    # Create Cloud Workflow for automated analytics
    cat > analytics-workflow.yaml << 'EOF'
@@ -538,11 +573,9 @@ main:
   params: [args]
   steps:
     - analyze_traffic:
-        call: http.get
+        call: googleapis.bigquery.v2.jobs.query
         args:
-          url: ${"https://bigquery.googleapis.com/bigquery/v2/projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT") + "/queries"}
-          headers:
-            Authorization: ${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+          projectId: ${PROJECT_ID}
           body:
             query: |
               SELECT 
@@ -560,7 +593,7 @@ main:
     - log_insights:
         call: sys.log
         args:
-          text: ${"Analytics complete. Best performing service: " + query_result.body.rows[0].f[0].v}
+          text: ${"Analytics complete. Query executed successfully"}
           severity: INFO
     
     - return_result:
@@ -574,6 +607,7 @@ EOF
    
    echo "✅ BigQuery Data Canvas integration configured"
    echo "✅ Analytics workflow deployed for automated insights"
+   echo "✅ Use BigQuery Data Canvas in the Google Cloud Console to query traffic data with natural language"
    ```
 
    BigQuery Data Canvas is now integrated with our traffic analytics pipeline, enabling natural language queries to analyze routing performance and generate AI-powered insights. The automated workflow provides continuous analytics that feed back into our intelligent routing decisions.
@@ -588,7 +622,7 @@ EOF
        --global --format="table(name,IPAddress,target)"
    
    # Verify Service Extensions configuration
-   gcloud service-extensions extensions describe ${EXTENSION_NAME} \
+   gcloud network-services lb-traffic-extensions describe ${EXTENSION_NAME} \
        --location=${REGION} --format="yaml"
    
    # Test basic connectivity
@@ -690,7 +724,7 @@ EOF
 
    ```bash
    # Delete Service Extension
-   gcloud service-extensions extensions delete ${EXTENSION_NAME} \
+   gcloud network-services lb-traffic-extensions delete ${EXTENSION_NAME} \
        --location=${REGION} --quiet
    
    # Delete backend services
@@ -724,7 +758,7 @@ EOF
        --location=${REGION} --quiet
    
    # Remove local files
-   rm -f traffic-router-function.py generate_traffic.sh analytics-workflow.yaml
+   rm -f traffic-router-function.py requirements.txt generate_traffic.sh analytics-workflow.yaml
    
    echo "✅ Cloud Functions and Workflows removed"
    ```
@@ -754,13 +788,13 @@ EOF
 
 ## Discussion
 
-This intelligent traffic routing solution demonstrates the power of combining Google Cloud's Service Extensions with BigQuery Data Canvas to create AI-driven infrastructure management. The architecture leverages several key Google Cloud capabilities: Application Load Balancer's global reach and reliability, Service Extensions for custom traffic processing logic, BigQuery's analytics capabilities, and Gemini AI integration through Data Canvas for natural language insights.
+This intelligent traffic routing solution demonstrates the power of combining Google Cloud's Service Extensions with BigQuery Data Canvas to create AI-driven infrastructure management. The architecture leverages several key Google Cloud capabilities: Application Load Balancer's global reach and reliability, Service Extensions for custom traffic processing logic through callouts, BigQuery's analytics capabilities, and Gemini AI integration through Data Canvas for natural language insights.
 
-The Service Extensions feature provides unprecedented flexibility in load balancer behavior, allowing custom logic to run directly in the traffic path without compromising performance. By integrating with BigQuery Data Canvas, we transform static load balancing into a learning system that continuously optimizes based on real traffic patterns and performance metrics. This approach follows Google Cloud's principle of intelligent infrastructure that adapts to workload requirements rather than requiring manual optimization.
+The Service Extensions feature provides unprecedented flexibility in load balancer behavior through callout extensions, allowing custom logic to run during request processing without compromising performance. By integrating with BigQuery Data Canvas, we transform static load balancing into a learning system that continuously optimizes based on real traffic patterns and performance metrics. This approach follows Google Cloud's principle of intelligent infrastructure that adapts to workload requirements rather than requiring manual optimization.
 
 The solution addresses several critical challenges in modern application delivery: dynamic service selection based on real-time performance, predictive routing decisions using historical data analysis, and natural language interfaces for infrastructure analytics. BigQuery Data Canvas enables non-technical stakeholders to query complex traffic patterns using simple English, democratizing infrastructure insights across the organization. The integration with Gemini AI provides intelligent recommendations for routing optimization, capacity planning, and performance improvements.
 
-Performance considerations include the minimal latency added by Service Extensions (typically under 10ms), the scalability benefits of serverless Cloud Run backends, and the real-time analytics capabilities of BigQuery streaming inserts. Cost optimization opportunities exist through intelligent routing to cost-effective services, automatic scaling based on demand patterns, and predictive resource allocation using BigQuery ML models trained on historical traffic data.
+Performance considerations include the minimal latency added by Service Extensions callouts (typically under 50ms), the scalability benefits of serverless Cloud Run backends, and the real-time analytics capabilities of BigQuery streaming inserts. Cost optimization opportunities exist through intelligent routing to cost-effective services, automatic scaling based on demand patterns, and predictive resource allocation using BigQuery ML models trained on historical traffic data.
 
 > **Tip**: Use BigQuery Data Canvas natural language queries like "Show me the slowest services in the last hour" or "Which routing decisions had the highest confidence scores?" to quickly identify optimization opportunities and validate intelligent routing effectiveness.
 

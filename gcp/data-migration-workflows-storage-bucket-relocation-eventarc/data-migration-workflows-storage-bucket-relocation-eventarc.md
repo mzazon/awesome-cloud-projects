@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Storage, Eventarc, Cloud Functions, Cloud Audit Logs
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data migration, automation, event-driven architecture, compliance, governance
 recipe-generator-version: 1.3
@@ -98,7 +98,7 @@ export DEST_REGION="us-east1"
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
 
-# Set project ID and regions
+# Set default project and region
 gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
 
@@ -108,6 +108,7 @@ gcloud services enable cloudfunctions.googleapis.com
 gcloud services enable eventarc.googleapis.com
 gcloud services enable logging.googleapis.com
 gcloud services enable monitoring.googleapis.com
+gcloud services enable pubsub.googleapis.com
 
 # Create service account for automation functions
 gcloud iam service-accounts create migration-automation \
@@ -121,6 +122,10 @@ gcloud projects add-iam-policy-binding ${PROJECT_ID} \
 gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="serviceAccount:migration-automation@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="roles/logging.viewer"
+
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:migration-automation@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/eventarc.eventReceiver"
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "✅ Service account created and configured"
@@ -140,10 +145,10 @@ echo "✅ Service account created and configured"
        -l ${SOURCE_REGION} \
        gs://${SOURCE_BUCKET}
    
-   # Enable versioning and set lifecycle policy
+   # Enable versioning for data protection
    gsutil versioning set on gs://${SOURCE_BUCKET}
    
-   # Create sample data files with different storage classes
+   # Create sample data files with different content types
    echo "Critical business data - $(date)" > critical-data.txt
    echo "Archive data from last year - $(date)" > archive-data.txt
    echo "Log file entry - $(date)" > application.log
@@ -164,33 +169,23 @@ echo "✅ Service account created and configured"
 
    The source bucket now contains structured data with custom metadata and different storage patterns, providing a realistic scenario for testing the bucket relocation workflow and metadata preservation capabilities.
 
-2. **Set Up Eventarc Triggers for Migration Events**:
+2. **Create Pub/Sub Topic for Pre-Migration Validation**:
 
-   Eventarc enables event-driven automation by capturing Cloud Audit Log events generated during bucket operations. We'll create triggers that respond to bucket relocation events, object modifications, and administrative actions to ensure comprehensive monitoring throughout the migration process.
+   Before setting up Eventarc triggers, we need to create a Pub/Sub topic for triggering pre-migration validation. This topic enables decoupled communication between migration orchestration and validation functions.
 
    ```bash
-   # Create Eventarc trigger for bucket administrative events
-   gcloud eventarc triggers create bucket-admin-trigger \
-       --location=${REGION} \
-       --destination-cloud-function=migration-progress-monitor \
-       --destination-cloud-function-service=migration-automation@${PROJECT_ID}.iam.gserviceaccount.com \
-       --event-filters="type=google.cloud.audit.log.v1.written" \
-       --event-filters="serviceName=storage.googleapis.com" \
-       --event-filters="methodName=storage.buckets.patch"
+   # Create Pub/Sub topic for pre-migration validation
+   gcloud pubsub topics create pre-migration-topic
    
-   # Create trigger for object-level events during migration
-   gcloud eventarc triggers create object-event-trigger \
-       --location=${REGION} \
-       --destination-cloud-function=migration-event-processor \
-       --destination-cloud-function-service=migration-automation@${PROJECT_ID}.iam.gserviceaccount.com \
-       --event-filters="type=google.cloud.audit.log.v1.written" \
-       --event-filters="serviceName=storage.googleapis.com" \
-       --event-filters="methodName=storage.objects.create"
+   # Grant service account permissions to publish to the topic
+   gcloud pubsub topics add-iam-policy-binding pre-migration-topic \
+       --member="serviceAccount:migration-automation@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --role="roles/pubsub.publisher"
    
-   echo "✅ Eventarc triggers configured for migration monitoring"
+   echo "✅ Pub/Sub topic created for pre-migration validation"
    ```
 
-   These Eventarc triggers create a comprehensive event-driven monitoring system that captures both administrative operations and data-level changes, enabling real-time visibility into migration progress and automated response capabilities.
+   The Pub/Sub topic provides a reliable messaging mechanism for triggering validation workflows and enables asynchronous processing patterns that scale with migration workloads.
 
 3. **Deploy Pre-Migration Validation Cloud Function**:
 
@@ -265,23 +260,25 @@ def validate_pre_migration(cloud_event):
         return error_result
 EOF
    
-   # Create requirements.txt
+   # Create requirements.txt with updated versions
    cat > requirements.txt << 'EOF'
 functions-framework==3.*
 google-cloud-storage==2.*
 google-cloud-logging==3.*
 EOF
    
-   # Deploy the function
+   # Deploy the function with Pub/Sub trigger
    gcloud functions deploy pre-migration-validator \
-       --runtime python39 \
+       --gen2 \
+       --runtime python311 \
        --trigger-topic pre-migration-topic \
        --source . \
        --entry-point validate_pre_migration \
        --memory 256MB \
        --timeout 60s \
        --service-account=migration-automation@${PROJECT_ID}.iam.gserviceaccount.com \
-       --set-env-vars="PROJECT_ID=${PROJECT_ID},SOURCE_BUCKET=${SOURCE_BUCKET}"
+       --set-env-vars="PROJECT_ID=${PROJECT_ID},SOURCE_BUCKET=${SOURCE_BUCKET}" \
+       --region=${REGION}
    
    cd ../..
    
@@ -348,7 +345,7 @@ def monitor_migration_progress(cloud_event):
                 
                 # Check if relocation is in progress
                 try:
-                    # Attempt to get bucket metadata (this might fail during relocation)
+                    # Attempt to get bucket metadata
                     bucket.reload()
                     progress_data['status'] = 'ACTIVE'
                     progress_data['accessible'] = True
@@ -359,29 +356,6 @@ def monitor_migration_progress(cloud_event):
                 
                 # Log progress information
                 logger.log_struct(progress_data, severity='INFO')
-                
-                # Send custom metric to Cloud Monitoring
-                project_name = f"projects/{event_data.get('resource', {}).get('labels', {}).get('project_id', '')}"
-                series = monitoring_v3.TimeSeries()
-                series.metric.type = 'custom.googleapis.com/storage/bucket_relocation_progress'
-                series.resource.type = 'gcs_bucket'
-                series.resource.labels['bucket_name'] = bucket_name
-                series.resource.labels['project_id'] = project_name.split('/')[-1]
-                
-                point = series.points.add()
-                point.value.double_value = 1.0 if progress_data['accessible'] else 0.0
-                point.interval.end_time.seconds = int(datetime.now(timezone.utc).timestamp())
-                
-                try:
-                    monitoring_client.create_time_series(
-                        name=project_name,
-                        time_series=[series]
-                    )
-                except Exception as metric_error:
-                    logger.log_struct({
-                        'error': 'Failed to send monitoring metric',
-                        'details': str(metric_error)
-                    }, severity='WARNING')
                 
             except Exception as bucket_error:
                 error_data = {
@@ -414,7 +388,8 @@ EOF
    
    # Deploy the function
    gcloud functions deploy migration-progress-monitor \
-       --runtime python39 \
+       --gen2 \
+       --runtime python311 \
        --trigger-event-filter="type=google.cloud.audit.log.v1.written" \
        --trigger-event-filter="serviceName=storage.googleapis.com" \
        --source . \
@@ -422,7 +397,8 @@ EOF
        --memory 512MB \
        --timeout 120s \
        --service-account=migration-automation@${PROJECT_ID}.iam.gserviceaccount.com \
-       --set-env-vars="PROJECT_ID=${PROJECT_ID}"
+       --set-env-vars="PROJECT_ID=${PROJECT_ID}" \
+       --region=${REGION}
    
    cd ../..
    
@@ -446,7 +422,6 @@ import functions_framework
 from google.cloud import storage
 from google.cloud import logging
 import json
-import hashlib
 from datetime import datetime, timezone
 
 @functions_framework.cloud_event
@@ -462,8 +437,8 @@ def validate_post_migration(cloud_event):
     event_data = cloud_event.get_data()
     
     try:
-        # Extract bucket name from event or environment
-        bucket_name = event_data.get('bucketId') or event_data.get('resource', {}).get('labels', {}).get('bucket_name')
+        # Extract bucket name from event
+        bucket_name = event_data.get('bucketId')
         
         if not bucket_name:
             # Try to extract from audit log payload
@@ -524,8 +499,8 @@ def validate_post_migration(cloud_event):
         
         # Check for compliance requirements
         compliance_checks = {
-            'location_compliance': bucket.location in ['us-east1', 'us-central1', 'us-west1'],  # Example compliance rule
-            'encryption_enabled': bucket.encryption_configuration is not None or True,  # Default encryption
+            'location_compliance': bucket.location in ['us-east1', 'us-central1', 'us-west1'],
+            'encryption_enabled': bucket.encryption_configuration is not None or True,
             'access_control_configured': bucket.iam_configuration.uniform_bucket_level_access_enabled,
             'versioning_maintained': bucket.versioning_enabled
         }
@@ -546,7 +521,7 @@ def validate_post_migration(cloud_event):
         # Log comprehensive validation results
         logger.log_struct(validation_results, severity=validation_results['severity'])
         
-        # Return summary for potential downstream processing
+        # Return summary for downstream processing
         return {
             'bucket_name': bucket_name,
             'location': bucket.location,
@@ -562,7 +537,7 @@ def validate_post_migration(cloud_event):
             'bucket_name': bucket_name if 'bucket_name' in locals() else 'unknown',
             'validation_status': 'ERROR',
             'error_message': str(e),
-            'event_data_sample': str(event_data)[:500]  # Truncated for logging
+            'event_data_sample': str(event_data)[:500]
         }
         logger.log_struct(error_result, severity='ERROR')
         return error_result
@@ -577,7 +552,8 @@ EOF
    
    # Deploy the function
    gcloud functions deploy post-migration-validator \
-       --runtime python39 \
+       --gen2 \
+       --runtime python311 \
        --trigger-event-filter="type=google.cloud.audit.log.v1.written" \
        --trigger-event-filter="serviceName=storage.googleapis.com" \
        --trigger-event-filter="methodName=storage.buckets.patch" \
@@ -586,7 +562,8 @@ EOF
        --memory 512MB \
        --timeout 180s \
        --service-account=migration-automation@${PROJECT_ID}.iam.gserviceaccount.com \
-       --set-env-vars="PROJECT_ID=${PROJECT_ID}"
+       --set-env-vars="PROJECT_ID=${PROJECT_ID}" \
+       --region=${REGION}
    
    cd ../..
    
@@ -595,11 +572,45 @@ EOF
 
    The post-migration validation function ensures comprehensive verification of bucket relocation success, including data integrity, metadata preservation, and compliance adherence, providing confidence that migration objectives have been achieved.
 
-6. **Configure Cloud Audit Logs for Enhanced Monitoring**:
+6. **Set Up Eventarc Triggers for Migration Events**:
+
+   Eventarc enables event-driven automation by capturing Cloud Audit Log events generated during bucket operations. We'll create triggers that respond to bucket relocation events, object modifications, and administrative actions to ensure comprehensive monitoring throughout the migration process.
+
+   ```bash
+   # Create Eventarc trigger for bucket administrative events
+   gcloud eventarc triggers create bucket-admin-trigger \
+       --location=${REGION} \
+       --destination-cloud-function=migration-progress-monitor \
+       --destination-cloud-function-service=migration-automation@${PROJECT_ID}.iam.gserviceaccount.com \
+       --event-filters="type=google.cloud.audit.log.v1.written" \
+       --event-filters="serviceName=storage.googleapis.com" \
+       --event-filters="methodName=storage.buckets.patch"
+   
+   # Create trigger for validation events
+   gcloud eventarc triggers create validation-trigger \
+       --location=${REGION} \
+       --destination-cloud-function=post-migration-validator \
+       --destination-cloud-function-service=migration-automation@${PROJECT_ID}.iam.gserviceaccount.com \
+       --event-filters="type=google.cloud.audit.log.v1.written" \
+       --event-filters="serviceName=storage.googleapis.com" \
+       --event-filters="methodName=storage.buckets.relocate"
+   
+   echo "✅ Eventarc triggers configured for migration monitoring"
+   ```
+
+   These Eventarc triggers create a comprehensive event-driven monitoring system that captures both administrative operations and data-level changes, enabling real-time visibility into migration progress and automated response capabilities.
+
+7. **Configure Cloud Audit Logs for Enhanced Monitoring**:
 
    Cloud Audit Logs provide detailed tracking of all administrative and data access activities during bucket relocation. Configuring comprehensive audit logging ensures complete visibility into migration operations and enables automated response to specific events throughout the process.
 
    ```bash
+   # Create BigQuery dataset for audit logs
+   bq mk --dataset \
+       --location=${REGION} \
+       --description="Migration audit logs dataset" \
+       ${PROJECT_ID}:migration_audit
+   
    # Create audit log sink for storage operations
    gcloud logging sinks create migration-audit-sink \
        bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/migration_audit \
@@ -607,12 +618,6 @@ EOF
    
    # Grant the sink's service account BigQuery Data Editor permissions
    SINK_SA=$(gcloud logging sinks describe migration-audit-sink --format="value(writerIdentity)")
-   
-   # Create BigQuery dataset for audit logs (if it doesn't exist)
-   bq mk --dataset \
-       --location=${REGION} \
-       --description="Migration audit logs dataset" \
-       ${PROJECT_ID}:migration_audit || true
    
    # Grant sink service account permissions to write to BigQuery
    bq add-iam-policy-binding \
@@ -658,12 +663,13 @@ EOF
 
    The audit logging configuration provides comprehensive tracking of all storage operations, enabling both real-time monitoring through Cloud Functions and historical analysis through BigQuery for compliance and optimization insights.
 
-7. **Perform Bucket Relocation with Automation**:
+8. **Perform Bucket Relocation with Automation**:
 
    Now we'll initiate the actual bucket relocation from us-west1 to us-east1 using Google Cloud's bucket relocation service. This serverless migration maintains bucket accessibility while preserving all metadata and triggering our automated monitoring workflows.
 
    ```bash
    # First, run a dry run to validate relocation compatibility
+   echo "Running dry run to validate bucket relocation..."
    gcloud storage buckets relocate gs://${SOURCE_BUCKET} \
        --location=${DEST_REGION} \
        --dry-run
@@ -677,6 +683,7 @@ EOF
    sleep 30
    
    # Check validation results in logs
+   echo "Checking pre-migration validation results..."
    gcloud logging read "resource.type=\"cloud_function\" AND resource.labels.function_name=\"pre-migration-validator\" AND timestamp>=\"$(date -u -d '2 minutes ago' +%Y-%m-%dT%H:%M:%SZ)\"" \
        --limit=5 --format="value(jsonPayload.validation_status)"
    
@@ -687,6 +694,7 @@ EOF
        --async
    
    # Store relocation operation for tracking
+   sleep 5
    RELOCATION_OP=$(gcloud storage operations list \
        --filter="metadata.verb=relocate AND metadata.target:${SOURCE_BUCKET}" \
        --format="value(name)" \
@@ -699,7 +707,7 @@ EOF
 
    The bucket relocation process now runs in the background while our automated monitoring functions track progress and validate the migration. The serverless approach ensures minimal disruption to applications accessing the bucket during relocation.
 
-8. **Monitor Migration Progress and Validate Completion**:
+9. **Monitor Migration Progress and Validate Completion**:
 
    Monitor the relocation operation using both Google Cloud's built-in tracking and our custom automation functions. This provides comprehensive visibility into migration status and automated validation of successful completion.
 
@@ -726,7 +734,7 @@ EOF
        check_relocation_status
        
        # Check if bucket is accessible and location has changed
-       CURRENT_LOCATION=$(gsutil ls -L -b gs://${SOURCE_BUCKET} | grep "Location constraint:" | awk '{print $3}')
+       CURRENT_LOCATION=$(gsutil ls -L -b gs://${SOURCE_BUCKET} 2>/dev/null | grep "Location constraint:" | awk '{print $3}' || echo "CHECKING")
        echo "Current bucket location: ${CURRENT_LOCATION}"
        
        # Check recent Cloud Function logs for progress updates
@@ -825,9 +833,9 @@ EOF
 
    ```bash
    # Delete all migration-related functions
-   gcloud functions delete pre-migration-validator --quiet
-   gcloud functions delete migration-progress-monitor --quiet
-   gcloud functions delete post-migration-validator --quiet
+   gcloud functions delete pre-migration-validator --region=${REGION} --quiet
+   gcloud functions delete migration-progress-monitor --region=${REGION} --quiet
+   gcloud functions delete post-migration-validator --region=${REGION} --quiet
    
    echo "✅ Cloud Functions deleted"
    ```
@@ -837,14 +845,17 @@ EOF
    ```bash
    # Delete Eventarc triggers
    gcloud eventarc triggers delete bucket-admin-trigger --location=${REGION} --quiet
-   gcloud eventarc triggers delete object-event-trigger --location=${REGION} --quiet
+   gcloud eventarc triggers delete validation-trigger --location=${REGION} --quiet
    
    echo "✅ Eventarc triggers deleted"
    ```
 
-4. **Clean up logging and monitoring resources**:
+4. **Clean up Pub/Sub and logging resources**:
 
    ```bash
+   # Delete Pub/Sub topic
+   gcloud pubsub topics delete pre-migration-topic --quiet
+   
    # Delete BigQuery dataset
    bq rm -r -f ${PROJECT_ID}:migration_audit
    

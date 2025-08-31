@@ -6,10 +6,10 @@ difficulty: 300
 subject: gcp
 services: Cloud Run, Pub/Sub, Cloud Storage, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: edge-computing, webassembly, iot, real-time-analytics, serverless
 recipe-generator-version: 1.3
@@ -81,7 +81,7 @@ graph TB
 5. Rust toolchain installed for compiling WebAssembly modules (rustc 1.70+)
 6. Estimated cost: $5-15 per day for moderate IoT data volumes (1000 messages/hour)
 
-> **Note**: This recipe uses Cloud Run's newest container runtime features to support WebAssembly workloads. Ensure your project has the latest Cloud Run APIs enabled.
+> **Note**: This recipe uses Cloud Run's container runtime features to support WebAssembly workloads. Ensure your project has the latest Cloud Run APIs enabled.
 
 ## Preparation
 
@@ -98,10 +98,22 @@ export SUBSCRIPTION_NAME="analytics-subscription-${RANDOM_SUFFIX}"
 export SERVICE_NAME="edge-analytics-${RANDOM_SUFFIX}"
 export BUCKET_NAME="edge-analytics-data-${RANDOM_SUFFIX}"
 
+# Create the project if it doesn't exist
+gcloud projects create ${PROJECT_ID} \
+    --set-as-default
+
+# Enable billing (replace BILLING_ACCOUNT_ID with your billing account)
+# gcloud billing projects link ${PROJECT_ID} \
+#     --billing-account=BILLING_ACCOUNT_ID
+
 # Set default project and region
 gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
 gcloud config set compute/zone ${ZONE}
+
+# Get project number for later use
+export PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} \
+    --format="value(projectNumber)")
 
 # Enable required APIs
 gcloud services enable run.googleapis.com
@@ -109,8 +121,10 @@ gcloud services enable pubsub.googleapis.com
 gcloud services enable storage.googleapis.com
 gcloud services enable monitoring.googleapis.com
 gcloud services enable cloudbuild.googleapis.com
+gcloud services enable firestore.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
+echo "✅ Project number: ${PROJECT_NUMBER}"
 echo "✅ Required APIs enabled"
 ```
 
@@ -164,19 +178,12 @@ echo "✅ Required APIs enabled"
    gcloud pubsub topics create ${TOPIC_NAME} \
        --message-retention-duration=7d
    
-   # Create push subscription that will trigger Cloud Run
-   gcloud pubsub subscriptions create ${SUBSCRIPTION_NAME} \
-       --topic=${TOPIC_NAME} \
-       --push-endpoint=https://${SERVICE_NAME}-${PROJECT_ID}.a.run.app/process \
-       --ack-deadline=60 \
-       --message-retention-duration=7d \
-       --max-retry-delay=600s \
-       --min-retry-delay=10s
+   # Note: We'll create the subscription later after the Cloud Run service is deployed
    
-   echo "✅ Pub/Sub topic and subscription configured"
+   echo "✅ Pub/Sub topic configured"
    ```
 
-   The Pub/Sub infrastructure now provides guaranteed message delivery with automatic retry logic, ensuring that IoT sensor data reliably reaches the analytics processing pipeline even during temporary outages or capacity constraints.
+   The Pub/Sub topic is now ready to receive IoT sensor data with a 7-day message retention period, ensuring data durability even during extended processing outages.
 
 3. **Develop WebAssembly Analytics Module**:
 
@@ -445,19 +452,16 @@ echo "✅ Required APIs enabled"
    # Deploy to Cloud Run with appropriate configuration
    gcloud run deploy ${SERVICE_NAME} \
        --image gcr.io/${PROJECT_ID}/${SERVICE_NAME} \
-       --platform managed \
        --region ${REGION} \
        --allow-unauthenticated \
        --memory 1Gi \
        --cpu 2 \
        --concurrency 80 \
        --max-instances 100 \
-       --set-env-vars="BUCKET_NAME=${BUCKET_NAME}" \
-       --set-env-vars="GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
+       --set-env-vars="BUCKET_NAME=${BUCKET_NAME},GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
    
    # Get the service URL
    SERVICE_URL=$(gcloud run services describe ${SERVICE_NAME} \
-       --platform managed \
        --region ${REGION} \
        --format 'value(status.url)')
    
@@ -468,24 +472,25 @@ echo "✅ Required APIs enabled"
 
    The Cloud Run service is now deployed with optimized resource allocation for WebAssembly workloads, providing automatic scaling from zero to handle varying IoT data volumes while maintaining sub-second response times for real-time analytics.
 
-6. **Update Pub/Sub Subscription with Service Endpoint**:
+6. **Create Pub/Sub Push Subscription to Cloud Run Service**:
 
    Configuring the Pub/Sub push subscription to target the deployed Cloud Run service establishes the event-driven architecture that automatically processes IoT data as it arrives, ensuring real-time analytics without manual intervention or complex orchestration.
 
    ```bash
-   # Update subscription with actual Cloud Run service URL
-   gcloud pubsub subscriptions modify-push-config ${SUBSCRIPTION_NAME} \
-       --push-endpoint="${SERVICE_URL}/process"
+   # Create push subscription that will trigger Cloud Run
+   gcloud pubsub subscriptions create ${SUBSCRIPTION_NAME} \
+       --topic=${TOPIC_NAME} \
+       --push-endpoint="${SERVICE_URL}/process" \
+       --ack-deadline=60 \
+       --message-retention-duration=7d \
+       --max-retry-delay=600s \
+       --min-retry-delay=10s
    
    # Grant Pub/Sub permission to invoke Cloud Run service
    gcloud run services add-iam-policy-binding ${SERVICE_NAME} \
        --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com" \
        --role="roles/run.invoker" \
        --region=${REGION}
-   
-   # Get project number for service account
-   PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} \
-       --format="value(projectNumber)")
    
    echo "✅ Pub/Sub subscription configured to trigger Cloud Run service"
    ```
@@ -525,7 +530,8 @@ echo "✅ Required APIs enabled"
    EOF
    
    # Create the alert policy
-   gcloud alpha monitoring policies create --policy-from-file=anomaly-alert-policy.json
+   gcloud alpha monitoring policies create \
+       --policy-from-file=anomaly-alert-policy.json
    
    # Create dashboard for monitoring edge analytics
    cat > dashboard-config.json << EOF
@@ -560,7 +566,8 @@ echo "✅ Required APIs enabled"
    }
    EOF
    
-   gcloud monitoring dashboards create --config-from-file=dashboard-config.json
+   gcloud monitoring dashboards create \
+       --config-from-file=dashboard-config.json
    
    echo "✅ Cloud Monitoring alerts and dashboard configured"
    ```
@@ -657,7 +664,6 @@ echo "✅ Required APIs enabled"
    ```bash
    # Check Cloud Run service status
    gcloud run services describe ${SERVICE_NAME} \
-       --platform managed \
        --region ${REGION} \
        --format="table(status.conditions[].type,status.conditions[].status)"
    
@@ -714,12 +720,12 @@ echo "✅ Required APIs enabled"
    ```bash
    # Delete Cloud Run service
    gcloud run services delete ${SERVICE_NAME} \
-       --platform managed \
        --region ${REGION} \
        --quiet
    
    # Delete container images
-   gcloud container images delete gcr.io/${PROJECT_ID}/${SERVICE_NAME} --quiet
+   gcloud container images delete gcr.io/${PROJECT_ID}/${SERVICE_NAME} \
+       --quiet
    
    echo "✅ Deleted Cloud Run service and images"
    ```
@@ -753,11 +759,21 @@ echo "✅ Required APIs enabled"
    ```bash
    # Clean up alert policies and dashboards
    gcloud alpha monitoring policies list --format="value(name)" | \
-       grep "IoT Anomaly" | xargs gcloud alpha monitoring policies delete --quiet
+       grep "IoT Anomaly" | \
+       xargs -I {} gcloud alpha monitoring policies delete {} --quiet
    
    # Remove custom metrics (they will expire automatically)
    
    echo "✅ Cleaned up monitoring resources"
+   ```
+
+5. **Delete the project (optional)**:
+
+   ```bash
+   # Delete the entire project if created specifically for this recipe
+   gcloud projects delete ${PROJECT_ID} --quiet
+   
+   echo "✅ Project deleted (may take several minutes to complete)"
    ```
 
 ## Discussion
@@ -773,7 +789,7 @@ The WebAssembly module's design demonstrates efficient anomaly detection using s
 > **Tip**: Consider implementing model versioning and A/B testing capabilities within the WebAssembly modules to safely deploy improved analytics algorithms while maintaining service reliability.
 
 **Documentation References:**
-- [Cloud Run WebAssembly Support](https://cloud.google.com/run/docs/tutorials)
+- [Cloud Run Container Runtime](https://cloud.google.com/run/docs/container-contract)
 - [Pub/Sub Push Subscriptions](https://cloud.google.com/pubsub/docs/push)
 - [Cloud Storage Lifecycle Management](https://cloud.google.com/storage/docs/lifecycle)
 - [Cloud Monitoring Custom Metrics](https://cloud.google.com/monitoring/custom-metrics)

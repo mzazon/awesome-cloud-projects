@@ -1,0 +1,649 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Simple JSON to CSV Converter with Lambda and S3
+  
+  This template creates a serverless data transformation pipeline that automatically 
+  converts JSON files to CSV format using AWS Lambda and S3. When JSON files are 
+  uploaded to an input S3 bucket, a Lambda function is triggered to process the data 
+  and save the converted CSV files to an output bucket.
+  
+  Recipe ID: a1b8f4e7
+  Services: Lambda, S3
+  Difficulty: 100 (Beginner)
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Bucket Configuration"
+        Parameters:
+          - InputBucketName
+          - OutputBucketName
+          - EnableVersioning
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaFunctionName
+          - LambdaRuntime
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ResourcePrefix
+    ParameterLabels:
+      InputBucketName:
+        default: "Input S3 Bucket Name"
+      OutputBucketName:
+        default: "Output S3 Bucket Name"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      LambdaFunctionName:
+        default: "Lambda Function Name"
+      LambdaRuntime:
+        default: "Lambda Runtime Version"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      Environment:
+        default: "Environment"
+      ResourcePrefix:
+        default: "Resource Prefix"
+
+# Input Parameters
+Parameters:
+  InputBucketName:
+    Type: String
+    Description: >
+      Name for the S3 bucket that will receive JSON input files. Must be globally unique.
+      If left empty, a unique name will be generated automatically.
+    Default: ""
+    AllowedPattern: ^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: >
+      Bucket name must be between 3-63 characters, contain only lowercase letters, 
+      numbers, and hyphens, and cannot start or end with a hyphen.
+  
+  OutputBucketName:
+    Type: String
+    Description: >
+      Name for the S3 bucket that will store converted CSV output files. Must be globally unique.
+      If left empty, a unique name will be generated automatically.
+    Default: ""
+    AllowedPattern: ^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: >
+      Bucket name must be between 3-63 characters, contain only lowercase letters, 
+      numbers, and hyphens, and cannot start or end with a hyphen.
+  
+  EnableVersioning:
+    Type: String
+    Description: Enable versioning on S3 buckets for data protection
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+  
+  LambdaFunctionName:
+    Type: String
+    Description: Name for the Lambda function that performs JSON to CSV conversion
+    Default: ""
+    AllowedPattern: ^$|^[a-zA-Z0-9-_]{1,64}$
+    ConstraintDescription: >
+      Function name must be 1-64 characters and contain only letters, numbers, hyphens, and underscores.
+  
+  LambdaRuntime:
+    Type: String
+    Description: Python runtime version for the Lambda function
+    Default: "python3.12"
+    AllowedValues:
+      - "python3.12"
+      - "python3.11"
+      - "python3.10"
+  
+  LambdaTimeout:
+    Type: Number
+    Description: Maximum execution time for Lambda function in seconds
+    Default: 60
+    MinValue: 1
+    MaxValue: 900
+    ConstraintDescription: Timeout must be between 1 and 900 seconds.
+  
+  LambdaMemorySize:
+    Type: Number
+    Description: Amount of memory available to Lambda function in MB
+    Default: 256
+    AllowedValues: [128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536, 1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048, 2112, 2176, 2240, 2304, 2368, 2432, 2496, 2560, 2624, 2688, 2752, 2816, 2880, 2944, 3008]
+  
+  Environment:
+    Type: String
+    Description: Environment designation for resource tagging
+    Default: "dev"
+    AllowedValues:
+      - "dev"
+      - "test"
+      - "staging"
+      - "prod"
+  
+  ResourcePrefix:
+    Type: String
+    Description: Prefix for resource names to ensure uniqueness
+    Default: "json-csv-converter"
+    AllowedPattern: ^[a-z][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: >
+      Prefix must start with a lowercase letter, contain only lowercase letters, 
+      numbers, and hyphens, and end with a letter or number.
+
+# Conditional Logic
+Conditions:
+  # Check if custom bucket names are provided
+  UseCustomInputBucket: !Not [!Equals [!Ref InputBucketName, ""]]
+  UseCustomOutputBucket: !Not [!Equals [!Ref OutputBucketName, ""]]
+  UseCustomFunctionName: !Not [!Equals [!Ref LambdaFunctionName, ""]]
+  
+  # Check if versioning should be enabled
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, "true"]
+  
+  # Environment-based conditions
+  IsProduction: !Equals [!Ref Environment, "prod"]
+
+# AWS Resources
+Resources:
+  # Random suffix for unique resource naming
+  RandomSuffixFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-random-suffix-${AWS::StackName}"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt RandomSuffixRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import string
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Generate 6-character random suffix
+                  suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+                  
+                  response_data = {'RandomSuffix': suffix}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: "JSON-CSV-Converter"
+        - Key: Purpose
+          Value: "Random Suffix Generator"
+
+  # IAM Role for Random Suffix Lambda
+  RandomSuffixRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-random-suffix-role-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: "JSON-CSV-Converter"
+
+  # Custom Resource to generate random suffix
+  RandomSuffix:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RandomSuffixFunction.Arn
+
+  # Input S3 Bucket for JSON files
+  InputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - UseCustomInputBucket
+        - !Ref InputBucketName
+        - !Sub "${ResourcePrefix}-json-input-${RandomSuffix.RandomSuffix}"
+      VersioningConfiguration: !If
+        - EnableS3Versioning
+        - Status: Enabled
+        - !Ref AWS::NoValue
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt JsonCsvConverterFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .json
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: "JSON-CSV-Converter"
+        - Key: Purpose
+          Value: "JSON Input Storage"
+        - Key: DataClassification
+          Value: "Internal"
+
+  # Output S3 Bucket for CSV files
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - UseCustomOutputBucket
+        - !Ref OutputBucketName
+        - !Sub "${ResourcePrefix}-csv-output-${RandomSuffix.RandomSuffix}"
+      VersioningConfiguration: !If
+        - EnableS3Versioning
+        - Status: Enabled
+        - !Ref AWS::NoValue
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: "JSON-CSV-Converter"
+        - Key: Purpose
+          Value: "CSV Output Storage"
+        - Key: DataClassification
+          Value: "Internal"
+
+  # IAM Role for Lambda Function
+  JsonCsvConverterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !If
+        - UseCustomFunctionName
+        - !Sub "${LambdaFunctionName}-role"
+        - !Sub "${ResourcePrefix}-converter-role-${RandomSuffix.RandomSuffix}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub "${InputBucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub "${OutputBucket}/*"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: "JSON-CSV-Converter"
+        - Key: Purpose
+          Value: "Lambda Execution Role"
+
+  # Lambda Function for JSON to CSV conversion
+  JsonCsvConverterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !If
+        - UseCustomFunctionName
+        - !Ref LambdaFunctionName
+        - !Sub "${ResourcePrefix}-converter-${RandomSuffix.RandomSuffix}"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt JsonCsvConverterRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref OutputBucket
+          ENVIRONMENT: !Ref Environment
+      ReservedConcurrencyLimit: !If
+        - IsProduction
+        - 100
+        - 10
+      Code:
+        ZipFile: |
+          import json
+          import csv
+          import boto3
+          import urllib.parse
+          import os
+          from io import StringIO
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          s3_client = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              """
+              AWS Lambda function to convert JSON files to CSV format.
+              
+              This function is triggered by S3 events when JSON files are uploaded
+              to the input bucket. It processes the JSON data and converts it to
+              CSV format, then saves the result to the output bucket.
+              
+              Args:
+                  event: AWS Lambda event containing S3 event information
+                  context: AWS Lambda context object
+              
+              Returns:
+                  dict: Response with statusCode and processing result
+              """
+              try:
+                  # Extract S3 event information
+                  record = event['Records'][0]
+                  bucket = record['s3']['bucket']['name']
+                  key = urllib.parse.unquote_plus(
+                      record['s3']['object']['key'], 
+                      encoding='utf-8'
+                  )
+                  
+                  logger.info(f"Processing file: {key} from bucket: {bucket}")
+                  
+                  # Validate file extension
+                  if not key.lower().endswith('.json'):
+                      logger.warning(f"Skipping non-JSON file: {key}")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps(f'Skipped non-JSON file: {key}')
+                      }
+                  
+                  # Read JSON file from S3
+                  try:
+                      response = s3_client.get_object(Bucket=bucket, Key=key)
+                      json_content = response['Body'].read().decode('utf-8')
+                      
+                      # Validate JSON content is not empty
+                      if not json_content.strip():
+                          raise ValueError("JSON file is empty")
+                      
+                      data = json.loads(json_content)
+                      logger.info(f"Successfully parsed JSON data with type: {type(data)}")
+                      
+                  except json.JSONDecodeError as e:
+                      logger.error(f"Invalid JSON format in file {key}: {str(e)}")
+                      raise ValueError(f"Invalid JSON format: {str(e)}")
+                  except Exception as e:
+                      logger.error(f"Error reading file {key}: {str(e)}")
+                      raise
+                  
+                  # Convert JSON to CSV based on data structure
+                  csv_buffer = StringIO()
+                  
+                  if isinstance(data, list) and len(data) > 0:
+                      # Handle array of objects or simple values
+                      if isinstance(data[0], dict):
+                          # Array of objects - use keys as column headers
+                          fieldnames = list(data[0].keys())
+                          writer = csv.DictWriter(csv_buffer, fieldnames=fieldnames)
+                          writer.writeheader()
+                          
+                          for item in data:
+                              if isinstance(item, dict):
+                                  # Ensure all items have the same structure
+                                  row = {field: item.get(field, '') for field in fieldnames}
+                                  writer.writerow(row)
+                              else:
+                                  logger.warning(f"Inconsistent data structure in array: {type(item)}")
+                          
+                          logger.info(f"Converted {len(data)} objects with {len(fieldnames)} columns")
+                      else:
+                          # Array of simple values
+                          writer = csv.writer(csv_buffer)
+                          writer.writerow(['value'])  # Header for simple values
+                          for item in data:
+                              writer.writerow([str(item)])
+                          
+                          logger.info(f"Converted {len(data)} simple values")
+                  
+                  elif isinstance(data, dict):
+                      # Single object - convert to single-row CSV
+                      fieldnames = list(data.keys())
+                      writer = csv.DictWriter(csv_buffer, fieldnames=fieldnames)
+                      writer.writeheader()
+                      writer.writerow(data)
+                      
+                      logger.info(f"Converted single object with {len(fieldnames)} columns")
+                  
+                  elif isinstance(data, (str, int, float, bool)):
+                      # Simple value - create CSV with single cell
+                      writer = csv.writer(csv_buffer)
+                      writer.writerow(['value'])
+                      writer.writerow([str(data)])
+                      
+                      logger.info("Converted simple value")
+                  
+                  else:
+                      raise ValueError(f"Unsupported JSON structure: {type(data)}")
+                  
+                  # Generate output file name
+                  output_key = key.rsplit('.json', 1)[0] + '.csv'
+                  output_bucket = os.environ['OUTPUT_BUCKET']
+                  
+                  # Upload CSV to output bucket
+                  s3_client.put_object(
+                      Bucket=output_bucket,
+                      Key=output_key,
+                      Body=csv_buffer.getvalue(),
+                      ContentType='text/csv',
+                      Metadata={
+                          'source-file': key,
+                          'source-bucket': bucket,
+                          'conversion-timestamp': context.aws_request_id,
+                          'processor': 'json-csv-converter'
+                      }
+                  )
+                  
+                  # Log successful conversion
+                  csv_size = len(csv_buffer.getvalue())
+                  logger.info(f"Successfully converted {key} to {output_key} ({csv_size} bytes)")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully converted {key} to CSV',
+                          'input_file': key,
+                          'output_file': output_key,
+                          'output_bucket': output_bucket,
+                          'csv_size_bytes': csv_size
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_msg = f"Error processing file {key if 'key' in locals() else 'unknown'}: {str(e)}"
+                  logger.error(error_msg)
+                  
+                  # Re-raise the exception to trigger Lambda error handling
+                  raise Exception(error_msg)
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: "JSON-CSV-Converter"
+        - Key: Purpose
+          Value: "Data Transformation"
+
+  # Lambda Permission for S3 to invoke the function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref JsonCsvConverterFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "${InputBucket}/*"
+
+  # CloudWatch Log Group for Lambda Function (with retention policy)
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${JsonCsvConverterFunction}"
+      RetentionInDays: !If
+        - IsProduction
+        - 30
+        - 7
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: "JSON-CSV-Converter"
+        - Key: Purpose
+          Value: "Function Logging"
+
+  # CloudWatch Alarm for Lambda Errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub "${JsonCsvConverterFunction}-errors"
+      AlarmDescription: "Monitor Lambda function errors"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref JsonCsvConverterFunction
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Lambda Duration
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub "${JsonCsvConverterFunction}-duration"
+      AlarmDescription: "Monitor Lambda function duration"
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref JsonCsvConverterFunction
+      TreatMissingData: notBreaching
+
+# Stack Outputs
+Outputs:
+  InputBucketName:
+    Description: "Name of the S3 bucket for JSON input files"
+    Value: !Ref InputBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-InputBucket"
+
+  InputBucketArn:
+    Description: "ARN of the S3 input bucket"
+    Value: !GetAtt InputBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-InputBucketArn"
+
+  OutputBucketName:
+    Description: "Name of the S3 bucket for CSV output files"
+    Value: !Ref OutputBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-OutputBucket"
+
+  OutputBucketArn:
+    Description: "ARN of the S3 output bucket"
+    Value: !GetAtt OutputBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-OutputBucketArn"
+
+  LambdaFunctionName:
+    Description: "Name of the Lambda function performing the conversion"
+    Value: !Ref JsonCsvConverterFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunction"
+
+  LambdaFunctionArn:
+    Description: "ARN of the Lambda function"
+    Value: !GetAtt JsonCsvConverterFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunctionArn"
+
+  LambdaRoleArn:
+    Description: "ARN of the Lambda execution role"
+    Value: !GetAtt JsonCsvConverterRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaRole"
+
+  CloudWatchLogGroup:
+    Description: "CloudWatch Log Group for Lambda function"
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroup"
+
+  StackRegion:
+    Description: "AWS Region where the stack is deployed"
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub "${AWS::StackName}-Region"
+
+  DeploymentInstructions:
+    Description: "Quick start instructions for using the converter"
+    Value: !Sub |
+      1. Upload JSON files to: s3://${InputBucket}/
+      2. Converted CSV files will appear in: s3://${OutputBucket}/
+      3. Monitor processing: CloudWatch Logs -> /aws/lambda/${JsonCsvConverterFunction}
+      4. Example upload: aws s3 cp your-file.json s3://${InputBucket}/
+
+  EstimatedMonthlyCost:
+    Description: "Estimated monthly cost for typical usage (approximate)"
+    Value: !Sub |
+      Based on 1,000 conversions per month with 1KB average file size:
+      - Lambda: $0.20 (requests) + $0.03 (compute time) = $0.23
+      - S3: $0.10 (storage) + $0.05 (requests) = $0.15
+      - CloudWatch: $0.05 (logs)
+      Total: ~$0.43/month (excluding free tier benefits)

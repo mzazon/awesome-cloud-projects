@@ -6,10 +6,10 @@ difficulty: 400
 subject: aws
 services: eks, app-mesh, ecr, elastic-load-balancing
 estimated-time: 180 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: containers,service-mesh,microservices,eks,app-mesh,observability,traffic-management
 recipe-generator-version: 1.3
@@ -19,11 +19,11 @@ recipe-generator-version: 1.3
 
 ## Problem
 
-Modern organizations operating complex microservices architectures face significant challenges in managing service-to-service communication, observability, and traffic control. Without proper service mesh implementation, teams struggle with inconsistent networking policies, lack of end-to-end visibility across services, and difficulty implementing advanced deployment patterns like canary releases. This results in increased operational overhead, security vulnerabilities, and prolonged incident resolution times that can impact business continuity.
+Modern organizations operating complex microservices architectures face significant challenges in managing service-to-service communication, observability, and traffic control. Without proper service mesh implementation, teams struggle with inconsistent networking policies, lack of end-to-end visibility across services, and difficulty implementing advanced deployment patterns like canary releases. This results in increased operational overhead, security vulnerabilities, and prolonged incident resolution times that can impact business continuity and customer satisfaction.
 
 ## Solution
 
-AWS App Mesh provides a comprehensive service mesh solution that standardizes how microservices communicate on Amazon EKS, offering centralized traffic management, security policies, and observability. By implementing App Mesh with EKS, organizations can achieve consistent service-to-service communication through Envoy proxies, implement sophisticated traffic routing rules, and gain deep insights into application performance across their entire microservices ecosystem.
+AWS App Mesh provides a comprehensive service mesh solution that standardizes how microservices communicate on Amazon EKS, offering centralized traffic management, security policies, and observability. By implementing App Mesh with EKS, organizations can achieve consistent service-to-service communication through Envoy proxies, implement sophisticated traffic routing rules, and gain deep insights into application performance across their entire microservices ecosystem while maintaining application code separation from infrastructure concerns.
 
 ## Architecture Diagram
 
@@ -122,15 +122,15 @@ graph TB
 ## Prerequisites
 
 1. AWS account with EKS, App Mesh, ECR, and associated service permissions
-2. AWS CLI v2 installed and configured (minimum version 2.0.38)
-3. kubectl client installed and configured
-4. eksctl CLI tool installed (version 0.100.0 or later)
+2. AWS CLI v2 installed and configured (minimum version 2.15.0)
+3. kubectl client installed and configured (version 1.28+)
+4. eksctl CLI tool installed (version 0.190.0 or later)
 5. Helm v3 installed for App Mesh controller deployment
 6. Docker installed for container image building
 7. Basic understanding of Kubernetes, service mesh concepts, and microservices architectures
-8. Estimated cost: $50-100 for a 4-hour session (EKS cluster, ALB, ECR storage)
+8. Estimated cost: $75-125 for a 4-hour session (EKS cluster, ALB, ECR storage, extended support)
 
-> **Note**: This advanced recipe requires solid understanding of Kubernetes networking, service mesh architecture, and container orchestration principles.
+> **Warning**: AWS App Mesh will reach end of support on September 30, 2026. This recipe is provided for educational purposes and existing implementations. Consider alternative service mesh solutions like Istio, Linkerd, or Amazon ECS Service Connect for new production deployments.
 
 ## Preparation
 
@@ -170,7 +170,7 @@ echo "✅ ECR repositories created successfully"
 eksctl create cluster \
     --name ${CLUSTER_NAME} \
     --region ${AWS_REGION} \
-    --version 1.28 \
+    --version 1.31 \
     --nodegroup-name standard-workers \
     --node-type m5.large \
     --nodes 3 \
@@ -306,12 +306,12 @@ echo "✅ Kubeconfig updated successfully"
    EOF
    
    cat <<EOF > /tmp/demo-apps/frontend/requirements.txt
-   Flask==2.3.3
-   requests==2.31.0
+   Flask==3.0.3
+   requests==2.32.3
    EOF
    
    cat <<EOF > /tmp/demo-apps/frontend/Dockerfile
-   FROM python:3.9-slim
+   FROM python:3.11-slim
    WORKDIR /app
    COPY requirements.txt .
    RUN pip install -r requirements.txt
@@ -350,7 +350,8 @@ echo "✅ Kubeconfig updated successfully"
        try:
            db_url = os.getenv('DATABASE_URL', 'http://database:5432')
            response = requests.get(f'{db_url}/query')
-           return f'Backend data: {response.text}'
+           version = os.getenv('VERSION', 'v1')
+           return f'Backend {version} data: {response.text}'
        except Exception as e:
            return f'Backend error: {str(e)}'
    
@@ -359,12 +360,12 @@ echo "✅ Kubeconfig updated successfully"
    EOF
    
    cat <<EOF > /tmp/demo-apps/backend/requirements.txt
-   Flask==2.3.3
-   requests==2.31.0
+   Flask==3.0.3
+   requests==2.32.3
    EOF
    
    cat <<EOF > /tmp/demo-apps/backend/Dockerfile
-   FROM python:3.9-slim
+   FROM python:3.11-slim
    WORKDIR /app
    COPY requirements.txt .
    RUN pip install -r requirements.txt
@@ -403,11 +404,11 @@ echo "✅ Kubeconfig updated successfully"
    EOF
    
    cat <<EOF > /tmp/demo-apps/database/requirements.txt
-   Flask==2.3.3
+   Flask==3.0.3
    EOF
    
    cat <<EOF > /tmp/demo-apps/database/Dockerfile
-   FROM python:3.9-slim
+   FROM python:3.11-slim
    WORKDIR /app
    COPY requirements.txt .
    RUN pip install -r requirements.txt
@@ -475,6 +476,7 @@ echo "✅ Kubeconfig updated successfully"
      podSelector:
        matchLabels:
          app: backend
+         version: v1
      listeners:
        - portMapping:
            port: 8080
@@ -675,10 +677,12 @@ echo "✅ Kubeconfig updated successfully"
      selector:
        matchLabels:
          app: backend
+         version: v1
      template:
        metadata:
          labels:
            app: backend
+           version: v1
        spec:
          containers:
          - name: backend
@@ -688,6 +692,8 @@ echo "✅ Kubeconfig updated successfully"
            env:
            - name: DATABASE_URL
              value: "http://database:5432"
+           - name: VERSION
+             value: "v1"
            resources:
              requests:
                memory: "64Mi"
@@ -764,13 +770,15 @@ echo "✅ Kubeconfig updated successfully"
    The AWS Load Balancer Controller enables native integration between Kubernetes ingress resources and AWS Application Load Balancers, providing external access to your mesh-enabled applications. This integration is crucial for production deployments as it leverages AWS-native load balancing capabilities while maintaining the security and observability benefits of the service mesh for internal service communication. The ALB serves as the entry point for external traffic, which then flows through the service mesh infrastructure.
 
    ```bash
-   # Install AWS Load Balancer Controller
+   # Download IAM policy for AWS Load Balancer Controller
    curl -o iam_policy.json \
-       https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.2/docs/install/iam_policy.json
+       https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.8.0/docs/install/iam_policy.json
    
+   # Create IAM policy
    aws iam create-policy \
        --policy-name AWSLoadBalancerControllerIAMPolicy \
-       --policy-document file://iam_policy.json
+       --policy-document file://iam_policy.json \
+       --no-cli-pager
    
    # Create IAM role for Load Balancer Controller
    eksctl create iamserviceaccount \
@@ -792,6 +800,12 @@ echo "✅ Kubeconfig updated successfully"
        --set serviceAccount.create=false \
        --set serviceAccount.name=aws-load-balancer-controller
    
+   # Wait for controller to be ready
+   kubectl wait --for=condition=available \
+       --timeout=300s \
+       deployment/aws-load-balancer-controller \
+       -n kube-system
+   
    # Create ingress for frontend service
    cat <<EOF | kubectl apply -f -
    apiVersion: networking.k8s.io/v1
@@ -800,11 +814,11 @@ echo "✅ Kubeconfig updated successfully"
      name: frontend-ingress
      namespace: ${NAMESPACE}
      annotations:
-       kubernetes.io/ingress.class: alb
        alb.ingress.kubernetes.io/scheme: internet-facing
        alb.ingress.kubernetes.io/target-type: ip
        alb.ingress.kubernetes.io/healthcheck-path: /
    spec:
+     ingressClassName: alb
      rules:
      - http:
          paths:
@@ -874,7 +888,7 @@ echo "✅ Kubeconfig updated successfully"
         spec:
           containers:
           - name: xray-daemon
-            image: amazon/aws-xray-daemon:latest
+            image: amazon/aws-xray-daemon:3.3.8
             ports:
             - containerPort: 2000
               protocol: UDP
@@ -1216,13 +1230,13 @@ echo "✅ Kubeconfig updated successfully"
 
 AWS App Mesh provides a comprehensive service mesh solution that addresses the complex challenges of microservices communication in production environments. By implementing App Mesh with Amazon EKS, organizations can achieve several critical architectural benefits that directly impact operational efficiency and application reliability.
 
-The Envoy proxy integration serves as the foundation of App Mesh's capabilities, providing transparent service-to-service communication without requiring application code changes. This sidecar pattern ensures that all network traffic between services is managed consistently, enabling advanced features like automatic retries, circuit breakers, and load balancing. The proxy's integration with AWS services provides native support for distributed tracing through X-Ray, comprehensive metrics through CloudWatch, and centralized logging capabilities.
+The Envoy proxy integration serves as the foundation of App Mesh's capabilities, providing transparent service-to-service communication without requiring application code changes. This sidecar pattern ensures that all network traffic between services is managed consistently, enabling advanced features like automatic retries, circuit breakers, and load balancing. The proxy's integration with AWS services provides native support for distributed tracing through X-Ray, comprehensive metrics through CloudWatch, and centralized logging capabilities that align with the AWS Well-Architected Framework's operational excellence pillar.
 
-Traffic management capabilities in App Mesh enable sophisticated deployment strategies essential for modern DevOps practices. The virtual router and weighted routing features demonstrated in this recipe allow for seamless canary deployments, blue-green deployments, and A/B testing scenarios. Organizations can gradually shift traffic between service versions, monitor performance metrics, and roll back changes if issues arise, all without service disruption. This level of control is particularly valuable for high-availability applications where downtime has significant business impact.
+Traffic management capabilities in App Mesh enable sophisticated deployment strategies essential for modern DevOps practices. The virtual router and weighted routing features demonstrated in this recipe allow for seamless canary deployments, blue-green deployments, and A/B testing scenarios. Organizations can gradually shift traffic between service versions, monitor performance metrics, and roll back changes if issues arise, all without service disruption. This level of control is particularly valuable for high-availability applications where downtime has significant business impact and supports the reliability pillar of well-architected systems.
 
-The observability features provided by App Mesh integration significantly reduce mean time to resolution (MTTR) for production incidents. Distributed tracing capabilities allow teams to track requests across multiple services, identify bottlenecks, and understand service dependencies. Combined with centralized logging and metrics collection, teams gain comprehensive visibility into application behavior, enabling proactive monitoring and rapid issue diagnosis. For detailed implementation guidance, refer to the [AWS App Mesh User Guide](https://docs.aws.amazon.com/app-mesh/latest/userguide/what-is-app-mesh.html) and [EKS User Guide](https://docs.aws.amazon.com/eks/latest/userguide/getting-started.html).
+The observability features provided by App Mesh integration significantly reduce mean time to resolution (MTTR) for production incidents. Distributed tracing capabilities allow teams to track requests across multiple services, identify bottlenecks, and understand service dependencies. Combined with centralized logging and metrics collection, teams gain comprehensive visibility into application behavior, enabling proactive monitoring and rapid issue diagnosis. For detailed implementation guidance, refer to the [AWS App Mesh User Guide](https://docs.aws.amazon.com/app-mesh/latest/userguide/what-is-app-mesh.html), [EKS User Guide](https://docs.aws.amazon.com/eks/latest/userguide/getting-started.html), and [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
-> **Warning**: AWS App Mesh will reach end of support on September 30, 2026. Organizations should plan migration to alternative service mesh solutions such as Istio, Linkerd, or Amazon ECS Service Connect for new deployments.
+> **Warning**: AWS App Mesh will reach end of support on September 30, 2026. Organizations should plan migration to alternative service mesh solutions such as Istio, Linkerd, or Amazon ECS Service Connect for new deployments. Consider this timeline when making architectural decisions for production workloads.
 
 ## Challenge
 
@@ -1230,13 +1244,13 @@ Extend this solution by implementing these enhancements:
 
 1. **Implement mutual TLS (mTLS) authentication** between services using AWS Certificate Manager Private CA integration, enabling zero-trust security between microservices with automatic certificate rotation and validation.
 
-2. **Add comprehensive monitoring and alerting** by integrating CloudWatch Container Insights, creating custom dashboards for service mesh metrics, and implementing automated alerting for service failures and performance degradation.
+2. **Add comprehensive monitoring and alerting** by integrating CloudWatch Container Insights, creating custom dashboards for service mesh metrics, and implementing automated alerting for service failures and performance degradation using CloudWatch Alarms.
 
-3. **Implement circuit breaker patterns** using App Mesh timeout and retry policies, creating resilient service communication that fails fast and provides graceful degradation during service outages.
+3. **Implement circuit breaker patterns** using App Mesh timeout and retry policies, creating resilient service communication that fails fast and provides graceful degradation during service outages with proper fallback mechanisms.
 
 4. **Create a multi-environment deployment pipeline** using AWS CodePipeline and CodeDeploy, implementing automated testing, canary analysis, and rollback capabilities for service mesh deployments across development, staging, and production environments.
 
-5. **Integrate with AWS App Runner or Lambda** for serverless components, creating a hybrid architecture that combines containerized microservices with serverless functions while maintaining consistent service mesh communication patterns.
+5. **Integrate with AWS App Runner or Lambda** for serverless components, creating a hybrid architecture that combines containerized microservices with serverless functions while maintaining consistent service mesh communication patterns and observability.
 
 ## Infrastructure Code
 

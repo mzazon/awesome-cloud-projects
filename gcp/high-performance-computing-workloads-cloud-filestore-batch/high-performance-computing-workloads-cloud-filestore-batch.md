@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Filestore, Cloud Batch, Cloud Monitoring
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: hpc, high-performance-computing, scientific-computing, batch-processing, shared-storage, filestore, monitoring
 recipe-generator-version: 1.3
@@ -144,7 +144,7 @@ echo "✅ HPC environment variables set for region: ${REGION}"
 
 2. **Deploy High-Performance Cloud Filestore Instance**:
 
-   Cloud Filestore provides enterprise-grade NFS storage optimized for HPC workloads, delivering consistent low-latency access to shared datasets across compute nodes. The high-scale tier configuration ensures optimal throughput and IOPS performance for data-intensive scientific computations and parallel processing workflows.
+   Cloud Filestore provides enterprise-grade NFS storage optimized for HPC workloads, delivering consistent low-latency access to shared datasets across compute nodes. The ENTERPRISE tier configuration ensures optimal throughput and IOPS performance for data-intensive scientific computations and parallel processing workflows.
 
    ```bash
    # Create high-performance Filestore instance
@@ -156,15 +156,16 @@ echo "✅ HPC environment variables set for region: ${REGION}"
    
    # Wait for Filestore instance to become ready
    echo "Waiting for Filestore instance to be ready..."
-   gcloud filestore instances describe ${FILESTORE_NAME} \
-       --location ${ZONE} \
-       --format="value(state)" | \
-       while read state; do
-           if [ "$state" = "READY" ]; then
-               break
-           fi
-           sleep 30
-       done
+   while true; do
+       STATE=$(gcloud filestore instances describe ${FILESTORE_NAME} \
+           --location ${ZONE} \
+           --format="value(state)")
+       echo "Current state: ${STATE}"
+       if [ "$STATE" = "READY" ]; then
+           break
+       fi
+       sleep 30
+   done
    
    # Get Filestore IP address for mounting
    export FILESTORE_IP=$(gcloud filestore instances describe ${FILESTORE_NAME} \
@@ -287,28 +288,7 @@ echo "✅ HPC environment variables set for region: ${REGION}"
    Cloud Monitoring provides comprehensive observability for HPC workloads, tracking compute utilization, storage performance, and job execution metrics. Setting up custom dashboards and alerts enables proactive optimization of resource allocation and early detection of performance bottlenecks in computational workflows.
 
    ```bash
-   # Create monitoring workspace for HPC metrics
-   gcloud alpha monitoring workspaces create \
-       --display-name="HPC Monitoring Workspace"
-   
-   # Create custom metric for job completion tracking
-   cat > job-metric-descriptor.json << EOF
-   {
-     "type": "custom.googleapis.com/hpc/job_completion_rate",
-     "displayName": "HPC Job Completion Rate",
-     "description": "Rate of successful HPC job completions",
-     "metricKind": "GAUGE",
-     "valueType": "DOUBLE",
-     "labels": [
-       {
-         "key": "job_type",
-         "description": "Type of HPC job"
-       }
-     ]
-   }
-   EOF
-   
-   # Create alert policy for failed jobs
+   # Create alert policy for failed batch jobs
    cat > alert-policy.json << EOF
    {
      "displayName": "HPC Job Failure Alert",
@@ -320,18 +300,24 @@ echo "✅ HPC environment variables set for region: ${REGION}"
        {
          "displayName": "Batch job failure condition",
          "conditionThreshold": {
-           "filter": "resource.type=\"batch_job\"",
-           "comparison": "COMPARISON_EQUAL",
-           "thresholdValue": 1
+           "filter": "resource.type=\"batch_job\" AND metric.type=\"logging.googleapis.com/log_entry_count\"",
+           "comparison": "COMPARISON_GREATER_THAN",
+           "thresholdValue": 0
          }
        }
      ],
+     "alertStrategy": {
+       "autoClose": "86400s"
+     },
      "enabled": true
    }
    EOF
    
+   # Create alert policy for monitoring
+   gcloud alpha monitoring policies create --policy-from-file=alert-policy.json
+   
    echo "✅ Cloud Monitoring configured for HPC workloads"
-   echo "✅ Custom metrics and alerts set up for performance tracking"
+   echo "✅ Alert policies set up for batch job failure detection"
    ```
 
    Cloud Monitoring is now configured to provide comprehensive observability for the HPC environment, enabling performance optimization and proactive issue detection across compute and storage resources.
@@ -341,7 +327,7 @@ echo "✅ HPC environment variables set for region: ${REGION}"
    Configuring automated scaling policies ensures optimal resource utilization for varying HPC workload demands. The scaling configuration monitors job queue length and resource utilization to automatically provision additional compute capacity during peak demand periods while minimizing costs during low-utilization periods.
 
    ```bash
-   # Create instance group for auto-scaling HPC nodes
+   # Create instance template for auto-scaling HPC nodes
    gcloud compute instance-templates create hpc-node-template \
        --machine-type e2-standard-4 \
        --image-family ubuntu-2004-lts \
@@ -351,8 +337,8 @@ echo "✅ HPC environment variables set for region: ${REGION}"
    apt-get update
    apt-get install -y nfs-common
    mkdir -p /mnt/hpc_data
-   mount -t nfs ${FILESTORE_IP}:/hpc_data /mnt/hpc_data
-   echo "${FILESTORE_IP}:/hpc_data /mnt/hpc_data nfs defaults 0 0" >> /etc/fstab'
+   mount -t nfs '${FILESTORE_IP}':/hpc_data /mnt/hpc_data
+   echo "'${FILESTORE_IP}':/hpc_data /mnt/hpc_data nfs defaults 0 0" >> /etc/fstab'
    
    # Create managed instance group for scaling
    gcloud compute instance-groups managed create hpc-compute-group \
@@ -424,24 +410,26 @@ echo "✅ HPC environment variables set for region: ${REGION}"
    
    # Wait and check mounting success
    sleep 60
-   gcloud compute ssh hpc-test-vm --zone ${ZONE} --command "df -h | grep hpc_data"
+   gcloud compute ssh hpc-test-vm \
+       --zone ${ZONE} \
+       --command "df -h | grep hpc_data"
    ```
 
    Expected output: Successful NFS mount showing available storage capacity and accessible result files from batch job execution.
 
-4. Verify monitoring and alerting configuration:
+4. Verify monitoring configuration:
 
    ```bash
-   # Check monitoring workspace status
-   gcloud alpha monitoring workspaces list \
-       --format="table(displayName,name)"
-   
-   # Verify alert policies are active
+   # Check alert policies
    gcloud alpha monitoring policies list \
        --format="table(displayName,enabled,conditions[0].displayName)"
+   
+   # Verify Cloud Logging for batch jobs
+   gcloud logging sinks list \
+       --format="table(name,destination,filter)"
    ```
 
-   Expected output: Active monitoring workspace and enabled alert policies configured for HPC job monitoring and failure detection.
+   Expected output: Active alert policies and logging configuration for HPC job monitoring and failure detection.
 
 ## Cleanup
 
@@ -496,17 +484,17 @@ echo "✅ HPC environment variables set for region: ${REGION}"
        --quiet
    
    # Clean up local configuration files
-   rm -f hpc-job-config.json job-metric-descriptor.json alert-policy.json
+   rm -f hpc-job-config.json alert-policy.json
    
    echo "✅ Network and configuration resources cleaned up"
-   echo "Note: Monitoring workspace may need manual deletion from console"
+   echo "Note: Alert policies may need manual deletion from console"
    ```
 
 ## Discussion
 
 This HPC solution demonstrates the power of combining Cloud Filestore's high-performance shared storage with Cloud Batch's automated compute provisioning to create a scalable, cost-effective scientific computing environment. The architecture leverages Google Cloud's managed services to eliminate traditional HPC infrastructure management overhead while providing enterprise-grade performance and reliability for demanding computational workloads.
 
-The Cloud Filestore enterprise tier provides consistent, high-throughput NFS storage that scales seamlessly with compute demands, supporting concurrent access patterns typical in scientific computing, financial modeling, and data processing workflows. The NFS compatibility ensures existing HPC applications can migrate without modification, while the managed service eliminates storage administration complexity. Combined with Cloud Batch's automatic resource provisioning, this creates a truly elastic HPC environment that adapts to varying workload requirements.
+The Cloud Filestore ENTERPRISE tier provides consistent, high-throughput NFS storage that scales seamlessly with compute demands, supporting concurrent access patterns typical in scientific computing, financial modeling, and data processing workflows. The NFS compatibility ensures existing HPC applications can migrate without modification, while the managed service eliminates storage administration complexity. Combined with Cloud Batch's automatic resource provisioning, this creates a truly elastic HPC environment that adapts to varying workload requirements.
 
 The integration of Cloud Monitoring provides essential observability for optimizing HPC performance and costs. By tracking job completion rates, resource utilization patterns, and storage performance metrics, teams can identify bottlenecks, optimize resource allocation, and implement predictive scaling strategies. The automated alerting capabilities ensure rapid response to job failures or performance degradation, maintaining research productivity and computational efficiency.
 

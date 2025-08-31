@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: Kinesis Data Firehose, Lambda, S3, CloudWatch
 estimated-time: 45 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: analytics, streaming, kinesis-firehose, lambda, real-time, data-processing, data-transformation
 recipe-generator-version: 1.3
@@ -84,7 +84,7 @@ graph TB
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions to create and manage Kinesis Firehose, Lambda, S3, IAM, and CloudWatch resources
+1. AWS account with appropriate permissions to create and manage Kinesis Data Firehose, Lambda, S3, IAM, and CloudWatch resources
 2. AWS CLI v2 installed and configured with administrator or appropriate permissions
 3. Basic understanding of data streaming concepts and JSON data formats
 4. Knowledge of Lambda functions and Node.js programming
@@ -385,7 +385,7 @@ echo "✅ S3 buckets created successfully"
    
    LAMBDA_ARN=$(aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION} \
-       --runtime nodejs16.x \
+       --runtime nodejs20.x \
        --handler index.handler \
        --role ${LAMBDA_ROLE_ARN} \
        --zip-file fileb://lambda_transform.zip \
@@ -397,7 +397,7 @@ echo "✅ S3 buckets created successfully"
    echo "✅ Lambda function created: ${LAMBDA_FUNCTION}"
    ```
 
-   The Lambda function is now deployed and ready to process Firehose data. It has appropriate timeout (60 seconds) and memory (256 MB) settings for typical log processing workloads. The function includes comprehensive error handling and logging to track processing status and identify issues with malformed data.
+   The Lambda function is now deployed with the latest supported Node.js 20.x runtime and ready to process Firehose data. It has appropriate timeout (60 seconds) and memory (256 MB) settings for typical log processing workloads. The function includes comprehensive error handling and logging to track processing status and identify issues with malformed data.
 
    > **Note**: The Lambda function processes data in batches for optimal performance. Buffer configuration parameters in Firehose control batch size and frequency. Learn more about [Firehose data transformation](https://docs.aws.amazon.com/kinesis/latest/dev/lambda-preprocessing.html).
 
@@ -633,10 +633,10 @@ echo "✅ S3 buckets created successfully"
    ```bash
    # Create test data generator
    cat > test_data.json << 'EOF'
-   {"timestamp": "2025-01-12T10:30:00Z", "level": "INFO", "service": "user-service", "message": "User login successful", "userId": "user123"}
-   {"timestamp": "2025-01-12T10:30:01Z", "level": "ERROR", "service": "payment-service", "message": "Payment failed", "userId": "user456", "creditCard": "4111111111111111"}
-   {"timestamp": "2025-01-12T10:30:02Z", "level": "DEBUG", "service": "db-service", "message": "Query executed", "duration": "45ms"}
-   {"timestamp": "2025-01-12T10:30:03Z", "level": "WARN", "service": "cache-service", "message": "Cache miss detected", "key": "user_profile_789"}
+   {"timestamp": "2025-07-23T10:30:00Z", "level": "INFO", "service": "user-service", "message": "User login successful", "userId": "user123"}
+   {"timestamp": "2025-07-23T10:30:01Z", "level": "ERROR", "service": "payment-service", "message": "Payment failed", "userId": "user456", "creditCard": "4111111111111111"}
+   {"timestamp": "2025-07-23T10:30:02Z", "level": "DEBUG", "service": "db-service", "message": "Query executed", "duration": "45ms"}
+   {"timestamp": "2025-07-23T10:30:03Z", "level": "WARN", "service": "cache-service", "message": "Cache miss detected", "key": "user_profile_789"}
    EOF
    
    # Send test records to Firehose
@@ -780,15 +780,15 @@ echo "✅ S3 buckets created successfully"
 
 ## Discussion
 
-Amazon Kinesis Data Firehose represents a pivotal component in modern real-time data processing architectures. As a fully managed service, it eliminates the operational overhead of building and maintaining complex data ingestion pipelines, allowing organizations to focus on extracting value from their data rather than managing infrastructure. The key architectural strength of Firehose lies in its seamless integration with other AWS services, particularly Lambda for transformation and multiple destinations for storage and analysis.
+Amazon Kinesis Data Firehose represents a pivotal component in modern real-time data processing architectures that aligns with the AWS Well-Architected Framework principles. As a fully managed service, it eliminates the operational overhead of building and maintaining complex data ingestion pipelines, allowing organizations to focus on extracting value from their data rather than managing infrastructure. The service provides operational excellence through automation, security through encryption and IAM integration, reliability through fault tolerance, performance efficiency through auto-scaling, and cost optimization through serverless pricing.
 
 The transformation capability through Lambda functions enables powerful in-flight processing of data. This pattern allows for data cleaning, filtering, format conversion, enrichment, and aggregation before delivery, which significantly reduces downstream processing requirements. By performing these transformations during ingestion rather than after storage, you ensure that downstream analytical systems receive clean, properly formatted data, improving query performance and reducing storage costs. The [Lambda blueprint for Firehose transformations](https://docs.aws.amazon.com/firehose/latest/dev/data-transformation.html) provides a solid foundation that can be customized to meet specific business needs.
 
-Error handling is a critical aspect of any data processing pipeline, and Firehose addresses this through backup options and dead-letter queues. Raw data is preserved before transformation, allowing for reprocessing if errors occur, while failed records can be routed to a separate error bucket for analysis and debugging. This approach ensures no data loss while maintaining the quality of the delivered dataset. CloudWatch integration provides comprehensive monitoring and alerting capabilities, enabling proactive management of the pipeline and rapid response to issues.
+Error handling is a critical aspect of any data processing pipeline, and Firehose addresses this through backup options and dead-letter queues. Raw data is preserved before transformation, allowing for reprocessing if errors occur, while failed records can be routed to a separate error bucket for analysis and debugging. This approach ensures no data loss while maintaining the quality of the delivered dataset. CloudWatch integration provides comprehensive monitoring and alerting capabilities through [Firehose monitoring metrics](https://docs.aws.amazon.com/firehose/latest/dev/monitoring.html), enabling proactive management of the pipeline and rapid response to issues.
 
 > **Tip**: When implementing Firehose transformations with Lambda, carefully tune the buffer size and interval parameters to find the optimal balance between latency and efficiency. Smaller buffers reduce latency but increase Lambda invocations, while larger buffers improve throughput at the cost of freshness.
 
-One important consideration when working with Kinesis Data Firehose is cost optimization. While the service itself is cost-effective, the volume of data processed can significantly impact overall expenses. Implementing proper data filtering early in the pipeline can substantially reduce costs by eliminating unnecessary data before it incurs storage and processing charges. Additionally, compressing data (as demonstrated in this recipe with GZIP) reduces storage costs and improves query performance in downstream systems.
+One important consideration when working with Kinesis Data Firehose is cost optimization following AWS Well-Architected practices. While the service itself is cost-effective, the volume of data processed can significantly impact overall expenses. Implementing proper data filtering early in the pipeline can substantially reduce costs by eliminating unnecessary data before it incurs storage and processing charges. Additionally, compressing data (as demonstrated in this recipe with GZIP) reduces storage costs and improves query performance in downstream systems.
 
 ## Challenge
 

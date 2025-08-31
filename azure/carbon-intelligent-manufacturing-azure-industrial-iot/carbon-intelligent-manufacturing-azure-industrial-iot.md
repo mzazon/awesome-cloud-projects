@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Industrial IoT, Azure Sustainability Manager, Azure Event Grid, Azure Data Explorer
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: iot, sustainability, manufacturing, carbon-footprint, industrial-automation, environmental-monitoring
 recipe-generator-version: 1.3
@@ -216,7 +216,7 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        --storage-account ${STORAGE_ACCOUNT_NAME} \
        --consumption-plan-location ${LOCATION} \
        --runtime python \
-       --runtime-version 3.9 \
+       --runtime-version 3.11 \
        --functions-version 4
    
    # Configure application settings for carbon calculations
@@ -246,22 +246,20 @@ echo "✅ Storage account created: ${STORAGE_ACCOUNT_NAME}"
        --endpoint "https://${FUNCTION_APP_NAME}.azurewebsites.net/api/ProcessCarbonData" \
        --included-event-types "Microsoft.Devices.DeviceTelemetry"
    
-   # Configure IoT Hub message routing for sustainability data
-   az iot hub routing-endpoint create \
+   # Configure IoT Hub built-in Event Hub endpoint for data ingestion
+   az iot hub consumer-group create \
        --hub-name ${IOT_HUB_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --endpoint-name "CarbonDataEndpoint" \
-       --endpoint-type eventhub \
-       --connection-string ${IOT_CONNECTION_STRING}
+       --name "carbon-consumer"
    
    echo "✅ IoT Hub integrated with Event Grid for automated carbon monitoring"
    ```
 
    The integration now automatically routes industrial sensor data through Event Grid to trigger carbon footprint calculations. This event-driven approach ensures that sustainability metrics are updated in real-time as factory operations change, enabling immediate visibility into environmental impact.
 
-6. **Configure Data Explorer Data Connection**:
+6. **Configure Event Hub for High-Volume Data Ingestion**:
 
-   Establishing a direct data connection between IoT Hub and Data Explorer creates a high-throughput ingestion pipeline for industrial telemetry data. This connection enables real-time analytics on energy consumption patterns, production efficiency, and environmental metrics essential for accurate carbon footprint monitoring.
+   Establishing a separate Event Hub provides a dedicated high-throughput ingestion pipeline for industrial telemetry data. This architecture ensures that Data Explorer can handle massive volumes of sensor data while maintaining the low latency required for real-time carbon footprint monitoring.
 
    ```bash
    # Create Event Hub namespace for data ingestion

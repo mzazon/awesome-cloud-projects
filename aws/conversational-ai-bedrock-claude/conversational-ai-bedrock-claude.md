@@ -5,11 +5,11 @@ category: ai
 difficulty: 300
 subject: aws
 services: Bedrock, Lambda, API Gateway, DynamoDB
-estimated-time: 60 minutes
-recipe-version: 1.2
+estimated-time: 90 minutes
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: bedrock, claude, ai, conversational-ai, lambda, api-gateway, dynamodb
 recipe-generator-version: 1.3
@@ -73,7 +73,7 @@ graph TB
     LAMBDA1 --> BEDROCK
     
     LAMBDA2 --> DYNAMODB
-    LAMBDA3--> DYNAMODB
+    LAMBDA3 --> DYNAMODB
     
     BEDROCK --> PROMPT
     LAMBDA1 --> S3
@@ -95,9 +95,9 @@ graph TB
 1. AWS account with permissions to use Amazon Bedrock, Lambda, API Gateway, and DynamoDB
 2. AWS CLI v2 installed and configured with appropriate credentials
 3. Access to Amazon Bedrock Claude models (requires model access request)
-4. Python 3.9+ for Lambda function development
+4. Python 3.11+ for Lambda function development
 5. Basic understanding of conversational AI concepts and REST APIs
-6. Estimated cost: Bedrock (~$0.008/1K input tokens, ~$0.024/1K output tokens), Lambda (~$0.20/million requests), DynamoDB (~$0.25/million requests)
+6. Estimated cost: Bedrock (~$0.008/1K input tokens, ~$0.024/1K output tokens), Lambda (~$0.20/million requests), DynamoDB (~$0.25/million requests), API Gateway (~$3.50/million requests)
 
 > **Note**: You must request access to Bedrock models through the AWS console before using them. This process may take a few minutes to hours depending on the model. See [Amazon Bedrock Model Access](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html) for detailed instructions.
 
@@ -160,7 +160,7 @@ echo "✅ Environment variables configured"
 
 2. **Create DynamoDB table for conversation storage**:
 
-   DynamoDB provides fast, scalable storage for conversation history with the ability to query conversations by session ID and maintain chronological order through timestamp sorting.
+   DynamoDB provides fast, scalable storage for conversation history with the ability to query conversations by session ID and maintain chronological order through timestamp sorting. The composite key design enables efficient retrieval of conversation history while maintaining data consistency across concurrent users.
 
    ```bash
    # Create DynamoDB table with composite key for efficient querying
@@ -181,6 +181,8 @@ echo "✅ Environment variables configured"
    echo "✅ Created DynamoDB table for conversation storage"
    echo "ℹ️  Table uses session_id as partition key and timestamp as sort key"
    ```
+
+   The DynamoDB table structure supports efficient conversation retrieval and scales automatically with usage. This design enables the application to maintain context across conversation turns while providing fast access to recent messages for AI context building.
 
 3. **Create IAM role for Lambda functions**:
 
@@ -292,6 +294,7 @@ echo "✅ Environment variables configured"
    import time
    from datetime import datetime
    import logging
+   import os
    
    # Configure logging
    logger = logging.getLogger()
@@ -300,10 +303,10 @@ echo "✅ Environment variables configured"
    # Initialize AWS clients
    bedrock_runtime = boto3.client('bedrock-runtime')
    dynamodb = boto3.resource('dynamodb')
-   table = dynamodb.Table('${TABLE_NAME}')
+   table = dynamodb.Table(os.environ.get('TABLE_NAME'))
    
    # Claude model configuration
-   CLAUDE_MODEL_ID = '${CLAUDE_MODEL_ID}'
+   CLAUDE_MODEL_ID = os.environ.get('CLAUDE_MODEL_ID')
    MAX_TOKENS = 1000
    TEMPERATURE = 0.7
    
@@ -493,7 +496,7 @@ echo "✅ Environment variables configured"
    # Deploy Lambda function with appropriate configuration
    LAMBDA_FUNCTION_ARN=$(aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.11 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler conversational_ai_handler.lambda_handler \
        --zip-file fileb://conversational_ai_handler.zip \
@@ -506,6 +509,8 @@ echo "✅ Environment variables configured"
    echo "✅ Deployed conversational AI Lambda function"
    echo "Function ARN: ${LAMBDA_FUNCTION_ARN}"
    ```
+
+   The Lambda function now handles the complete conversational AI workflow with proper error handling, logging, and environment variable usage. The updated runtime (Python 3.11) provides improved performance and security features compared to older versions.
 
 5. **Create API Gateway for REST API access**:
 
@@ -613,7 +618,7 @@ echo "✅ Environment variables configured"
 
 6. **Grant API Gateway permission to invoke Lambda**:
 
-   API Gateway needs explicit permission to invoke your Lambda function. This step creates the necessary resource-based policy on the Lambda function.
+   API Gateway needs explicit permission to invoke your Lambda function. This step creates the necessary resource-based policy on the Lambda function, following AWS security best practices for service-to-service communication.
 
    ```bash
    # Add permission for API Gateway to invoke Lambda function
@@ -946,23 +951,23 @@ echo "✅ Environment variables configured"
 
 ## Discussion
 
-This conversational AI application demonstrates the power of Amazon Bedrock for building sophisticated AI-powered applications without the complexity of model management. By leveraging Claude's advanced language understanding capabilities, the solution provides natural, context-aware conversations that can be easily integrated into existing applications.
+This conversational AI application demonstrates the power of Amazon Bedrock for building sophisticated AI-powered applications without the complexity of model management. By leveraging Claude's advanced language understanding capabilities, the solution provides natural, context-aware conversations that can be easily integrated into existing applications. The architecture follows AWS Well-Architected Framework principles, particularly the Operational Excellence and Security pillars.
 
-The architecture separates concerns effectively: API Gateway handles HTTP requests and CORS, Lambda functions manage business logic and orchestration, DynamoDB provides fast and scalable conversation storage, and Bedrock delivers state-of-the-art AI capabilities. This separation allows for independent scaling and maintenance of each component.
+The architecture separates concerns effectively: API Gateway handles HTTP requests and CORS, Lambda functions manage business logic and orchestration, DynamoDB provides fast and scalable conversation storage, and Bedrock delivers state-of-the-art AI capabilities. This separation allows for independent scaling and maintenance of each component while maintaining cost efficiency through serverless pricing models.
 
-The conversation memory system stores both user messages and AI responses, enabling the system to maintain context across multiple turns in a conversation. The session-based approach allows multiple concurrent users while keeping their conversations isolated. For production deployments, consider implementing user authentication with Amazon Cognito, adding rate limiting to prevent abuse, implementing conversation analytics with Amazon QuickSight, and adding content filtering for safety.
+The conversation memory system stores both user messages and AI responses, enabling the system to maintain context across multiple turns in a conversation. The session-based approach allows multiple concurrent users while keeping their conversations isolated. For production deployments, consider implementing user authentication with Amazon Cognito, adding rate limiting to prevent abuse, implementing conversation analytics with Amazon QuickSight, and adding content filtering for safety. Additionally, implementing proper monitoring with CloudWatch dashboards and X-Ray tracing will provide visibility into system performance and user behavior patterns.
 
-> **Tip**: Experiment with different Claude models (Haiku for speed, Sonnet for balance, Opus for complex reasoning) based on your use case requirements and cost considerations. Reference the [Anthropic Claude models documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-claude.html) for detailed model specifications and capabilities.
+> **Tip**: Experiment with different Claude models (Haiku for speed, Sonnet for balance, Opus for complex reasoning) based on your use case requirements and cost considerations. Reference the [Anthropic Claude models documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-claude.html) for detailed model specifications and capabilities. The [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) provides additional guidance for optimizing your architecture for production workloads.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Add streaming responses** using Bedrock's streaming API and WebSocket connections through API Gateway for real-time conversation experiences
-2. **Implement conversation summarization** using Claude to automatically summarize long conversations and maintain context while reducing token usage
-3. **Build a web interface** with React or Vue.js that provides a chat UI with conversation history, typing indicators, and message formatting
-4. **Add multi-modal capabilities** by integrating with Bedrock's vision models to allow users to upload and discuss images within conversations
-5. **Create conversation analytics** with CloudWatch dashboards to track usage patterns, popular topics, user satisfaction, and system performance metrics
+1. **Add streaming responses** using Bedrock's streaming API and WebSocket connections through API Gateway for real-time conversation experiences, reducing perceived latency for users
+2. **Implement conversation summarization** using Claude to automatically summarize long conversations and maintain context while reducing token usage and costs
+3. **Build a web interface** with React or Vue.js that provides a chat UI with conversation history, typing indicators, and message formatting for improved user experience
+4. **Add multi-modal capabilities** by integrating with Bedrock's vision models to allow users to upload and discuss images within conversations, expanding interaction possibilities
+5. **Create conversation analytics** with CloudWatch dashboards to track usage patterns, popular topics, user satisfaction metrics, and system performance for continuous improvement
 
 ## Infrastructure Code
 

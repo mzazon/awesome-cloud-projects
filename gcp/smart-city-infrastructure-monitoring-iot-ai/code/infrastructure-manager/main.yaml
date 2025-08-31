@@ -1,0 +1,757 @@
+# Infrastructure Manager Configuration for Smart City Infrastructure Monitoring with IoT and AI
+# This configuration deploys a complete smart city monitoring solution using Google Cloud services
+# including Pub/Sub for IoT data ingestion, Vertex AI for anomaly detection, BigQuery for analytics,
+# and Cloud Monitoring for comprehensive observability.
+
+# Provider configuration
+apiVersion: v1
+kind: BlueprintMetadata
+metadata:
+  name: smart-city-infrastructure-monitoring
+  description: Complete smart city infrastructure monitoring solution with IoT data ingestion, ML-powered anomaly detection, and real-time analytics
+  version: "1.0"
+  author: Infrastructure Manager
+spec:
+  title: Smart City Infrastructure Monitoring with IoT and AI
+  source:
+    repo: https://github.com/GoogleCloudPlatform/infrastructure-manager-examples
+    sourceType: git
+  requirements:
+    services:
+      - pubsub.googleapis.com
+      - bigquery.googleapis.com
+      - aiplatform.googleapis.com
+      - monitoring.googleapis.com
+      - cloudfunctions.googleapis.com
+      - storage.googleapis.com
+      - iam.googleapis.com
+      - cloudresourcemanager.googleapis.com
+
+---
+# Input variables for customizable deployment
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smart-city-config
+data:
+  # Project configuration
+  project_id: "${PROJECT_ID}"
+  region: "us-central1"
+  zone: "us-central1-a"
+  
+  # Resource naming configuration
+  random_suffix: "${RANDOM_SUFFIX:-$(openssl rand -hex 3)}"
+  dataset_name: "smart_city_data"
+  topic_name: "sensor-telemetry"
+  service_account_name: "city-sensors-${random_suffix}"
+  bucket_name: "smart-city-ml-${random_suffix}"
+  
+  # Cloud Function configuration
+  function_name: "process-sensor-data"
+  function_memory: "512MB"
+  function_timeout: "120s"
+  function_max_instances: "100"
+  
+  # BigQuery configuration
+  table_retention_days: "365"
+  
+  # Monitoring configuration
+  dashboard_name: "Smart City Infrastructure Monitoring"
+  alert_policy_name: "Smart City - High Anomaly Detection Alert"
+
+---
+# IAM Service Account for IoT device authentication
+apiVersion: v1
+kind: IAMServiceAccount
+metadata:
+  name: smart-city-iot-service-account
+spec:
+  accountId: "${service_account_name}"
+  displayName: "Smart City IoT Sensors"
+  description: "Service account for city sensor data ingestion and processing"
+  project: "${project_id}"
+
+---
+# IAM Policy binding for Pub/Sub publisher role
+apiVersion: v1
+kind: IAMPolicy
+metadata:
+  name: iot-pubsub-publisher-binding
+spec:
+  resource: "projects/${project_id}"
+  bindings:
+    - role: "roles/pubsub.publisher"
+      members:
+        - "serviceAccount:${service_account_name}@${project_id}.iam.gserviceaccount.com"
+    - role: "roles/bigquery.dataEditor"
+      members:
+        - "serviceAccount:${service_account_name}@${project_id}.iam.gserviceaccount.com"
+    - role: "roles/monitoring.metricWriter"
+      members:
+        - "serviceAccount:${service_account_name}@${project_id}.iam.gserviceaccount.com"
+
+---
+# Pub/Sub topic for sensor telemetry data
+apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+kind: PubSubTopic
+metadata:
+  name: sensor-telemetry-topic
+spec:
+  displayName: "Smart City Sensor Telemetry"
+  # Enable message storage policy for multi-region availability
+  messageStoragePolicy:
+    allowedPersistenceRegions:
+      - "${region}"
+  # Configure message retention for 7 days
+  messageRetentionDuration: "604800s"
+  # Enable schema validation for data quality
+  schemaSettings:
+    encoding: "JSON"
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "data-ingestion"
+
+---
+# Pub/Sub subscription for BigQuery streaming
+apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+kind: PubSubSubscription
+metadata:
+  name: sensor-telemetry-bigquery-subscription
+spec:
+  displayName: "Sensor Telemetry to BigQuery"
+  topic: "projects/${project_id}/topics/${topic_name}"
+  # Configure acknowledgment deadline for processing
+  ackDeadlineSeconds: 60
+  # Enable message ordering for consistent processing
+  enableMessageOrdering: true
+  # Configure retry policy for failed messages
+  retryPolicy:
+    minimumBackoff: "10s"
+    maximumBackoff: "600s"
+  # Dead letter queue configuration
+  deadLetterPolicy:
+    deadLetterTopic: "projects/${project_id}/topics/${topic_name}-dlq"
+    maxDeliveryAttempts: 5
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "bigquery-streaming"
+
+---
+# Pub/Sub subscription for ML processing
+apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+kind: PubSubSubscription
+metadata:
+  name: sensor-telemetry-ml-subscription
+spec:
+  displayName: "Sensor Telemetry for ML Processing"
+  topic: "projects/${project_id}/topics/${topic_name}"
+  # Configure longer acknowledgment deadline for ML processing
+  ackDeadlineSeconds: 120
+  # Configure exponential backoff for retries
+  retryPolicy:
+    minimumBackoff: "15s"
+    maximumBackoff: "900s"
+  # Dead letter queue configuration
+  deadLetterPolicy:
+    deadLetterTopic: "projects/${project_id}/topics/${topic_name}-dlq"
+    maxDeliveryAttempts: 3
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "ml-processing"
+
+---
+# Dead letter topic for failed messages
+apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+kind: PubSubTopic
+metadata:
+  name: sensor-telemetry-dlq-topic
+spec:
+  displayName: "Smart City Sensor Telemetry Dead Letter Queue"
+  messageRetentionDuration: "604800s"  # 7 days retention
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "error-handling"
+
+---
+# Dead letter subscription for monitoring failed messages
+apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+kind: PubSubSubscription
+metadata:
+  name: sensor-telemetry-dlq-subscription
+spec:
+  displayName: "Dead Letter Queue Monitoring"
+  topic: "projects/${project_id}/topics/${topic_name}-dlq"
+  ackDeadlineSeconds: 60
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "error-monitoring"
+
+---
+# BigQuery dataset for smart city data
+apiVersion: bigquery.cnrm.cloud.google.com/v1beta1
+kind: BigQueryDataset
+metadata:
+  name: smart-city-dataset
+spec:
+  datasetId: "${dataset_name}"
+  displayName: "Smart City Sensor Data and Analytics"
+  description: "Central data warehouse for smart city sensor data, ML results, and analytics"
+  location: "${region}"
+  # Configure default table expiration (365 days)
+  defaultTableExpirationMs: 31536000000
+  # Enable deletion protection
+  deletionProtection: true
+  # Configure access controls
+  access:
+    - role: "OWNER"
+      userByEmail: "admin@${project_id}.iam.gserviceaccount.com"
+    - role: "WRITER"
+      userByEmail: "${service_account_name}@${project_id}.iam.gserviceaccount.com"
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "data-warehouse"
+
+---
+# BigQuery table for sensor readings with optimized schema
+apiVersion: bigquery.cnrm.cloud.google.com/v1beta1
+kind: BigQueryTable
+metadata:
+  name: sensor-readings-table
+spec:
+  datasetId: "${dataset_name}"
+  tableId: "sensor_readings"
+  displayName: "Real-time Sensor Readings"
+  description: "Real-time sensor readings from city infrastructure with time partitioning and clustering"
+  # Configure time-based partitioning for performance
+  timePartitioning:
+    type: "DAY"
+    field: "timestamp"
+    requirePartitionFilter: true
+    expirationMs: 31536000000  # 365 days
+  # Configure clustering for query optimization
+  clustering:
+    - "sensor_type"
+    - "location"
+  # Define optimized schema
+  schema:
+    fields:
+      - name: "device_id"
+        type: "STRING"
+        mode: "REQUIRED"
+        description: "Unique identifier for the IoT device"
+      - name: "sensor_type"
+        type: "STRING"
+        mode: "REQUIRED"
+        description: "Type of sensor (traffic_flow, air_quality, energy, water)"
+      - name: "location"
+        type: "STRING"
+        mode: "REQUIRED"
+        description: "Physical location of the sensor"
+      - name: "timestamp"
+        type: "TIMESTAMP"
+        mode: "REQUIRED"
+        description: "Timestamp when the reading was taken"
+      - name: "value"
+        type: "FLOAT"
+        mode: "REQUIRED"
+        description: "Sensor reading value"
+      - name: "unit"
+        type: "STRING"
+        mode: "NULLABLE"
+        description: "Unit of measurement for the sensor value"
+      - name: "metadata"
+        type: "JSON"
+        mode: "NULLABLE"
+        description: "Additional metadata about the sensor reading"
+      - name: "ingestion_time"
+        type: "TIMESTAMP"
+        mode: "REQUIRED"
+        description: "Timestamp when the data was ingested into BigQuery"
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "sensor-data"
+
+---
+# BigQuery table for anomaly detection results
+apiVersion: bigquery.cnrm.cloud.google.com/v1beta1
+kind: BigQueryTable
+metadata:
+  name: anomalies-table
+spec:
+  datasetId: "${dataset_name}"
+  tableId: "anomalies"
+  displayName: "Anomaly Detection Results"
+  description: "Anomaly detection results from ML models with confidence scores"
+  # Configure time-based partitioning
+  timePartitioning:
+    type: "DAY"
+    field: "timestamp"
+    requirePartitionFilter: true
+    expirationMs: 7776000000  # 90 days
+  # Define schema for anomaly results
+  schema:
+    fields:
+      - name: "device_id"
+        type: "STRING"
+        mode: "REQUIRED"
+        description: "Device that triggered the anomaly"
+      - name: "timestamp"
+        type: "TIMESTAMP"
+        mode: "REQUIRED"
+        description: "Timestamp of the anomalous reading"
+      - name: "anomaly_score"
+        type: "FLOAT"
+        mode: "REQUIRED"
+        description: "Anomaly score from ML model (0.0 to 1.0)"
+      - name: "anomaly_type"
+        type: "STRING"
+        mode: "NULLABLE"
+        description: "Type of anomaly detected"
+      - name: "confidence"
+        type: "FLOAT"
+        mode: "REQUIRED"
+        description: "Confidence level of the anomaly detection"
+      - name: "model_version"
+        type: "STRING"
+        mode: "REQUIRED"
+        description: "Version of the ML model used for detection"
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "anomaly-detection"
+
+---
+# BigQuery table for aggregated sensor metrics
+apiVersion: bigquery.cnrm.cloud.google.com/v1beta1
+kind: BigQueryTable
+metadata:
+  name: sensor-metrics-table
+spec:
+  datasetId: "${dataset_name}"
+  tableId: "sensor_metrics"
+  displayName: "Aggregated Sensor Metrics"
+  description: "Daily aggregated metrics for dashboard and reporting"
+  # Configure date partitioning for historical data
+  timePartitioning:
+    type: "DAY"
+    field: "date"
+    requirePartitionFilter: true
+    expirationMs: 94608000000  # 3 years
+  # Define schema for aggregated metrics
+  schema:
+    fields:
+      - name: "sensor_type"
+        type: "STRING"
+        mode: "REQUIRED"
+        description: "Type of sensor"
+      - name: "location"
+        type: "STRING"
+        mode: "REQUIRED"
+        description: "Sensor location"
+      - name: "date"
+        type: "DATE"
+        mode: "REQUIRED"
+        description: "Date of the aggregated metrics"
+      - name: "avg_value"
+        type: "FLOAT"
+        mode: "NULLABLE"
+        description: "Average sensor value for the day"
+      - name: "min_value"
+        type: "FLOAT"
+        mode: "NULLABLE"
+        description: "Minimum sensor value for the day"
+      - name: "max_value"
+        type: "FLOAT"
+        mode: "NULLABLE"
+        description: "Maximum sensor value for the day"
+      - name: "anomaly_count"
+        type: "INTEGER"
+        mode: "NULLABLE"
+        description: "Number of anomalies detected for the day"
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "metrics-aggregation"
+
+---
+# Cloud Storage bucket for ML models and artifacts
+apiVersion: storage.cnrm.cloud.google.com/v1beta1
+kind: StorageBucket
+metadata:
+  name: smart-city-ml-bucket
+spec:
+  bucketName: "${bucket_name}"
+  location: "${region}"
+  storageClass: "STANDARD"
+  # Enable versioning for model artifacts
+  versioning:
+    enabled: true
+  # Configure lifecycle management for cost optimization
+  lifecycle:
+    rule:
+      - action:
+          type: "SetStorageClass"
+          storageClass: "NEARLINE"
+        condition:
+          age: 30
+      - action:
+          type: "SetStorageClass"
+          storageClass: "COLDLINE"
+        condition:
+          age: 90
+      - action:
+          type: "Delete"
+        condition:
+          age: 365
+  # Configure uniform bucket-level access
+  uniformBucketLevelAccess:
+    enabled: true
+  # Enable public access prevention
+  publicAccessPrevention: "enforced"
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "ml-storage"
+
+---
+# Cloud Storage bucket IAM for service account access
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicy
+metadata:
+  name: ml-bucket-access-policy
+spec:
+  resourceRef:
+    apiVersion: storage.cnrm.cloud.google.com/v1beta1
+    kind: StorageBucket
+    name: smart-city-ml-bucket
+  bindings:
+    - role: "roles/storage.objectAdmin"
+      members:
+        - "serviceAccount:${service_account_name}@${project_id}.iam.gserviceaccount.com"
+    - role: "roles/storage.objectViewer"
+      members:
+        - "serviceAccount:${function_name}@${project_id}.iam.gserviceaccount.com"
+
+---
+# Cloud Function for sensor data processing
+apiVersion: cloudfunctions.cnrm.cloud.google.com/v1beta1
+kind: CloudFunction
+metadata:
+  name: sensor-data-processor
+spec:
+  name: "${function_name}"
+  region: "${region}"
+  description: "Process IoT sensor data with validation and BigQuery insertion"
+  # Configure function runtime and resources
+  runtime: "python311"
+  availableMemoryMb: 512
+  timeout: "120s"
+  maxInstances: 100
+  # Configure Pub/Sub trigger
+  eventTrigger:
+    eventType: "providers/cloud.pubsub/eventTypes/topic.publish"
+    resource: "projects/${project_id}/topics/${topic_name}"
+    failurePolicy:
+      retry: true
+  # Set environment variables
+  environmentVariables:
+    PROJECT_ID: "${project_id}"
+    DATASET_NAME: "${dataset_name}"
+    BUCKET_NAME: "${bucket_name}"
+    LOG_LEVEL: "INFO"
+  # Configure service account
+  serviceAccountEmail: "${service_account_name}@${project_id}.iam.gserviceaccount.com"
+  # Source code configuration (in production, use source repository)
+  sourceArchiveUrl: "gs://${bucket_name}/functions/process-sensor-data.zip"
+  entryPoint: "process_sensor_data"
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "data-processing"
+
+---
+# Vertex AI dataset for ML training
+apiVersion: aiplatform.cnrm.cloud.google.com/v1beta1
+kind: VertexAIDataset
+metadata:
+  name: smart-city-sensor-dataset
+spec:
+  displayName: "Smart City Sensor Data"
+  description: "Dataset for training anomaly detection models on sensor data"
+  region: "${region}"
+  # Configure for tabular data
+  metadataSchemaUri: "gs://google-cloud-aiplatform/schema/dataset/metadata/tabular_1.0.0.yaml"
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "machine-learning"
+
+---
+# Cloud Monitoring dashboard for smart city metrics
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringDashboard
+metadata:
+  name: smart-city-monitoring-dashboard
+spec:
+  displayName: "${dashboard_name}"
+  # Dashboard configuration with multiple widgets
+  mosaicLayout:
+    tiles:
+      # Sensor message rate widget
+      - width: 6
+        height: 4
+        widget:
+          title: "Sensor Message Rate (per minute)"
+          xyChart:
+            dataSets:
+              - timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="pubsub_topic" AND resource.labels.topic_id="${topic_name}"'
+                    aggregation:
+                      alignmentPeriod: "60s"
+                      perSeriesAligner: "ALIGN_RATE"
+                      crossSeriesReducer: "REDUCE_SUM"
+                plotType: "LINE"
+            yAxis:
+              label: "Messages/minute"
+              scale: "LINEAR"
+      # Cloud Function executions widget
+      - width: 6
+        height: 4
+        xPos: 6
+        widget:
+          title: "Cloud Function Executions"
+          xyChart:
+            dataSets:
+              - timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="cloud_function" AND resource.labels.function_name="${function_name}"'
+                    aggregation:
+                      alignmentPeriod: "60s"
+                      perSeriesAligner: "ALIGN_RATE"
+                      crossSeriesReducer: "REDUCE_SUM"
+                plotType: "STACKED_AREA"
+      # BigQuery data ingestion widget
+      - width: 12
+        height: 4
+        yPos: 4
+        widget:
+          title: "BigQuery Data Ingestion Rate"
+          xyChart:
+            dataSets:
+              - timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="bigquery_table" AND resource.labels.table_id="sensor_readings"'
+                    aggregation:
+                      alignmentPeriod: "300s"
+                      perSeriesAligner: "ALIGN_RATE"
+                plotType: "LINE"
+      # Anomaly detection scores widget
+      - width: 6
+        height: 4
+        yPos: 8
+        widget:
+          title: "Anomaly Detection Scores"
+          xyChart:
+            dataSets:
+              - timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'metric.type="custom.googleapis.com/iot/anomaly_scores"'
+                    aggregation:
+                      alignmentPeriod: "300s"
+                      perSeriesAligner: "ALIGN_MEAN"
+                plotType: "STACKED_AREA"
+      # System health overview widget
+      - width: 6
+        height: 4
+        xPos: 6
+        yPos: 8
+        widget:
+          title: "System Health Overview"
+          scorecard:
+            timeSeriesQuery:
+              timeSeriesFilter:
+                filter: 'metric.type="custom.googleapis.com/iot/sensor_messages_processed"'
+                aggregation:
+                  alignmentPeriod: "3600s"
+                  perSeriesAligner: "ALIGN_RATE"
+                  crossSeriesReducer: "REDUCE_SUM"
+            gaugeView:
+              lowerBound: 0.0
+              upperBound: 1000.0
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "observability"
+
+---
+# Alert policy for high anomaly detection scores
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringAlertPolicy
+metadata:
+  name: high-anomaly-alert-policy
+spec:
+  displayName: "${alert_policy_name}"
+  documentation:
+    content: "Alert when anomaly detection scores exceed threshold, indicating potential infrastructure issues requiring immediate attention"
+    mimeType: "text/markdown"
+  # Configure alert conditions
+  conditions:
+    - displayName: "Anomaly score threshold exceeded"
+      conditionThreshold:
+        filter: 'metric.type="custom.googleapis.com/iot/anomaly_scores" AND resource.type="global"'
+        comparison: "COMPARISON_GT"
+        thresholdValue: 0.85
+        duration: "300s"
+        aggregations:
+          - alignmentPeriod: "60s"
+            perSeriesAligner: "ALIGN_MEAN"
+            crossSeriesReducer: "REDUCE_MAX"
+  # Configure alert strategy
+  alertStrategy:
+    autoClose: "1800s"  # Auto-close after 30 minutes
+    notificationRateLimit:
+      period: "300s"  # Limit notifications to once per 5 minutes
+  # Set alert severity
+  severity: "WARNING"
+  enabled: true
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "alerting"
+
+---
+# Alert policy for Pub/Sub message backlog
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringAlertPolicy
+metadata:
+  name: pubsub-backlog-alert-policy
+spec:
+  displayName: "Smart City - Pub/Sub Message Backlog Alert"
+  documentation:
+    content: "Alert when Pub/Sub subscription has excessive message backlog, indicating processing issues"
+    mimeType: "text/markdown"
+  conditions:
+    - displayName: "High message backlog in subscription"
+      conditionThreshold:
+        filter: 'metric.type="pubsub.googleapis.com/subscription/num_undelivered_messages" AND resource.labels.subscription_id="${topic_name}-bigquery"'
+        comparison: "COMPARISON_GT"
+        thresholdValue: 1000
+        duration: "180s"
+        aggregations:
+          - alignmentPeriod: "60s"
+            perSeriesAligner: "ALIGN_MEAN"
+  alertStrategy:
+    autoClose: "1800s"
+  severity: "CRITICAL"
+  enabled: true
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "data-pipeline-health"
+
+---
+# Alert policy for Cloud Function errors
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringAlertPolicy
+metadata:
+  name: function-error-alert-policy
+spec:
+  displayName: "Smart City - Cloud Function Error Rate Alert"
+  documentation:
+    content: "Alert when Cloud Function error rate exceeds acceptable threshold"
+    mimeType: "text/markdown"
+  conditions:
+    - displayName: "High error rate in sensor processing function"
+      conditionThreshold:
+        filter: 'metric.type="cloudfunctions.googleapis.com/function/execution_count" AND resource.labels.function_name="${function_name}" AND metric.labels.status!="ok"'
+        comparison: "COMPARISON_GT"
+        thresholdValue: 10
+        duration: "300s"
+        aggregations:
+          - alignmentPeriod: "60s"
+            perSeriesAligner: "ALIGN_RATE"
+            crossSeriesReducer: "REDUCE_SUM"
+  alertStrategy:
+    autoClose: "1800s"
+  severity: "ERROR"
+  enabled: true
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "function-health"
+
+---
+# Log sink for exporting sensor data logs to BigQuery
+apiVersion: logging.cnrm.cloud.google.com/v1beta1
+kind: LoggingLogSink
+metadata:
+  name: sensor-data-log-sink
+spec:
+  name: "smart-city-sensor-logs"
+  description: "Export sensor processing logs to BigQuery for analysis"
+  destination: "bigquery.googleapis.com/projects/${project_id}/datasets/${dataset_name}"
+  # Filter for relevant log entries
+  filter: |
+    resource.type="cloud_function"
+    resource.labels.function_name="${function_name}"
+    (severity="ERROR" OR severity="WARNING" OR jsonPayload.event_type="sensor_processed")
+  # Configure unique writer identity
+  uniqueWriterIdentity: true
+  # Include children resources
+  includeChildren: true
+  labels:
+    environment: "production"
+    application: "smart-city-monitoring"
+    component: "log-aggregation"
+
+---
+# Output values for integration and verification
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smart-city-outputs
+data:
+  # Pub/Sub configuration outputs
+  pubsub_topic_name: "projects/${project_id}/topics/${topic_name}"
+  bigquery_subscription_name: "projects/${project_id}/subscriptions/${topic_name}-bigquery"
+  ml_subscription_name: "projects/${project_id}/subscriptions/${topic_name}-ml"
+  dlq_topic_name: "projects/${project_id}/topics/${topic_name}-dlq"
+  
+  # BigQuery outputs
+  dataset_id: "${project_id}:${dataset_name}"
+  sensor_table_name: "${project_id}:${dataset_name}.sensor_readings"
+  anomalies_table_name: "${project_id}:${dataset_name}.anomalies"
+  metrics_table_name: "${project_id}:${dataset_name}.sensor_metrics"
+  
+  # Storage and ML outputs
+  ml_bucket_name: "${bucket_name}"
+  vertex_ai_dataset_name: "projects/${project_id}/locations/${region}/datasets/smart-city-sensor-dataset"
+  
+  # Function and monitoring outputs
+  function_name: "${function_name}"
+  function_url: "https://${region}-${project_id}.cloudfunctions.net/${function_name}"
+  dashboard_url: "https://console.cloud.google.com/monitoring/dashboards/custom/${dashboard_name}"
+  
+  # Service account outputs
+  service_account_email: "${service_account_name}@${project_id}.iam.gserviceaccount.com"
+  
+  # Deployment information
+  deployment_region: "${region}"
+  deployment_zone: "${zone}"
+  
+  # Instructions for next steps
+  next_steps: |
+    1. Deploy Cloud Function code to gs://${bucket_name}/functions/process-sensor-data.zip
+    2. Create service account key for IoT device authentication
+    3. Configure IoT devices to publish to Pub/Sub topic
+    4. Set up Vertex AI training pipeline with prepared data
+    5. Configure notification channels for monitoring alerts
+    6. Test end-to-end data flow with sample sensor data

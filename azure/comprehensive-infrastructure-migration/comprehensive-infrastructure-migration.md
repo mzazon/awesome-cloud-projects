@@ -6,10 +6,10 @@ difficulty: 300
 subject: azure
 services: Azure Resource Mover, Azure Update Manager, Azure Workbooks
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: migration, resource-mover, update-manager, workbooks, automation, monitoring
 recipe-generator-version: 1.3
@@ -83,12 +83,12 @@ graph TB
 ## Prerequisites
 
 1. Azure subscription with appropriate permissions (Resource Mover Contributor, Update Manager Contributor)
-2. Azure CLI v2.50.0 or later installed and configured
+2. Azure CLI v2.60.0 or later installed and configured
 3. Two Azure regions configured for migration testing
 4. Virtual machines and associated resources in source region
 5. Estimated cost: $50-150 for testing resources over 2 hours
 
-> **Note**: Azure Resource Mover supports moving VMs, disks, NICs, availability sets, and virtual networks. Review the [supported resources documentation](https://docs.microsoft.com/en-us/azure/resource-mover/support-matrix-move-region-azure-vm) for current limitations.
+> **Note**: Azure Resource Mover supports moving VMs, disks, NICs, availability sets, and virtual networks. Review the [supported resources documentation](https://learn.microsoft.com/en-us/azure/resource-mover/support-matrix-move-region-azure-vm) for current limitations.
 
 ## Preparation
 
@@ -96,12 +96,12 @@ graph TB
 # Set environment variables for the migration workflow
 export SOURCE_REGION="eastus"
 export TARGET_REGION="westus2"
-export RESOURCE_GROUP="rg-migration-${RANDOM_SUFFIX}"
-export MOVE_COLLECTION_NAME="move-collection-${RANDOM_SUFFIX}"
 export SUBSCRIPTION_ID=$(az account show --query id --output tsv)
 
 # Generate unique suffix for resource names
 RANDOM_SUFFIX=$(openssl rand -hex 3)
+export RESOURCE_GROUP="rg-migration-${RANDOM_SUFFIX}"
+export MOVE_COLLECTION_NAME="move-collection-${RANDOM_SUFFIX}"
 
 # Create resource groups in both regions
 az group create \
@@ -180,6 +180,7 @@ echo "✅ Resource groups and Log Analytics workspace created"
        --source-region ${SOURCE_REGION} \
        --target-region ${TARGET_REGION} \
        --location ${SOURCE_REGION} \
+       --move-type RegionToRegion \
        --tags purpose=migration-orchestration
    
    # Get the move collection resource ID for future operations
@@ -288,13 +289,12 @@ echo "✅ Resource groups and Log Analytics workspace created"
        --name ${MAINTENANCE_CONFIG_NAME} \
        --location ${TARGET_REGION} \
        --maintenance-scope "InGuestPatch" \
-       --maintenance-window-start-date-time "2024-01-15 03:00:00" \
-       --maintenance-window-duration "02:00" \
-       --maintenance-window-recur-every "1Week" \
-       --maintenance-window-days-of-week "Saturday" \
-       --maintenance-window-time-zone "UTC" \
-       --install-patches-linux-classifications "Critical Security" \
-       --install-patches-reboot-setting "IfRequired"
+       --duration "02:00" \
+       --recur-every "1Week" \
+       --start-date-time "2025-08-01 03:00:00" \
+       --time-zone "UTC" \
+       --linux-parameters classifications="Critical Security" \
+       --reboot-setting "IfRequired"
    
    # Get maintenance configuration ID
    MAINTENANCE_CONFIG_ID=$(az maintenance configuration show \
@@ -327,9 +327,9 @@ echo "✅ Resource groups and Log Analytics workspace created"
          "type": 3,
          "content": {
            "version": "KqlItem/1.0",
-           "query": "ResourceMoverOperationResults_CL\n| where TimeGenerated > ago(24h)\n| summarize OperationCount = count() by OperationName_s, ResourceType_s\n| order by OperationCount desc",
+           "query": "AzureActivity\n| where TimeGenerated > ago(24h)\n| where OperationNameValue contains \"ResourceMover\"\n| summarize OperationCount = count() by OperationNameValue, ResourceGroup\n| order by OperationCount desc",
            "size": 0,
-           "title": "Migration Operations by Resource Type",
+           "title": "Resource Mover Operations",
            "timeContext": {
              "durationMs": 86400000
            },
@@ -341,9 +341,9 @@ echo "✅ Resource groups and Log Analytics workspace created"
          "type": 3,
          "content": {
            "version": "KqlItem/1.0",
-           "query": "UpdateManagementOperationResults_CL\n| where TimeGenerated > ago(7d)\n| summarize ComplianceCount = count() by ComplianceStatus_s\n| order by ComplianceCount desc",
+           "query": "AzureActivity\n| where TimeGenerated > ago(7d)\n| where OperationNameValue contains \"Maintenance\"\n| summarize ComplianceCount = count() by OperationNameValue\n| order by ComplianceCount desc",
            "size": 0,
-           "title": "Update Compliance Status",
+           "title": "Update Compliance Activity",
            "timeContext": {
              "durationMs": 604800000
            },
@@ -424,9 +424,11 @@ echo "✅ Resource groups and Log Analytics workspace created"
    # Assign maintenance configuration to migrated VM
    az maintenance assignment create \
        --resource-group "${RESOURCE_GROUP}-target" \
-       --assignment-name "assignment-${RANDOM_SUFFIX}" \
-       --maintenance-configuration-id ${MAINTENANCE_CONFIG_ID} \
-       --resource-id ${MIGRATED_VM_ID}
+       --resource-name vm-source-test \
+       --resource-type virtualMachines \
+       --provider-name Microsoft.Compute \
+       --configuration-assignment-name "assignment-${RANDOM_SUFFIX}" \
+       --maintenance-configuration-id ${MAINTENANCE_CONFIG_ID}
    
    # Trigger immediate assessment of migrated resources
    az vm run-command invoke \
@@ -436,10 +438,11 @@ echo "✅ Resource groups and Log Analytics workspace created"
        --scripts "sudo apt update && sudo apt list --upgradable"
    
    # Enable monitoring for the migrated VM
-   az vm monitor enable \
+   az vm extension set \
        --resource-group "${RESOURCE_GROUP}-target" \
-       --name vm-source-test \
-       --log-analytics-workspace ${LOG_WORKSPACE_NAME}
+       --vm-name vm-source-test \
+       --name AzureMonitorLinuxAgent \
+       --publisher Microsoft.Azure.Monitor
    
    echo "✅ Update management applied to migrated resources"
    ```
@@ -553,11 +556,11 @@ echo "✅ Resource groups and Log Analytics workspace created"
 
 ## Discussion
 
-Azure Resource Mover provides enterprise-grade infrastructure migration capabilities that address common challenges in cross-region resource movement. The service automatically resolves resource dependencies, validates migration feasibility, and provides rollback capabilities for complex migration scenarios. When combined with Azure Update Manager, organizations can maintain security compliance throughout the migration process while gaining comprehensive visibility through Azure Workbooks monitoring. This integrated approach follows [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of reliability and operational excellence.
+Azure Resource Mover provides enterprise-grade infrastructure migration capabilities that address common challenges in cross-region resource movement. The service automatically resolves resource dependencies, validates migration feasibility, and provides rollback capabilities for complex migration scenarios. When combined with Azure Update Manager, organizations can maintain security compliance throughout the migration process while gaining comprehensive visibility through Azure Workbooks monitoring. This integrated approach follows [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/architecture/framework/) principles of reliability and operational excellence.
 
-The Resource Mover service supports a wide range of Azure resources including virtual machines, managed disks, network interfaces, and availability sets. The dependency mapping capability ensures that related resources are migrated together, preventing configuration drift and maintaining application functionality. For comprehensive guidance on supported resources and limitations, see the [Azure Resource Mover documentation](https://docs.microsoft.com/en-us/azure/resource-mover/overview) and [migration support matrix](https://docs.microsoft.com/en-us/azure/resource-mover/support-matrix-move-region-azure-vm).
+The Resource Mover service supports a wide range of Azure resources including virtual machines, managed disks, network interfaces, and availability sets. The dependency mapping capability ensures that related resources are migrated together, preventing configuration drift and maintaining application functionality. For comprehensive guidance on supported resources and limitations, see the [Azure Resource Mover documentation](https://learn.microsoft.com/en-us/azure/resource-mover/overview) and [migration support matrix](https://learn.microsoft.com/en-us/azure/resource-mover/support-matrix-move-region-azure-vm).
 
-Azure Update Manager's integration with the migration workflow provides immediate security compliance for migrated resources through automated patch management and compliance monitoring. The maintenance configuration approach enables organizations to maintain consistent security posture across regions while providing flexibility for different patch schedules and reboot policies. The service supports both Windows and Linux environments with extensive customization options for patch classifications and installation timing. For detailed configuration guidance, review the [Update Manager documentation](https://docs.microsoft.com/en-us/azure/update-manager/overview).
+Azure Update Manager's integration with the migration workflow provides immediate security compliance for migrated resources through automated patch management and compliance monitoring. The maintenance configuration approach enables organizations to maintain consistent security posture across regions while providing flexibility for different patch schedules and reboot policies. The service supports both Windows and Linux environments with extensive customization options for patch classifications and installation timing. For detailed configuration guidance, review the [Update Manager documentation](https://learn.microsoft.com/en-us/azure/update-manager/overview).
 
 > **Tip**: Use Azure Resource Mover's test migration capability to validate migration workflows before executing production migrations. This enables identification of issues and optimization of migration procedures without impacting production resources.
 

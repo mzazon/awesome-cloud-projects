@@ -1,0 +1,417 @@
+# Google Cloud Infrastructure Manager Configuration
+# Random Quote API with Cloud Functions and Firestore
+# 
+# This configuration deploys a serverless REST API that serves random quotes
+# using Cloud Functions for HTTP handling and Firestore for data storage.
+#
+# Architecture:
+# - Cloud Functions: HTTP-triggered serverless compute for API endpoints
+# - Firestore: NoSQL document database for quote storage
+# - Required APIs: Cloud Functions API, Firestore API
+#
+# Prerequisites:
+# - Google Cloud project with billing enabled
+# - Infrastructure Manager API enabled
+# - Appropriate IAM permissions for resource creation
+
+apiVersion: 'blueprints.cloud.google.com/v1alpha1'
+kind: 'Blueprint'
+metadata:
+  name: 'random-quote-api'
+  annotations:
+    description: 'Serverless Random Quote API using Cloud Functions and Firestore'
+    version: '1.0'
+
+spec:
+  # Input variables for customization
+  variables:
+    # Project configuration
+    - name: project_id
+      description: 'Google Cloud Project ID'
+      varType: string
+      required: true
+    
+    - name: region
+      description: 'Deployment region for resources'
+      varType: string
+      defaultValue: 'us-central1'
+    
+    # Firestore configuration
+    - name: database_id
+      description: 'Firestore database identifier'
+      varType: string
+      defaultValue: 'quotes-db'
+    
+    - name: database_location
+      description: 'Firestore database location'
+      varType: string
+      defaultValue: 'us-central1'
+    
+    # Cloud Function configuration
+    - name: function_name
+      description: 'Cloud Function name'
+      varType: string
+      defaultValue: 'random-quote-api'
+    
+    - name: function_memory
+      description: 'Memory allocation for Cloud Function'
+      varType: string
+      defaultValue: '256Mi'
+    
+    - name: function_timeout
+      description: 'Timeout for Cloud Function execution'
+      varType: string
+      defaultValue: '60s'
+    
+    # Resource naming and tagging
+    - name: environment
+      description: 'Environment label (dev, staging, prod)'
+      varType: string
+      defaultValue: 'dev'
+    
+    - name: owner
+      description: 'Resource owner for billing and management'
+      varType: string
+      defaultValue: 'infrastructure-team'
+
+  # Resource definitions following Google Cloud best practices
+  resources:
+    # Enable required Google Cloud APIs
+    - name: enable-cloudfunctions-api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/$(var.project_id)/services/cloudfunctions.googleapis.com
+        disableDependentServices: false
+      metadata:
+        dependsOn: []
+    
+    - name: enable-firestore-api  
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/$(var.project_id)/services/firestore.googleapis.com
+        disableDependentServices: false
+      metadata:
+        dependsOn: []
+    
+    - name: enable-cloudbuild-api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/$(var.project_id)/services/cloudbuild.googleapis.com
+        disableDependentServices: false
+      metadata:
+        dependsOn: []
+
+    # Create Firestore database in Native mode
+    # Native mode provides strong consistency and supports complex queries
+    - name: firestore-database
+      type: gcp-types/firestore-v1:projects.databases
+      properties:
+        parent: projects/$(var.project_id)
+        databaseId: $(var.database_id)
+        type: FIRESTORE_NATIVE
+        locationId: $(var.database_location)
+        # Enable point-in-time recovery for data protection
+        pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_ENABLED
+      metadata:
+        dependsOn:
+          - enable-firestore-api
+
+    # Create Cloud Storage bucket for function source code
+    # Regional bucket in same region as function for optimal performance
+    - name: function-source-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        project: $(var.project_id)
+        name: $(var.project_id)-function-source-$(var.environment)
+        location: $(var.region)
+        storageClass: STANDARD
+        # Enable versioning for source code management
+        versioning:
+          enabled: true
+        # Lifecycle management to control storage costs
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+              condition:
+                age: 30
+                numNewerVersions: 3
+        # Security and access control
+        iamConfiguration:
+          uniformBucketLevelAccess:
+            enabled: true
+        # Encryption with Google-managed keys
+        encryption:
+          defaultKmsKeyName: null
+      metadata:
+        dependsOn: []
+
+    # Upload Cloud Function source code to storage bucket
+    # This creates a ZIP archive of the function code for deployment
+    - name: function-source-archive
+      type: gcp-types/storage-v1:objects
+      properties:
+        bucket: $(ref.function-source-bucket.name)
+        name: random-quote-function-$(var.environment).zip
+        # Source code content (base64 encoded ZIP file)
+        # In production, this would reference actual source code repository
+        contentType: application/zip
+      metadata:
+        dependsOn:
+          - function-source-bucket
+
+    # Deploy Cloud Function with HTTP trigger
+    # Configured for optimal performance and security
+    - name: random-quote-function
+      type: gcp-types/cloudfunctions-v1:projects.locations.functions
+      properties:
+        parent: projects/$(var.project_id)/locations/$(var.region)
+        functionId: $(var.function_name)
+        function:
+          name: projects/$(var.project_id)/locations/$(var.region)/functions/$(var.function_name)
+          description: 'Serverless API that returns random quotes from Firestore'
+          
+          # Source code configuration
+          sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/$(ref.function-source-archive.name)
+          
+          # Runtime and execution configuration  
+          runtime: nodejs20
+          entryPoint: randomQuote
+          timeout: $(var.function_timeout)
+          availableMemoryMb: 256
+          maxInstances: 100
+          
+          # HTTP trigger configuration for REST API
+          httpsTrigger:
+            securityLevel: SECURE_ALWAYS
+          
+          # Environment variables for function configuration
+          environmentVariables:
+            DATABASE_ID: $(var.database_id)
+            NODE_ENV: production
+            GOOGLE_CLOUD_PROJECT: $(var.project_id)
+          
+          # Resource labels for organization and billing
+          labels:
+            environment: $(var.environment)
+            component: api
+            owner: $(var.owner)
+            managed-by: infrastructure-manager
+          
+          # Service account for function execution
+          # Uses default Compute Engine service account with minimal permissions
+          serviceAccountEmail: $(var.project_id)@appspot.gserviceaccount.com
+          
+          # Ingress settings for security
+          ingressSettings: ALLOW_ALL
+          
+          # VPC connector (optional, for private networking)
+          # vpcConnector: projects/$(var.project_id)/locations/$(var.region)/connectors/connector-name
+          
+      metadata:
+        dependsOn:
+          - enable-cloudfunctions-api
+          - firestore-database
+          - function-source-archive
+
+    # IAM binding to allow public access to HTTP function
+    # In production, consider using authenticated access with API keys
+    - name: function-public-access
+      type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+      properties:
+        resource: $(ref.random-quote-function.name)
+        policy:
+          bindings:
+            - role: roles/cloudfunctions.invoker
+              members:
+                - allUsers
+          # Optional: Add audit logging for function invocations
+          auditConfigs:
+            - service: cloudfunctions.googleapis.com
+              auditLogConfigs:
+                - logType: DATA_READ
+                - logType: DATA_WRITE
+      metadata:
+        dependsOn:
+          - random-quote-function
+
+    # Firestore collection for quotes (logical resource)
+    # Note: Firestore collections are created implicitly when documents are added
+    # This serves as documentation of the expected data structure
+    - name: quotes-collection-schema
+      type: gcp-types/firestore-v1:projects.databases.documents
+      properties:
+        parent: projects/$(var.project_id)/databases/$(var.database_id)/documents
+        collectionId: quotes
+        documentId: schema-definition
+        document:
+          fields:
+            text:
+              stringValue: "Sample quote text"
+            author:
+              stringValue: "Quote author name"
+            category:
+              stringValue: "Quote category (motivation, inspiration, etc.)"
+            created_at:
+              timestampValue: "2025-01-12T10:00:00Z"
+            metadata:
+              mapValue:
+                fields:
+                  source:
+                    stringValue: "Quote source or book"
+                  verified:
+                    booleanValue: true
+      metadata:
+        dependsOn:
+          - firestore-database
+
+    # Cloud Monitoring alert policy for function errors
+    # Monitors function execution errors and sends notifications
+    - name: function-error-alert
+      type: gcp-types/monitoring-v1:projects.alertPolicies
+      properties:
+        parent: projects/$(var.project_id)
+        alertPolicy:
+          displayName: 'Random Quote API - Function Errors'
+          documentation:
+            content: 'Alert triggered when Cloud Function error rate exceeds threshold'
+            mimeType: text/markdown
+          
+          # Alert conditions
+          conditions:
+            - displayName: 'Function error rate'
+              conditionThreshold:
+                filter: 'resource.type="cloud_function" AND resource.labels.function_name="$(var.function_name)"'
+                comparison: COMPARISON_GREATER_THAN
+                thresholdValue: 0.1  # 10% error rate
+                duration: 300s  # 5 minutes
+                aggregations:
+                  - alignmentPeriod: 60s
+                    crossSeriesReducer: REDUCE_MEAN
+                    perSeriesAligner: ALIGN_RATE
+          
+          # Notification channels (would need to be pre-configured)
+          # notificationChannels:
+          #   - projects/$(var.project_id)/notificationChannels/NOTIFICATION_CHANNEL_ID
+          
+          # Alert policy configuration
+          enabled: true
+          combiner: OR
+          
+      metadata:
+        dependsOn:
+          - random-quote-function
+
+    # Cloud Logging sink for function logs (optional)
+    # Exports function logs to BigQuery for analysis
+    - name: function-log-sink
+      type: gcp-types/logging-v2:projects.sinks
+      properties:
+        parent: projects/$(var.project_id)
+        sinkId: random-quote-function-logs
+        sink:
+          name: projects/$(var.project_id)/sinks/random-quote-function-logs
+          description: 'Export Cloud Function logs for analysis'
+          destination: 'bigquery.googleapis.com/projects/$(var.project_id)/datasets/function_logs'
+          filter: 'resource.type="cloud_function" AND resource.labels.function_name="$(var.function_name)"'
+          # Include all log levels
+          includeChildren: true
+      metadata:
+        dependsOn:
+          - random-quote-function
+
+  # Output values for integration and verification
+  outputs:
+    # Function HTTP endpoint URL
+    - name: function_url
+      description: 'HTTP endpoint URL for the Random Quote API'
+      value: $(ref.random-quote-function.httpsTrigger.url)
+    
+    # Function resource name for management
+    - name: function_name
+      description: 'Full resource name of the deployed Cloud Function'
+      value: $(ref.random-quote-function.name)
+    
+    # Firestore database information
+    - name: firestore_database_name
+      description: 'Firestore database resource name'
+      value: projects/$(var.project_id)/databases/$(var.database_id)
+    
+    # Storage bucket for function source
+    - name: source_bucket_name
+      description: 'Cloud Storage bucket containing function source code'
+      value: $(ref.function-source-bucket.name)
+    
+    # API testing information
+    - name: api_test_command
+      description: 'curl command to test the API endpoint'
+      value: 'curl -X GET "$(ref.random-quote-function.httpsTrigger.url)" -H "Accept: application/json"'
+    
+    # Management URLs
+    - name: function_console_url
+      description: 'Google Cloud Console URL for function management'
+      value: 'https://console.cloud.google.com/functions/details/$(var.region)/$(var.function_name)?project=$(var.project_id)'
+    
+    - name: firestore_console_url
+      description: 'Google Cloud Console URL for Firestore management'  
+      value: 'https://console.cloud.google.com/firestore/databases/$(var.database_id)/data?project=$(var.project_id)'
+    
+    # Resource identification
+    - name: deployment_labels
+      description: 'Common labels applied to all resources'
+      value:
+        environment: $(var.environment)
+        component: random-quote-api
+        owner: $(var.owner)
+        managed-by: infrastructure-manager
+
+# Additional configuration for Infrastructure Manager
+config:
+  # Preview mode for testing configuration without deployment
+  preview: false
+  
+  # Deployment policy configuration
+  deployment:
+    # Update policy for resource changes
+    updatePolicy: UPDATE_ON_CHANGE
+    
+    # Rollback configuration
+    rollbackPolicy:
+      enabled: true
+      maxRevisions: 5
+    
+    # Resource protection (prevent accidental deletion)
+    protectedResources:
+      - firestore-database
+      - function-source-bucket
+  
+  # Cost control and governance
+  governance:
+    # Budget alert threshold (optional)
+    budgetAlertThreshold: 100.00  # USD
+    
+    # Required resource labels
+    requiredLabels:
+      - environment
+      - owner
+      - managed-by
+    
+    # Allowed regions for compliance
+    allowedRegions:
+      - us-central1
+      - us-east1
+      - us-west1
+      - europe-west1
+    
+    # Security policies
+    security:
+      # Require HTTPS for all web-facing services
+      requireHTTPS: true
+      
+      # Enable audit logging
+      auditLogging: true
+      
+      # Default encryption settings
+      encryption:
+        atRest: true
+        inTransit: true

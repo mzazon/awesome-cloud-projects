@@ -4,12 +4,12 @@ id: e7f2c8d4
 category: monitoring
 difficulty: 200
 subject: azure
-services: Azure Service Fabric, Azure Functions, Application Insights, Azure Monitor
+services: Service Fabric, Application Insights, Azure Functions, Event Hubs
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: microservices, monitoring, observability, telemetry, service-fabric
 recipe-generator-version: 1.3
@@ -73,7 +73,7 @@ graph TB
     AM --> WB
     
     style AI fill:#FF6B6B
-    style SF fill:#4ECDC4
+    style SFA fill:#4ECDC4
     style AM fill:#45B7D1
     style AF fill:#96CEB4
 ```
@@ -81,7 +81,7 @@ graph TB
 ## Prerequisites
 
 1. Azure account with permissions to create Service Fabric clusters, Application Insights, and Azure Functions
-2. Azure CLI v2.40.0 or later installed and configured
+2. Azure CLI v2.50.0 or later installed and configured
 3. Basic understanding of microservices architecture and distributed systems
 4. Familiarity with Azure Service Fabric and Application Insights concepts
 5. Estimated cost: $50-100 per day for development/testing environment
@@ -196,10 +196,7 @@ echo "✅ Environment prepared for microservices monitoring setup"
        --location ${LOCATION} \
        --admin-username azureuser \
        --admin-password 'ComplexPassword123!' \
-       --sku Standard \
-       --cluster-code-version 9.1.1436.9590 \
-       --client-connection-port 19000 \
-       --http-gateway-port 19080
+       --sku Standard
 
    # Wait for cluster to be ready
    echo "Waiting for Service Fabric cluster to be ready..."
@@ -237,44 +234,38 @@ echo "✅ Environment prepared for microservices monitoring setup"
        --storage-account ${STORAGE_ACCOUNT_NAME} \
        --os-type Linux
 
-   # Get Application Insights instrumentation key
-   APPINSIGHTS_KEY=$(az monitor app-insights component show \
+   # Get Application Insights connection string (preferred over instrumentation key)
+   APP_INSIGHTS_CONNECTION=$(az monitor app-insights component show \
        --app ${APP_INSIGHTS_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query instrumentationKey --output tsv)
+       --query connectionString --output tsv)
 
    # Configure Function App with monitoring settings
    az functionapp config appsettings set \
        --name ${FUNCTION_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --settings \
-       "APPINSIGHTS_INSTRUMENTATIONKEY=${APPINSIGHTS_KEY}" \
+       "APPLICATIONINSIGHTS_CONNECTION_STRING=${APP_INSIGHTS_CONNECTION}" \
        "EventHubConnectionString=${EVENT_HUB_CONNECTION}" \
        "ApplicationInsightsAgent_EXTENSION_VERSION=~3"
 
    echo "✅ Azure Function created for event processing"
    ```
 
-   The Function App is configured with Application Insights integration and Event Hub connectivity, enabling real-time processing of microservices events. This serverless architecture automatically scales to handle varying event volumes while maintaining cost efficiency.
+   The Function App is configured with Application Insights integration using the recommended connection string and Event Hub connectivity, enabling real-time processing of microservices events. This serverless architecture automatically scales to handle varying event volumes while maintaining cost efficiency.
 
 5. **Configure Service Fabric Cluster Monitoring**:
 
    Service Fabric clusters generate extensive telemetry data including health reports, performance counters, and operational events. Configuring diagnostic settings ensures this data flows into Application Insights and Log Analytics for comprehensive monitoring and analysis.
 
    ```bash
-   # Enable diagnostics on Service Fabric cluster
-   az sf managed-cluster update \
-       --resource-group ${RESOURCE_GROUP} \
-       --cluster-name ${SF_CLUSTER_NAME} \
-       --enable-diagnostics true
-
    # Get cluster resource ID
    CLUSTER_ID=$(az sf managed-cluster show \
        --resource-group ${RESOURCE_GROUP} \
        --cluster-name ${SF_CLUSTER_NAME} \
        --query id --output tsv)
 
-   # Configure diagnostic settings
+   # Configure diagnostic settings for Service Fabric cluster
    az monitor diagnostic-settings create \
        --resource ${CLUSTER_ID} \
        --name sf-diagnostics \
@@ -370,12 +361,6 @@ echo "✅ Environment prepared for microservices monitoring setup"
    Distributed tracing enables end-to-end request tracking across multiple microservices, providing visibility into service dependencies and performance characteristics. Application Insights automatically correlates related operations using trace context propagation.
 
    ```bash
-   # Get Application Insights connection string
-   APP_INSIGHTS_CONNECTION=$(az monitor app-insights component show \
-       --app ${APP_INSIGHTS_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --query connectionString --output tsv)
-
    # Create configuration for distributed tracing
    cat > ~/distributed-tracing-config.json << EOF
    {
@@ -400,7 +385,7 @@ echo "✅ Environment prepared for microservices monitoring setup"
    }
    EOF
 
-   # Create monitoring dashboard query
+   # Create monitoring dashboard queries
    cat > ~/monitoring-queries.kql << 'EOF'
    // Service dependency map
    dependencies
@@ -431,50 +416,7 @@ echo "✅ Environment prepared for microservices monitoring setup"
    Azure Monitor dashboards provide real-time visibility into microservices health, performance, and business metrics. Custom alerts enable proactive monitoring and automated responses to service degradation or failure conditions.
 
    ```bash
-   # Create custom dashboard
-   az portal dashboard create \
-       --resource-group ${RESOURCE_GROUP} \
-       --name "Microservices Monitoring Dashboard" \
-       --input-path <(cat << 'EOF'
-   {
-     "lenses": {
-       "0": {
-         "order": 0,
-         "parts": {
-           "0": {
-             "position": {"x": 0, "y": 0, "colSpan": 6, "rowSpan": 4},
-             "metadata": {
-               "inputs": [],
-               "type": "Extension/HubsExtension/PartType/MonitorChartPart"
-             }
-           },
-           "1": {
-             "position": {"x": 6, "y": 0, "colSpan": 6, "rowSpan": 4},
-             "metadata": {
-               "inputs": [],
-               "type": "Extension/Microsoft_Azure_Monitoring/PartType/MetricsChartPart"
-             }
-           }
-         }
-       }
-     },
-     "metadata": {
-       "model": {
-         "timeRange": {
-           "value": {
-             "relative": {
-               "duration": 24,
-               "timeUnit": 1
-             }
-           }
-         }
-       }
-     }
-   }
-   EOF
-   )
-
-   # Create alert rules for service health
+   # Create alert rules for cluster health
    az monitor metrics alert create \
        --name "Service Fabric Cluster Health" \
        --resource-group ${RESOURCE_GROUP} \
@@ -485,7 +427,7 @@ echo "✅ Environment prepared for microservices monitoring setup"
        --window-size 5m \
        --severity 2
 
-   # Create alert for application errors
+   # Create alert for application errors using Log Analytics
    az monitor scheduled-query create \
        --resource-group ${RESOURCE_GROUP} \
        --name "High Error Rate Alert" \
@@ -498,10 +440,29 @@ echo "✅ Environment prepared for microservices monitoring setup"
        --window-size 5m \
        --severity 2
 
+   # Create workbook for comprehensive monitoring
+   cat > ~/monitoring-workbook.json << 'EOF'
+   {
+     "version": "Notebook/1.0",
+     "items": [
+       {
+         "type": 3,
+         "content": {
+           "version": "KqlItem/1.0",
+           "query": "requests | where timestamp > ago(1h) | summarize count() by cloud_RoleName | render piechart",
+           "size": 0,
+           "title": "Request Distribution by Service"
+         }
+       }
+     ],
+     "isLocked": false
+   }
+   EOF
+
    echo "✅ Monitoring dashboard and alerts created"
    ```
 
-   The monitoring dashboard provides comprehensive visibility into microservices health and performance, while automated alerts ensure immediate notification of service degradation. This proactive monitoring approach enables rapid incident response and maintains service reliability.
+   The monitoring infrastructure provides comprehensive visibility into microservices health and performance, while automated alerts ensure immediate notification of service degradation. This proactive monitoring approach enables rapid incident response and maintains service reliability.
 
 ## Validation & Testing
 
@@ -534,13 +495,13 @@ echo "✅ Environment prepared for microservices monitoring setup"
 3. **Validate Event Hub Message Processing**:
 
    ```bash
-   # Check Event Hub metrics
+   # Check Event Hub metrics using full resource ID
+   EVENT_HUB_RESOURCE_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.EventHub/namespaces/${EVENT_HUB_NAMESPACE}"
+   
    az monitor metrics list \
-       --resource ${EVENT_HUB_NAMESPACE} \
-       --resource-group ${RESOURCE_GROUP} \
-       --resource-type Microsoft.EventHub/namespaces \
+       --resource ${EVENT_HUB_RESOURCE_ID} \
        --metric IncomingMessages \
-       --interval 1m \
+       --interval PT1M \
        --output table
    ```
 
@@ -620,17 +581,18 @@ echo "✅ Environment prepared for microservices monitoring setup"
        --no-wait
    
    echo "✅ Resource group deletion initiated"
+   echo "Note: Deletion may take several minutes to complete"
    ```
 
 ## Discussion
 
-This comprehensive monitoring solution addresses the critical challenges of observability in distributed microservices architectures. By integrating Azure Service Fabric with Application Insights and Azure Monitor, organizations gain end-to-end visibility into service performance, health, and dependencies. The solution leverages distributed tracing to correlate requests across service boundaries, enabling rapid identification of performance bottlenecks and failure points. For detailed guidance on Service Fabric monitoring best practices, see the [Azure Service Fabric monitoring documentation](https://docs.microsoft.com/en-us/azure/service-fabric/service-fabric-best-practices-monitoring).
+This comprehensive monitoring solution addresses the critical challenges of observability in distributed microservices architectures. By integrating Azure Service Fabric with Application Insights and Azure Monitor, organizations gain end-to-end visibility into service performance, health, and dependencies. The solution leverages distributed tracing to correlate requests across service boundaries, enabling rapid identification of performance bottlenecks and failure points. For detailed guidance on Service Fabric monitoring best practices, see the [Azure Service Fabric monitoring documentation](https://learn.microsoft.com/en-us/azure/service-fabric/service-fabric-best-practices-monitoring).
 
-The event-driven architecture using Azure Functions and Event Hub provides scalable, real-time processing of telemetry data, enabling automated responses to service conditions and intelligent alerting. This approach follows the [Azure Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) principles of reliability and operational excellence. The serverless event processing model automatically scales with monitoring workloads while maintaining cost efficiency.
+The event-driven architecture using Azure Functions and Event Hub provides scalable, real-time processing of telemetry data, enabling automated responses to service conditions and intelligent alerting. This approach follows the [Azure Well-Architected Framework](https://learn.microsoft.com/en-us/azure/well-architected/operational-excellence/principles) principles of reliability and operational excellence. The serverless event processing model automatically scales with monitoring workloads while maintaining cost efficiency.
 
-Application Insights' distributed tracing capabilities provide crucial visibility into microservices interactions, supporting both synchronous and asynchronous communication patterns. The correlation engine automatically tracks request flows across service boundaries, making it easier to diagnose issues in complex distributed systems. For comprehensive guidance on implementing distributed tracing, review the [Application Insights distributed tracing documentation](https://docs.microsoft.com/en-us/azure/azure-monitor/app/distributed-tracing).
+Application Insights' distributed tracing capabilities provide crucial visibility into microservices interactions, supporting both synchronous and asynchronous communication patterns. The correlation engine automatically tracks request flows across service boundaries, making it easier to diagnose issues in complex distributed systems. For comprehensive guidance on implementing distributed tracing, review the [Application Insights distributed tracing documentation](https://learn.microsoft.com/en-us/azure/azure-monitor/app/distributed-tracing).
 
-The monitoring dashboard and alert system provide proactive visibility into service health and performance trends. By combining real-time metrics with historical analysis, teams can identify patterns, predict capacity needs, and maintain service reliability. For advanced monitoring scenarios, consider implementing custom metrics and business-specific KPIs using the [Azure Monitor custom metrics guide](https://docs.microsoft.com/en-us/azure/azure-monitor/platform/metrics-custom-overview).
+The monitoring dashboard and alert system provide proactive visibility into service health and performance trends. By combining real-time metrics with historical analysis, teams can identify patterns, predict capacity needs, and maintain service reliability. The solution uses connection strings instead of instrumentation keys, following current Azure best practices for Application Insights integration. For advanced monitoring scenarios, consider implementing custom metrics and business-specific KPIs using the [Azure Monitor custom metrics guide](https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/metrics-custom-overview).
 
 > **Tip**: Use Application Insights Live Metrics Stream for real-time monitoring during deployments and troubleshooting sessions. This feature provides immediate visibility into service performance and can help identify issues before they impact users.
 

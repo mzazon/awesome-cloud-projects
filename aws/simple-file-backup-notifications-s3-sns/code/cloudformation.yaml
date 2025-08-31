@@ -1,0 +1,489 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Simple File Backup Notifications with S3 and SNS
+  
+  This template creates an automated notification system using Amazon S3 event notifications 
+  integrated with Amazon SNS to send instant email alerts whenever files are uploaded to 
+  your backup bucket. The solution provides real-time monitoring of backup operations while 
+  eliminating the need for manual checking or custom monitoring scripts.
+  
+  Recipe ID: a7f3b2c1
+  Category: Storage
+  Difficulty: Beginner (100)
+  Services: S3, SNS
+  Estimated Time: 20 minutes
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - EmailAddress
+          - NotificationPrefix
+      - Label:
+          default: "S3 Bucket Configuration"
+        Parameters:
+          - BucketNamePrefix
+          - EnableVersioning
+          - EnableEncryption
+      - Label:
+          default: "Advanced Configuration"
+        Parameters:
+          - Environment
+          - CostCenter
+    ParameterLabels:
+      EmailAddress:
+        default: "Email Address for Notifications"
+      NotificationPrefix:
+        default: "Object Key Prefix Filter"
+      BucketNamePrefix:
+        default: "S3 Bucket Name Prefix"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      EnableEncryption:
+        default: "Enable S3 Encryption"
+      Environment:
+        default: "Environment Tag"
+      CostCenter:
+        default: "Cost Center Tag"
+
+Parameters:
+  EmailAddress:
+    Type: String
+    Description: Email address to receive backup notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address format
+    MinLength: 5
+    MaxLength: 254
+
+  NotificationPrefix:
+    Type: String
+    Description: Optional S3 object key prefix to filter notifications (e.g., "backups/", "logs/")
+    Default: ""
+    MaxLength: 1024
+    ConstraintDescription: Must be a valid S3 object key prefix
+
+  BucketNamePrefix:
+    Type: String
+    Description: Prefix for the S3 bucket name (random suffix will be added)
+    Default: backup-notifications
+    AllowedPattern: ^[a-z0-9-]*$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 50
+
+  EnableVersioning:
+    Type: String
+    Description: Enable S3 bucket versioning for data protection
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+
+  EnableEncryption:
+    Type: String
+    Description: Enable S3 server-side encryption with AES-256
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+
+  Environment:
+    Type: String
+    Description: Environment designation for resource tagging
+    Default: Development
+    AllowedValues:
+      - Development
+      - Testing
+      - Staging
+      - Production
+    ConstraintDescription: Must be one of the predefined environment values
+
+  CostCenter:
+    Type: String
+    Description: Cost center code for billing allocation
+    Default: IT-Operations
+    AllowedPattern: ^[a-zA-Z0-9-_]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+    MinLength: 2
+    MaxLength: 50
+
+Conditions:
+  # Condition to enable S3 versioning based on parameter
+  EnableVersioningCondition: !Equals [!Ref EnableVersioning, 'true']
+  
+  # Condition to enable S3 encryption based on parameter
+  EnableEncryptionCondition: !Equals [!Ref EnableEncryption, 'true']
+  
+  # Condition to apply prefix filter for notifications
+  HasNotificationPrefix: !Not [!Equals [!Ref NotificationPrefix, '']]
+  
+  # Condition for production environment (additional security controls)
+  IsProductionEnvironment: !Equals [!Ref Environment, 'Production']
+
+Resources:
+  # Random suffix for unique resource naming
+  RandomSuffixFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-random-suffix-generator'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt RandomSuffixFunctionRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import string
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Generate 6-character random suffix
+                  suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+                  
+                  response_data = {'RandomSuffix': suffix}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  RandomSuffixFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: Random suffix generation for unique resource naming
+
+  RandomSuffixCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RandomSuffixFunction.Arn
+
+  # SNS Topic for backup notifications
+  BackupNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${BucketNamePrefix}-alerts-${RandomSuffixCustomResource.RandomSuffix}'
+      DisplayName: S3 Backup Notification Topic
+      # Enable server-side encryption for production environments
+      KmsMasterKeyId: !If
+        - IsProductionEnvironment
+        - alias/aws/sns
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: S3 backup file upload notifications
+        - Key: Service
+          Value: SNS
+
+  # SNS Topic Policy to allow S3 to publish messages
+  BackupNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref BackupNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3ToPublishMessages
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref BackupNotificationTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+              StringLike:
+                'aws:SourceArn': !Sub '${BackupBucket.Arn}'
+
+  # Email subscription to SNS topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref BackupNotificationTopic
+      Endpoint: !Ref EmailAddress
+
+  # S3 Bucket for backup file storage
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${BucketNamePrefix}-${RandomSuffixCustomResource.RandomSuffix}'
+      # Configure versioning if enabled
+      VersioningConfiguration: !If
+        - EnableVersioningCondition
+        - Status: Enabled
+        - !Ref AWS::NoValue
+      # Configure server-side encryption if enabled
+      BucketEncryption: !If
+        - EnableEncryptionCondition
+        - ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+              BucketKeyEnabled: true
+        - !Ref AWS::NoValue
+      # Configure event notifications
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Topic: !Ref BackupNotificationTopic
+            Event: s3:ObjectCreated:*
+            Filter: !If
+              - HasNotificationPrefix
+              - S3Key:
+                  Rules:
+                    - Name: prefix
+                      Value: !Ref NotificationPrefix
+              - !Ref AWS::NoValue
+      # Enable access logging for production environments
+      LoggingConfiguration: !If
+        - IsProductionEnvironment
+        - DestinationBucketName: !Ref AccessLogsBucket
+          LogFilePrefix: backup-bucket-access-logs/
+        - !Ref AWS::NoValue
+      # Configure lifecycle rules for cost optimization
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      # Public access block (security best practice)
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Resource tags
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: Backup file storage with automated notifications
+        - Key: Service
+          Value: S3
+        - Key: BackupNotifications
+          Value: Enabled
+
+  # S3 Bucket for access logs (production only)
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: IsProductionEnvironment
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${BucketNamePrefix}-access-logs-${RandomSuffixCustomResource.RandomSuffix}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAccessLogsAfter90Days
+            Status: Enabled
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: Access logs for backup bucket
+        - Key: Service
+          Value: S3
+
+  # CloudWatch Dashboard for monitoring (optional)
+  BackupMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-backup-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${BackupBucket}", "StorageType", "StandardStorage" ],
+                  [ "...", "StandardIAStorage" ],
+                  [ "...", "GlacierStorage" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "S3 Bucket Storage Usage",
+                "period": 86400,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "NumberOfObjects", "BucketName", "${BackupBucket}", "StorageType", "AllStorageTypes" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "S3 Object Count",
+                "period": 86400,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${BackupNotificationTopic.TopicName}" ],
+                  [ ".", "NumberOfNotificationsFailed", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "SNS Notification Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # S3 Bucket Information
+  BackupBucketName:
+    Description: Name of the S3 bucket for backup files
+    Value: !Ref BackupBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupBucketName'
+
+  BackupBucketArn:
+    Description: ARN of the S3 bucket for backup files
+    Value: !GetAtt BackupBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupBucketArn'
+
+  BackupBucketWebsiteURL:
+    Description: Website URL of the S3 bucket (for reference)
+    Value: !GetAtt BackupBucket.WebsiteURL
+
+  BackupBucketDomainName:
+    Description: Domain name of the S3 bucket
+    Value: !GetAtt BackupBucket.DomainName
+
+  # SNS Topic Information
+  NotificationTopicArn:
+    Description: ARN of the SNS topic for backup notifications
+    Value: !Ref BackupNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  NotificationTopicName:
+    Description: Name of the SNS topic for backup notifications
+    Value: !GetAtt BackupNotificationTopic.TopicName
+
+  # Subscription Information
+  EmailSubscriptionArn:
+    Description: ARN of the email subscription (requires confirmation)
+    Value: !Ref EmailSubscription
+
+  # Configuration Information
+  NotificationPrefix:
+    Description: Object key prefix filter for notifications
+    Value: !Ref NotificationPrefix
+    Condition: HasNotificationPrefix
+
+  # CloudWatch Dashboard
+  DashboardURL:
+    Description: URL to the CloudWatch dashboard for monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${BackupMonitoringDashboard}'
+
+  # Deployment Information
+  StackName:
+    Description: CloudFormation stack name
+    Value: !Ref AWS::StackName
+
+  DeploymentRegion:
+    Description: AWS region where resources were deployed
+    Value: !Ref AWS::Region
+
+  RandomSuffix:
+    Description: Random suffix used for unique resource naming
+    Value: !GetAtt RandomSuffixCustomResource.RandomSuffix
+
+  # Usage Instructions
+  UploadCommand:
+    Description: AWS CLI command to upload files and trigger notifications
+    Value: !Sub 'aws s3 cp your-file.txt s3://${BackupBucket}/${NotificationPrefix}'
+
+  # Cost Optimization Information
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for typical usage (excluding data transfer)
+    Value: '$0.01-$0.50 for notifications + S3 storage costs'
+
+  # Security Information
+  EncryptionEnabled:
+    Description: Whether S3 server-side encryption is enabled
+    Value: !Ref EnableEncryption
+
+  VersioningEnabled:
+    Description: Whether S3 versioning is enabled
+    Value: !Ref EnableVersioning

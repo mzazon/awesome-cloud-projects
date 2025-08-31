@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: Systems Manager, EC2, CloudWatch, SNS
 estimated-time: 120 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: patching, maintenance, systems-manager, automation, security
 recipe-generator-version: 1.3
@@ -130,7 +130,7 @@ echo "   - SNS Topic: ${SNS_TOPIC_ARN}"
        --name ${PATCH_BASELINE_NAME} \
        --description "Custom patch baseline for production instances" \
        --operating-system AMAZON_LINUX_2 \
-       --approval-rules Rules='[{
+       --approval-rules '{
            "PatchRules": [{
                "PatchFilterGroup": {
                    "PatchFilters": [{
@@ -141,7 +141,7 @@ echo "   - SNS Topic: ${SNS_TOPIC_ARN}"
                "ApproveAfterDays": 7,
                "ComplianceLevel": "CRITICAL"
            }]
-       }]' \
+       }' \
        --approved-patches-compliance-level CRITICAL
    
    # Store the baseline ID
@@ -198,7 +198,7 @@ echo "   - SNS Topic: ${SNS_TOPIC_ARN}"
 
 3. **Create Maintenance Window**:
 
-   Maintenance windows define the schedule for when patching operations can occur. The cron expression controls the exact timing, while duration and cutoff parameters manage how long the window stays open and when new tasks stop being initiated.
+   Maintenance windows define the schedule for when patching operations can occur, providing precise control over timing to minimize business impact. The cron expression controls the exact timing, while duration and cutoff parameters manage how long the window stays open and when new tasks stop being initiated. This scheduled approach ensures patches are applied during approved maintenance periods while preventing disruption to business-critical operations.
 
    ```bash
    # Create maintenance window scheduled for weekly patching
@@ -219,6 +219,8 @@ echo "   - SNS Topic: ${SNS_TOPIC_ARN}"
    
    echo "✅ Created maintenance window: ${MAINTENANCE_WINDOW_ID}"
    ```
+
+   The maintenance window is now configured to run every Sunday at 2 AM UTC with a 4-hour duration and 1-hour cutoff. This schedule provides adequate time for patch installation while ensuring tasks complete within the defined window. The cutoff period prevents new tasks from starting too close to the window's end, reducing the risk of incomplete patching operations.
 
 4. **Register Maintenance Window Targets**:
 
@@ -246,7 +248,7 @@ echo "   - SNS Topic: ${SNS_TOPIC_ARN}"
 
 5. **Register Patch Management Task**:
 
-   The patch management task executes the actual patching operation during the maintenance window. Concurrency and error threshold settings ensure controlled rollout, preventing system-wide issues if patches cause problems on individual instances.
+   The patch management task executes the actual patching operation during the maintenance window, using the AWS-RunPatchBaseline document to install approved patches. Concurrency and error threshold settings ensure controlled rollout, preventing system-wide issues if patches cause problems on individual instances. The task configuration integrates with your custom patch baseline to ensure only approved patches are installed according to your organization's requirements.
 
    ```bash
    # Register patching task with the maintenance window
@@ -299,7 +301,7 @@ echo "   - SNS Topic: ${SNS_TOPIC_ARN}"
 
 7. **Set Up Automated Patch Scanning**:
 
-   Regular patch scanning provides continuous visibility into patch compliance without making changes to systems. This proactive approach helps identify security vulnerabilities and plan maintenance activities before patches accumulate.
+   Regular patch scanning provides continuous visibility into patch compliance without making changes to systems. This proactive approach helps identify security vulnerabilities and plan maintenance activities before patches accumulate. Scanning operations run separately from installation operations, allowing you to maintain compliance visibility without disrupting production systems.
 
    ```bash
    # Create a separate maintenance window for patch scanning
@@ -505,13 +507,13 @@ echo "   - SNS Topic: ${SNS_TOPIC_ARN}"
 
 ## Discussion
 
-AWS Systems Manager Patch Manager provides a comprehensive solution for automating patch management across your infrastructure. The key architectural components work together to ensure consistent, reliable patching operations while maintaining operational control.
+AWS Systems Manager Patch Manager provides a comprehensive solution for automating patch management across your infrastructure while following AWS Well-Architected Framework principles. The key architectural components work together to ensure consistent, reliable patching operations while maintaining operational control and security compliance.
 
-Custom patch baselines allow you to define precise criteria for which patches get approved for installation. The approval rules can be configured to automatically approve patches based on classification (Security, Bugfix, Critical) and severity levels, with configurable approval delays to allow for testing. This approach ensures that only appropriate patches are installed while maintaining security posture.
+Custom patch baselines allow you to define precise criteria for which patches get approved for installation. The approval rules can be configured to automatically approve patches based on classification (Security, Bugfix, Critical) and severity levels, with configurable approval delays to allow for testing. This approach ensures that only appropriate patches are installed while maintaining security posture, following the security pillar's principle of implementing defense in depth.
 
-Maintenance windows provide the scheduling framework that determines when patching operations occur. By separating scanning operations from installation operations, you can maintain continuous visibility into patch compliance while controlling when potentially disruptive installations happen. The rate control settings (concurrency and error thresholds) help ensure that patching operations don't overwhelm your infrastructure or cause widespread service disruption.
+Maintenance windows provide the scheduling framework that determines when patching operations occur, supporting the operational excellence pillar through automated operations and predictable maintenance schedules. By separating scanning operations from installation operations, you can maintain continuous visibility into patch compliance while controlling when potentially disruptive installations happen. The rate control settings (concurrency and error thresholds) help ensure that patching operations don't overwhelm your infrastructure or cause widespread service disruption, supporting the reliability pillar's emphasis on graceful degradation and controlled failure modes.
 
-The integration with CloudWatch and SNS enables proactive monitoring and alerting on patch compliance status. This monitoring capability is essential for maintaining security compliance and operational visibility across large fleets of instances. The compliance reporting features can generate detailed reports that are useful for security audits and compliance verification.
+The integration with CloudWatch and SNS enables proactive monitoring and alerting on patch compliance status, essential for maintaining security compliance and operational visibility across large fleets of instances. The compliance reporting features can generate detailed reports that are useful for security audits and compliance verification. For comprehensive guidance on AWS Well-Architected practices for patch management, see the [AWS Well-Architected Framework documentation](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
 
 > **Tip**: Use patch groups to organize instances with similar patching requirements. For example, separate development, staging, and production environments into different patch groups with different approval criteria and maintenance window schedules.
 

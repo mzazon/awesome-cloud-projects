@@ -4,19 +4,18 @@ id: 754e4fa2
 category: networking
 difficulty: 300
 subject: aws
-services: API Gateway, Route 53, ACM, CloudFront
+services: API Gateway, Route 53, ACM, Lambda
 estimated-time: 90 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: api-gateway, custom-domain, route-53, ssl, certificates
 recipe-generator-version: 1.3
 ---
 
 # API Gateway with Custom Domain Names
-
 
 ## Problem
 
@@ -54,7 +53,6 @@ graph TB
     
     subgraph "Backend"
         LAMBDA[Lambda Functions]
-        DYNAMO[DynamoDB]
     end
     
     CLIENT --> ROUTE53
@@ -65,7 +63,6 @@ graph TB
     GATEWAY --> AUTHORIZER
     GATEWAY --> STAGES
     STAGES --> LAMBDA
-    LAMBDA --> DYNAMO
     ACM --> CERT
     CERT --> DOMAIN
     
@@ -241,7 +238,7 @@ echo "✅ Environment prepared with domain: ${API_SUBDOMAIN}"
    # Create Lambda function
    LAMBDA_FUNCTION_ARN=$(aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_FUNCTION_NAME}-role \
        --handler lambda-function.lambda_handler \
        --zip-file fileb://lambda-function.zip \
@@ -308,7 +305,7 @@ echo "✅ Environment prepared with domain: ${API_SUBDOMAIN}"
    # Create authorizer Lambda function
    AUTHORIZER_FUNCTION_ARN=$(aws lambda create-function \
        --function-name ${AUTHORIZER_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_FUNCTION_NAME}-role \
        --handler authorizer-function.lambda_handler \
        --zip-file fileb://authorizer-function.zip \
@@ -388,8 +385,7 @@ echo "✅ Environment prepared with domain: ${API_SUBDOMAIN}"
        --resource-id ${PETS_RESOURCE_ID} \
        --http-method GET \
        --authorization-type CUSTOM \
-       --authorizer-id ${AUTHORIZER_ID} \
-       --request-validator-id null
+       --authorizer-id ${AUTHORIZER_ID}
    
    # Create POST method for /pets
    aws apigateway put-method \
@@ -397,8 +393,7 @@ echo "✅ Environment prepared with domain: ${API_SUBDOMAIN}"
        --resource-id ${PETS_RESOURCE_ID} \
        --http-method POST \
        --authorization-type CUSTOM \
-       --authorizer-id ${AUTHORIZER_ID} \
-       --request-validator-id null
+       --authorizer-id ${AUTHORIZER_ID}
    
    # Create Lambda integration for GET /pets
    aws apigateway put-integration \
@@ -466,7 +461,7 @@ echo "✅ Environment prepared with domain: ${API_SUBDOMAIN}"
 
 9. **Wait for Certificate Validation and Create Custom Domain**:
 
-   Custom domain creation establishes the professional API endpoint that clients will use to access your services. This process requires a validated SSL certificate from ACM and creates a CloudFront distribution or regional endpoint that handles the HTTPS termination. The TLS_1_2 security policy ensures modern encryption standards while maintaining compatibility with most clients, providing the secure foundation for your branded API endpoint.
+   Custom domain creation establishes the professional API endpoint that clients will use to access your services. This process requires a validated SSL certificate from ACM and creates a regional endpoint that handles the HTTPS termination. The TLS_1_2 security policy ensures modern encryption standards while maintaining compatibility with most clients, providing the secure foundation for your branded API endpoint.
 
    ```bash
    # Wait for certificate validation (manual step - check DNS)
@@ -674,6 +669,9 @@ echo "✅ Environment prepared with domain: ${API_SUBDOMAIN}"
        --domain-name ${API_SUBDOMAIN} \
        --query 'items[].basePath' --output text | \
    while read -r base_path; do
+       if [ "$base_path" = "None" ]; then
+           base_path=""
+       fi
        aws apigateway delete-base-path-mapping \
            --domain-name ${API_SUBDOMAIN} \
            --base-path "${base_path}"

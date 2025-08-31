@@ -1,0 +1,583 @@
+# Infrastructure Manager Configuration for Automated Video Generation using Veo 3
+# This configuration deploys a complete serverless video generation pipeline
+# using Google Cloud's Veo 3 model with automated batch processing capabilities
+
+imports:
+  - path: templates/storage-buckets.jinja
+  - path: templates/cloud-functions.jinja
+  - path: templates/iam-service-accounts.jinja
+  - path: templates/cloud-scheduler.jinja
+
+resources:
+  # ==============================================================================
+  # PROJECT AND API CONFIGURATION
+  # ==============================================================================
+  
+  # Enable required APIs for the video generation workflow
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/aiplatform.googleapis.com
+    metadata:
+      dependsOn: []
+
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/cloudfunctions.googleapis.com
+    metadata:
+      dependsOn: []
+
+  - name: enable-cloudscheduler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/cloudscheduler.googleapis.com
+    metadata:
+      dependsOn: []
+
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/storage.googleapis.com
+    metadata:
+      dependsOn: []
+
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/cloudbuild.googleapis.com
+    metadata:
+      dependsOn: []
+
+  # ==============================================================================
+  # STORAGE INFRASTRUCTURE
+  # ==============================================================================
+
+  # Input bucket for creative briefs and content specifications
+  - name: video-briefs-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.project-id.value)-video-briefs-$(ref.random-suffix.value)
+      location: {{ properties["region"] }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90  # Delete files older than 90 days
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30  # Move to nearline after 30 days
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        environment: {{ properties["environment"] }}
+        component: video-generation
+        purpose: input-storage
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Output bucket for generated videos and metadata
+  - name: generated-videos-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.project-id.value)-generated-videos-$(ref.random-suffix.value)
+      location: {{ properties["region"] }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90  # Move to coldline for long-term archival
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        environment: {{ properties["environment"] }}
+        component: video-generation
+        purpose: output-storage
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # ==============================================================================
+  # IAM SERVICE ACCOUNTS AND PERMISSIONS
+  # ==============================================================================
+
+  # Service account for video generation functions with least privilege access
+  - name: video-generation-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: video-gen-sa-$(ref.random-suffix.value)
+      displayName: Video Generation Service Account
+      description: Service account for automated Veo 3 video generation functions
+    metadata:
+      dependsOn: []
+
+  # Grant Vertex AI User role for Veo 3 model access
+  - name: video-sa-aiplatform-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.value)
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.video-generation-service-account.email)
+    metadata:
+      dependsOn:
+        - video-generation-service-account
+
+  # Grant Storage Admin role for bucket operations
+  - name: video-sa-storage-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.value)
+      role: roles/storage.admin
+      member: serviceAccount:$(ref.video-generation-service-account.email)
+    metadata:
+      dependsOn:
+        - video-generation-service-account
+
+  # Grant Cloud Functions Invoker role for function-to-function calls
+  - name: video-sa-functions-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.value)
+      role: roles/cloudfunctions.invoker
+      member: serviceAccount:$(ref.video-generation-service-account.email)
+    metadata:
+      dependsOn:
+        - video-generation-service-account
+
+  # ==============================================================================
+  # CLOUD FUNCTIONS FOR VIDEO GENERATION PIPELINE
+  # ==============================================================================
+
+  # Core video generation function using Veo 3
+  - name: video-generation-function
+    type: gcp-types/cloudfunctions2-v1:projects.locations.functions
+    properties:
+      location: {{ properties["region"] }}
+      functionId: video-generation-$(ref.random-suffix.value)
+      function:
+        description: Core function for generating videos using Vertex AI Veo 3 model
+        buildConfig:
+          runtime: python312
+          entryPoint: generate_video
+          source:
+            storageSource:
+              bucket: $(ref.generated-videos-bucket.name)
+              object: functions/video-generation-source.zip
+          environmentVariables:
+            GCP_PROJECT: $(ref.project-id.value)
+            FUNCTION_REGION: {{ properties["region"] }}
+        serviceConfig:
+          serviceAccountEmail: $(ref.video-generation-service-account.email)
+          timeoutSeconds: 540  # 9 minutes for video generation
+          availableMemory: 1024Mi
+          maxInstanceCount: 10  # Control concurrency for cost management
+          minInstanceCount: 0   # Scale to zero when not in use
+          environmentVariables:
+            GCP_PROJECT: $(ref.project-id.value)
+            FUNCTION_REGION: {{ properties["region"] }}
+            OUTPUT_BUCKET: $(ref.generated-videos-bucket.name)
+          ingressSettings: ALLOW_ALL
+          allTrafficOnLatestRevision: true
+        labels:
+          environment: {{ properties["environment"] }}
+          component: video-generation
+          function-type: core-generation
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - video-generation-service-account
+        - generated-videos-bucket
+
+  # Orchestrator function for batch processing of creative briefs
+  - name: video-orchestrator-function
+    type: gcp-types/cloudfunctions2-v1:projects.locations.functions
+    properties:
+      location: {{ properties["region"] }}
+      functionId: video-orchestrator-$(ref.random-suffix.value)
+      function:
+        description: Orchestrator function for batch processing creative briefs
+        buildConfig:
+          runtime: python312
+          entryPoint: orchestrate_video_generation
+          source:
+            storageSource:
+              bucket: $(ref.generated-videos-bucket.name)
+              object: functions/orchestrator-source.zip
+          environmentVariables:
+            GCP_PROJECT: $(ref.project-id.value)
+            FUNCTION_REGION: {{ properties["region"] }}
+        serviceConfig:
+          serviceAccountEmail: $(ref.video-generation-service-account.email)
+          timeoutSeconds: 900  # 15 minutes for batch processing
+          availableMemory: 512Mi
+          maxInstanceCount: 3   # Limit concurrency for orchestration
+          minInstanceCount: 0
+          environmentVariables:
+            GCP_PROJECT: $(ref.project-id.value)
+            FUNCTION_REGION: {{ properties["region"] }}
+            INPUT_BUCKET: $(ref.video-briefs-bucket.name)
+            OUTPUT_BUCKET: $(ref.generated-videos-bucket.name)
+            VIDEO_FUNCTION_URL: $(ref.video-generation-function.serviceConfig.uri)
+          ingressSettings: ALLOW_ALL
+          allTrafficOnLatestRevision: true
+        labels:
+          environment: {{ properties["environment"] }}
+          component: video-generation
+          function-type: orchestrator
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - video-generation-service-account
+        - video-generation-function
+        - video-briefs-bucket
+        - generated-videos-bucket
+
+  # ==============================================================================
+  # CLOUD SCHEDULER FOR AUTOMATED VIDEO GENERATION
+  # ==============================================================================
+
+  # Scheduled job for automated video generation (Monday, Wednesday, Friday at 9 AM)
+  - name: automated-video-generation-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: projects/$(ref.project-id.value)/locations/{{ properties["region"] }}/jobs/automated-video-generation-$(ref.random-suffix.value)
+      description: Automated video generation job for batch processing creative briefs
+      schedule: "0 9 * * MON,WED,FRI"
+      timeZone: "America/New_York"
+      httpTarget:
+        uri: $(ref.video-orchestrator-function.serviceConfig.uri)
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: |
+          {
+            "trigger": "scheduled",
+            "batch_size": 10,
+            "priority": "normal"
+          }
+        oidcToken:
+          serviceAccountEmail: $(ref.video-generation-service-account.email)
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 1800s  # 30 minutes
+        minBackoffDuration: 60s
+        maxBackoffDuration: 300s
+    metadata:
+      dependsOn:
+        - enable-cloudscheduler-api
+        - video-orchestrator-function
+        - video-generation-service-account
+
+  # On-demand job for manual video generation (scheduled but never runs automatically)
+  - name: on-demand-video-generation-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: projects/$(ref.project-id.value)/locations/{{ properties["region"] }}/jobs/on-demand-video-generation-$(ref.random-suffix.value)
+      description: On-demand video generation job for manual triggering
+      schedule: "0 0 31 2 *"  # February 31st - never runs automatically
+      timeZone: "America/New_York"
+      httpTarget:
+        uri: $(ref.video-orchestrator-function.serviceConfig.uri)
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: |
+          {
+            "trigger": "manual",
+            "batch_size": 5,
+            "priority": "high"
+          }
+        oidcToken:
+          serviceAccountEmail: $(ref.video-generation-service-account.email)
+      retryConfig:
+        retryCount: 2
+        maxRetryDuration: 900s   # 15 minutes
+        minBackoffDuration: 30s
+        maxBackoffDuration: 120s
+    metadata:
+      dependsOn:
+        - enable-cloudscheduler-api
+        - video-orchestrator-function
+        - video-generation-service-account
+
+  # ==============================================================================
+  # MONITORING AND ALERTING INFRASTRUCTURE
+  # ==============================================================================
+
+  # Alert policy for video generation function failures
+  - name: video-generation-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: Video Generation Function Failures - $(ref.random-suffix.value)
+      documentation:
+        content: |
+          This alert monitors the video generation functions for high error rates.
+          
+          ## Troubleshooting Steps:
+          1. Check Cloud Function logs for specific error messages
+          2. Verify Vertex AI Veo 3 model availability and quotas
+          3. Check storage bucket permissions and capacity
+          4. Review function memory and timeout configurations
+          
+          ## Contact Information:
+          - Primary: DevOps Team
+          - Secondary: AI/ML Engineering Team
+        mimeType: text/markdown
+      conditions:
+        - displayName: Cloud Function Error Rate
+          conditionThreshold:
+            filter: |
+              resource.type="cloud_function"
+              AND metric.type="cloudfunctions.googleapis.com/function/execution_count"
+              AND metric.label.status!="ok"
+              AND resource.label.function_name=~"video-generation.*"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 5
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+                groupByFields:
+                  - resource.label.function_name
+      alertStrategy:
+        autoClose: 1800s  # Auto-close after 30 minutes
+      combiner: OR
+      enabled: true
+    metadata:
+      dependsOn:
+        - video-generation-function
+        - video-orchestrator-function
+
+  # ==============================================================================
+  # UTILITY RESOURCES FOR DYNAMIC VALUES
+  # ==============================================================================
+
+  # Generate random suffix for unique resource naming
+  - name: random-suffix
+    type: gcp-types/runtimeconfig-v1beta1:configs.variables
+    properties:
+      parent: projects/$(ref.project-id.value)/configs/video-gen-config
+      variable: random-suffix
+      text: "$(env['deployment'])-$(substr(sha256(env['project'] + env['deployment']), 0, 6))"
+    metadata:
+      dependsOn: []
+
+  # Project ID reference for consistent usage
+  - name: project-id
+    type: gcp-types/runtimeconfig-v1beta1:configs.variables
+    properties:
+      parent: projects/$(ref.project-id.value)/configs/video-gen-config
+      variable: project-id
+      text: "$(env['project'])"
+    metadata:
+      dependsOn: []
+
+# ==============================================================================
+# TEMPLATE PROPERTIES AND SCHEMA DEFINITION
+# ==============================================================================
+
+info:
+  title: Automated Video Generation with Veo 3
+  author: Generated by Infrastructure Manager
+  description: |
+    Complete infrastructure for automated video content generation using Google's Veo 3 model.
+    
+    This template deploys:
+    - Cloud Storage buckets for input briefs and output videos
+    - Cloud Functions for video generation and orchestration
+    - Cloud Scheduler for automated batch processing
+    - IAM service accounts with least privilege access
+    - Monitoring and alerting for production reliability
+    
+    The system processes creative briefs stored in Cloud Storage and generates
+    high-quality 1080p videos with synchronized audio using Vertex AI's Veo 3 capabilities.
+
+properties:
+  region:
+    type: string
+    default: us-central1
+    description: |
+      Google Cloud region for resource deployment.
+      Recommended regions for Vertex AI: us-central1, us-east1, europe-west4
+    enum:
+      - us-central1
+      - us-east1
+      - us-west1
+      - europe-west1
+      - europe-west4
+      - asia-southeast1
+
+  environment:
+    type: string
+    default: development
+    description: |
+      Environment designation for resource labeling and configuration.
+      Used for organizing resources and applying environment-specific policies.
+    enum:
+      - development
+      - staging
+      - production
+
+  videoGenerationTimeout:
+    type: integer
+    default: 540
+    description: |
+      Timeout in seconds for video generation function.
+      Veo 3 typically requires 3-8 minutes for 8-second videos.
+      Range: 60-540 seconds (Cloud Functions Gen2 limit)
+    minimum: 60
+    maximum: 540
+
+  batchProcessingTimeout:
+    type: integer
+    default: 900
+    description: |
+      Timeout in seconds for batch processing orchestration.
+      Should accommodate multiple video generations plus overhead.
+      Range: 300-900 seconds
+    minimum: 300
+    maximum: 900
+
+  maxConcurrentVideos:
+    type: integer
+    default: 10
+    description: |
+      Maximum number of concurrent video generation instances.
+      Higher values increase throughput but also cost.
+      Consider Vertex AI quotas and budget constraints.
+    minimum: 1
+    maximum: 50
+
+  scheduledGenerationTime:
+    type: string
+    default: "0 9 * * MON,WED,FRI"
+    description: |
+      Cron schedule for automated video generation.
+      Default: Monday, Wednesday, Friday at 9 AM EST.
+      Format: "minute hour day month day-of-week"
+
+  lifecycleColdlineAgeDays:
+    type: integer
+    default: 90
+    description: |
+      Number of days before moving generated videos to Coldline storage.
+      Coldline storage reduces costs for infrequently accessed content.
+      Range: 30-365 days
+    minimum: 30
+    maximum: 365
+
+  enableMonitoring:
+    type: boolean
+    default: true
+    description: |
+      Enable Cloud Monitoring alerts for function failures and performance issues.
+      Recommended for production environments.
+
+  notificationEmail:
+    type: string
+    default: ""
+    description: |
+      Email address for alert notifications (optional).
+      Leave empty to skip email notification configuration.
+      Must be a valid email address if provided.
+
+# ==============================================================================
+# OUTPUTS FOR INTEGRATION AND VERIFICATION
+# ==============================================================================
+
+outputs:
+  inputBucketName:
+    description: Name of the Cloud Storage bucket for creative briefs
+    value: $(ref.video-briefs-bucket.name)
+
+  outputBucketName:
+    description: Name of the Cloud Storage bucket for generated videos
+    value: $(ref.generated-videos-bucket.name)
+
+  videoGenerationFunctionUrl:
+    description: HTTP trigger URL for the video generation function
+    value: $(ref.video-generation-function.serviceConfig.uri)
+
+  orchestratorFunctionUrl:
+    description: HTTP trigger URL for the orchestrator function
+    value: $(ref.video-orchestrator-function.serviceConfig.uri)
+
+  serviceAccountEmail:
+    description: Email of the service account used by the functions
+    value: $(ref.video-generation-service-account.email)
+
+  automatedJobName:
+    description: Name of the automated video generation Cloud Scheduler job
+    value: $(ref.automated-video-generation-job.name)
+
+  onDemandJobName:
+    description: Name of the on-demand video generation Cloud Scheduler job
+    value: $(ref.on-demand-video-generation-job.name)
+
+  alertPolicyName:
+    description: Name of the Cloud Monitoring alert policy for function failures
+    value: $(ref.video-generation-alert-policy.name)
+
+  deploymentInstructions:
+    description: Quick start instructions for using the deployed infrastructure
+    value: |
+      # Automated Video Generation System Deployed Successfully!
+      
+      ## Upload Creative Briefs:
+      Upload JSON files to: gs://$(ref.video-briefs-bucket.name)/briefs/
+      
+      ## Manual Generation:
+      curl -X POST "$(ref.video-generation-function.serviceConfig.uri)" \
+           -H "Content-Type: application/json" \
+           -d '{"prompt":"Your video description","output_bucket":"$(ref.generated-videos-bucket.name)","resolution":"1080p"}'
+      
+      ## Trigger Batch Processing:
+      gcloud scheduler jobs run $(ref.on-demand-video-generation-job.name) --location={{ properties["region"] }}
+      
+      ## View Generated Videos:
+      gsutil ls gs://$(ref.generated-videos-bucket.name)/videos/
+      
+      ## Monitor Logs:
+      gcloud functions logs read video-generation-$(ref.random-suffix.value) --region={{ properties["region"] }}
+
+  costEstimate:
+    description: Estimated monthly costs for different usage patterns
+    value: |
+      ## Monthly Cost Estimates (USD):
+      
+      ### Light Usage (10 videos/month):
+      - Video Generation (Veo 3): $60 (10 videos × 8 seconds × $0.75/second)
+      - Cloud Functions: $1-2
+      - Cloud Storage: $1-3
+      - Cloud Scheduler: $0.10
+      - Total: ~$62-65/month
+      
+      ### Medium Usage (50 videos/month):
+      - Video Generation (Veo 3): $300 (50 videos × 8 seconds × $0.75/second)
+      - Cloud Functions: $3-5
+      - Cloud Storage: $3-8
+      - Cloud Scheduler: $0.10
+      - Total: ~$306-313/month
+      
+      ### Heavy Usage (200 videos/month):
+      - Video Generation (Veo 3): $1,200 (200 videos × 8 seconds × $0.75/second)
+      - Cloud Functions: $10-15
+      - Cloud Storage: $10-25
+      - Cloud Scheduler: $0.10
+      - Total: ~$1,220-1,240/month
+      
+      Note: Costs may vary based on region, storage usage patterns, and function execution time.
+      Monitor usage with Cloud Billing and set up budget alerts as needed.

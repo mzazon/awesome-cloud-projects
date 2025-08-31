@@ -1,21 +1,21 @@
 ---
-title: Proactive Resource Health Monitoring with Service Bus
+title: Proactive Infrastructure Health Monitoring Service Health Update Manager
 id: f3a8d2c7
 category: monitoring
 difficulty: 200
 subject: azure
 services: Azure Resource Health, Azure Service Bus, Azure Logic Apps, Azure Monitor
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: health monitoring, event-driven, messaging, proactive remediation, resource health, service bus
 recipe-generator-version: 1.3
 ---
 
-# Proactive Resource Health Monitoring with Service Bus
+# Proactive Infrastructure Health Monitoring Service Health Update Manager
 
 ## Problem
 
@@ -108,7 +108,6 @@ export REMEDIATION_TOPIC_NAME="remediation-actions"
 
 # Logic Apps configuration
 export LOGIC_APP_NAME="la-health-orchestrator-${RANDOM_SUFFIX}"
-export CONSUMPTION_PLAN_NAME="plan-health-monitoring-${RANDOM_SUFFIX}"
 
 # Monitoring configuration
 export LOG_ANALYTICS_WORKSPACE="log-health-monitoring-${RANDOM_SUFFIX}"
@@ -130,7 +129,7 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    Azure Service Bus provides reliable, enterprise-grade messaging infrastructure that enables decoupled communication between health monitoring components and remediation services. The namespace serves as the central message broker for all health events, supporting both queue-based point-to-point messaging for specific handlers and topic-based publish-subscribe patterns for broadcast scenarios.
 
    ```bash
-   # Create Service Bus namespace with premium tier for advanced features
+   # Create Service Bus namespace with Standard tier for production features
    az servicebus namespace create \
        --name ${SERVICE_BUS_NAMESPACE} \
        --resource-group ${RESOURCE_GROUP} \
@@ -221,104 +220,111 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    Azure Logic Apps serves as the orchestration engine that connects Resource Health events with Service Bus messaging patterns. This serverless workflow service automatically processes health alerts, enriches event data, and routes messages to appropriate remediation handlers based on configurable business rules.
 
    ```bash
-   # Create Logic App with consumption plan
-   az logic workflow create \
+   # Create a Standard Logic App with required configuration
+   az logicapp create \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
+       --plan ${LOGIC_APP_NAME} \
        --location ${LOCATION} \
-       --definition '{
-         "$schema": "https://schema.management.azure.com/schemas/2016-06-01/Microsoft.Logic.json",
-         "contentVersion": "1.0.0.0",
-         "triggers": {
-           "When_a_resource_health_alert_is_fired": {
-             "type": "request",
-             "kind": "http",
-             "inputs": {
-               "schema": {
-                 "type": "object",
-                 "properties": {
-                   "resourceId": {"type": "string"},
-                   "status": {"type": "string"},
-                   "eventTime": {"type": "string"},
-                   "resourceType": {"type": "string"}
-                 }
-               }
-             }
-           }
-         },
-         "actions": {
-           "Send_to_Health_Queue": {
-             "type": "ServiceBusQueue",
-             "inputs": {
-               "host": {
-                 "connection": {
-                   "name": "@parameters($connections)[\"servicebus\"][\"connectionId\"]"
-                 }
-               },
-               "method": "post",
-               "path": "/@{encodeURIComponent(encodeURIComponent(\"'${HEALTH_QUEUE_NAME}'\"))}/messages",
-               "body": {
-                 "ContentData": "@base64(triggerBody())",
-                 "ContentType": "application/json"
-               }
-             }
-           },
-           "Determine_Remediation_Action": {
-             "type": "Switch",
-             "expression": "@triggerBody()[\"status\"]",
-             "cases": {
-               "Unavailable": {
-                 "case": "Unavailable",
-                 "actions": {
-                   "Send_to_Remediation_Topic": {
-                     "type": "ServiceBusTopic",
-                     "inputs": {
-                       "host": {
-                         "connection": {
-                           "name": "@parameters($connections)[\"servicebus\"][\"connectionId\"]"
-                         }
-                       },
-                       "method": "post",
-                       "path": "/@{encodeURIComponent(encodeURIComponent(\"'${REMEDIATION_TOPIC_NAME}'\"))}/messages",
-                       "body": {
-                         "ContentData": "@base64(triggerBody())",
-                         "ContentType": "application/json",
-                         "Properties": {
-                           "ActionType": "restart"
-                         }
-                       }
-                     }
-                   }
-                 }
-               },
-               "Degraded": {
-                 "case": "Degraded",
-                 "actions": {
-                   "Send_Scale_Action": {
-                     "type": "ServiceBusTopic",
-                     "inputs": {
-                       "host": {
-                         "connection": {
-                           "name": "@parameters($connections)[\"servicebus\"][\"connectionId\"]"
-                         }
-                       },
-                       "method": "post",
-                       "path": "/@{encodeURIComponent(encodeURIComponent(\"'${REMEDIATION_TOPIC_NAME}'\"))}/messages",
-                       "body": {
-                         "ContentData": "@base64(triggerBody())",
-                         "ContentType": "application/json",
-                         "Properties": {
-                           "ActionType": "scale"
-                         }
-                       }
-                     }
-                   }
-                 }
-               }
-             }
-           }
-         }
-       }'
+       --sku WS1 \
+       --functions-version 4 \
+       --runtime dotnet-isolated
+
+   # Create Logic App workflow definition file
+   cat > workflow_definition.json << 'EOF'
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "$connections": {
+      "defaultValue": {},
+      "type": "Object"
+    }
+  },
+  "triggers": {
+    "manual": {
+      "type": "Request",
+      "kind": "Http",
+      "inputs": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "resourceId": {"type": "string"},
+            "status": {"type": "string"},
+            "eventTime": {"type": "string"},
+            "resourceType": {"type": "string"}
+          }
+        }
+      }
+    }
+  },
+  "actions": {
+    "Log_Health_Event": {
+      "type": "Compose",
+      "inputs": {
+        "message": "Processing health event for @{triggerBody()?['resourceId']}",
+        "status": "@{triggerBody()?['status']}",
+        "timestamp": "@{utcNow()}"
+      }
+    },
+    "Determine_Action": {
+      "type": "Switch",
+      "expression": "@triggerBody()?['status']",
+      "cases": {
+        "Unavailable": {
+          "case": "Unavailable",
+          "actions": {
+            "Log_Unavailable": {
+              "type": "Compose",
+              "inputs": {
+                "action": "restart",
+                "resourceId": "@{triggerBody()?['resourceId']}",
+                "reason": "Resource is unavailable"
+              }
+            }
+          }
+        },
+        "Degraded": {
+          "case": "Degraded",
+          "actions": {
+            "Log_Degraded": {
+              "type": "Compose",
+              "inputs": {
+                "action": "scale",
+                "resourceId": "@{triggerBody()?['resourceId']}",
+                "reason": "Resource performance is degraded"
+              }
+            }
+          }
+        }
+      },
+      "default": {
+        "actions": {
+          "Log_Default": {
+            "type": "Compose",
+            "inputs": {
+              "action": "monitor",
+              "resourceId": "@{triggerBody()?['resourceId']}",
+              "reason": "Resource status requires monitoring"
+            }
+          }
+        }
+      },
+      "runAfter": {
+        "Log_Health_Event": [
+          "Succeeded"
+        ]
+      }
+    }
+  }
+}
+EOF
+
+   # Deploy the workflow to the Logic App
+   az logicapp deployment source config-zip \
+       --name ${LOGIC_APP_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --src workflow_definition.json
 
    echo "✅ Logic Apps workflow created for health event orchestration"
    ```
@@ -330,17 +336,19 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
    Azure Action Groups provide the notification infrastructure that connects Resource Health events to your Logic Apps workflow. This component enables automated triggering of remediation workflows when resource health changes occur, ensuring immediate response to critical health events.
 
    ```bash
-   # Create Action Group with Logic App webhook
-   LOGIC_APP_TRIGGER_URL=$(az logic workflow show \
+   # Get Logic App callback URL
+   export LOGIC_APP_CALLBACK_URL=$(az logicapp show \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
-       --query "accessEndpoint" --output tsv)
+       --query defaultHostName --output tsv | \
+       sed 's/^/https:\/\//' | sed 's/$/\/api\/manual\/paths\/invoke?api-version=2022-05-01&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0/')
 
+   # Create Action Group with Logic App webhook
    az monitor action-group create \
        --name ${ACTION_GROUP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --short-name "HealthAlert" \
-       --action webhook healthWebhook ${LOGIC_APP_TRIGGER_URL}
+       --action webhook healthWebhook "${LOGIC_APP_CALLBACK_URL}"
 
    echo "✅ Action Group created with Logic App integration"
    ```
@@ -382,85 +390,102 @@ echo "✅ Resource group created: ${RESOURCE_GROUP}"
 
    The Resource Health alert system is now monitoring your critical resources and will automatically trigger remediation workflows when health issues are detected. This proactive approach ensures rapid response to resource health changes before they impact users.
 
-7. **Deploy Sample Remediation Handlers**:
+7. **Deploy Sample Webhook Handler for Testing**:
 
-   Remediation handlers are specialized Logic Apps that process specific types of health events and execute appropriate recovery actions. These handlers subscribe to the remediation topic and implement business logic for different failure scenarios, such as auto-scaling, service restarts, or failover operations.
+   A simple webhook handler demonstrates how remediation actions can be processed when Service Bus messages are received. This handler provides a foundation for building more sophisticated remediation logic tailored to specific resource types and failure scenarios.
 
    ```bash
-   # Create restart handler Logic App
-   az logic workflow create \
-       --name "la-restart-handler-${RANDOM_SUFFIX}" \
-       --resource-group ${RESOURCE_GROUP} \
-       --location ${LOCATION} \
-       --definition '{
-         "$schema": "https://schema.management.azure.com/schemas/2016-06-01/Microsoft.Logic.json",
-         "contentVersion": "1.0.0.0",
-         "triggers": {
-           "When_a_restart_message_is_received": {
-             "type": "ServiceBusSubscription",
-             "inputs": {
-               "host": {
-                 "connection": {
-                   "name": "@parameters($connections)[\"servicebus\"][\"connectionId\"]"
-                 }
-               },
-               "method": "get",
-               "path": "/@{encodeURIComponent(encodeURIComponent(\"'${REMEDIATION_TOPIC_NAME}'\"))}/subscriptions/@{encodeURIComponent(\"restart-handler\")}/messages/head",
-               "queries": {
-                 "subscriptionType": "Main"
-               }
-             }
-           }
-         },
-         "actions": {
-           "Log_Restart_Action": {
-             "type": "Http",
-             "inputs": {
-               "method": "POST",
-               "uri": "https://httpbin.org/post",
-               "body": {
-                 "action": "restart",
-                 "resourceId": "@triggerBody()[\"resourceId\"]",
-                 "timestamp": "@utcnow()"
-               }
-             }
-           }
-         }
-       }'
+   # Create a sample webhook endpoint for testing remediation actions
+   cat > test_webhook.py << 'EOF'
+#!/usr/bin/env python3
+import json
+import http.server
+import socketserver
+from datetime import datetime
 
-   echo "✅ Restart handler Logic App deployed"
+class WebhookHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length)
+        
+        try:
+            data = json.loads(post_data.decode('utf-8'))
+            print(f"[{datetime.now()}] Received remediation action:")
+            print(json.dumps(data, indent=2))
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"status": "processed"}')
+        except Exception as e:
+            print(f"Error processing webhook: {e}")
+            self.send_response(500)
+            self.end_headers()
+
+PORT = 8080
+with socketserver.TCPServer(("", PORT), WebhookHandler) as httpd:
+    print(f"Webhook server started on port {PORT}")
+    httpd.serve_forever()
+EOF
+
+   chmod +x test_webhook.py
+
+   echo "✅ Sample webhook handler created for testing"
+   echo "Run 'python3 test_webhook.py' to start the test server"
    ```
 
-   The remediation handlers provide specialized processing for different types of health events, enabling targeted recovery actions based on the specific nature of each health issue. This modular approach ensures maintainable and scalable remediation logic.
+   The webhook handler provides a testing endpoint for validating that health events trigger appropriate remediation actions. This foundation can be extended with actual remediation logic specific to your infrastructure requirements.
 
 8. **Create Monitoring Dashboard and Queries**:
 
-   Azure Monitor dashboards provide comprehensive visibility into your health monitoring system's performance and effectiveness. Custom queries enable analysis of health event patterns, remediation success rates, and system performance metrics.
+   Azure Monitor dashboards provide comprehensive visibility into your health monitoring system's performance and effectiveness. Custom KQL queries enable analysis of health event patterns, remediation success rates, and system performance metrics.
 
    ```bash
-   # Create custom queries for health monitoring analytics
+   # Create custom KQL queries for health monitoring analytics
    cat > health_monitoring_queries.kql << 'EOF'
-// Health Events Analysis
+// Health Events Analysis - Resource Health state changes
 AzureActivity
 | where CategoryValue == "ResourceHealth"
-| summarize count() by ResourceId, Status, bin(TimeGenerated, 1h)
+| where OperationNameValue == "Microsoft.ResourceHealth/healthevent/Activated/action"
+| summarize count() by ResourceId, 
+    tostring(Properties.currentHealthStatus), 
+    bin(TimeGenerated, 1h)
 | order by TimeGenerated desc
 
-// Remediation Actions Tracking
+// Logic Apps Execution Tracking
 AzureActivity
-| where OperationNameValue contains "Logic"
 | where ResourceProvider == "Microsoft.Logic"
-| summarize count() by bin(TimeGenerated, 1h), OperationNameValue
+| where OperationNameValue contains "workflows/runs"
+| summarize count() by OperationNameValue, 
+    ActivityStatusValue, 
+    bin(TimeGenerated, 1h)
 | order by TimeGenerated desc
 
-// Service Bus Message Processing
-ServiceBusLogs
+// Service Bus Message Processing Metrics
+AzureDiagnostics
+| where ResourceProvider == "MICROSOFT.SERVICEBUS"
 | where Category == "OperationalLogs"
-| summarize count() by bin(TimeGenerated, 15m), Status
+| summarize count() by OperationName, 
+    ResultType, 
+    bin(TimeGenerated, 15m)
 | order by TimeGenerated desc
+
+// Health Alert Response Time Analysis
+AzureActivity
+| where CategoryValue == "ResourceHealth"
+| extend AlertTriggered = TimeGenerated
+| join kind=inner (
+    AzureActivity
+    | where ResourceProvider == "Microsoft.Logic"
+    | extend WorkflowStarted = TimeGenerated
+) on CorrelationId
+| extend ResponseTimeMinutes = datetime_diff('minute', WorkflowStarted, AlertTriggered)
+| summarize avg(ResponseTimeMinutes), max(ResponseTimeMinutes), min(ResponseTimeMinutes)
+    by bin(TimeGenerated, 1h)
 EOF
 
    echo "✅ Monitoring queries created for health analytics"
+   echo "Import these queries into your Log Analytics workspace for monitoring"
    ```
 
    The monitoring dashboard and queries provide essential visibility into your health monitoring system's operation, enabling performance optimization and troubleshooting of remediation workflows.
@@ -482,7 +507,7 @@ EOF
        --namespace-name ${SERVICE_BUS_NAMESPACE} \
        --resource-group ${RESOURCE_GROUP} \
        --name ${HEALTH_QUEUE_NAME} \
-       --query "{Name:name,Status:status,MessageCount:messageCount}" \
+       --query "{Name:name,Status:status,MaxSizeInMegabytes:maxSizeInMegabytes}" \
        --output table
    ```
 
@@ -491,29 +516,16 @@ EOF
 2. **Test Logic Apps Workflow Execution**:
 
    ```bash
-   # Check Logic Apps workflow status
-   az logic workflow show \
+   # Check Logic Apps status
+   az logicapp show \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --query "{Name:name,State:state,Location:location}" \
        --output table
    
-   # Verify workflow run history
-   az logic workflow run list \
-       --workflow-name ${LOGIC_APP_NAME} \
-       --resource-group ${RESOURCE_GROUP} \
-       --query "[].{RunId:name,Status:status,StartTime:startTime}" \
-       --output table
-   ```
-
-   Expected output: Logic Apps should show "Enabled" state with successful run history.
-
-3. **Simulate Health Event Processing**:
-
-   ```bash
-   # Send test health event to Logic Apps trigger
+   # Test workflow with sample health event
    curl -X POST \
-       "${LOGIC_APP_TRIGGER_URL}" \
+       "${LOGIC_APP_CALLBACK_URL}" \
        -H "Content-Type: application/json" \
        -d '{
          "resourceId": "/subscriptions/'${SUBSCRIPTION_ID}'/resourceGroups/'${RESOURCE_GROUP}'/providers/Microsoft.Compute/virtualMachines/test-vm",
@@ -525,40 +537,53 @@ EOF
    echo "✅ Test health event sent to Logic Apps"
    ```
 
-4. **Monitor Service Bus Message Processing**:
+   Expected output: Logic Apps should show "Running" state and process the test event successfully.
+
+3. **Verify Resource Health Alert Configuration**:
 
    ```bash
-   # Check message counts in queue and topic
-   az servicebus queue show \
-       --namespace-name ${SERVICE_BUS_NAMESPACE} \
+   # Check Activity Log Alert status
+   az monitor activity-log alert show \
+       --name "vm-health-alert-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${HEALTH_QUEUE_NAME} \
-       --query "messageCount"
+       --query "{Name:name,Enabled:enabled,Location:location}" \
+       --output table
    
-   az servicebus topic show \
-       --namespace-name ${SERVICE_BUS_NAMESPACE} \
+   # Verify VM health status
+   az vm get-instance-view \
+       --name "vm-health-demo-${RANDOM_SUFFIX}" \
        --resource-group ${RESOURCE_GROUP} \
-       --name ${REMEDIATION_TOPIC_NAME} \
-       --query "messageCount"
+       --query "instanceView.vmHealth.status.code" \
+       --output tsv
    ```
+
+   Expected output: Alert should be enabled and VM should show healthy status.
+
+4. **Monitor Action Group Integration**:
+
+   ```bash
+   # Check Action Group configuration
+   az monitor action-group show \
+       --name ${ACTION_GROUP_NAME} \
+       --resource-group ${RESOURCE_GROUP} \
+       --query "{Name:name,Enabled:enabled,WebhookReceivers:webhookReceivers[0].name}" \
+       --output table
+   ```
+
+   Expected output: Action Group should be enabled with webhook receiver configured.
 
 ## Cleanup
 
 1. **Remove Logic Apps and Workflows**:
 
    ```bash
-   # Delete Logic Apps workflows
-   az logic workflow delete \
+   # Delete Logic App
+   az logicapp delete \
        --name ${LOGIC_APP_NAME} \
        --resource-group ${RESOURCE_GROUP} \
        --yes
    
-   az logic workflow delete \
-       --name "la-restart-handler-${RANDOM_SUFFIX}" \
-       --resource-group ${RESOURCE_GROUP} \
-       --yes
-   
-   echo "✅ Logic Apps workflows deleted"
+   echo "✅ Logic App deleted"
    ```
 
 2. **Clean Up Service Bus Resources**:
@@ -611,9 +636,9 @@ The Service Bus integration provides enterprise-grade messaging reliability with
 
 Logic Apps serves as the intelligent orchestration layer that bridges Resource Health events with business-specific remediation workflows. The serverless nature of Logic Apps eliminates infrastructure management overhead while providing rich integration capabilities with over 400 built-in connectors. This enables seamless integration with existing tools, notification systems, and automation platforms. The visual workflow designer simplifies maintenance and enables non-technical stakeholders to understand and modify remediation logic. For detailed Logic Apps guidance, review the [Logic Apps documentation](https://docs.microsoft.com/en-us/azure/logic-apps/) and [workflow best practices](https://docs.microsoft.com/en-us/azure/logic-apps/logic-apps-workflow-definition-language-functions-reference).
 
-From a cost perspective, this solution leverages consumption-based pricing models that scale automatically with actual usage. Service Bus Standard tier provides sufficient capabilities for most scenarios while maintaining cost-effectiveness. Logic Apps consumption plans ensure you only pay for actual executions, making this solution financially viable for organizations of all sizes. The modular architecture enables incremental deployment and scaling based on specific business needs and resource criticality. For cost optimization strategies, see the [Azure cost management documentation](https://docs.microsoft.com/en-us/azure/cost-management-billing/) and [Service Bus pricing guidance](https://docs.microsoft.com/en-us/azure/service-bus-messaging/service-bus-pricing-billing).
+From a cost perspective, this solution leverages consumption-based pricing models that scale automatically with actual usage. Service Bus Standard tier provides sufficient capabilities for most scenarios while maintaining cost-effectiveness. Logic Apps Standard plans offer predictable pricing for high-volume scenarios while maintaining enterprise-grade features. The modular architecture enables incremental deployment and scaling based on specific business needs and resource criticality. For cost optimization strategies, see the [Azure cost management documentation](https://docs.microsoft.com/en-us/azure/cost-management-billing/) and [Service Bus pricing guidance](https://docs.microsoft.com/en-us/azure/service-bus-messaging/service-bus-pricing-billing).
 
-> **Tip**: Enable Service Bus message sessions for scenarios requiring ordered processing of health events from the same resource. This ensures remediation actions are processed in the correct sequence and prevents conflicting operations. Configure appropriate message TTL values to prevent stale health events from triggering unnecessary remediation actions.
+> **Tip**: Configure Resource Health alerts to filter out "Unknown" status events to reduce noise from temporary communication issues. Use the condition `properties.currentHealthStatus != 'Unknown' and properties.previousHealthStatus != 'Unknown'` in your alert rules to focus on actionable health state changes that require immediate attention.
 
 ## Challenge
 

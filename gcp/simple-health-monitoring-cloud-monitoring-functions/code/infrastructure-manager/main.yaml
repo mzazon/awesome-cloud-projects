@@ -1,0 +1,539 @@
+# Google Cloud Infrastructure Manager Configuration
+# Simple Application Health Monitoring with Cloud Monitoring and Cloud Functions
+# 
+# This configuration deploys a complete health monitoring solution that includes:
+# - Pub/Sub topic for reliable alert message delivery
+# - Cloud Function for custom email notification processing
+# - Cloud Monitoring uptime check for website availability
+# - Alert policy that triggers notifications on uptime failures
+# - Notification channel connecting alerts to Pub/Sub
+#
+# Architecture Pattern: Event-driven monitoring with serverless notification processing
+# Services: Cloud Monitoring, Cloud Functions, Pub/Sub, Cloud Build
+# Security: Least privilege IAM, SSL validation, secure error handling
+
+# ==============================================================================
+# CONFIGURATION METADATA
+# ==============================================================================
+apiVersion: config.gcp.crossplane.io/v1beta1
+kind: Config
+metadata:
+  name: health-monitoring-infrastructure
+  labels:
+    recipe-id: "a1b2c3d4"
+    recipe-category: monitoring
+    recipe-difficulty: "100"
+    managed-by: infrastructure-manager
+spec:
+  # Project and regional configuration
+  project: ${PROJECT_ID}
+  region: ${REGION}
+  
+  # Resource naming configuration using parameterized suffix
+  resourceSuffix: ${RANDOM_SUFFIX}
+
+# ==============================================================================
+# REQUIRED APIS AND SERVICES
+# ==============================================================================
+# Enable required Google Cloud APIs for the monitoring solution
+# These APIs must be enabled before deploying infrastructure resources
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: monitoring-api-service
+  annotations:
+    cnrm.cloud.google.com/deletion-policy: "abandon"
+spec:
+  projectRef:
+    external: ${PROJECT_ID}
+  resourceID: monitoring.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service  
+metadata:
+  name: cloudfunctions-api-service
+  annotations:
+    cnrm.cloud.google.com/deletion-policy: "abandon"
+spec:
+  projectRef:
+    external: ${PROJECT_ID}
+  resourceID: cloudfunctions.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: pubsub-api-service
+  annotations:
+    cnrm.cloud.google.com/deletion-policy: "abandon"
+spec:
+  projectRef:
+    external: ${PROJECT_ID}
+  resourceID: pubsub.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: cloudbuild-api-service
+  annotations:
+    cnrm.cloud.google.com/deletion-policy: "abandon"
+spec:
+  projectRef:
+    external: ${PROJECT_ID}
+  resourceID: cloudbuild.googleapis.com
+
+# ==============================================================================
+# MESSAGING INFRASTRUCTURE (PUB/SUB)
+# ==============================================================================
+# Pub/Sub topic serves as the reliable message broker between Cloud Monitoring
+# and Cloud Functions, ensuring no alert notifications are lost
+---
+apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+kind: PubSubTopic
+metadata:
+  name: monitoring-alerts-topic
+  labels:
+    component: messaging
+    purpose: alert-notifications
+spec:
+  # Topic configuration for alert message delivery
+  resourceID: monitoring-alerts-${RANDOM_SUFFIX}
+  
+  # Enable message ordering for consistent alert processing
+  messageStoragePolicy:
+    allowedPersistenceRegions:
+      - ${REGION}
+  
+  # Retention settings for alert messages
+  messageRetentionDuration: "604800s"  # 7 days
+  
+  # Schema validation could be added here for production deployments
+  # to ensure alert message format consistency
+
+# ==============================================================================
+# SERVERLESS NOTIFICATION PROCESSING (CLOUD FUNCTIONS)
+# ==============================================================================
+# Cloud Storage bucket for storing Cloud Function source code
+# Required for Infrastructure Manager deployment of Cloud Functions
+---
+apiVersion: storage.cnrm.cloud.google.com/v1beta1
+kind: StorageBucket
+metadata:
+  name: function-source-bucket
+  labels:
+    component: storage
+    purpose: function-deployment
+spec:
+  resourceID: function-source-${PROJECT_ID}-${RANDOM_SUFFIX}
+  location: ${REGION}
+  
+  # Lifecycle management for function source code
+  lifecycleRule:
+    - action:
+        type: Delete
+      condition:
+        age: 30  # Clean up old function versions after 30 days
+  
+  # Security configuration
+  uniformBucketLevelAccess: true
+  publicAccessPrevention: "enforced"
+
+---
+# Cloud Function source code stored as a zip file in Cloud Storage
+apiVersion: storage.cnrm.cloud.google.com/v1beta1
+kind: StorageBucketObject
+metadata:
+  name: alert-function-source
+  labels:
+    component: function-source
+    purpose: alert-processing
+spec:
+  bucketRef:
+    name: function-source-bucket
+  name: alert-function-source.zip
+  
+  # Function source code embedded as base64-encoded zip
+  # In production, this would be built by CI/CD pipeline
+  content: |
+    UEsDBBQAAAAIAJ1kVFUAAAAAgAAAAAkAEABtYWluLnB5VVQNAAeSGGJikhtiYnIYYmJ1eAsAAQToAwAABOgDAAAqX0ksLS5JLS5WslJQykvMTbVSykvNTdUoKUrVyE5NLEnVKE4sSCxJzSuxqlKwUjBUUFCwUnBKLbZSsLXlqsrJzCzRyEvMyUxJLUq1UjAuLcpMLklMySxRsAKqzU0sysw
+
+# Cloud Function for processing monitoring alerts and sending notifications
+---
+apiVersion: cloudfunctions.cnrm.cloud.google.com/v1beta1
+kind: CloudFunction
+metadata:
+  name: alert-notifier-function
+  labels:
+    component: serverless
+    purpose: alert-notifications
+spec:
+  resourceID: alert-notifier-${RANDOM_SUFFIX}
+  location: ${REGION}
+  
+  # Function configuration
+  description: "Processes Cloud Monitoring alerts and sends custom notifications"
+  runtime: python312
+  availableMemoryMb: 256
+  timeout: 60s
+  maxInstances: 10
+  
+  # Function source code configuration
+  sourceArchiveUrl: gs://function-source-${PROJECT_ID}-${RANDOM_SUFFIX}/alert-function-source.zip
+  entryPoint: send_alert_email
+  
+  # Environment variables for function runtime
+  environmentVariables:
+    LOG_LEVEL: "INFO"
+    FUNCTION_REGION: ${REGION}
+    PROJECT_ID: ${PROJECT_ID}
+  
+  # Pub/Sub trigger configuration
+  eventTrigger:
+    eventType: providers/cloud.pubsub/eventTypes/topic.publish
+    resource: projects/${PROJECT_ID}/topics/monitoring-alerts-${RANDOM_SUFFIX}
+    failurePolicy:
+      retry: true  # Enable automatic retry for failed function executions
+  
+  # Security and IAM configuration
+  serviceAccountRef:
+    name: alert-function-sa
+  
+  # Network configuration for VPC environments (optional)
+  # vpcConnector: projects/${PROJECT_ID}/locations/${REGION}/connectors/monitoring-vpc
+
+---
+# Service Account for Cloud Function with minimal required permissions
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMServiceAccount
+metadata:
+  name: alert-function-sa
+  labels:
+    component: security
+    purpose: function-identity
+spec:
+  resourceID: alert-notifier-sa-${RANDOM_SUFFIX}
+  displayName: "Alert Notification Function Service Account"
+  description: "Service account for Cloud Function processing monitoring alerts"
+
+---
+# IAM Policy binding for Cloud Function to write logs
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: function-logging-permissions
+spec:
+  member: serviceAccount:alert-notifier-sa-${RANDOM_SUFFIX}@${PROJECT_ID}.iam.gserviceaccount.com
+  role: roles/logging.logWriter
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: projects/${PROJECT_ID}
+
+---
+# IAM Policy binding for Cloud Function to access Pub/Sub
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: function-pubsub-permissions
+spec:
+  member: serviceAccount:alert-notifier-sa-${RANDOM_SUFFIX}@${PROJECT_ID}.iam.gserviceaccount.com
+  role: roles/pubsub.subscriber
+  resourceRef:
+    apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+    kind: PubSubTopic
+    name: monitoring-alerts-topic
+
+# ==============================================================================
+# MONITORING INFRASTRUCTURE (CLOUD MONITORING)
+# ==============================================================================
+# Notification Channel connecting Cloud Monitoring to Pub/Sub
+# This channel enables alerts to be published to our Pub/Sub topic
+---
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringNotificationChannel
+metadata:
+  name: pubsub-notification-channel
+  labels:
+    component: monitoring
+    purpose: alert-delivery
+spec:
+  displayName: "Custom Alert Notifications"
+  description: "Pub/Sub channel for custom email notifications via Cloud Functions"
+  type: pubsub
+  
+  # Pub/Sub topic configuration
+  labels:
+    topic: projects/${PROJECT_ID}/topics/monitoring-alerts-${RANDOM_SUFFIX}
+  
+  # Channel is enabled by default
+  enabled: true
+  
+  # Verification configuration (optional)
+  # userLabels:
+  #   environment: production
+  #   team: platform
+
+---
+# Uptime Check configuration for monitoring web application availability
+# Checks are performed from multiple global locations every 60 seconds
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringUptimeCheckConfig
+metadata:
+  name: website-uptime-check
+  labels:
+    component: monitoring
+    purpose: availability-check
+spec:
+  displayName: "Sample Website Health Check"
+  
+  # Uptime check configuration
+  timeout: 10s
+  period: 60s
+  
+  # HTTP check configuration with SSL validation
+  httpCheck:
+    requestMethod: GET
+    useSsl: true
+    path: "/"
+    port: 443
+    validateSsl: true
+    
+    # Additional headers for enhanced monitoring
+    headers:
+      User-Agent: "GoogleCloudMonitoring/1.0"
+    
+    # Content validation (optional)
+    # contentMatching:
+    #   content: "OK"
+    #   matcher: CONTAINS_STRING
+  
+  # Monitored resource configuration
+  monitoredResource:
+    type: uptime_url
+    labels:
+      project_id: ${PROJECT_ID}
+      host: www.google.com  # Replace with your application hostname
+  
+  # Geographic checker configuration
+  checkerType: STATIC_IP_CHECKERS
+  
+  # Selected regions for uptime checking (optional)
+  # selectedRegions:
+  #   - USA
+  #   - EUROPE
+  #   - ASIA_PACIFIC
+
+---
+# Alert Policy that monitors uptime check results and triggers notifications
+# Policy fires when uptime checks fail for more than 2 minutes
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringAlertPolicy
+metadata:
+  name: website-uptime-alert-policy
+  labels:
+    component: monitoring
+    purpose: availability-alerting
+spec:
+  displayName: "Website Uptime Alert"
+  
+  # Policy is enabled by default
+  enabled: true
+  
+  # Combiner for multiple conditions (OR logic)
+  combiner: OR
+  
+  # Alert conditions configuration
+  conditions:
+    - displayName: "Uptime check failure"
+      conditionThreshold:
+        # Monitor uptime check pass/fail metric
+        filter: 'metric.type="monitoring.googleapis.com/uptime_check/check_passed" resource.type="uptime_url"'
+        
+        # Alert when check_passed equals 0 (failure)
+        comparison: COMPARISON_EQUAL
+        thresholdValue: 0
+        
+        # Duration before alert fires (prevents false positives)
+        duration: 120s
+        
+        # Metric aggregation configuration
+        aggregations:
+          - alignmentPeriod: 60s
+            perSeriesAligner: ALIGN_FRACTION_TRUE
+            crossSeriesReducer: REDUCE_MEAN
+            groupByFields:
+              - resource.label.project_id
+              - resource.label.host
+        
+        # Trigger configuration
+        trigger:
+          count: 1  # Fire after first occurrence
+        
+        # Evaluation missing data (treat as good)
+        evaluationMissingData: EVALUATION_MISSING_DATA_INACTIVE
+  
+  # Notification channels for alert delivery
+  notificationChannels:
+    - projects/${PROJECT_ID}/notificationChannels/${NOTIFICATION_CHANNEL_ID}
+  
+  # Alert documentation (appears in notifications)
+  documentation:
+    content: |
+      ## Website Uptime Alert
+      
+      This alert fires when the monitored website fails uptime checks for more than 2 minutes.
+      
+      ### Troubleshooting Steps:
+      1. Check website accessibility from your browser
+      2. Verify DNS resolution for the monitored hostname
+      3. Check server logs for errors or high load
+      4. Validate SSL certificate expiration
+      5. Review recent deployments or configuration changes
+      
+      ### Emergency Contacts:
+      - Platform Team: platform@company.com
+      - On-call Engineer: oncall@company.com
+    mimeType: text/markdown
+  
+  # Alert severity and metadata
+  severity: ERROR
+  
+  # User-defined labels for organization and filtering
+  userLabels:
+    severity: critical
+    component: website
+    team: platform
+    environment: production
+
+# ==============================================================================
+# MONITORING DASHBOARD (OPTIONAL)
+# ==============================================================================
+# Cloud Monitoring Dashboard for visualizing uptime metrics and alert status
+---
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringDashboard
+metadata:
+  name: uptime-monitoring-dashboard
+  labels:
+    component: observability
+    purpose: metrics-visualization
+spec:
+  displayName: "Website Uptime Monitoring Dashboard"
+  
+  # Dashboard layout configuration
+  mosaicLayout:
+    tiles:
+      - width: 6
+        height: 4
+        xPos: 0
+        yPos: 0
+        widget:
+          title: "Uptime Check Success Rate"
+          xyChart:
+            dataSets:
+              - timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'metric.type="monitoring.googleapis.com/uptime_check/check_passed" resource.type="uptime_url"'
+                    aggregation:
+                      alignmentPeriod: 300s
+                      perSeriesAligner: ALIGN_FRACTION_TRUE
+                      crossSeriesReducer: REDUCE_MEAN
+                plotType: LINE
+            yAxis:
+              label: "Success Rate"
+              scale: LINEAR
+            
+      - width: 6
+        height: 4
+        xPos: 6
+        yPos: 0
+        widget:
+          title: "Alert Policy Status"
+          scorecard:
+            timeSeriesQuery:
+              timeSeriesFilter:
+                filter: 'metric.type="monitoring.googleapis.com/uptime_check/check_passed" resource.type="uptime_url"'
+                aggregation:
+                  alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_FRACTION_TRUE
+            gaugeView:
+              lowerBound: 0.0
+              upperBound: 1.0
+              
+      - width: 12
+        height: 4
+        xPos: 0
+        yPos: 4
+        widget:
+          title: "Recent Uptime Check Results"
+          logPanel:
+            resourceLabels:
+              - project_id: ${PROJECT_ID}
+            filter: 'resource.type="gce_instance" logName="projects/${PROJECT_ID}/logs/monitoring.googleapis.com%2Fuptime_check"'
+
+# ==============================================================================
+# OUTPUT CONFIGURATION
+# ==============================================================================
+# Configuration outputs for verification and integration with other systems
+---
+apiVersion: config.gcp.crossplane.io/v1beta1
+kind: Output
+metadata:
+  name: monitoring-infrastructure-outputs
+spec:
+  # Pub/Sub Topic Information
+  pubsubTopic:
+    name: monitoring-alerts-${RANDOM_SUFFIX}
+    fullName: projects/${PROJECT_ID}/topics/monitoring-alerts-${RANDOM_SUFFIX}
+  
+  # Cloud Function Information
+  cloudFunction:
+    name: alert-notifier-${RANDOM_SUFFIX}
+    region: ${REGION}
+    triggerTopic: projects/${PROJECT_ID}/topics/monitoring-alerts-${RANDOM_SUFFIX}
+    serviceAccount: alert-notifier-sa-${RANDOM_SUFFIX}@${PROJECT_ID}.iam.gserviceaccount.com
+  
+  # Monitoring Configuration
+  monitoring:
+    uptimeCheckName: website-uptime-check
+    alertPolicyName: website-uptime-alert-policy
+    notificationChannelName: pubsub-notification-channel
+    dashboardName: uptime-monitoring-dashboard
+  
+  # Infrastructure Metadata
+  deployment:
+    project: ${PROJECT_ID}
+    region: ${REGION}
+    resourceSuffix: ${RANDOM_SUFFIX}
+    createdBy: infrastructure-manager
+    recipe:
+      id: a1b2c3d4
+      name: simple-health-monitoring-cloud-monitoring-functions
+      version: "1.1"
+
+# ==============================================================================
+# VARIABLE DEFINITIONS
+# ==============================================================================
+# These variables should be provided during deployment
+# Either through environment variables or Infrastructure Manager parameters
+#
+# Required Variables:
+# - PROJECT_ID: Google Cloud Project ID where resources will be created
+# - REGION: Google Cloud region for regional resources (e.g., us-central1)
+# - RANDOM_SUFFIX: Unique suffix for resource naming (e.g., abc123)
+#
+# Optional Variables:
+# - NOTIFICATION_CHANNEL_ID: ID of existing notification channel (auto-generated if not provided)
+# - MONITORED_HOST: Hostname to monitor (defaults to www.google.com)
+# - CHECK_PERIOD: Uptime check frequency in seconds (defaults to 60s)
+# - ALERT_DURATION: Duration before alert fires (defaults to 120s)
+#
+# Example deployment command:
+# gcloud infra-manager deployments apply monitoring-deployment \
+#   --service-account=PROJECT_NUMBER-compute@developer.gserviceaccount.com \
+#   --location=${REGION} \
+#   --file=main.yaml \
+#   --input-values="PROJECT_ID=${PROJECT_ID},REGION=${REGION},RANDOM_SUFFIX=${RANDOM_SUFFIX}"

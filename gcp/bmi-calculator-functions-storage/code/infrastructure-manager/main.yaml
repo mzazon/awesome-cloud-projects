@@ -1,0 +1,390 @@
+# BMI Calculator API Infrastructure Manager Configuration
+# This configuration deploys a serverless BMI calculator using Cloud Functions and Cloud Storage
+# Infrastructure Manager YAML for Google Cloud Platform
+
+# Configuration metadata
+metadata:
+  version: "1.0"
+  description: "BMI Calculator API with Cloud Functions and Cloud Storage"
+  labels:
+    recipe-id: "7f8e9a1b"
+    category: "serverless"
+    difficulty: "100"
+    services: "cloud-functions,cloud-storage"
+
+# Input parameters for customization
+inputs:
+  # Project configuration
+  - name: project_id
+    description: "Google Cloud Project ID where resources will be created"
+    type: string
+    required: true
+    
+  - name: region
+    description: "Google Cloud region for deploying resources"
+    type: string
+    default: "us-central1"
+    
+  - name: function_name
+    description: "Name for the Cloud Function"
+    type: string
+    default: "bmi-calculator"
+    
+  - name: bucket_name_suffix
+    description: "Unique suffix for the Cloud Storage bucket name"
+    type: string
+    required: true
+    
+  # Function configuration
+  - name: function_memory
+    description: "Memory allocation for the Cloud Function in MB"
+    type: string
+    default: "256MB"
+    
+  - name: function_timeout
+    description: "Timeout for the Cloud Function in seconds"
+    type: string
+    default: "60s"
+    
+  - name: python_runtime
+    description: "Python runtime version for the Cloud Function"
+    type: string
+    default: "python311"
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-cloud-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/cloudfunctions.googleapis.com
+      consumerId: project:$(ref.project_id)
+    metadata:
+      dependsOn: []
+      
+  - name: enable-cloud-build-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/cloudbuild.googleapis.com
+      consumerId: project:$(ref.project_id)
+    metadata:
+      dependsOn: []
+      
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/storage.googleapis.com
+      consumerId: project:$(ref.project_id)
+    metadata:
+      dependsOn: []
+      
+  - name: enable-artifact-registry-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/artifactregistry.googleapis.com
+      consumerId: project:$(ref.project_id)
+    metadata:
+      dependsOn: []
+      
+  - name: enable-cloud-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/run.googleapis.com
+      consumerId: project:$(ref.project_id)
+    metadata:
+      dependsOn: []
+
+  # Cloud Storage bucket for calculation history
+  - name: bmi-history-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: bmi-history-$(ref.bucket_name_suffix)
+      project: $(ref.project_id)
+      location: $(ref.region)
+      storageClass: STANDARD
+      # Enable uniform bucket-level access for better security
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Enable versioning for data protection
+      versioning:
+        enabled: true
+      # Set lifecycle rules for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Delete files older than 1 year
+              matchesStorageClass: [STANDARD]
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90  # Move to Coldline after 90 days
+              matchesStorageClass: [STANDARD]
+      # Enable logging for audit purposes
+      logging:
+        logBucket: $(ref.bmi-history-bucket)
+        logObjectPrefix: access-logs/
+      # Security labels
+      labels:
+        purpose: bmi-calculation-history
+        environment: production
+        data-classification: healthcare
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Service account for Cloud Function with minimal permissions
+  - name: bmi-function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: bmi-function-sa
+      serviceAccount:
+        displayName: "BMI Calculator Function Service Account"
+        description: "Service account for BMI Calculator Cloud Function with minimal permissions"
+      project: $(ref.project_id)
+    metadata:
+      dependsOn: []
+
+  # IAM binding for Cloud Function service account to access Storage bucket
+  - name: storage-object-creator-binding
+    type: gcp-types/storage-v1:buckets.iamPolicy
+    properties:
+      bucket: $(ref.bmi-history-bucket.name)
+      policy:
+        bindings:
+          - role: roles/storage.objectCreator
+            members:
+              - serviceAccount:$(ref.bmi-function-service-account.email)
+          - role: roles/storage.legacyBucketReader
+            members:
+              - serviceAccount:$(ref.bmi-function-service-account.email)
+    metadata:
+      dependsOn:
+        - bmi-history-bucket
+        - bmi-function-service-account
+
+  # Cloud Function for BMI calculation
+  - name: bmi-calculator-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      functionId: $(ref.function_name)
+      function:
+        # Function description and labels
+        description: "Serverless HTTP API for BMI calculation with history storage"
+        labels:
+          purpose: bmi-calculation
+          environment: production
+          runtime: $(ref.python_runtime)
+        
+        # Build configuration
+        buildConfig:
+          runtime: $(ref.python_runtime)
+          entryPoint: calculate_bmi
+          # Source code configuration - this would typically reference a Cloud Storage object
+          # For this example, we'll use inline source code
+          source:
+            storageSource:
+              # Note: In a real deployment, you would upload your source to Cloud Storage
+              # and reference it here. For Infrastructure Manager, you typically
+              # prepare the source separately and reference the Cloud Storage object.
+              bucket: ""  # Would be populated with source bucket
+              object: ""  # Would be populated with source object path
+          # Environment variables for build
+          environmentVariables:
+            BUILD_ENV_VAR: "production"
+        
+        # Service configuration
+        serviceConfig:
+          # Maximum instances for cost control and scaling limits
+          maxInstanceCount: 100
+          # Minimum instances (0 for cost optimization)
+          minInstanceCount: 0
+          # Available memory for the function
+          availableMemory: $(ref.function_memory)
+          # Request timeout
+          timeoutSeconds: $(text-to-int $(ref.function_timeout | split('s') | .[0]))
+          # Environment variables for runtime
+          environmentVariables:
+            BUCKET_NAME: $(ref.bmi-history-bucket.name)
+            FUNCTION_REGION: $(ref.region)
+            LOG_LEVEL: "INFO"
+          # Service account configuration
+          serviceAccountEmail: $(ref.bmi-function-service-account.email)
+          # Ingress settings - allow all traffic for public API
+          ingressSettings: ALLOW_ALL
+          # Security settings
+          securityLevel: SECURE_ALWAYS
+        
+        # Event trigger configuration for HTTP
+        eventTrigger:
+          triggerRegion: $(ref.region)
+          eventType: providers/cloud.pubsub/eventTypes/topic.publish
+          # For HTTP functions, we need to configure this differently
+          # Using httpsTrigger instead for gen2 functions
+    metadata:
+      dependsOn:
+        - enable-cloud-functions-api
+        - enable-cloud-build-api
+        - enable-cloud-run-api
+        - bmi-function-service-account
+        - storage-object-creator-binding
+
+  # Alternative HTTP trigger configuration for gen2 Cloud Functions
+  - name: bmi-calculator-function-http
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      functionId: $(ref.function_name)-http
+      function:
+        description: "HTTP-triggered BMI Calculator API function"
+        labels:
+          purpose: bmi-calculation-api
+          environment: production
+          trigger-type: http
+        
+        buildConfig:
+          runtime: $(ref.python_runtime)
+          entryPoint: calculate_bmi
+          # Docker configuration for gen2 functions
+          dockerRepository: projects/$(ref.project_id)/locations/$(ref.region)/repositories/gcf-artifacts
+          
+        serviceConfig:
+          maxInstanceCount: 100
+          minInstanceCount: 0
+          availableMemory: $(ref.function_memory)
+          timeoutSeconds: 60
+          environmentVariables:
+            BUCKET_NAME: $(ref.bmi-history-bucket.name)
+            FUNCTION_REGION: $(ref.region)
+            PYTHON_VERSION: $(ref.python_runtime)
+          serviceAccountEmail: $(ref.bmi-function-service-account.email)
+          ingressSettings: ALLOW_ALL
+          # Enable all users to invoke the function (public API)
+          allUsersIamPolicy:
+            bindings:
+              - role: roles/cloudfunctions.invoker
+                members:
+                  - allUsers
+    metadata:
+      dependsOn:
+        - enable-cloud-functions-api
+        - enable-cloud-build-api
+        - enable-cloud-run-api
+        - bmi-function-service-account
+        - storage-object-creator-binding
+
+  # Cloud Monitoring alert policy for function errors
+  - name: function-error-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      project: projects/$(ref.project_id)
+      alertPolicy:
+        displayName: "BMI Function Error Rate Alert"
+        documentation:
+          content: "Alert when BMI Calculator function error rate exceeds threshold"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Function error rate condition"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.labels.function_name="$(ref.function_name)"'
+              comparison: GREATER_THAN
+              thresholdValue: 0.05  # 5% error rate
+              duration: "300s"  # 5 minutes
+              aggregations:
+                - alignmentPeriod: "60s"
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.labels.function_name
+        # Notification channels would be configured here
+        enabled: true
+        alertStrategy:
+          autoClose: "86400s"  # 24 hours
+    metadata:
+      dependsOn:
+        - bmi-calculator-function-http
+
+  # Cloud Storage bucket IAM policy for public read access to function logs (optional)
+  - name: bucket-public-read-policy
+    type: gcp-types/storage-v1:buckets.iamPolicy
+    properties:
+      bucket: $(ref.bmi-history-bucket.name)
+      policy:
+        bindings:
+          # Function service account permissions
+          - role: roles/storage.objectCreator
+            members:
+              - serviceAccount:$(ref.bmi-function-service-account.email)
+          - role: roles/storage.legacyBucketReader
+            members:
+              - serviceAccount:$(ref.bmi-function-service-account.email)
+          # Optional: Admin access for project owners
+          - role: roles/storage.admin
+            members:
+              - projectOwner:$(ref.project_id)
+              - projectEditor:$(ref.project_id)
+    metadata:
+      dependsOn:
+        - bmi-history-bucket
+        - bmi-function-service-account
+
+# Output values for reference and integration
+outputs:
+  - name: function_url
+    description: "HTTPS URL of the deployed BMI Calculator function"
+    value: $(ref.bmi-calculator-function-http.serviceConfig.uri)
+    
+  - name: bucket_name
+    description: "Name of the Cloud Storage bucket for calculation history"
+    value: $(ref.bmi-history-bucket.name)
+    
+  - name: bucket_url
+    description: "Cloud Storage bucket URL"
+    value: "gs://$(ref.bmi-history-bucket.name)"
+    
+  - name: function_service_account
+    description: "Email of the function's service account"
+    value: $(ref.bmi-function-service-account.email)
+    
+  - name: project_id
+    description: "Google Cloud Project ID used for deployment"
+    value: $(ref.project_id)
+    
+  - name: region
+    description: "Google Cloud region where resources are deployed"
+    value: $(ref.region)
+    
+  - name: function_name
+    description: "Name of the deployed Cloud Function"
+    value: $(ref.function_name)
+
+# Deployment notes and requirements
+# 
+# Prerequisites:
+# 1. Google Cloud CLI installed and authenticated
+# 2. Infrastructure Manager API enabled in the target project
+# 3. Sufficient IAM permissions for resource creation
+# 4. Function source code prepared and uploaded to Cloud Storage
+#
+# Deployment command:
+# gcloud infra-manager deployments create bmi-calculator-deployment \
+#   --location=us-central1 \
+#   --file=main.yaml \
+#   --input-values=project_id=YOUR-PROJECT-ID,bucket_name_suffix=UNIQUE-SUFFIX
+#
+# Security considerations:
+# - Function uses a dedicated service account with minimal permissions
+# - Storage bucket has uniform bucket-level access enabled
+# - Function allows public access (suitable for public API)
+# - Monitoring alerts configured for error detection
+# - Lifecycle policies configured for cost optimization
+#
+# Cost optimization features:
+# - Minimum instances set to 0 (no cold start penalty for demo)
+# - Storage lifecycle rules for automatic data archival
+# - Function timeout limits to prevent runaway costs
+# - Maximum instance limits to control scaling costs

@@ -4,12 +4,12 @@ id: f3a8b7e2
 category: devops
 difficulty: 200
 subject: gcp
-services: Google Workspace APIs, Cloud Run, Cloud Scheduler, Pub/Sub
+services: Cloud Run, Pub/Sub, Cloud Scheduler, Secret Manager
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: automation, code-review, documentation, workspace, api-integration, serverless, workflow-orchestration
 recipe-generator-version: 1.3
@@ -306,7 +306,6 @@ echo "✅ APIs enabled successfully"
        try:
            credentials = get_workspace_credentials()
            docs_service = build('docs', 'v1', credentials=credentials)
-           drive_service = build('drive', 'v3', credentials=credentials)
            
            # Create new document
            doc = docs_service.documents().create(body={
@@ -414,16 +413,16 @@ echo "✅ APIs enabled successfully"
        app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
    EOF
    
-   # Create requirements file
+   # Create requirements file with current versions
    cat > requirements.txt << 'EOF'
-   flask==2.3.3
-   google-cloud-secret-manager==2.16.4
-   google-cloud-storage==2.10.0
-   google-cloud-pubsub==2.18.1
-   google-api-python-client==2.95.0
-   google-auth==2.22.0
-   google-auth-oauthlib==1.0.0
-   google-auth-httplib2==0.1.0
+   flask==3.0.0
+   google-cloud-secret-manager==2.18.1
+   google-cloud-storage==2.12.0
+   google-cloud-pubsub==2.19.0
+   google-api-python-client==2.109.0
+   google-auth==2.24.0
+   google-auth-oauthlib==1.1.0
+   google-auth-httplib2==0.2.0
    requests==2.31.0
    EOF
    
@@ -929,10 +928,13 @@ echo "✅ APIs enabled successfully"
 
    ```bash
    # Check Cloud Run services status
-   gcloud run services list --region ${REGION} --format="table(metadata.name,status.url,status.conditions[0].type)"
+   gcloud run services list --region ${REGION} \
+       --format="table(metadata.name,status.url,status.conditions[0].type)"
    
    # Test service health endpoints
-   SERVICE_URL=$(gcloud run services describe ${SERVICE_NAME} --region ${REGION} --format="value(status.url)")
+   SERVICE_URL=$(gcloud run services describe ${SERVICE_NAME} \
+       --region ${REGION} \
+       --format="value(status.url)")
    curl -f "${SERVICE_URL}/health"
    ```
 
@@ -967,7 +969,8 @@ echo "✅ APIs enabled successfully"
 
    ```bash
    # Check Secret Manager access
-   gcloud secrets versions access latest --secret="workspace-credentials" > /dev/null
+   gcloud secrets versions access latest \
+       --secret="workspace-credentials" > /dev/null
    echo $? # Should return 0 for success
    
    # Verify Cloud Storage artifacts
@@ -1077,9 +1080,9 @@ This automation workflow demonstrates the power of combining Google Workspace AP
 
 The architecture follows Google Cloud's Well-Architected Framework principles by implementing robust error handling, comprehensive monitoring, and secure credential management through Secret Manager. The use of Pub/Sub for event-driven processing ensures reliable message delivery and enables loose coupling between services, allowing each component to scale independently based on workload demands. This design pattern is particularly effective for DevOps automation because it can handle varying code review frequencies and team sizes without manual infrastructure adjustments.
 
-The integration with Google Workspace APIs provides significant value by leveraging familiar collaboration tools that teams already use daily. Rather than introducing new platforms, this solution enhances existing workflows by automatically populating Google Docs with structured code review data and sending targeted Gmail notifications based on configurable criteria. The AI-powered analysis capabilities can be extended with additional intelligence layers, such as integration with Google Cloud's Vertex AI for more sophisticated code quality assessment and natural language generation for review summaries.
+The integration with Google Workspace APIs provides significant value by leveraging familiar collaboration tools that teams already use daily. Rather than introducing new platforms, this solution enhances existing workflows by automatically populating Google Docs with structured code review data and sending targeted Gmail notifications based on configurable criteria. The analysis capabilities can be extended with additional intelligence layers, such as integration with Google Cloud's Vertex AI for more sophisticated code quality assessment and natural language generation for review summaries.
 
-Security considerations are paramount in this implementation, with service accounts following the principle of least privilege and sensitive credentials stored securely in Secret Manager. The solution supports enterprise requirements through Google Workspace's administrative controls and audit logging, enabling organizations to maintain compliance while automating routine development processes. For organizations requiring enhanced security, the architecture can be extended with VPC Service Controls and additional encryption layers.
+Security considerations are paramount in this implementation, with service accounts following the principle of least privilege and sensitive credentials stored securely in Secret Manager. The solution supports enterprise requirements through Google Workspace's administrative controls and audit logging, enabling organizations to maintain compliance while automating routine development processes. For organizations requiring enhanced security, the architecture can be extended with VPC Service Controls and additional encryption layers. For more details on Google Cloud security best practices, see the [Google Cloud Security Documentation](https://cloud.google.com/security/best-practices).
 
 > **Tip**: Monitor the webhook processing latency through Cloud Monitoring to optimize the balance between document generation quality and response time, adjusting Cloud Run memory allocation and timeout settings based on actual usage patterns.
 

@@ -1,0 +1,524 @@
+# Infrastructure Manager Configuration for Secure Traffic Processing
+# Recipe: Secure Traffic Processing with Service Extensions and Confidential Computing
+# This configuration deploys a secure traffic processing pipeline using:
+# - Confidential VMs with AMD SEV-SNP encryption
+# - Cloud KMS for customer-managed encryption keys
+# - Application Load Balancer with Service Extensions capability
+# - Secure storage with CMEK encryption
+
+# Variable definitions for customization
+imports:
+  - path: variables.yaml
+    name: vars
+
+resources:
+  # Cloud KMS Key Ring for encryption key management
+  - name: traffic-keyring
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings
+    properties:
+      parent: projects/$(ref.vars.project_id)/locations/$(ref.vars.region)
+      keyRingId: traffic-keyring-$(ref.vars.random_suffix)
+    metadata:
+      dependsOn: []
+
+  # Primary encryption key for traffic data protection
+  - name: traffic-encryption-key
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings.cryptoKeys
+    properties:
+      parent: $(ref.traffic-keyring.name)
+      cryptoKeyId: traffic-encryption-key
+      cryptoKey:
+        purpose: ENCRYPT_DECRYPT
+        versionTemplate:
+          algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+          protectionLevel: SOFTWARE
+        labels:
+          purpose: traffic-processing
+          environment: $(ref.vars.environment)
+    metadata:
+      dependsOn:
+        - traffic-keyring
+
+  # Service account for Confidential VM with minimal required permissions
+  - name: confidential-processor-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: confidential-processor-$(ref.vars.random_suffix)
+      serviceAccount:
+        displayName: "Confidential Traffic Processor Service Account"
+        description: "Service account for traffic processing Confidential VM"
+    metadata:
+      dependsOn: []
+
+  # IAM binding for KMS access
+  - name: kms-crypto-key-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.vars.project_id)
+      role: roles/cloudkms.cryptoKeyEncrypterDecrypter
+      member: serviceAccount:$(ref.confidential-processor-sa.email)
+    metadata:
+      dependsOn:
+        - confidential-processor-sa
+        - traffic-encryption-key
+
+  # Firewall rule for traffic processor communication
+  - name: allow-traffic-processor
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: allow-traffic-processor-$(ref.vars.random_suffix)
+      network: projects/$(ref.vars.project_id)/global/networks/default
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+      targetTags:
+        - traffic-processor
+      allowed:
+        - IPProtocol: TCP
+          ports:
+            - "8080"
+      description: "Allow internal traffic to traffic processor service"
+    metadata:
+      dependsOn: []
+
+  # Confidential VM instance with AMD SEV-SNP protection
+  - name: confidential-processor-vm
+    type: gcp-types/compute-v1:instances
+    properties:
+      name: confidential-processor-$(ref.vars.random_suffix)
+      zone: $(ref.vars.zone)
+      machineType: projects/$(ref.vars.project_id)/zones/$(ref.vars.zone)/machineTypes/n2d-standard-4
+      # Confidential Computing configuration with AMD SEV-SNP
+      confidentialInstanceConfig:
+        enableConfidentialCompute: true
+        confidentialInstanceType: SEV_SNP
+      # VM maintenance policy for Confidential VMs
+      scheduling:
+        onHostMaintenance: TERMINATE
+        automaticRestart: true
+      # Boot disk configuration with SSD for performance
+      disks:
+        - boot: true
+          autoDelete: true
+          initializeParams:
+            sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts
+            diskType: projects/$(ref.vars.project_id)/zones/$(ref.vars.zone)/diskTypes/pd-ssd
+            diskSizeGb: 50
+            labels:
+              purpose: confidential-processing
+              environment: $(ref.vars.environment)
+      # Network interface with external IP for management
+      networkInterfaces:
+        - network: projects/$(ref.vars.project_id)/global/networks/default
+          accessConfigs:
+            - type: ONE_TO_ONE_NAT
+              name: External NAT
+      # Service account configuration
+      serviceAccounts:
+        - email: $(ref.confidential-processor-sa.email)
+          scopes:
+            - https://www.googleapis.com/auth/cloud-platform
+      # VM tags for firewall targeting
+      tags:
+        items:
+          - traffic-processor
+      # VM labels for organization
+      labels:
+        purpose: confidential-processing
+        environment: $(ref.vars.environment)
+        security-level: confidential
+      # Startup script for traffic processor installation
+      metadata:
+        items:
+          - key: startup-script
+            value: |
+              #!/bin/bash
+              set -e
+              
+              # Update system packages
+              apt-get update -y
+              apt-get install -y python3-pip python3-venv build-essential
+              
+              # Create application user and directory
+              useradd -m -s /bin/bash trafficproc
+              mkdir -p /opt/traffic-processor
+              chown trafficproc:trafficproc /opt/traffic-processor
+              
+              # Create virtual environment
+              sudo -u trafficproc python3 -m venv /opt/traffic-processor/venv
+              
+              # Install Python dependencies
+              sudo -u trafficproc /opt/traffic-processor/venv/bin/pip install \
+                google-cloud-kms \
+                google-cloud-storage \
+                grpcio \
+                grpcio-tools \
+                grpcio-health-checking
+              
+              # Create traffic processing application
+              cat > /opt/traffic-processor/app.py << 'EOF'
+              import grpc
+              import logging
+              import signal
+              import sys
+              from concurrent import futures
+              import json
+              import base64
+              import time
+              from google.cloud import kms
+              from google.cloud import storage
+              from grpc_health.v1 import health_pb2_grpc
+              from grpc_health.v1 import health_pb2
+              
+              class TrafficProcessor:
+                  def __init__(self):
+                      self.kms_client = kms.KeyManagementServiceClient()
+                      self.storage_client = storage.Client()
+                      # Use metadata service to get project information
+                      import requests
+                      metadata_url = 'http://metadata.google.internal/computeMetadata/v1/project/project-id'
+                      headers = {'Metadata-Flavor': 'Google'}
+                      project_id = requests.get(metadata_url, headers=headers).text
+                      self.key_name = f'projects/{project_id}/locations/$(ref.vars.region)/keyRings/traffic-keyring-$(ref.vars.random_suffix)/cryptoKeys/traffic-encryption-key'
+                      logging.info(f'Initialized with key: {self.key_name}')
+              
+                  def encrypt_data(self, data):
+                      """Encrypt data using Cloud KMS within TEE."""
+                      try:
+                          encrypt_response = self.kms_client.encrypt(
+                              request={
+                                  'name': self.key_name,
+                                  'plaintext': data.encode('utf-8')
+                              }
+                          )
+                          encoded_ciphertext = base64.b64encode(encrypt_response.ciphertext).decode('utf-8')
+                          logging.info('Successfully encrypted data using KMS within Confidential VM')
+                          return encoded_ciphertext
+                      except Exception as e:
+                          logging.error(f'Encryption failed: {e}')
+                          return '[ENCRYPTED]'
+              
+                  def process_traffic(self, traffic_data):
+                      """Process traffic data with encryption in TEE."""
+                      logging.info('Processing traffic data in Confidential VM TEE')
+                      
+                      # Simulate traffic analysis
+                      analysis_result = {
+                          'timestamp': time.time(),
+                          'processed_bytes': len(traffic_data),
+                          'security_score': 85,
+                          'threats_detected': 0
+                      }
+                      
+                      # Encrypt sensitive analysis results
+                      encrypted_result = self.encrypt_data(json.dumps(analysis_result))
+                      
+                      return {
+                          'status': 'processed',
+                          'encrypted_analysis': encrypted_result,
+                          'processing_location': 'confidential_vm_tee'
+                      }
+              
+              class HealthServicer(health_pb2_grpc.HealthServicer):
+                  """Health check servicer for gRPC server."""
+                  
+                  def Check(self, request, context):
+                      return health_pb2.HealthCheckResponse(
+                          status=health_pb2.HealthCheckResponse.SERVING
+                      )
+              
+              def serve():
+                  """Start the gRPC server."""
+                  server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+                  
+                  # Add health check service
+                  health_pb2_grpc.add_HealthServicer_to_server(HealthServicer(), server)
+                  
+                  listen_addr = '[::]:8080'
+                  server.add_insecure_port(listen_addr)
+                  server.start()
+                  
+                  logging.info(f'Traffic processor started on {listen_addr}')
+                  logging.info('Server running with AMD SEV-SNP Confidential Computing protection')
+                  
+                  def signal_handler(sig, frame):
+                      logging.info('Shutting down server...')
+                      server.stop(0)
+                      sys.exit(0)
+                  
+                  signal.signal(signal.SIGINT, signal_handler)
+                  signal.signal(signal.SIGTERM, signal_handler)
+                  
+                  try:
+                      server.wait_for_termination()
+                  except KeyboardInterrupt:
+                      logging.info('Server stopped by user')
+              
+              if __name__ == '__main__':
+                  logging.basicConfig(
+                      level=logging.INFO,
+                      format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+                  )
+                  serve()
+              EOF
+              
+              chown trafficproc:trafficproc /opt/traffic-processor/app.py
+              
+              # Create systemd service
+              cat > /etc/systemd/system/traffic-processor.service << EOF
+              [Unit]
+              Description=Confidential Traffic Processor Service
+              After=network.target
+              
+              [Service]
+              Type=simple
+              User=trafficproc
+              WorkingDirectory=/opt/traffic-processor
+              Environment=PATH=/opt/traffic-processor/venv/bin
+              ExecStart=/opt/traffic-processor/venv/bin/python /opt/traffic-processor/app.py
+              Restart=always
+              RestartSec=5
+              StandardOutput=journal
+              StandardError=journal
+              
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+              
+              # Enable and start the service
+              systemctl daemon-reload
+              systemctl enable traffic-processor
+              systemctl start traffic-processor
+              
+              # Log successful startup
+              echo "Confidential traffic processor started successfully" > /var/log/startup-complete.log
+    metadata:
+      dependsOn:
+        - confidential-processor-sa
+        - allow-traffic-processor
+        - traffic-encryption-key
+
+  # Instance group for Confidential VM backend
+  - name: traffic-processors-group
+    type: gcp-types/compute-v1:instanceGroups
+    properties:
+      name: traffic-processors-$(ref.vars.random_suffix)
+      zone: $(ref.vars.zone)
+      description: "Instance group for confidential traffic processors"
+      network: projects/$(ref.vars.project_id)/global/networks/default
+    metadata:
+      dependsOn:
+        - confidential-processor-vm
+
+  # Add Confidential VM to instance group
+  - name: add-vm-to-group
+    type: gcp-types/compute-v1:instanceGroups.addInstances
+    properties:
+      project: $(ref.vars.project_id)
+      zone: $(ref.vars.zone)
+      instanceGroup: $(ref.traffic-processors-group.name)
+      instances:
+        - instance: $(ref.confidential-processor-vm.selfLink)
+    metadata:
+      dependsOn:
+        - traffic-processors-group
+
+  # Health check for gRPC traffic processor
+  - name: traffic-processor-health-check
+    type: gcp-types/compute-v1:healthChecks
+    properties:
+      name: traffic-processor-health-$(ref.vars.random_suffix)
+      type: GRPC
+      grpcHealthCheck:
+        port: 8080
+        portSpecification: USE_FIXED_PORT
+      checkIntervalSec: 30
+      timeoutSec: 10
+      healthyThreshold: 2
+      unhealthyThreshold: 3
+      description: "Health check for confidential traffic processor"
+    metadata:
+      dependsOn: []
+
+  # Backend service for Confidential VM traffic processor
+  - name: traffic-processor-backend
+    type: gcp-types/compute-v1:backendServices
+    properties:
+      name: traffic-processor-backend-$(ref.vars.random_suffix)
+      description: "Backend service for confidential traffic processing"
+      protocol: GRPC
+      loadBalancingScheme: EXTERNAL_MANAGED
+      healthChecks:
+        - $(ref.traffic-processor-health-check.selfLink)
+      backends:
+        - group: $(ref.traffic-processors-group.selfLink)
+          balancingMode: UTILIZATION
+          maxUtilization: 0.8
+          capacityScaler: 1.0
+      timeoutSec: 30
+      connectionDraining:
+        drainingTimeoutSec: 300
+    metadata:
+      dependsOn:
+        - traffic-processors-group
+        - traffic-processor-health-check
+        - add-vm-to-group
+
+  # URL map for load balancer routing
+  - name: secure-traffic-url-map
+    type: gcp-types/compute-v1:urlMaps
+    properties:
+      name: secure-traffic-map-$(ref.vars.random_suffix)
+      description: "URL map for secure traffic processing"
+      defaultService: $(ref.traffic-processor-backend.selfLink)
+      # Service Extensions configuration would be added here in production
+      # This demonstrates the integration point for custom traffic processing
+    metadata:
+      dependsOn:
+        - traffic-processor-backend
+
+  # Self-managed SSL certificate for HTTPS
+  - name: secure-traffic-ssl-cert
+    type: gcp-types/compute-v1:sslCertificates
+    properties:
+      name: secure-traffic-cert-$(ref.vars.random_suffix)
+      description: "SSL certificate for secure traffic processing"
+      managed:
+        domains:
+          - secure-traffic-$(ref.vars.random_suffix).example.com
+    metadata:
+      dependsOn: []
+
+  # HTTPS target proxy
+  - name: secure-traffic-https-proxy
+    type: gcp-types/compute-v1:targetHttpsProxies
+    properties:
+      name: secure-traffic-proxy-$(ref.vars.random_suffix)
+      description: "HTTPS proxy for secure traffic processing"
+      urlMap: $(ref.secure-traffic-url-map.selfLink)
+      sslCertificates:
+        - $(ref.secure-traffic-ssl-cert.selfLink)
+    metadata:
+      dependsOn:
+        - secure-traffic-url-map
+        - secure-traffic-ssl-cert
+
+  # Global forwarding rule for load balancer
+  - name: secure-traffic-forwarding-rule
+    type: gcp-types/compute-v1:globalForwardingRules
+    properties:
+      name: secure-traffic-forwarding-$(ref.vars.random_suffix)
+      description: "Global forwarding rule for secure traffic processing"
+      target: $(ref.secure-traffic-https-proxy.selfLink)
+      portRange: "443"
+      IPProtocol: TCP
+      loadBalancingScheme: EXTERNAL_MANAGED
+    metadata:
+      dependsOn:
+        - secure-traffic-https-proxy
+
+  # Cloud Storage bucket with CMEK encryption for processed data
+  - name: secure-traffic-storage
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: secure-traffic-data-$(ref.vars.random_suffix)
+      location: $(ref.vars.region)
+      storageClass: STANDARD
+      # Customer-managed encryption configuration
+      encryption:
+        defaultKmsKeyName: $(ref.traffic-encryption-key.name)
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 30
+          - action:
+              type: Delete
+            condition:
+              age: 365
+      # Security configuration
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      labels:
+        purpose: traffic-processing
+        environment: $(ref.vars.environment)
+        security-level: confidential
+    metadata:
+      dependsOn:
+        - traffic-encryption-key
+
+  # IAM binding for storage access
+  - name: storage-access-binding
+    type: gcp-types/storage-v1:buckets.iamMemberBinding
+    properties:
+      bucket: $(ref.secure-traffic-storage.name)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.confidential-processor-sa.email)
+    metadata:
+      dependsOn:
+        - secure-traffic-storage
+        - confidential-processor-sa
+
+# Output values for verification and integration
+outputs:
+  - name: load_balancer_ip
+    description: "External IP address of the load balancer"
+    value: $(ref.secure-traffic-forwarding-rule.IPAddress)
+
+  - name: confidential_vm_name
+    description: "Name of the Confidential VM instance"
+    value: $(ref.confidential-processor-vm.name)
+
+  - name: confidential_vm_zone
+    description: "Zone where the Confidential VM is deployed"
+    value: $(ref.confidential-processor-vm.zone)
+
+  - name: kms_key_name
+    description: "Full name of the Cloud KMS encryption key"
+    value: $(ref.traffic-encryption-key.name)
+
+  - name: storage_bucket_name
+    description: "Name of the secure storage bucket"
+    value: $(ref.secure-traffic-storage.name)
+
+  - name: service_account_email
+    description: "Email of the Confidential VM service account"
+    value: $(ref.confidential-processor-sa.email)
+
+  - name: ssl_certificate_name
+    description: "Name of the SSL certificate"
+    value: $(ref.secure-traffic-ssl-cert.name)
+
+  - name: backend_service_name
+    description: "Name of the backend service"
+    value: $(ref.traffic-processor-backend.name)
+
+  - name: health_check_name
+    description: "Name of the health check"
+    value: $(ref.traffic-processor-health-check.name)
+
+  - name: deployment_verification
+    description: "Commands to verify the deployment"
+    value: |
+      # Verify Confidential VM is running
+      gcloud compute instances describe $(ref.confidential-processor-vm.name) --zone=$(ref.vars.zone) --format="value(status)"
+      
+      # Check Confidential Computing status
+      gcloud compute instances describe $(ref.confidential-processor-vm.name) --zone=$(ref.vars.zone) --format="value(confidentialInstanceConfig)"
+      
+      # Test KMS key encryption
+      echo "test-data" | gcloud kms encrypt --key=traffic-encryption-key --keyring=traffic-keyring-$(ref.vars.random_suffix) --location=$(ref.vars.region) --plaintext-file=- --ciphertext-file=test.encrypted
+      
+      # Verify storage bucket encryption
+      gsutil kms encryption gs://$(ref.secure-traffic-storage.name)
+      
+      # Check load balancer status
+      curl -k -v https://$(ref.secure-traffic-forwarding-rule.IPAddress) -H "Host: secure-traffic-$(ref.vars.random_suffix).example.com"

@@ -1,0 +1,472 @@
+# Infrastructure Manager Configuration for Simple Password Generator with Cloud Functions
+# This configuration deploys a serverless password generator API using Google Cloud Functions
+# with comprehensive security, monitoring, and best practices implementation.
+
+# Import required resource types
+imports:
+  - path: https://www.googleapis.com/compute/v1/projects/PROJECT_ID/global/networks
+  - path: https://www.googleapis.com/servicemanagement/v1/services
+  - path: https://www.googleapis.com/cloudfunctions/v2/projects/PROJECT_ID/locations/LOCATION/functions
+
+# Define template metadata
+info:
+  title: Password Generator Cloud Function Infrastructure
+  description: |
+    Deploys a secure, serverless password generator API using Google Cloud Functions Gen 2
+    with automatic scaling, comprehensive logging, and monitoring capabilities.
+  version: "1.0"
+  author: "Google Cloud Infrastructure Manager"
+
+# Input parameters for customization
+properties:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID where resources will be created"
+    pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+  
+  region:
+    type: string
+    description: "Google Cloud region for function deployment"
+    default: "us-central1"
+    enum:
+      - "us-central1"
+      - "us-east1"
+      - "us-west1"
+      - "europe-west1"
+      - "asia-east1"
+  
+  function_name:
+    type: string
+    description: "Name for the Cloud Function"
+    default: "password-generator"
+    pattern: "^[a-z][a-z0-9-]{0,62}$"
+  
+  memory_limit:
+    type: string
+    description: "Memory allocation for the function"
+    default: "256Mi"
+    enum:
+      - "128Mi"
+      - "256Mi"
+      - "512Mi"
+      - "1Gi"
+      - "2Gi"
+  
+  timeout:
+    type: string
+    description: "Function execution timeout"
+    default: "60s"
+  
+  max_instances:
+    type: integer
+    description: "Maximum number of function instances"
+    default: 10
+    minimum: 1
+    maximum: 1000
+  
+  min_instances:
+    type: integer
+    description: "Minimum number of function instances"
+    default: 0
+    minimum: 0
+    maximum: 1000
+  
+  allow_unauthenticated:
+    type: boolean
+    description: "Allow unauthenticated access to the function"
+    default: true
+  
+  environment:
+    type: string
+    description: "Environment tag for resource identification"
+    default: "development"
+    enum:
+      - "development"
+      - "staging"
+      - "production"
+
+# Define the infrastructure resources
+resources:
+  # Enable required Google Cloud APIs
+  - name: cloudfunctions-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: cloudfunctions.googleapis.com
+      projectId: $(ref.project_id)
+    metadata:
+      description: "Enable Cloud Functions API for serverless compute capabilities"
+
+  - name: cloudbuild-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: cloudbuild.googleapis.com
+      projectId: $(ref.project_id)
+    metadata:
+      description: "Enable Cloud Build API for function deployment and container building"
+
+  - name: run-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: run.googleapis.com
+      projectId: $(ref.project_id)
+    metadata:
+      description: "Enable Cloud Run API (required for Cloud Functions Gen 2)"
+
+  - name: logging-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: logging.googleapis.com
+      projectId: $(ref.project_id)
+    metadata:
+      description: "Enable Cloud Logging API for comprehensive log management"
+
+  - name: monitoring-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: monitoring.googleapis.com
+      projectId: $(ref.project_id)
+    metadata:
+      description: "Enable Cloud Monitoring API for performance and health tracking"
+
+  # Create Cloud Storage bucket for function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:storage.buckets
+    properties:
+      name: $(ref.project_id)-password-generator-source
+      project: $(ref.project_id)
+      location: $(ref.region)
+      storageClass: REGIONAL
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              numNewerVersions: 5
+      encryption:
+        defaultKmsKeyName: ""
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        purpose: "cloud-function-source"
+        environment: $(ref.environment)
+        managed-by: "infrastructure-manager"
+    metadata:
+      description: "Storage bucket for Cloud Function source code with versioning and lifecycle management"
+
+  # Create the Cloud Function source code archive
+  - name: function-source-archive
+    type: gcp-types/storage-v1:storage.objects
+    properties:
+      bucket: $(ref.function-source-bucket.name)
+      name: password-generator-source.zip
+      # Source code will be provided as base64 encoded zip file
+      # In a real deployment, this would reference actual source code
+      contentType: application/zip
+      metadata:
+        created-by: "infrastructure-manager"
+        function-name: $(ref.function_name)
+    metadata:
+      description: "Source code archive for the password generator function"
+
+  # Create IAM service account for the Cloud Function
+  - name: function-service-account
+    type: gcp-types/iam-v1:iam.projects.serviceAccounts
+    properties:
+      projectId: $(ref.project_id)
+      accountId: $(ref.function_name)-sa
+      serviceAccount:
+        displayName: "Password Generator Function Service Account"
+        description: "Service account for password generator Cloud Function with minimal required permissions"
+    metadata:
+      description: "Dedicated service account following least privilege principle"
+
+  # Grant minimal required permissions to the service account
+  - name: function-sa-logging-writer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      description: "Allow function to write logs to Cloud Logging"
+
+  - name: function-sa-monitoring-writer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      description: "Allow function to write metrics to Cloud Monitoring"
+
+  # Deploy the Cloud Function Gen 2
+  - name: password-generator-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      functionId: $(ref.function_name)
+      function:
+        description: "Secure password generator API with customizable complexity options"
+        buildConfig:
+          runtime: python311
+          entryPoint: generate_password
+          source:
+            storageSource:
+              bucket: $(ref.function-source-bucket.name)
+              object: $(ref.function-source-archive.name)
+          environmentVariables:
+            GOOGLE_FUNCTION_SOURCE: "password-generator"
+        serviceConfig:
+          timeoutSeconds: $(ref.timeout)
+          availableMemory: $(ref.memory_limit)
+          maxInstanceCount: $(ref.max_instances)
+          minInstanceCount: $(ref.min_instances)
+          maxInstanceRequestConcurrency: 1000
+          serviceAccountEmail: $(ref.function-service-account.email)
+          ingressSettings: ALLOW_ALL
+          environmentVariables:
+            LOG_LEVEL: "INFO"
+            FUNCTION_REGION: $(ref.region)
+            FUNCTION_PROJECT: $(ref.project_id)
+          # Security configuration
+          securityLevel: SECURE_ALWAYS
+          # Enable VPC connector if needed (commented out for basic deployment)
+          # vpcConnector: projects/$(ref.project_id)/locations/$(ref.region)/connectors/default
+          # vpcConnectorEgressSettings: ALL_TRAFFIC
+        labels:
+          purpose: "password-generation"
+          environment: $(ref.environment)
+          managed-by: "infrastructure-manager"
+          security-level: "public-api"
+    dependsOn:
+      - cloudfunctions-api
+      - cloudbuild-api
+      - run-api
+      - function-source-archive
+      - function-service-account
+    metadata:
+      description: "Main Cloud Function implementing secure password generation with HTTP trigger"
+
+  # Create IAM policy for public access (if enabled)
+  - name: function-public-access
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions.setIamPolicy
+    properties:
+      resource: $(ref.password-generator-function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    condition: $(ref.allow_unauthenticated)
+    metadata:
+      description: "Grant public access to the function (conditional based on allow_unauthenticated parameter)"
+
+  # Create Cloud Monitoring alert policy for function errors
+  - name: function-error-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      name: projects/$(ref.project_id)/alertPolicies/password-generator-errors
+      displayName: "Password Generator Function Errors"
+      documentation:
+        content: |
+          This alert triggers when the password generator function experiences elevated error rates.
+          This could indicate issues with function logic, external dependencies, or resource constraints.
+        mimeType: text/markdown
+      conditions:
+        - displayName: "Function Error Rate"
+          conditionThreshold:
+            filter: |
+              resource.type="cloud_function"
+              resource.labels.function_name="$(ref.function_name)"
+              metric.type="cloudfunctions.googleapis.com/function/execution_count"
+              metric.labels.status!="ok"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 5
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      alertStrategy:
+        autoClose: 1800s
+      enabled: true
+      combiner: OR
+    dependsOn:
+      - monitoring-api
+      - password-generator-function
+    metadata:
+      description: "Alert policy to monitor function error rates and notify on anomalies"
+
+  # Create Cloud Monitoring dashboard for function metrics
+  - name: function-monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/$(ref.project_id)
+      dashboard:
+        displayName: "Password Generator Function Metrics"
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: "Function Executions"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: |
+                            resource.type="cloud_function"
+                            resource.labels.function_name="$(ref.function_name)"
+                            metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                      plotType: LINE
+            - width: 6
+              height: 4
+              xPos: 6
+              widget:
+                title: "Function Duration"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: |
+                            resource.type="cloud_function"
+                            resource.labels.function_name="$(ref.function_name)"
+                            metric.type="cloudfunctions.googleapis.com/function/execution_times"
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_MEAN
+                      plotType: LINE
+            - width: 12
+              height: 4
+              yPos: 4
+              widget:
+                title: "Function Memory Usage"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: |
+                            resource.type="cloud_function"
+                            resource.labels.function_name="$(ref.function_name)"
+                            metric.type="cloudfunctions.googleapis.com/function/user_memory_bytes"
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_MEAN
+                      plotType: LINE
+    dependsOn:
+      - monitoring-api
+      - password-generator-function
+    metadata:
+      description: "Comprehensive monitoring dashboard for function performance and health metrics"
+
+  # Create log sink for function audit logs (optional, for production environments)
+  - name: function-audit-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/$(ref.project_id)
+      sink:
+        name: password-generator-audit-sink
+        description: "Audit log sink for password generator function access patterns"
+        destination: storage.googleapis.com/$(ref.function-source-bucket.name)/audit-logs
+        filter: |
+          resource.type="cloud_function"
+          resource.labels.function_name="$(ref.function_name)"
+          protoPayload.methodName="google.cloud.functions.v1.CloudFunctionsService.CallFunction"
+        includeChildren: true
+    condition: $(ref.environment) == "production"
+    dependsOn:
+      - logging-api
+      - password-generator-function
+      - function-source-bucket
+    metadata:
+      description: "Audit logging for production environments to track function access patterns"
+
+# Define outputs for integration and verification
+outputs:
+  function_url:
+    description: "HTTPS URL for the deployed password generator function"
+    value: $(ref.password-generator-function.serviceConfig.uri)
+  
+  function_name:
+    description: "Full resource name of the deployed function"
+    value: $(ref.password-generator-function.name)
+  
+  service_account_email:
+    description: "Email of the function's service account"
+    value: $(ref.function-service-account.email)
+  
+  source_bucket:
+    description: "Cloud Storage bucket containing function source code"
+    value: $(ref.function-source-bucket.name)
+  
+  project_id:
+    description: "Google Cloud Project ID where resources were created"
+    value: $(ref.project_id)
+  
+  region:
+    description: "Google Cloud region where function is deployed"
+    value: $(ref.region)
+  
+  monitoring_dashboard_url:
+    description: "URL to access the function monitoring dashboard"
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.function-monitoring-dashboard.name)?project=$(ref.project_id)
+  
+  function_logs_url:
+    description: "URL to access function logs in Cloud Console"
+    value: https://console.cloud.google.com/functions/details/$(ref.region)/$(ref.function_name)?project=$(ref.project_id)&tab=logs
+  
+  estimated_monthly_cost:
+    description: "Estimated monthly cost for the function (excluding free tier)"
+    value: "Varies based on usage. Free tier includes 2M invocations/month. Beyond free tier: ~$0.40 per million invocations"
+
+# Deployment configuration and metadata
+metadata:
+  version: "1.0"
+  created_date: "2025-01-12"
+  updated_date: "2025-01-12"
+  template_description: |
+    This Infrastructure Manager template deploys a complete serverless password generator
+    solution using Google Cloud Functions Gen 2. The template includes:
+    
+    - Cloud Function with Python 3.11 runtime for secure password generation
+    - Dedicated service account with minimal required permissions
+    - Cloud Storage bucket for source code with lifecycle management
+    - Comprehensive monitoring with Cloud Monitoring dashboard and alerts
+    - Optional audit logging for production environments
+    - Security best practices including HTTPS-only access and proper IAM roles
+    
+    The solution follows Google Cloud security best practices and can handle
+    variable request loads with automatic scaling while maintaining cost efficiency
+    through pay-per-invocation pricing.
+  
+  security_considerations: |
+    - Function uses dedicated service account with minimal permissions
+    - All communication is HTTPS-only (securityLevel: SECURE_ALWAYS)
+    - Source code stored in versioned Cloud Storage bucket
+    - Audit logging available for production environments
+    - Public access is configurable via allow_unauthenticated parameter
+    - Consider implementing API Gateway for additional security in production
+  
+  cost_optimization: |
+    - Uses Google Cloud free tier (2M invocations/month)
+    - Configurable memory allocation and scaling parameters
+    - Lifecycle policies on storage bucket to manage costs
+    - Monitoring alerts to detect unusual usage patterns
+    - Consider min_instances > 0 only for production workloads requiring low latency
+  
+  maintenance_notes: |
+    - Regularly update Python runtime and dependencies for security
+    - Monitor function performance through the included dashboard
+    - Review and rotate service account keys if using key-based authentication
+    - Update source code through Cloud Storage bucket with versioning
+    - Scale parameters can be adjusted based on actual usage patterns

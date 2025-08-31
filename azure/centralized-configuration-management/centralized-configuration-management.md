@@ -6,10 +6,10 @@ difficulty: 100
 subject: azure
 services: Azure App Configuration, Azure Key Vault, Azure Web Apps
 estimated-time: 75 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: configuration-management, secrets-management, devops, centralized-config, feature-flags
 recipe-generator-version: 1.3
@@ -80,7 +80,7 @@ graph TB
 ## Prerequisites
 
 1. Azure account with appropriate permissions for App Configuration, Key Vault, and Web Apps
-2. Azure CLI v2 installed and configured (or Azure CloudShell)
+2. Azure CLI v2.50 or later installed and configured (or Azure Cloud Shell)
 3. Basic understanding of Azure Resource Manager and managed identities
 4. Familiarity with web application deployment concepts
 5. Estimated cost: $5-15 USD for resources created during this recipe
@@ -150,7 +150,7 @@ echo "   Web App: ${WEB_APP_NAME}"
    Azure Key Vault provides enterprise-grade security for storing application secrets, certificates, and cryptographic keys. The service uses hardware security modules (HSMs) for key protection and integrates seamlessly with Azure Active Directory for access control, ensuring sensitive configuration data remains encrypted and auditable.
 
    ```bash
-   # Create Key Vault with soft delete and purge protection
+   # Create Key Vault with soft delete enabled
    az keyvault create \
        --name ${KEY_VAULT_NAME} \
        --resource-group ${RESOURCE_GROUP} \
@@ -168,7 +168,7 @@ echo "   Web App: ${WEB_APP_NAME}"
    az keyvault set-policy \
        --name ${KEY_VAULT_NAME} \
        --object-id ${USER_OBJECT_ID} \
-       --secret-permissions all
+       --secret-permissions get list set delete
 
    echo "✅ Key Vault created: ${KEY_VAULT_NAME}"
    ```
@@ -210,7 +210,7 @@ echo "   Web App: ${WEB_APP_NAME}"
    az keyvault secret set \
        --vault-name ${KEY_VAULT_NAME} \
        --name "DatabaseConnection" \
-       --value "Server=db.example.com;Database=prod;Uid=admin;Pwd=SecureP@ssw0rd123;"
+       --value "Server=db.example.com;Database=prod;User Id=admin;Password=SecureP@ssw0rd123;"
 
    az keyvault secret set \
        --vault-name ${KEY_VAULT_NAME} \

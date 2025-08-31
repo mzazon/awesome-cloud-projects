@@ -6,10 +6,10 @@ difficulty: 400
 subject: gcp
 services: Cloud IDS, BigQuery Data Canvas, Cloud Functions, Pub/Sub
 estimated-time: 150 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: security, threat-detection, network-monitoring, data-analytics, automation
 recipe-generator-version: 1.3
@@ -75,7 +75,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with Project Owner or Security Admin permissions for Cloud IDS, BigQuery, Cloud Functions, and Pub/Sub
-2. Google Cloud CLI (gcloud) installed and configured (version 400.0.0 or later)
+2. Google Cloud CLI (gcloud) installed and configured (version 450.0.0 or later)
 3. Understanding of network security concepts, SQL queries, and serverless functions
 4. VPC network with virtual machines to monitor (or ability to create test instances)
 5. Estimated cost: $200-500/month for Cloud IDS endpoint, BigQuery analysis, and Cloud Functions (varies by traffic volume)
@@ -195,11 +195,11 @@ echo "✅ Network infrastructure prepared for Cloud IDS"
    mkdir -p threat-processor-function
    cd threat-processor-function
    
-   # Create requirements.txt file
+   # Create requirements.txt file with updated package versions
    cat > requirements.txt << 'EOF'
-   google-cloud-bigquery==3.15.0
-   google-cloud-pubsub==2.18.4
-   google-cloud-logging==3.8.0
+   google-cloud-bigquery==3.17.0
+   google-cloud-pubsub==2.20.0
+   google-cloud-logging==3.9.0
    functions-framework==3.5.0
    EOF
    
@@ -272,9 +272,9 @@ echo "✅ Network infrastructure prepared for Cloud IDS"
            raise
    EOF
    
-   # Deploy Cloud Function
+   # Deploy Cloud Function with updated Python runtime
    gcloud functions deploy process-threat-finding \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-topic threat-detection-findings \
        --source . \
        --entry-point process_threat_finding \
@@ -302,16 +302,17 @@ echo "✅ Network infrastructure prepared for Cloud IDS"
    
    # Wait for endpoint creation (this may take 10-15 minutes)
    echo "Waiting for Cloud IDS endpoint creation..."
-   gcloud ids endpoints describe threat-detection-endpoint \
-       --zone ${ZONE} \
-       --format="value(state)" | grep -q "READY"
-   
-   while [ $? -ne 0 ]; do
-       echo "IDS endpoint still creating... waiting 60 seconds"
-       sleep 60
-       gcloud ids endpoints describe threat-detection-endpoint \
+   while true; do
+       STATE=$(gcloud ids endpoints describe threat-detection-endpoint \
            --zone ${ZONE} \
-           --format="value(state)" | grep -q "READY"
+           --format="value(state)")
+       
+       if [ "$STATE" = "READY" ]; then
+           break
+       fi
+       
+       echo "IDS endpoint still creating (current state: $STATE)... waiting 60 seconds"
+       sleep 60
    done
    
    # Get endpoint service attachment
@@ -335,7 +336,7 @@ echo "✅ Network infrastructure prepared for Cloud IDS"
        --zone ${ZONE} \
        --machine-type e2-medium \
        --network-interface subnet=threat-detection-subnet \
-       --image-family debian-11 \
+       --image-family debian-12 \
        --image-project debian-cloud \
        --tags web-server,mirrored-vm
    
@@ -343,7 +344,7 @@ echo "✅ Network infrastructure prepared for Cloud IDS"
        --zone ${ZONE} \
        --machine-type e2-medium \
        --network-interface subnet=threat-detection-subnet \
-       --image-family debian-11 \
+       --image-family debian-12 \
        --image-project debian-cloud \
        --tags app-server,mirrored-vm
    
@@ -407,11 +408,11 @@ echo "✅ Network infrastructure prepared for Cloud IDS"
    mkdir -p alert-processor-function
    cd alert-processor-function
    
-   # Create requirements.txt for alert processor
+   # Create requirements.txt for alert processor with updated versions
    cat > requirements.txt << 'EOF'
-   google-cloud-pubsub==2.18.4
-   google-cloud-logging==3.8.0
-   google-cloud-compute==1.14.1
+   google-cloud-pubsub==2.20.0
+   google-cloud-logging==3.9.0
+   google-cloud-compute==1.16.0
    functions-framework==3.5.0
    EOF
    
@@ -472,9 +473,9 @@ echo "✅ Network infrastructure prepared for Cloud IDS"
            raise
    EOF
    
-   # Deploy alert processing function
+   # Deploy alert processing function with updated Python runtime
    gcloud functions deploy process-security-alert \
-       --runtime python39 \
+       --runtime python312 \
        --trigger-topic security-alerts \
        --source . \
        --entry-point process_security_alert \
@@ -493,7 +494,7 @@ echo "✅ Network infrastructure prepared for Cloud IDS"
 
    ```bash
    # Create Cloud Monitoring alerting policy for IDS findings
-   cat > alerting-policy.json << EOF
+   cat > alerting-policy.json << 'EOF'
    {
      "displayName": "High Severity Threat Detection Alert",
      "documentation": {
@@ -526,7 +527,7 @@ echo "✅ Network infrastructure prepared for Cloud IDS"
    EOF
    
    # Create monitoring dashboard configuration
-   cat > dashboard-config.json << EOF
+   cat > dashboard-config.json << 'EOF'
    {
      "displayName": "Threat Detection Dashboard",
      "mosaicLayout": {
@@ -716,9 +717,9 @@ This automated threat detection pipeline demonstrates the power of combining Goo
 
 The integration of Cloud Functions and Pub/Sub creates a robust event-driven architecture that processes security findings asynchronously and triggers automated response workflows based on threat severity. This approach aligns with Google Cloud's security best practices by implementing defense in depth, automated monitoring, and rapid incident response capabilities. The visual analytics provided by BigQuery Data Canvas democratizes threat hunting by allowing security teams to explore complex data patterns without requiring deep SQL expertise.
 
-BigQuery Data Canvas represents a significant advancement in security analytics, leveraging Gemini AI to provide natural language interfaces for threat investigation. Security analysts can ask questions like "Show me all high-severity threats from the last 24 hours targeting our web servers" and receive both visual charts and underlying SQL queries, accelerating incident response and threat analysis workflows. This AI-powered approach enables faster pattern recognition and more effective threat hunting across large volumes of security telemetry data.
+BigQuery Data Canvas represents a significant advancement in security analytics, leveraging Gemini AI to provide natural language interfaces for threat investigation. Security analysts can ask questions like "Show me all high-severity threats from the last 24 hours targeting our web servers" and receive both visual charts and underlying SQL queries, accelerating incident response and threat analysis workflows. This AI-powered approach enables faster pattern recognition and more effective threat hunting across large volumes of security telemetry data, as documented in the [BigQuery Data Canvas documentation](https://cloud.google.com/bigquery/docs/data-canvas).
 
-The architecture follows Google Cloud's Well-Architected Framework principles by implementing operational excellence through automated monitoring and alerting, security through comprehensive threat detection and least privilege access, reliability through managed services and automatic scaling, performance efficiency through serverless processing, and cost optimization through pay-per-use pricing models. For production deployments, consider implementing additional security measures such as VPC Service Controls, customer-managed encryption keys, and integration with Security Command Center for centralized security management.
+The architecture follows Google Cloud's Well-Architected Framework principles by implementing operational excellence through automated monitoring and alerting, security through comprehensive threat detection and least privilege access, reliability through managed services and automatic scaling, performance efficiency through serverless processing, and cost optimization through pay-per-use pricing models. For production deployments, consider implementing additional security measures such as VPC Service Controls, customer-managed encryption keys, and integration with Security Command Center for centralized security management. The [Cloud IDS documentation](https://cloud.google.com/intrusion-detection-system/docs) provides comprehensive guidance on advanced configuration options and best practices.
 
 > **Tip**: Use BigQuery Data Canvas's system instructions feature to provide domain-specific context about your organization's network topology and threat landscape, improving the accuracy of AI-generated insights and recommendations.
 

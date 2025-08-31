@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: S3, Athena, Glue, CloudWatch
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: analytics, s3, cost-optimization, intelligent-tiering, athena, storage
 recipe-generator-version: 1.3
@@ -106,10 +106,14 @@ export GLUE_DATABASE="analytics_database_${RANDOM_SUFFIX}"
 export ATHENA_WORKGROUP="cost-optimized-workgroup-${RANDOM_SUFFIX}"
 
 # Create S3 bucket with versioning and encryption
-aws s3api create-bucket \
-    --bucket $BUCKET_NAME \
-    --region $AWS_REGION \
-    --create-bucket-configuration LocationConstraint=$AWS_REGION
+if [ "$AWS_REGION" = "us-east-1" ]; then
+    aws s3api create-bucket --bucket $BUCKET_NAME
+else
+    aws s3api create-bucket \
+        --bucket $BUCKET_NAME \
+        --region $AWS_REGION \
+        --create-bucket-configuration LocationConstraint=$AWS_REGION
+fi
 
 aws s3api put-bucket-versioning \
     --bucket $BUCKET_NAME \
@@ -132,7 +136,7 @@ echo "✅ Created bucket: $BUCKET_NAME"
 
 1. **Configure S3 Intelligent-Tiering with Deep Archive**:
 
-   S3 Intelligent-Tiering automatically optimizes storage costs by monitoring access patterns and moving objects between frequent and infrequent access tiers. The configuration below enables automatic archiving to both Archive Instant Access (90 days) and Deep Archive Access (180 days) tiers, providing maximum cost savings for long-term data retention.
+   S3 Intelligent-Tiering automatically optimizes storage costs by monitoring access patterns and moving objects between frequent and infrequent access tiers. The configuration below enables automatic archiving to both Archive Instant Access (90 days) and Deep Archive Access (180 days) tiers, providing maximum cost savings for long-term data retention while maintaining millisecond retrieval times for archived data.
 
    ```bash
    # Create S3 Intelligent-Tiering configuration with all tiers
@@ -160,9 +164,11 @@ echo "✅ Created bucket: $BUCKET_NAME"
    echo "✅ Configured S3 Intelligent-Tiering with archive tiers"
    ```
 
+   The configuration enables automatic tier transitions based on access patterns: objects move to Infrequent Access after 30 days of no access, Archive Instant Access after 90 days, and Deep Archive Access after 180 days. This eliminates manual lifecycle management while ensuring immediate data availability for analytics workloads across all tiers.
+
 2. **Create Lifecycle Policy for Automatic Transitions**:
 
-   Lifecycle policies work in conjunction with Intelligent-Tiering to ensure new objects are automatically enrolled in cost optimization. Setting the transition to 0 days means objects are immediately enrolled in Intelligent-Tiering upon upload.
+   Lifecycle policies work in conjunction with Intelligent-Tiering to ensure new objects are automatically enrolled in cost optimization. Setting the transition to 0 days means objects are immediately enrolled in Intelligent-Tiering upon upload, allowing S3 to monitor their access patterns from the moment they are created.
 
    ```bash
    # Create lifecycle policy for new objects
@@ -184,6 +190,8 @@ echo "✅ Created bucket: $BUCKET_NAME"
    
    echo "✅ Created lifecycle policy for automatic transitions"
    ```
+
+   This lifecycle rule ensures all new objects under the `analytics-data/` prefix are immediately placed in the INTELLIGENT_TIERING storage class, where S3 begins monitoring access patterns and optimizing costs automatically without manual intervention.
 
 3. **Upload Sample Analytics Data**:
 
@@ -254,7 +262,7 @@ echo "✅ Created bucket: $BUCKET_NAME"
 
 5. **Configure Amazon Athena Workgroup**:
 
-   Workgroups provide cost control and governance for Athena queries. The BytesScannedCutoffPerQuery setting (1GB here) prevents runaway query costs by canceling queries that scan excessive data, which is crucial when analyzing large datasets across multiple storage tiers.
+   Workgroups provide cost control and governance for Athena queries. The BytesScannedCutoffPerQuery setting (1GB here) prevents runaway query costs by canceling queries that scan excessive data, which is crucial when analyzing large datasets across multiple storage tiers in an Intelligent-Tiering setup.
 
    ```bash
    # Create Athena workgroup with cost controls
@@ -272,6 +280,8 @@ echo "✅ Created bucket: $BUCKET_NAME"
    
    echo "✅ Created Athena workgroup with cost controls"
    ```
+
+   The workgroup configuration enforces query result storage location and enables CloudWatch metrics publishing for monitoring query performance and costs. The 1GB scan limit provides an important safety net against expensive queries that could scan large amounts of archived data unnecessarily.
 
    > **Warning**: Athena charges $5 per TB of data scanned. Use columnar formats like Parquet and partition your data to minimize scan costs, especially when querying archived data. For cost optimization strategies, see [Athena cost control best practices](https://docs.aws.amazon.com/athena/latest/ug/workgroups-manage-queries-control-costs.html).
 
@@ -336,22 +346,28 @@ echo "Bucket: $BUCKET_NAME"
 echo "Date: $(date)"
 echo
    
-# Get storage metrics
+# Get storage metrics for different tiers
 echo "Storage Distribution by Tier:"
-aws cloudwatch get-metric-statistics \
-    --namespace AWS/S3 \
-    --metric-name BucketSizeBytes \
-    --dimensions Name=BucketName,Value=$BUCKET_NAME Name=StorageType,Value=IntelligentTieringFAStorage \
-    --start-time $(date -d '1 day ago' -u +%Y-%m-%dT%H:%M:%S) \
-    --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
-    --period 3600 \
-    --statistics Average \
-    --query 'Datapoints[0].Average' \
-    --output text | awk '{printf "Frequent Access: %.2f GB\n", $1/1024/1024/1024}'
+for tier in IntelligentTieringFAStorage IntelligentTieringIAStorage IntelligentTieringAAStorage IntelligentTieringAIAStorage IntelligentTieringDAAStorage; do
+    size=$(aws cloudwatch get-metric-statistics \
+        --namespace AWS/S3 \
+        --metric-name BucketSizeBytes \
+        --dimensions Name=BucketName,Value=$BUCKET_NAME Name=StorageType,Value=$tier \
+        --start-time $(date -d '1 day ago' -u +%Y-%m-%dT%H:%M:%S) \
+        --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+        --period 3600 \
+        --statistics Average \
+        --query 'Datapoints[0].Average' \
+        --output text 2>/dev/null || echo "0")
+    
+    if [ "$size" != "None" ] && [ "$size" != "0" ]; then
+        echo "$tier: $(echo $size | awk '{printf "%.2f GB\n", $1/1024/1024/1024}')"
+    fi
+done
    
-# Get Athena query costs
+# Get Athena query costs (if available)
 echo -e "\nAthena Query Metrics:"
-aws cloudwatch get-metric-statistics \
+data_scanned=$(aws cloudwatch get-metric-statistics \
     --namespace AWS/Athena \
     --metric-name DataScannedInBytes \
     --start-time $(date -d '1 day ago' -u +%Y-%m-%dT%H:%M:%S) \
@@ -359,7 +375,14 @@ aws cloudwatch get-metric-statistics \
     --period 3600 \
     --statistics Sum \
     --query 'Datapoints[0].Sum' \
-    --output text | awk '{printf "Data Scanned: %.2f GB\n", $1/1024/1024/1024}'
+    --output text 2>/dev/null || echo "0")
+
+if [ "$data_scanned" != "None" ] && [ "$data_scanned" != "0" ]; then
+    echo "Data Scanned: $(echo $data_scanned | awk '{printf "%.2f GB\n", $1/1024/1024/1024}')"
+    echo "Estimated Query Cost: $(echo $data_scanned | awk '{printf "$%.4f\n", ($1/1024/1024/1024/1024)*5}')"
+else
+    echo "No Athena queries detected in the last 24 hours"
+fi
 EOF
    
    chmod +x /tmp/cost-analysis.sh
@@ -382,6 +405,10 @@ EOF
        --output text)
    
    # Wait for query completion
+   echo "Waiting for query to complete..."
+   aws athena wait query-succeeded --query-execution-id $QUERY_ID
+   
+   # Get query execution details
    aws athena get-query-execution \
        --query-execution-id $QUERY_ID \
        --query 'QueryExecution.Status.State' \
@@ -430,7 +457,9 @@ EOF
        --query 'QueryExecutionId' \
        --output text)
    
-   # Check query execution details
+   # Wait for completion and check query execution details
+   aws athena wait query-succeeded --query-execution-id $QUERY_ID
+   
    aws athena get-query-execution \
        --query-execution-id $QUERY_ID \
        --query 'QueryExecution.Statistics'
@@ -485,7 +514,7 @@ EOF
        --query 'AnomalyDetectors[?DetectorName==`S3-Cost-Anomaly-'$RANDOM_SUFFIX'`].DetectorArn' \
        --output text)
    
-   if [ ! -z "$DETECTOR_ARN" ]; then
+   if [ ! -z "$DETECTOR_ARN" ] && [ "$DETECTOR_ARN" != "None" ]; then
        aws ce delete-anomaly-detector \
            --detector-arn $DETECTOR_ARN
    fi
@@ -499,9 +528,26 @@ EOF
    # Remove all objects and versions
    aws s3 rm s3://$BUCKET_NAME --recursive
    
-   # Remove delete markers and versions
-   aws s3api delete-bucket \
-       --bucket $BUCKET_NAME
+   # Delete any remaining object versions and delete markers
+   aws s3api list-object-versions \
+       --bucket $BUCKET_NAME \
+       --output json \
+       --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' | \
+   aws s3api delete-objects \
+       --bucket $BUCKET_NAME \
+       --delete file:///dev/stdin || true
+   
+   # Remove delete markers
+   aws s3api list-object-versions \
+       --bucket $BUCKET_NAME \
+       --output json \
+       --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' | \
+   aws s3api delete-objects \
+       --bucket $BUCKET_NAME \
+       --delete file:///dev/stdin || true
+   
+   # Delete bucket
+   aws s3api delete-bucket --bucket $BUCKET_NAME
    
    # Clean up local files
    rm -rf /tmp/analytics-data
@@ -512,27 +558,27 @@ EOF
 
 ## Discussion
 
-S3 Intelligent-Tiering provides automatic cost optimization by monitoring access patterns and moving objects between storage tiers without performance impact. The solution automatically transitions objects to Infrequent Access after 30 days of no access, then to Archive Instant Access after 90 days, with optional Deep Archive Access after 180 days. This eliminates the need for manual lifecycle management while ensuring data remains immediately accessible when needed. For detailed tier transition behavior, see [How S3 Intelligent-Tiering works](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intelligent-tiering-overview.html).
+S3 Intelligent-Tiering provides automatic cost optimization by monitoring access patterns and moving objects between storage tiers without performance impact or operational overhead. The solution automatically transitions objects to Infrequent Access after 30 days of no access, then to Archive Instant Access after 90 days, with optional Deep Archive Access after 180 days. This eliminates the need for manual lifecycle management while ensuring data remains immediately accessible when needed. For detailed tier transition behavior, see [How S3 Intelligent-Tiering works](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intelligent-tiering-overview.html).
 
-The integration with Amazon Athena enables cost-effective analytics across all storage tiers. Unlike traditional archive solutions, Intelligent-Tiering's Archive Instant Access tier provides millisecond retrieval times, allowing analytical queries to run seamlessly across hot and cold data. The workgroup configuration with query limits prevents runaway costs while maintaining analytical capabilities. For more information on Athena-S3 integration, see [Querying S3 with Amazon Athena](https://docs.aws.amazon.com/athena/latest/ug/querying-s3.html).
+The integration with Amazon Athena enables cost-effective analytics across all storage tiers without data movement or retrieval delays. Unlike traditional archive solutions that require restoration before querying, Intelligent-Tiering's Archive Instant Access tier provides millisecond retrieval times, allowing analytical queries to run seamlessly across hot and cold data. The workgroup configuration with query limits prevents runaway costs while maintaining analytical capabilities, following AWS Well-Architected Framework cost optimization principles. For more information on Athena-S3 integration, see [Querying S3 with Amazon Athena](https://docs.aws.amazon.com/athena/latest/ug/querying-s3.html).
 
-Cost monitoring through CloudWatch metrics and Cost Explorer provides visibility into storage distribution and query costs. The anomaly detection helps identify unusual spending patterns, while the custom dashboard tracks tier distribution over time. Organizations typically see 20-40% cost reduction on analytics workloads with mixed access patterns, with savings increasing as data ages and moves to lower-cost tiers. For comprehensive monitoring guidance, see [CloudWatch Metrics concepts](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/cloudwatch_concepts.html).
+Cost monitoring through CloudWatch metrics and Cost Explorer provides comprehensive visibility into storage distribution and query costs across your analytics workload. The anomaly detection helps identify unusual spending patterns that could indicate data access pattern changes or misconfigurations, while the custom dashboard tracks tier distribution over time. Organizations typically see 20-40% cost reduction on analytics workloads with mixed access patterns, with savings increasing as data ages and moves to lower-cost tiers. For comprehensive monitoring guidance, see [CloudWatch Metrics concepts](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/cloudwatch_concepts.html).
 
-> **Tip**: Enable S3 Storage Class Analysis to understand access patterns before implementing Intelligent-Tiering, helping optimize the archive tier transition days for your specific workload. Learn more about [S3 Storage Class Analysis](https://docs.aws.amazon.com/AmazonS3/latest/userguide/analytics-storage-class.html) for data-driven storage optimization.
+> **Tip**: Enable S3 Storage Class Analysis to understand access patterns before implementing Intelligent-Tiering, helping optimize the archive tier transition days for your specific workload. Learn more about [S3 Storage Class Analysis](https://docs.aws.amazon.com/AmazonS3/latest/userguide/analytics-storage-class.html) for data-driven storage optimization decisions.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Implement Partitioned Analytics**: Create time-based partitions in Glue tables and configure partition projection in Athena to improve query performance and reduce costs for time-series analytics.
+1. **Implement Partitioned Analytics**: Create time-based partitions in Glue tables and configure partition projection in Athena to improve query performance and reduce costs for time-series analytics by limiting data scanned per query.
 
-2. **Add Automated Cost Reporting**: Build a Lambda function that generates weekly cost reports comparing storage costs across tiers and sends notifications when savings thresholds are met.
+2. **Add Automated Cost Reporting**: Build a Lambda function that generates weekly cost reports comparing storage costs across tiers and sends notifications when savings thresholds are met using SNS and CloudWatch Events.
 
-3. **Implement Query Result Caching**: Configure Athena query result caching and create a S3 Select optimization layer to reduce data scanning costs for frequently run analytical queries.
+3. **Implement Query Result Caching**: Configure Athena query result caching and create a S3 Select optimization layer to reduce data scanning costs for frequently run analytical queries by reusing previous results.
 
-4. **Create Multi-Region Analytics**: Extend the solution to support cross-region analytics with S3 Cross-Region Replication and regional Athena workgroups for global data analysis.
+4. **Create Multi-Region Analytics**: Extend the solution to support cross-region analytics with S3 Cross-Region Replication and regional Athena workgroups for global data analysis while maintaining cost optimization.
 
-5. **Add ML-Powered Access Prediction**: Integrate with Amazon SageMaker to predict future access patterns and proactively optimize storage tier transitions based on business cycles and historical usage.
+5. **Add ML-Powered Access Prediction**: Integrate with Amazon SageMaker to predict future access patterns and proactively optimize storage tier transitions based on business cycles and historical usage patterns for maximum cost efficiency.
 
 ## Infrastructure Code
 

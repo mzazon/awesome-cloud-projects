@@ -1,0 +1,539 @@
+# Google Cloud Infrastructure Manager Configuration
+# Recipe: Automated API Testing with Gemini and Functions
+# This configuration deploys a complete AI-powered API testing system using
+# Vertex AI Gemini, Cloud Functions, Cloud Run, and Cloud Storage
+
+imports:
+  - path: templates
+
+resources:
+  # Enable required Google Cloud APIs
+  # These APIs must be enabled before deploying the infrastructure
+  - name: vertex-ai-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/aiplatform.googleapis.com
+      
+  - name: cloud-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/cloudfunctions.googleapis.com
+      
+  - name: cloud-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/run.googleapis.com
+      
+  - name: cloud-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/storage.googleapis.com
+      
+  - name: cloud-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/logging.googleapis.com
+      
+  - name: cloud-build-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/cloudbuild.googleapis.com
+
+  # Cloud Storage bucket for test results, reports, and specifications
+  # Configured with versioning, lifecycle management, and appropriate access controls
+  - name: test-results-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.deployment-name.name)-test-results-$(ref.random-suffix.value)
+      location: {{ properties["region"] }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              isLive: false
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 7
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      cors:
+        - origin: ["*"]
+          method: ["GET", "POST", "PUT", "DELETE"]
+          responseHeader: ["Content-Type"]
+          maxAgeSeconds: 3600
+    metadata:
+      dependsOn:
+        - cloud-storage-api
+
+  # Bucket objects for organizing test artifacts
+  # Creates the folder structure for test specifications, results, and reports
+  - name: test-specifications-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.test-results-bucket.name)
+      name: test-specifications/.keep
+      contentType: text/plain
+    metadata:
+      dependsOn:
+        - test-results-bucket
+
+  - name: test-results-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.test-results-bucket.name)
+      name: test-results/.keep
+      contentType: text/plain
+    metadata:
+      dependsOn:
+        - test-results-bucket
+
+  - name: reports-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.test-results-bucket.name)
+      name: reports/.keep
+      contentType: text/plain
+    metadata:
+      dependsOn:
+        - test-results-bucket
+
+  # Service Account for Cloud Functions and Cloud Run
+  # Follows least privilege principle with minimal required permissions
+  - name: api-testing-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: api-testing-sa-$(ref.random-suffix.value)
+      displayName: API Testing Service Account
+      description: Service account for automated API testing components
+    metadata:
+      dependsOn:
+        - vertex-ai-api
+
+  # IAM roles for the service account
+  # Vertex AI User role for Gemini model access
+  - name: vertex-ai-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.deployment-name.name)
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.api-testing-service-account.email)
+    metadata:
+      dependsOn:
+        - api-testing-service-account
+
+  # Storage Object Admin role for bucket operations
+  - name: storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.deployment-name.name)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.api-testing-service-account.email)
+    metadata:
+      dependsOn:
+        - api-testing-service-account
+
+  # Logging Writer role for Cloud Logging
+  - name: logging-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.deployment-name.name)
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.api-testing-service-account.email)
+    metadata:
+      dependsOn:
+        - api-testing-service-account
+
+  # Cloud Functions deployment archive
+  # Creates a ZIP archive of the test generator function code
+  - name: function-source-archive
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.test-results-bucket.name)
+      name: function-source/test-generator-$(ref.random-suffix.value).zip
+      sourceUri: gs://$(ref.test-results-bucket.name)/function-source/test-generator-$(ref.random-suffix.value).zip
+    metadata:
+      dependsOn:
+        - test-results-bucket
+
+  # Cloud Function for AI-powered test case generation
+  # Integrates with Vertex AI Gemini for intelligent test case creation
+  - name: test-generator-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/{{ env["project"] }}/locations/{{ properties["region"] }}
+      function: test-generator-$(ref.random-suffix.value)
+      description: AI-powered test case generator using Gemini
+      runtime: python312
+      entryPoint: generate_test_cases
+      timeout: 300s
+      availableMemoryMb: 1024
+      maxInstances: 100
+      sourceArchiveUrl: gs://$(ref.test-results-bucket.name)/function-source/test-generator-$(ref.random-suffix.value).zip
+      serviceAccountEmail: $(ref.api-testing-service-account.email)
+      environmentVariables:
+        BUCKET_NAME: $(ref.test-results-bucket.name)
+        GCP_PROJECT: {{ env["project"] }}
+        FUNCTION_REGION: {{ properties["region"] }}
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      ingressSettings: ALLOW_ALL
+    metadata:
+      dependsOn:
+        - cloud-functions-api
+        - api-testing-service-account
+        - function-source-archive
+        - vertex-ai-user-binding
+
+  # Cloud Function IAM policy for public access
+  # Allows unauthenticated access for webhook integration
+  - name: function-invoker-binding
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+    properties:
+      resource: $(ref.test-generator-function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - test-generator-function
+
+  # Cloud Run service for scalable test execution
+  # Provides concurrent test execution with automatic scaling
+  - name: test-runner-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/{{ env["project"] }}
+      location: {{ properties["region"] }}
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: test-runner-$(ref.random-suffix.value)
+        namespace: {{ env["project"] }}
+        annotations:
+          run.googleapis.com/ingress: all
+          run.googleapis.com/execution-environment: gen2
+      spec:
+        template:
+          metadata:
+            annotations:
+              autoscaling.knative.dev/maxScale: "10"
+              autoscaling.knative.dev/minScale: "0"
+              run.googleapis.com/cpu-throttling: "false"
+              run.googleapis.com/memory: "2Gi"
+              run.googleapis.com/cpu: "2"
+              run.googleapis.com/timeout: "900"
+              run.googleapis.com/service-account: $(ref.api-testing-service-account.email)
+          spec:
+            containerConcurrency: 1000
+            timeoutSeconds: 900
+            containers:
+              - name: test-runner
+                image: gcr.io/{{ env["project"] }}/test-runner:latest
+                ports:
+                  - name: http1
+                    containerPort: 8080
+                    protocol: TCP
+                env:
+                  - name: BUCKET_NAME
+                    value: $(ref.test-results-bucket.name)
+                  - name: PROJECT_ID
+                    value: {{ env["project"] }}
+                  - name: REGION
+                    value: {{ properties["region"] }}
+                resources:
+                  limits:
+                    memory: "2Gi"
+                    cpu: "2"
+                  requests:
+                    memory: "1Gi"
+                    cpu: "1"
+    metadata:
+      dependsOn:
+        - cloud-run-api
+        - api-testing-service-account
+        - storage-admin-binding
+
+  # Cloud Run IAM policy for public access
+  # Allows unauthenticated access for test execution
+  - name: run-invoker-binding
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/services/$(ref.test-runner-service.metadata.name)
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - test-runner-service
+
+  # Cloud Build trigger for automated container builds
+  # Builds and deploys the test runner container image
+  - name: build-trigger
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      description: Build trigger for test runner container
+      filename: cloudbuild.yaml
+      github:
+        owner: {{ properties["github_owner"] | default("your-org") }}
+        name: {{ properties["github_repo"] | default("api-testing-repo") }}
+        push:
+          branch: ^main$
+      substitutions:
+        _SERVICE_NAME: $(ref.test-runner-service.metadata.name)
+        _REGION: {{ properties["region"] }}
+        _PROJECT_ID: {{ env["project"] }}
+    metadata:
+      dependsOn:
+        - cloud-build-api
+        - test-runner-service
+
+  # Cloud Monitoring dashboard for test metrics
+  # Provides observability into test execution and AI model usage
+  - name: monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      displayName: API Testing Dashboard
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: Function Invocations
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: resource.type="cloud_function" AND resource.labels.function_name=$(ref.test-generator-function.name)
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                primaryDataType: INT64
+          - width: 6
+            height: 4
+            xPos: 6
+            widget:
+              title: Cloud Run Requests
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: resource.type="cloud_run_revision" AND resource.labels.service_name=$(ref.test-runner-service.metadata.name)
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                primaryDataType: INT64
+          - width: 12
+            height: 4
+            yPos: 4
+            widget:
+              title: Storage Operations
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: resource.type="gcs_bucket" AND resource.labels.bucket_name=$(ref.test-results-bucket.name)
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                primaryDataType: INT64
+
+  # Log-based metric for test execution success rate
+  # Tracks the success rate of AI-generated test executions
+  - name: test-success-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      name: test_execution_success_rate
+      description: Success rate of API test executions
+      filter: resource.type="cloud_run_revision" AND textPayload:"Test execution completed"
+      metricDescriptor:
+        metricKind: GAUGE
+        valueType: DOUBLE
+        displayName: Test Success Rate
+      labelExtractors:
+        service_name: EXTRACT(resource.labels.service_name)
+        status: EXTRACT(jsonPayload.status)
+
+  # Alerting policy for failed test executions
+  # Notifies when test execution failure rate exceeds threshold
+  - name: test-failure-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: API Test Execution Failures
+      documentation:
+        content: Alert when API test execution failure rate is high
+        mimeType: text/markdown
+      conditions:
+        - displayName: High test failure rate
+          conditionThreshold:
+            filter: metric.type="logging.googleapis.com/user/test_execution_success_rate"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.1
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_MEAN
+      enabled: true
+      alertStrategy:
+        autoClose: 86400s
+
+  # Helper resource for generating random suffix
+  # Ensures unique resource names across deployments
+  - name: random-suffix
+    type: gcp-types/runtimeconfig-v1beta1:projects.configs.variables
+    properties:
+      parent: projects/{{ env["project"] }}/configs/api-testing-config
+      variable: random-suffix
+      text: {{ properties["random_suffix"] | default(env["deployment"].split("-")[-1]) }}
+
+  # Helper resource for deployment name reference
+  - name: deployment-name
+    type: gcp-types/runtimeconfig-v1beta1:projects.configs.variables
+    properties:
+      parent: projects/{{ env["project"] }}/configs/api-testing-config
+      variable: deployment-name
+      text: {{ env["deployment"] }}
+
+# Configuration schema definition
+# Defines the input parameters and validation rules
+schema:
+  info:
+    title: Automated API Testing Infrastructure
+    description: Deploys AI-powered API testing system using Gemini and serverless components
+    version: "1.0"
+
+  imports:
+    - path: schema.yaml
+
+  required:
+    - region
+
+  properties:
+    region:
+      type: string
+      description: Google Cloud region for resource deployment
+      default: us-central1
+      enum:
+        - us-central1
+        - us-east1
+        - us-west1
+        - europe-west1
+        - asia-east1
+
+    github_owner:
+      type: string
+      description: GitHub organization or user name for build triggers
+      default: your-org
+
+    github_repo:
+      type: string
+      description: GitHub repository name for source code
+      default: api-testing-repo
+
+    random_suffix:
+      type: string
+      description: Random suffix for unique resource naming
+      pattern: ^[a-z0-9]{6}$
+
+    enable_monitoring:
+      type: boolean
+      description: Enable Cloud Monitoring dashboard and alerting
+      default: true
+
+    enable_build_triggers:
+      type: boolean
+      description: Enable Cloud Build triggers for CI/CD
+      default: false
+
+    function_timeout:
+      type: integer
+      description: Cloud Function timeout in seconds
+      default: 300
+      minimum: 60
+      maximum: 540
+
+    max_function_instances:
+      type: integer
+      description: Maximum number of Cloud Function instances
+      default: 100
+      minimum: 1
+      maximum: 3000
+
+    service_max_instances:
+      type: integer
+      description: Maximum number of Cloud Run service instances
+      default: 10
+      minimum: 1
+      maximum: 100
+
+# Output values for integration and verification
+# Provides essential information for using the deployed infrastructure
+outputs:
+  - name: function_url
+    description: URL of the test generator Cloud Function
+    value: $(ref.test-generator-function.httpsTrigger.url)
+
+  - name: service_url
+    description: URL of the test runner Cloud Run service
+    value: $(ref.test-runner-service.status.url)
+
+  - name: bucket_name
+    description: Name of the Cloud Storage bucket for test results
+    value: $(ref.test-results-bucket.name)
+
+  - name: bucket_url
+    description: Console URL for the Cloud Storage bucket
+    value: https://console.cloud.google.com/storage/browser/$(ref.test-results-bucket.name)
+
+  - name: service_account_email
+    description: Email of the service account used by the components
+    value: $(ref.api-testing-service-account.email)
+
+  - name: dashboard_url
+    description: Cloud Monitoring dashboard URL
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.monitoring-dashboard.name)
+
+  - name: project_id
+    description: Google Cloud project ID
+    value: {{ env["project"] }}
+
+  - name: region
+    description: Deployment region
+    value: {{ properties["region"] }}
+
+  - name: deployment_name
+    description: Infrastructure Manager deployment name
+    value: {{ env["deployment"] }}
+
+# Metadata for deployment tracking and management
+metadata:
+  version: "1.1"
+  recipe_id: a8f9e3d2
+  recipe_title: "Automated API Testing with Gemini and Functions"
+  last_updated: "2025-07-12"
+  components:
+    - Vertex AI Gemini 2.0 Flash
+    - Cloud Functions Gen2
+    - Cloud Run Gen2
+    - Cloud Storage
+    - Cloud Monitoring
+    - Cloud Logging
+    - Cloud Build (optional)
+  estimated_cost: "$5-15 per month for moderate usage"
+  deployment_time: "10-15 minutes"
+  difficulty: "Intermediate (200 level)"

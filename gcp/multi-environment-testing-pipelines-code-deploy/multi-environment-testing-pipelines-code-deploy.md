@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Code, Cloud Deploy, Cloud Build, Cloud Monitoring
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: cicd, testing, automation, progressive-delivery, kubernetes, multi-environment
 recipe-generator-version: 1.3
@@ -74,7 +74,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with billing enabled and appropriate permissions for GKE, Cloud Build, Cloud Deploy, and Cloud Monitoring
-2. Google Cloud CLI v2 installed and configured (or Google Cloud Shell)
+2. Google Cloud CLI installed and configured (or Google Cloud Shell)
 3. Basic knowledge of Kubernetes, Docker, and CI/CD concepts
 4. VS Code or IntelliJ IDE for Cloud Code extension installation
 5. Git repository for source code management
@@ -227,7 +227,7 @@ echo "✅ Resource prefix: ${CLUSTER_PREFIX}"
    ```bash
    # Create Skaffold configuration for Cloud Deploy integration
    cat > skaffold.yaml << EOF
-   apiVersion: skaffold/v4beta1
+   apiVersion: skaffold/v4beta12
    kind: Config
    metadata:
      name: sample-app

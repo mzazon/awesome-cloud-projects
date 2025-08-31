@@ -6,10 +6,10 @@ difficulty: 200
 subject: azure
 services: Azure Service Health, Azure Update Manager, Azure Logic Apps, Azure Monitor
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: monitoring, automation, health-monitoring, update-management, proactive-remediation
 recipe-generator-version: 1.3
@@ -121,7 +121,7 @@ echo "Workspace ID: ${WORKSPACE_ID}"
 
 1. **Create Azure Service Health Alert Rule**:
 
-   Azure Service Health provides personalized alerts about Azure service issues that affect your specific resources and regions. By creating targeted alert rules, you can receive notifications only for incidents that impact your infrastructure, enabling proactive response to potential service disruptions. This foundational step ensures your monitoring system captures all relevant service health events.
+   Azure Service Health provides personalized alerts about Azure service issues that affect your specific resources and regions. By creating targeted alert rules, you can receive notifications only for incidents that impact your infrastructure, enabling proactive response to potential service disruptions. This foundational step ensures your monitoring system captures all relevant service health events that could affect your infrastructure.
 
    ```bash
    # Create action group for Service Health alerts
@@ -327,7 +327,7 @@ echo "Workspace ID: ${WORKSPACE_ID}"
 
    ```bash
    # Create monitoring workbook for health dashboard
-   WORKBOOK_NAME="Health-Monitoring-Dashboard"
+   WORKBOOK_NAME="health-monitoring-dashboard-${RANDOM_SUFFIX}"
    az monitor app-insights workbook create \
        --name ${WORKBOOK_NAME} \
        --resource-group ${RESOURCE_GROUP} \
@@ -335,7 +335,7 @@ echo "Workspace ID: ${WORKSPACE_ID}"
        --display-name "Infrastructure Health Monitoring" \
        --description "Comprehensive dashboard for service health and patch compliance" \
        --category "health-monitoring" \
-       --workbook-template '{
+       --serialized-data '{
            "version": "Notebook/1.0",
            "items": [
                {
@@ -361,7 +361,7 @@ echo "Workspace ID: ${WORKSPACE_ID}"
    
    echo "✅ Health monitoring dashboard created: ${WORKBOOK_NAME}"
    
-   # Create custom metric for monitoring automation effectiveness
+   # Create custom metric alert for monitoring automation effectiveness
    az monitor metrics alert create \
        --name "Automation-Effectiveness-Metric" \
        --resource-group ${RESOURCE_GROUP} \

@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: Amazon Bedrock, Amazon EventBridge, AWS Lambda, Amazon S3
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: content-moderation, ai-safety, event-driven, serverless, automation
 recipe-generator-version: 1.3
@@ -299,7 +299,7 @@ echo "✅ S3 buckets created with security features enabled"
            
            Assistant: """
            
-           # Invoke Bedrock Claude model
+           # Invoke Bedrock Claude model with latest 3.5 Sonnet v2
            body = json.dumps({
                "anthropic_version": "bedrock-2023-05-31",
                "max_tokens": 1000,
@@ -309,7 +309,7 @@ echo "✅ S3 buckets created with security features enabled"
            })
            
            bedrock_response = bedrock.invoke_model(
-               modelId='anthropic.claude-3-sonnet-20240229-v1:0',
+               modelId='anthropic.claude-3-5-sonnet-20241022-v2:0',
                body=body,
                contentType='application/json'
            )
@@ -372,7 +372,7 @@ echo "✅ S3 buckets created with security features enabled"
    
    CONTENT_ANALYSIS_FUNCTION_ARN=$(aws lambda create-function \
        --function-name ContentAnalysisFunction \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/ContentAnalysisLambdaRole \
        --handler index.lambda_handler \
        --zip-file fileb://content-analysis.zip \
@@ -475,7 +475,7 @@ echo "✅ S3 buckets created with security features enabled"
        
        aws lambda create-function \
            --function-name ${workflow^}HandlerFunction \
-           --runtime python3.9 \
+           --runtime python3.12 \
            --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/ContentAnalysisLambdaRole \
            --handler index.lambda_handler \
            --zip-file fileb://${workflow}-handler.zip \
@@ -823,6 +823,3 @@ Extend this content moderation solution by implementing these enhancements:
 ## Infrastructure Code
 
 *Infrastructure code will be generated after recipe approval.*
-
----
-*Recipe ID: building-intelligent-content-moderation-amazon-bedrock-eventbridge | Last Updated: 2025-07-12 | Tags: content-moderation, ai-safety, event-driven, serverless, automation*

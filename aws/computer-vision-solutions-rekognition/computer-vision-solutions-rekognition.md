@@ -6,17 +6,16 @@ difficulty: 200
 subject: aws
 services: Rekognition, S3, Lambda, DynamoDB
 estimated-time: 75 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: rekognition, computer-vision, image-processing, ai-ml
 recipe-generator-version: 1.3
 ---
 
 # Computer Vision Solutions with Rekognition
-
 
 ## Problem
 
@@ -81,7 +80,7 @@ graph TB
 4. Sample images for testing (faces, objects, text, and potentially inappropriate content)
 5. Estimated cost: $5-15 for testing (1,000 images free tier, additional images $0.001-$0.0012 each)
 
-> **Note**: Amazon Rekognition provides 1,000 free image analyses per month for the first 12 months, making this recipe cost-effective for learning and testing. See [Amazon Rekognition pricing](https://aws.amazon.com/rekognition/pricing/) for detailed cost information.
+> **Note**: Amazon Rekognition provides 5,000 free image analyses per month for the first 12 months under the AWS Free Tier, making this recipe cost-effective for learning and testing. See [Amazon Rekognition pricing](https://aws.amazon.com/rekognition/pricing/) for detailed cost information.
 
 ## Preparation
 
@@ -103,6 +102,11 @@ export ROLE_NAME="RekognitionDemoRole-${RANDOM_SUFFIX}"
 
 # Create S3 bucket for image storage
 aws s3 mb s3://${BUCKET_NAME} --region ${AWS_REGION}
+
+# Enable S3 bucket versioning for data protection
+aws s3api put-bucket-versioning \
+    --bucket ${BUCKET_NAME} \
+    --versioning-configuration Status=Enabled
 
 # Create IAM role for Rekognition access
 aws iam create-role \
@@ -140,7 +144,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 
 1. **Create Rekognition Face Collection for Face Recognition**:
 
-   Face collections are the foundation of Amazon Rekognition's face recognition capabilities. They store facial feature vectors (mathematical representations) rather than actual images, ensuring privacy while enabling fast face matching and search operations.
+   Face collections are the foundation of Amazon Rekognition's face recognition capabilities. They store facial feature vectors (mathematical representations) rather than actual images, ensuring privacy while enabling fast face matching and search operations as described in the [Amazon Rekognition Developer Guide](https://docs.aws.amazon.com/rekognition/latest/dg/collections.html).
 
    ```bash
    # Create a collection to store face metadata
@@ -172,10 +176,11 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    echo "Please add your test images to the sample-images/ directory"
    echo "Include: face photos, scenes with objects, images with text, and test content"
    
-   # Upload all images to S3
+   # Upload all images to S3 with appropriate content type
    if [ "$(ls -A sample-images/)" ]; then
        aws s3 cp sample-images/ s3://${BUCKET_NAME}/images/ \
-           --recursive
+           --recursive \
+           --content-type "image/jpeg"
        echo "✅ Uploaded sample images to S3"
    else
        echo "⚠️  No sample images found. Please add images to sample-images/ directory"
@@ -192,13 +197,13 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    # Analyze faces in an image (replace 'face-photo.jpg' with your actual image)
    FACE_IMAGE="face-photo.jpg"
    
-   # Detect faces with all attributes
+   # Detect faces with all attributes using AWS CLI v2 syntax
    aws rekognition detect-faces \
        --image "S3Object={Bucket=${BUCKET_NAME},Name=images/${FACE_IMAGE}}" \
        --attributes "ALL" \
        --output json > face-detection-results.json
    
-   # Display key face attributes
+   # Display key face attributes using jq for JSON parsing
    echo "Face Detection Results:"
    cat face-detection-results.json | jq '.FaceDetails[] | {
        Confidence: .Confidence,
@@ -214,7 +219,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 
 4. **Index Faces for Recognition and Search**:
 
-   Face indexing converts detected faces into searchable feature vectors stored in your collection. This process enables identity verification, duplicate detection, and face-based search across your image database.
+   Face indexing converts detected faces into searchable feature vectors stored in your collection. This process enables identity verification, duplicate detection, and face-based search across your image database, following AWS Well-Architected principles for scalability and performance.
 
    ```bash
    # Index a face in the collection for future recognition
@@ -242,14 +247,14 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    # Detect objects and scenes in images
    SCENE_IMAGE="scene-photo.jpg"
    
-   # Detect labels (objects, scenes, concepts)
+   # Detect labels (objects, scenes, concepts) with appropriate confidence thresholds
    aws rekognition detect-labels \
        --image "S3Object={Bucket=${BUCKET_NAME},Name=images/${SCENE_IMAGE}}" \
        --max-labels 10 \
        --min-confidence 75 \
        --output json > object-detection-results.json
    
-   # Display detected objects with confidence scores
+   # Display detected objects with confidence scores and hierarchical structure
    echo "Object Detection Results:"
    cat object-detection-results.json | jq '.Labels[] | {
        Name: .Name,
@@ -270,12 +275,12 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    # Detect and extract text from images
    TEXT_IMAGE="text-photo.jpg"
    
-   # Detect text in images
+   # Detect text in images with comprehensive analysis
    aws rekognition detect-text \
        --image "S3Object={Bucket=${BUCKET_NAME},Name=images/${TEXT_IMAGE}}" \
        --output json > text-detection-results.json
    
-   # Display detected text
+   # Display detected text with filtering for line-level text
    echo "Text Detection Results:"
    cat text-detection-results.json | jq '.TextDetections[] | 
        select(.Type == "LINE") | {
@@ -290,7 +295,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 
 7. **Implement Content Moderation**:
 
-   Content moderation uses specialized machine learning models to detect inappropriate content including explicit nudity, suggestive content, violence, and other unsafe material. This is essential for social media platforms, content management systems, and any application handling user-generated content.
+   Content moderation uses specialized machine learning models to detect inappropriate content including explicit nudity, suggestive content, violence, and other unsafe material. This is essential for social media platforms, content management systems, and any application handling user-generated content, following AWS security best practices.
 
    ```bash
    # Analyze content for inappropriate material
@@ -324,7 +329,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    # Search for similar faces in the collection
    SEARCH_IMAGE="search-face.jpg"
    
-   # Search for faces by image
+   # Search for faces by image with configurable similarity threshold
    aws rekognition search-faces-by-image \
        --collection-id ${COLLECTION_NAME} \
        --image "S3Object={Bucket=${BUCKET_NAME},Name=images/${SEARCH_IMAGE}}" \
@@ -332,7 +337,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
        --max-faces 5 \
        --output json > face-search-results.json
    
-   # Display search results
+   # Display search results with similarity scores and identifiers
    echo "Face Search Results:"
    cat face-search-results.json | jq '.FaceMatches[] | {
        Similarity: .Similarity,
@@ -350,7 +355,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    Building a comprehensive analysis function demonstrates how to orchestrate multiple Rekognition APIs for complete image understanding. This approach enables batch processing, consistent analysis pipelines, and centralized result aggregation essential for production computer vision systems handling diverse content types at scale.
 
    ```bash
-   # Create a comprehensive analysis script
+   # Create a comprehensive analysis script using boto3
    cat > comprehensive-analysis.py << 'EOF'
    import boto3
    import json
@@ -365,7 +370,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
        }
        
        try:
-           # Face Detection
+           # Face Detection with comprehensive attributes
            face_response = rekognition.detect_faces(
                Image={'S3Object': {'Bucket': bucket_name, 'Name': image_key}},
                Attributes=['ALL']
@@ -375,7 +380,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
                'details': face_response['FaceDetails']
            }
            
-           # Object Detection
+           # Object Detection with confidence filtering
            label_response = rekognition.detect_labels(
                Image={'S3Object': {'Bucket': bucket_name, 'Name': image_key}},
                MaxLabels=10,
@@ -386,7 +391,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
                'labels': label_response['Labels']
            }
            
-           # Text Detection
+           # Text Detection and Recognition
            text_response = rekognition.detect_text(
                Image={'S3Object': {'Bucket': bucket_name, 'Name': image_key}}
            )
@@ -396,7 +401,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
                'lines': text_lines
            }
            
-           # Content Moderation
+           # Content Moderation for safety compliance
            moderation_response = rekognition.detect_moderation_labels(
                Image={'S3Object': {'Bucket': bucket_name, 'Name': image_key}},
                MinConfidence=60
@@ -439,16 +444,16 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
     # Run comprehensive analysis on all uploaded images
     echo "Running comprehensive analysis..."
     
-    # List all images in the bucket
+    # List all images in the bucket and process them
     aws s3 ls s3://${BUCKET_NAME}/images/ --recursive | \
         awk '{print $4}' | while read image_path; do
         
-        # Extract just the filename
+        # Extract just the filename for processing
         image_key=$(basename "$image_path")
         
         echo "Analyzing: $image_key"
         
-        # Run comprehensive analysis
+        # Run comprehensive analysis with error handling
         python3 comprehensive-analysis.py \
             ${BUCKET_NAME} \
             "images/${image_key}" \
@@ -467,11 +472,11 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 1. **Verify Face Collection Creation**:
 
    ```bash
-   # Check collection details
+   # Check collection details and health
    aws rekognition describe-collection \
        --collection-id ${COLLECTION_NAME}
    
-   # List faces in collection
+   # List faces in collection to verify indexing
    aws rekognition list-faces \
        --collection-id ${COLLECTION_NAME}
    ```
@@ -481,13 +486,13 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 2. **Test Face Detection Accuracy**:
 
    ```bash
-   # Verify face detection results
+   # Verify face detection results with statistical analysis
    if [ -f face-detection-results.json ]; then
        echo "Face Detection Test Results:"
        cat face-detection-results.json | jq '.FaceDetails | length' | \
            xargs -I {} echo "Detected {} faces"
        
-       # Check confidence levels
+       # Check confidence levels for quality assessment
        cat face-detection-results.json | jq '.FaceDetails[].Confidence' | \
            awk '{sum+=$1; count++} END {print "Average confidence:", sum/count"%"}'
    fi
@@ -496,13 +501,13 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 3. **Test Object Recognition Performance**:
 
    ```bash
-   # Verify object detection results
+   # Verify object detection results with confidence analysis
    if [ -f object-detection-results.json ]; then
        echo "Object Detection Test Results:"
        cat object-detection-results.json | jq '.Labels | length' | \
            xargs -I {} echo "Detected {} objects/scenes"
        
-       # Show top 5 most confident detections
+       # Show top 5 most confident detections for validation
        echo "Top 5 detections:"
        cat object-detection-results.json | jq '.Labels[:5][] | 
            "\(.Name): \(.Confidence | round)%"' -r
@@ -512,7 +517,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 4. **Validate Content Moderation**:
 
    ```bash
-   # Check moderation effectiveness
+   # Check moderation effectiveness and safety compliance
    if [ -f moderation-results.json ]; then
        echo "Content Moderation Test Results:"
        
@@ -533,7 +538,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 1. **Delete Face Collection**:
 
    ```bash
-   # Delete the face collection
+   # Delete the face collection and all associated data
    aws rekognition delete-collection \
        --collection-id ${COLLECTION_NAME}
    
@@ -543,10 +548,10 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 2. **Remove S3 Bucket and Contents**:
 
    ```bash
-   # Delete all objects in bucket
+   # Delete all objects in bucket recursively
    aws s3 rm s3://${BUCKET_NAME} --recursive
    
-   # Delete the bucket
+   # Delete the bucket itself
    aws s3 rb s3://${BUCKET_NAME}
    
    echo "✅ Deleted S3 bucket and contents"
@@ -555,7 +560,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 3. **Delete IAM Role**:
 
    ```bash
-   # Detach policies from role
+   # Detach policies from role following proper cleanup order
    aws iam detach-role-policy \
        --role-name ${ROLE_NAME} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
@@ -568,7 +573,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
        --role-name ${ROLE_NAME} \
        --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
    
-   # Delete the role
+   # Delete the role after all policies are detached
    aws iam delete-role --role-name ${ROLE_NAME}
    
    echo "✅ Deleted IAM role"
@@ -588,7 +593,7 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
    rm -f analysis-*.json
    rm -rf sample-images/
    
-   # Clear environment variables
+   # Clear environment variables for security
    unset BUCKET_NAME COLLECTION_NAME ROLE_NAME RANDOM_SUFFIX
    
    echo "✅ Cleaned up local files and environment"
@@ -598,27 +603,27 @@ echo "✅ Environment prepared with bucket: ${BUCKET_NAME}"
 
 Amazon Rekognition provides a comprehensive computer vision solution that eliminates the need for extensive machine learning expertise while delivering enterprise-grade accuracy. The service's pre-trained models excel at detecting faces, objects, scenes, celebrities, and inappropriate content with confidence scores that enable fine-tuned business logic. The face collection feature enables sophisticated identity verification and search capabilities, making it ideal for security applications, user authentication, and photo management systems as detailed in the [Amazon Rekognition Developer Guide](https://docs.aws.amazon.com/rekognition/latest/dg/getting-started.html).
 
-The architecture demonstrated in this recipe shows how Rekognition integrates seamlessly with other AWS services to create scalable, event-driven computer vision pipelines. By storing images in S3 and triggering analysis through Lambda functions, organizations can process thousands of images automatically while maintaining cost efficiency through pay-per-use pricing. The service's ability to analyze both images and videos, combined with real-time processing capabilities, makes it suitable for diverse use cases from social media content moderation to security surveillance systems.
+The architecture demonstrated in this recipe shows how Rekognition integrates seamlessly with other AWS services to create scalable, event-driven computer vision pipelines. By storing images in S3 and triggering analysis through Lambda functions, organizations can process thousands of images automatically while maintaining cost efficiency through pay-per-use pricing. The service's ability to analyze both images and videos, combined with real-time processing capabilities, makes it suitable for diverse use cases from social media content moderation to security surveillance systems, following the AWS Well-Architected Framework's principles of operational excellence and cost optimization.
 
-One of Rekognition's key advantages is its continuous improvement through AWS's ongoing model updates and the ability to create custom models for business-specific requirements using Rekognition Custom Labels. This combination of pre-trained and custom capabilities allows organizations to start with general-purpose computer vision and evolve toward specialized use cases without changing their underlying architecture. The service also provides detailed metadata about detected elements, including bounding boxes, confidence scores, and hierarchical label relationships, enabling sophisticated post-processing and business rule implementation.
+One of Rekognition's key advantages is its continuous improvement through AWS's ongoing model updates and the ability to create custom models for business-specific requirements using Rekognition Custom Labels. This combination of pre-trained and custom capabilities allows organizations to start with general-purpose computer vision and evolve toward specialized use cases without changing their underlying architecture. The service also provides detailed metadata about detected elements, including bounding boxes, confidence scores, and hierarchical label relationships, enabling sophisticated post-processing and business rule implementation as demonstrated in our comprehensive analysis function.
 
-> **Tip**: Use Rekognition's batch processing capabilities for large-scale image analysis and implement confidence score thresholds that match your business requirements - higher thresholds reduce false positives but may miss edge cases. See [content moderation best practices](https://docs.aws.amazon.com/rekognition/latest/dg/moderation.html) for guidance.
+> **Tip**: Use Rekognition's batch processing capabilities for large-scale image analysis and implement confidence score thresholds that match your business requirements - higher thresholds reduce false positives but may miss edge cases. Monitor your API usage through CloudWatch to optimize costs and performance. See [Amazon Rekognition best practices](https://docs.aws.amazon.com/rekognition/latest/dg/best-practices.html) for detailed guidance.
 
-> **Warning**: Always implement proper access controls and data retention policies when working with facial recognition data, especially in regulated industries or regions with strict biometric privacy laws. Follow [AWS security best practices](https://docs.aws.amazon.com/whitepapers/latest/aws-security-best-practices/welcome.html) for compliance.
+> **Warning**: Always implement proper access controls and data retention policies when working with facial recognition data, especially in regulated industries or regions with strict biometric privacy laws. Follow [AWS security best practices](https://docs.aws.amazon.com/whitepapers/latest/aws-security-best-practices/welcome.html) for compliance and ensure you understand the legal implications of facial recognition technology in your jurisdiction.
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Build a real-time video analysis pipeline** using Rekognition Video APIs with Kinesis Video Streams to process live camera feeds for security monitoring or content moderation applications.
+1. **Build a real-time video analysis pipeline** using Rekognition Video APIs with Kinesis Video Streams to process live camera feeds for security monitoring or content moderation applications, integrating with AWS Lambda for automated response actions.
 
-2. **Implement custom object detection models** using Rekognition Custom Labels to detect company-specific objects like logos, products, or safety equipment in workplace environments.
+2. **Implement custom object detection models** using Rekognition Custom Labels to detect company-specific objects like logos, products, or safety equipment in workplace environments, training models with your own labeled datasets for specialized recognition tasks.
 
-3. **Create a face recognition attendance system** that combines face detection with DynamoDB storage and real-time notifications via SNS to track employee check-ins and access control.
+3. **Create a face recognition attendance system** that combines face detection with DynamoDB storage and real-time notifications via SNS to track employee check-ins and access control, including web dashboard visualization and mobile app integration.
 
-4. **Develop multi-language text extraction** by integrating Rekognition's text detection with Amazon Translate to automatically extract and translate text from images in multiple languages for global content management.
+4. **Develop multi-language text extraction** by integrating Rekognition's text detection with Amazon Translate to automatically extract and translate text from images in multiple languages for global content management and compliance monitoring.
 
-5. **Build an intelligent photo organization system** that automatically tags and categorizes personal or business photo libraries using object detection, face recognition, and scene analysis to create searchable photo databases.
+5. **Build an intelligent photo organization system** that automatically tags and categorizes personal or business photo libraries using object detection, face recognition, and scene analysis to create searchable photo databases with metadata-driven search capabilities and automated backup policies.
 
 ## Infrastructure Code
 

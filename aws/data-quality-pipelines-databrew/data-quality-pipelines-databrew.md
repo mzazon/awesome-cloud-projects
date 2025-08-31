@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: AWS Glue DataBrew, Amazon EventBridge, Amazon S3, AWS Lambda
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-quality, automation, etl, event-driven, analytics
 recipe-generator-version: 1.3
@@ -352,10 +352,10 @@ echo "✅ S3 bucket and sample data created successfully"
    # Wait for role propagation
    sleep 10
    
-   # Create Lambda function
+   # Create Lambda function with current Python runtime
    LAMBDA_FUNCTION_ARN=$(aws lambda create-function \
        --function-name DataQualityProcessor-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler lambda-function.lambda_handler \
        --zip-file fileb://lambda-function.zip \

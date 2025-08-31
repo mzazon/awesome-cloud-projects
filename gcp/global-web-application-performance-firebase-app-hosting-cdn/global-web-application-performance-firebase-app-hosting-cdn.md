@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Firebase App Hosting, Cloud CDN, Cloud Monitoring, Cloud Functions
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: firebase, cdn, performance, monitoring, global-distribution
 recipe-generator-version: 1.3
@@ -83,7 +83,7 @@ graph TB
 ## Prerequisites
 
 1. Google Cloud account with billing enabled and appropriate permissions for Firebase, Cloud CDN, Cloud Monitoring, and Cloud Functions
-2. gcloud CLI v2 installed and configured (or use Google Cloud Shell)
+2. gcloud CLI v450+ installed and configured (or use Google Cloud Shell)
 3. Node.js 18+ and npm installed for web application development
 4. GitHub account with repository access for continuous deployment
 5. Basic understanding of web application performance optimization and CDN concepts
@@ -258,21 +258,17 @@ The project setup enables Firebase App Hosting's core functionality while integr
    }
    EOF
    
-   # Initialize GitHub repository connection
-   firebase apphosting:backends:create \
-       --project=${PROJECT_ID} \
-       --location=${REGION} \
-       --service-id=web-app-backend \
-       --github-repo=${GITHUB_REPO}
+   # Create App Hosting backend (requires Firebase CLI 13.15.4+)
+   firebase apphosting:backends:create --project=${PROJECT_ID}
    
    echo "✅ Firebase App Hosting configured with GitHub integration"
    ```
 
    The hosting configuration implements aggressive caching policies for static assets while enabling single-page application routing, optimizing both performance and user experience across Cloud CDN's global network.
 
-5. **Configure Cloud CDN with Load Balancer**:
+5. **Configure Cloud CDN with Load Balancer and SSL Certificate**:
 
-   Cloud CDN requires a global load balancer to distribute traffic efficiently across Google's edge network. This configuration enables intelligent caching, compression, and geographic optimization that significantly reduces latency for global users.
+   Cloud CDN requires a global load balancer and SSL certificate to distribute traffic efficiently across Google's edge network. This configuration enables intelligent caching, compression, and geographic optimization that significantly reduces latency for global users.
 
    ```bash
    # Create global IP address for load balancer
@@ -283,6 +279,12 @@ The project setup enables Firebase App Hosting's core functionality while integr
    # Get the allocated IP address
    GLOBAL_IP=$(gcloud compute addresses describe web-app-ip \
        --global --format="get(address)")
+   
+   # Create managed SSL certificate
+   gcloud compute ssl-certificates create web-app-ssl-cert \
+       --domains=${PROJECT_ID}.com \
+       --global \
+       --project=${PROJECT_ID}
    
    # Create backend bucket for static assets
    gcloud compute backend-buckets create web-assets-backend \
@@ -298,20 +300,21 @@ The project setup enables Firebase App Hosting's core functionality while integr
        --default-backend-bucket=web-assets-backend \
        --project=${PROJECT_ID}
    
-   # Create target HTTP(S) proxy
+   # Create target HTTPS proxy with SSL certificate
    gcloud compute target-https-proxies create web-app-proxy \
        --url-map=web-app-urlmap \
+       --ssl-certificates=web-app-ssl-cert \
        --project=${PROJECT_ID}
    
    # Create forwarding rule
    gcloud compute forwarding-rules create web-app-forwarding-rule \
-       --address=${GLOBAL_IP} \
+       --address=web-app-ip \
        --global \
        --target-https-proxy=web-app-proxy \
        --ports=443 \
        --project=${PROJECT_ID}
    
-   echo "✅ Cloud CDN configured with global load balancer"
+   echo "✅ Cloud CDN configured with global load balancer and SSL"
    echo "Global IP: ${GLOBAL_IP}"
    ```
 
@@ -322,22 +325,6 @@ The project setup enables Firebase App Hosting's core functionality while integr
    Cloud Monitoring provides comprehensive visibility into application performance, CDN effectiveness, and user experience metrics. Real-time monitoring enables proactive optimization and rapid response to performance issues.
 
    ```bash
-   # Create custom metrics for performance monitoring
-   cat > monitoring-config.yaml << 'EOF'
-   displayName: "Web App Performance Dashboard"
-   mosaicLayout:
-     tiles:
-     - width: 6
-       height: 4
-       widget:
-         title: "CDN Cache Hit Rate"
-         xyChart:
-           dataSets:
-           - timeSeriesQuery:
-               timeSeriesFilter:
-                 filter: 'resource.type="gce_instance" AND metric.type="loadbalancing.googleapis.com/https/request_count"'
-   EOF
-   
    # Create alerting policy for performance degradation
    gcloud alpha monitoring policies create --policy-from-file=<(cat << 'EOF'
    {
@@ -346,7 +333,7 @@ The project setup enables Firebase App Hosting's core functionality while integr
        {
          "displayName": "High response time",
          "conditionThreshold": {
-           "filter": "resource.type=\"gae_app\" AND metric.type=\"appengine.googleapis.com/http/server/response_latencies\"",
+           "filter": "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/request_latencies\"",
            "comparison": "COMPARISON_GT",
            "thresholdValue": 1000,
            "duration": "300s"
@@ -360,6 +347,10 @@ The project setup enables Firebase App Hosting's core functionality while integr
    }
    EOF
    )
+   
+   # Create Pub/Sub topic for performance metrics
+   gcloud pubsub topics create performance-metrics \
+       --project=${PROJECT_ID}
    
    echo "✅ Cloud Monitoring configured for performance tracking"
    ```
@@ -377,6 +368,8 @@ The project setup enables Firebase App Hosting's core functionality while integr
    cat > main.py << 'EOF'
    import json
    import logging
+   import os
+   import time
    from google.cloud import monitoring_v3
    from google.cloud import compute_v1
    
@@ -425,19 +418,20 @@ The project setup enables Firebase App Hosting's core functionality while integr
    EOF
    
    cat > requirements.txt << 'EOF'
-   google-cloud-monitoring==2.14.1
-   google-cloud-compute==1.11.0
-   functions-framework==3.5.0
+   google-cloud-monitoring==2.21.0
+   google-cloud-compute==1.19.2
+   functions-framework==3.8.2
    EOF
    
    # Deploy the optimization function
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime=python39 \
+       --runtime=python312 \
        --trigger-topic=performance-metrics \
        --entry-point=optimize_performance \
        --memory=256MB \
        --timeout=60s \
        --set-env-vars=GCP_PROJECT=${PROJECT_ID} \
+       --region=${REGION} \
        --project=${PROJECT_ID}
    
    cd ..
@@ -509,6 +503,8 @@ The project setup enables Firebase App Hosting's core functionality while integr
    
    gcloud compute target-https-proxies delete web-app-proxy --quiet
    
+   gcloud compute ssl-certificates delete web-app-ssl-cert --quiet
+   
    gcloud compute url-maps delete web-app-urlmap --quiet
    
    gcloud compute backend-buckets delete web-assets-backend --quiet
@@ -524,7 +520,6 @@ The project setup enables Firebase App Hosting's core functionality while integr
    # Delete Firebase App Hosting backend
    firebase apphosting:backends:delete web-app-backend \
        --project=${PROJECT_ID} \
-       --location=${REGION} \
        --force
    
    # Remove Firebase hosting site
@@ -537,11 +532,14 @@ The project setup enables Firebase App Hosting's core functionality while integr
 
    ```bash
    # Delete Cloud Function
-   gcloud functions delete ${FUNCTION_NAME} --quiet
+   gcloud functions delete ${FUNCTION_NAME} --region=${REGION} --quiet
    
    # Delete monitoring policies
    gcloud alpha monitoring policies list --format="get(name)" | \
        xargs -I {} gcloud alpha monitoring policies delete {} --quiet
+   
+   # Delete Pub/Sub topic
+   gcloud pubsub topics delete performance-metrics --quiet
    
    # Remove Cloud Storage bucket
    gsutil -m rm -r gs://${BUCKET_NAME}

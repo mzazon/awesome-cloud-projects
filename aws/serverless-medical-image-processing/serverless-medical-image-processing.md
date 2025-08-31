@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: AWS HealthImaging, Step Functions, Lambda, EventBridge
 estimated-time: 90 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: healthcare, medical-imaging, DICOM, serverless, HIPAA, workflow-orchestration
 recipe-generator-version: 1.3
@@ -91,7 +91,7 @@ graph TB
 1. AWS account with appropriate permissions for HealthImaging, Step Functions, Lambda, S3, EventBridge, and IAM
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic understanding of DICOM format and medical imaging workflows
-4. Python 3.9+ for Lambda function development
+4. Python 3.12+ for Lambda function development
 5. Estimated cost: $5-10 for testing with sample DICOM files (varies based on data volume)
 
 > **Note**: AWS HealthImaging is a HIPAA-eligible service. Ensure you have a signed Business Associate Addendum (BAA) with AWS before processing protected health information (PHI).
@@ -163,10 +163,14 @@ echo "✅ S3 buckets created with encryption enabled"
        --role-name ${LAMBDA_ROLE_NAME} \
        --assume-role-policy-document file://lambda-trust-policy.json
 
-   # Attach managed policies
+   # Attach managed policies for Lambda execution and X-Ray tracing
    aws iam attach-role-policy \
        --role-name ${LAMBDA_ROLE_NAME} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+   aws iam attach-role-policy \
+       --role-name ${LAMBDA_ROLE_NAME} \
+       --policy-arn arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
 
    # Store role ARN
    export LAMBDA_ROLE_ARN=$(aws iam get-role \
@@ -176,7 +180,7 @@ echo "✅ S3 buckets created with encryption enabled"
    echo "✅ Lambda IAM role created: ${LAMBDA_ROLE_ARN}"
    ```
 
-   The Lambda execution role is now configured with basic permissions. We'll add specific permissions for HealthImaging and other services as we create the Lambda functions, following security best practices of granting minimal required permissions.
+   The Lambda execution role is now configured with basic permissions and X-Ray tracing capabilities. We'll add specific permissions for HealthImaging and other services as we create the Lambda functions, following security best practices of granting minimal required permissions.
 
 2. **Create HealthImaging Data Store**:
 
@@ -191,12 +195,23 @@ echo "✅ S3 buckets created with encryption enabled"
        {
          "Effect": "Allow",
          "Action": [
-           "medical-imaging:*",
+           "medical-imaging:*"
+         ],
+         "Resource": "*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
            "s3:GetObject",
            "s3:PutObject",
            "s3:ListBucket"
          ],
-         "Resource": "*"
+         "Resource": [
+           "arn:aws:s3:::${INPUT_BUCKET}",
+           "arn:aws:s3:::${INPUT_BUCKET}/*",
+           "arn:aws:s3:::${OUTPUT_BUCKET}",
+           "arn:aws:s3:::${OUTPUT_BUCKET}/*"
+         ]
        },
        {
          "Effect": "Allow",
@@ -227,9 +242,17 @@ echo "✅ S3 buckets created with encryption enabled"
    echo "Waiting for data store to become active..."
 
    # Wait for data store to be active
-   aws medical-imaging wait datastore-created \
-       --datastore-id ${DATASTORE_ID} \
-       --region ${AWS_REGION}
+   while true; do
+       STATUS=$(aws medical-imaging get-datastore \
+           --datastore-id ${DATASTORE_ID} \
+           --query 'datastoreProperties.datastoreStatus' \
+           --output text)
+       if [ "$STATUS" == "ACTIVE" ]; then
+           break
+       fi
+       echo "Data store status: $STATUS - waiting..."
+       sleep 10
+   done
 
    echo "✅ Data store is now active"
    ```
@@ -247,10 +270,17 @@ echo "✅ S3 buckets created with encryption enabled"
    import json
    import boto3
    import os
+   from aws_xray_sdk.core import xray_recorder
+   from aws_xray_sdk.core import patch_all
+
+   # Patch AWS SDK calls for X-Ray tracing
+   patch_all()
 
    medical_imaging = boto3.client('medical-imaging')
    s3 = boto3.client('s3')
+   stepfunctions = boto3.client('stepfunctions')
 
+   @xray_recorder.capture('lambda_handler')
    def lambda_handler(event, context):
        """
        Initiates a HealthImaging import job when DICOM files are uploaded to S3.
@@ -258,6 +288,7 @@ echo "✅ S3 buckets created with encryption enabled"
        """
        datastore_id = os.environ['DATASTORE_ID']
        output_bucket = os.environ['OUTPUT_BUCKET']
+       state_machine_arn = os.environ['STATE_MACHINE_ARN']
        
        # Extract S3 event details
        for record in event['Records']:
@@ -276,6 +307,15 @@ echo "✅ S3 buckets created with encryption enabled"
                dataAccessRoleArn=os.environ['LAMBDA_ROLE_ARN']
            )
            
+           # Start Step Functions workflow
+           stepfunctions.start_execution(
+               stateMachineArn=state_machine_arn,
+               input=json.dumps({
+                   'jobId': response['jobId'],
+                   'dataStoreId': response['dataStoreId']
+               })
+           )
+           
            return {
                'statusCode': 200,
                'body': json.dumps({
@@ -288,27 +328,30 @@ echo "✅ S3 buckets created with encryption enabled"
 
    # Package and create Lambda function
    cd lambda-functions
-   zip start_import.zip start_import.py
+   pip install aws-xray-sdk -t .  # Install X-Ray SDK
+   zip -r start_import.zip .
    cd ..
 
    aws lambda create-function \
        --function-name StartDicomImport-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler start_import.lambda_handler \
        --zip-file fileb://lambda-functions/start_import.zip \
        --timeout 60 \
        --memory-size 256 \
+       --tracing-config Mode=Active \
        --environment Variables="{
            DATASTORE_ID=${DATASTORE_ID},
            OUTPUT_BUCKET=${OUTPUT_BUCKET},
-           LAMBDA_ROLE_ARN=${LAMBDA_ROLE_ARN}
+           LAMBDA_ROLE_ARN=${LAMBDA_ROLE_ARN},
+           STATE_MACHINE_ARN=placeholder
        }"
 
    echo "✅ Import initiation Lambda function created"
    ```
 
-   The Lambda function now monitors S3 uploads and automatically triggers HealthImaging import jobs. This serverless approach ensures automatic scaling based on upload volume while maintaining cost efficiency through pay-per-invocation pricing.
+   The Lambda function now monitors S3 uploads and automatically triggers HealthImaging import jobs. This serverless approach ensures automatic scaling based on upload volume while maintaining cost efficiency through pay-per-invocation pricing. X-Ray tracing is enabled for comprehensive monitoring.
 
 4. **Create Step Functions State Machine**:
 
@@ -335,14 +378,51 @@ echo "✅ S3 buckets created with encryption enabled"
        --role-name StepFunctions-${RANDOM_SUFFIX} \
        --assume-role-policy-document file://stepfunctions-trust-policy.json
 
-   # Attach policies for Step Functions
-   aws iam attach-role-policy \
+   # Create custom policy for Step Functions
+   cat > stepfunctions-policy.json << EOF
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Action": [
+           "medical-imaging:GetDICOMImportJob",
+           "xray:PutTraceSegments",
+           "xray:PutTelemetryRecords"
+         ],
+         "Resource": "*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "logs:CreateLogDelivery",
+           "logs:GetLogDelivery",
+           "logs:UpdateLogDelivery",
+           "logs:DeleteLogDelivery",
+           "logs:ListLogDeliveries",
+           "logs:PutLogEvents",
+           "logs:PutResourcePolicy",
+           "logs:DescribeResourcePolicies",
+           "logs:DescribeLogGroups"
+         ],
+         "Resource": "*"
+       }
+     ]
+   }
+   EOF
+
+   aws iam put-role-policy \
        --role-name StepFunctions-${RANDOM_SUFFIX} \
-       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+       --policy-name StepFunctionsExecution \
+       --policy-document file://stepfunctions-policy.json
 
    STEP_FUNCTIONS_ROLE_ARN=$(aws iam get-role \
        --role-name StepFunctions-${RANDOM_SUFFIX} \
        --query 'Role.Arn' --output text)
+
+   # Create CloudWatch log group for Step Functions
+   aws logs create-log-group \
+       --log-group-name /aws/stepfunctions/${STATE_MACHINE_NAME}
 
    # Create state machine definition
    cat > state-machine.json << EOF
@@ -407,15 +487,26 @@ echo "✅ S3 buckets created with encryption enabled"
        --name ${STATE_MACHINE_NAME} \
        --definition file://state-machine.json \
        --role-arn ${STEP_FUNCTIONS_ROLE_ARN} \
-       --type EXPRESS \
+       --type STANDARD \
+       --tracing-configuration enabled=true \
        --logging-configuration \
        "level=ALL,includeExecutionData=true,destinations=[{cloudWatchLogsLogGroup={logGroupArn=arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:log-group:/aws/stepfunctions/${STATE_MACHINE_NAME}:*}}]" \
        --query 'stateMachineArn' --output text)
 
    echo "✅ Step Functions state machine created: ${STATE_MACHINE_ARN}"
+
+   # Update Lambda function with state machine ARN
+   aws lambda update-function-configuration \
+       --function-name StartDicomImport-${RANDOM_SUFFIX} \
+       --environment Variables="{
+           DATASTORE_ID=${DATASTORE_ID},
+           OUTPUT_BUCKET=${OUTPUT_BUCKET},
+           LAMBDA_ROLE_ARN=${LAMBDA_ROLE_ARN},
+           STATE_MACHINE_ARN=${STATE_MACHINE_ARN}
+       }"
    ```
 
-   The state machine now orchestrates the medical imaging workflow with visual tracking of each step. Express workflows provide high-volume, short-duration processing ideal for medical imaging pipelines, with automatic CloudWatch Logs integration for debugging and audit trails.
+   The state machine now orchestrates the medical imaging workflow with visual tracking of each step. Standard workflows provide reliable execution with X-Ray tracing enabled, and automatic CloudWatch Logs integration for debugging, monitoring, and audit trails.
 
 5. **Create Lambda Function for Metadata Processing**:
 
@@ -427,17 +518,29 @@ echo "✅ S3 buckets created with encryption enabled"
    import json
    import boto3
    import os
+   from aws_xray_sdk.core import xray_recorder
+   from aws_xray_sdk.core import patch_all
+
+   # Patch AWS SDK calls for X-Ray tracing
+   patch_all()
 
    medical_imaging = boto3.client('medical-imaging')
    s3 = boto3.client('s3')
 
+   @xray_recorder.capture('lambda_handler')
    def lambda_handler(event, context):
        """
        Extracts and processes DICOM metadata from HealthImaging image sets.
        Parses patient information, study details, and technical parameters.
        """
-       datastore_id = event['datastoreId']
-       image_set_id = event['imageSetId']
+       # Handle EventBridge events
+       if 'detail' in event:
+           datastore_id = event['detail']['datastoreId']
+           # In real implementation, extract imageSetId from job results
+           image_set_id = event['detail'].get('imageSetId', 'unknown')
+       else:
+           datastore_id = event['datastoreId']
+           image_set_id = event['imageSetId']
        
        try:
            # Get image set metadata
@@ -449,7 +552,7 @@ echo "✅ S3 buckets created with encryption enabled"
            # Parse DICOM metadata
            metadata = json.loads(response['imageSetMetadataBlob'].read())
            
-           # Extract relevant fields
+           # Extract relevant fields safely
            patient_info = metadata.get('Patient', {})
            study_info = metadata.get('Study', {})
            series_info = metadata.get('Series', {})
@@ -469,8 +572,9 @@ echo "✅ S3 buckets created with encryption enabled"
            s3.put_object(
                Bucket=os.environ['OUTPUT_BUCKET'],
                Key=output_key,
-               Body=json.dumps(processed_metadata),
-               ContentType='application/json'
+               Body=json.dumps(processed_metadata, indent=2),
+               ContentType='application/json',
+               ServerSideEncryption='AES256'
            )
            
            return {
@@ -488,23 +592,26 @@ echo "✅ S3 buckets created with encryption enabled"
 
    # Package and create function
    cd lambda-functions
-   zip process_metadata.zip process_metadata.py
+   rm -rf start_import.py aws_xray_sdk*  # Clean up
+   pip install aws-xray-sdk -t .
+   zip -r process_metadata.zip process_metadata.py aws_xray_sdk*
    cd ..
 
    aws lambda create-function \
        --function-name ProcessDicomMetadata-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler process_metadata.lambda_handler \
        --zip-file fileb://lambda-functions/process_metadata.zip \
        --timeout 120 \
        --memory-size 512 \
+       --tracing-config Mode=Active \
        --environment Variables="{OUTPUT_BUCKET=${OUTPUT_BUCKET}}"
 
    echo "✅ Metadata processing Lambda function created"
    ```
 
-   The metadata processing function extracts structured information from DICOM headers, enabling searchability and clinical decision support. This automated extraction eliminates manual data entry while ensuring consistency across the imaging workflow.
+   The metadata processing function extracts structured information from DICOM headers, enabling searchability and clinical decision support. This automated extraction eliminates manual data entry while ensuring consistency across the imaging workflow with comprehensive error handling and X-Ray tracing.
 
 6. **Create EventBridge Rules for Workflow Automation**:
 
@@ -516,9 +623,10 @@ echo "✅ S3 buckets created with encryption enabled"
        --name DicomImportCompleted-${RANDOM_SUFFIX} \
        --event-pattern '{
          "source": ["aws.medical-imaging"],
-         "detail-type": ["Import Job Completed"],
+         "detail-type": ["DICOM Import Job State Change"],
          "detail": {
-           "datastoreId": ["'${DATASTORE_ID}'"]
+           "datastoreId": ["'${DATASTORE_ID}'"],
+           "jobStatus": ["COMPLETED"]
          }
        }' \
        --state ENABLED
@@ -553,20 +661,32 @@ echo "✅ S3 buckets created with encryption enabled"
    import os
    import base64
    from io import BytesIO
+   from aws_xray_sdk.core import xray_recorder
+   from aws_xray_sdk.core import patch_all
+
+   # Patch AWS SDK calls for X-Ray tracing
+   patch_all()
 
    medical_imaging = boto3.client('medical-imaging')
    s3 = boto3.client('s3')
 
+   @xray_recorder.capture('lambda_handler')
    def lambda_handler(event, context):
        """
        Performs basic image analysis on medical images.
        In production, this would integrate with ML models for diagnostic support.
        """
-       datastore_id = event['datastoreId']
-       image_set_id = event['imageSetId']
+       datastore_id = event.get('datastoreId')
+       image_set_id = event.get('imageSetId')
+       
+       if not datastore_id or not image_set_id:
+           return {
+               'statusCode': 400,
+               'body': json.dumps({'error': 'Missing required parameters'})
+           }
        
        try:
-           # Get image frame information
+           # Get image set metadata
            image_set_metadata = medical_imaging.get_image_set_metadata(
                datastoreId=datastore_id,
                imageSetId=image_set_id
@@ -582,7 +702,11 @@ echo "✅ S3 buckets created with encryption enabled"
                    'imageQuality': 'GOOD',
                    'processingStatus': 'COMPLETED',
                    'anomaliesDetected': False,
-                   'confidenceScore': 0.95
+                   'confidenceScore': 0.95,
+                   'technicalParameters': {
+                       'imageCount': 1,
+                       'analysisMethod': 'BasicStatistics'
+                   }
                }
            }
            
@@ -591,8 +715,9 @@ echo "✅ S3 buckets created with encryption enabled"
            s3.put_object(
                Bucket=os.environ['OUTPUT_BUCKET'],
                Key=output_key,
-               Body=json.dumps(analysis_results),
-               ContentType='application/json'
+               Body=json.dumps(analysis_results, indent=2),
+               ContentType='application/json',
+               ServerSideEncryption='AES256'
            )
            
            return {
@@ -610,23 +735,25 @@ echo "✅ S3 buckets created with encryption enabled"
 
    # Package and create function
    cd lambda-functions
-   zip analyze_image.zip analyze_image.py
+   rm process_metadata.py  # Clean up
+   zip -r analyze_image.zip analyze_image.py aws_xray_sdk*
    cd ..
 
    aws lambda create-function \
        --function-name AnalyzeMedicalImage-${RANDOM_SUFFIX} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role ${LAMBDA_ROLE_ARN} \
        --handler analyze_image.lambda_handler \
        --zip-file fileb://lambda-functions/analyze_image.zip \
        --timeout 300 \
        --memory-size 1024 \
+       --tracing-config Mode=Active \
        --environment Variables="{OUTPUT_BUCKET=${OUTPUT_BUCKET}}"
 
    echo "✅ Image analysis Lambda function created"
    ```
 
-   The image analysis function provides a framework for integrating advanced medical imaging algorithms. This serverless approach enables scaling from single images to thousands of concurrent analyses while maintaining consistent performance and cost efficiency.
+   The image analysis function provides a framework for integrating advanced medical imaging algorithms. This serverless approach enables scaling from single images to thousands of concurrent analyses while maintaining consistent performance and cost efficiency with comprehensive monitoring capabilities.
 
 8. **Configure S3 Event Notifications**:
 
@@ -691,7 +818,7 @@ echo "✅ S3 buckets created with encryption enabled"
 
    ```bash
    # Create a test DICOM file (for demonstration)
-   echo "Sample DICOM content" > test.dcm
+   echo "Sample DICOM content for testing pipeline" > test.dcm
 
    # Upload to trigger the pipeline
    aws s3 cp test.dcm s3://${INPUT_BUCKET}/test-data/test.dcm
@@ -713,6 +840,15 @@ echo "✅ S3 buckets created with encryption enabled"
    ```bash
    # List processed metadata and analysis results
    aws s3 ls s3://${OUTPUT_BUCKET}/ --recursive
+   ```
+
+5. Check CloudWatch Logs for function execution details:
+
+   ```bash
+   # View recent log events
+   aws logs describe-log-groups \
+       --log-group-name-prefix "/aws/lambda/StartDicomImport-${RANDOM_SUFFIX}" \
+       --query 'logGroups[0].logGroupName' --output text
    ```
 
 ## Cleanup
@@ -781,13 +917,27 @@ echo "✅ S3 buckets created with encryption enabled"
    echo "✅ S3 buckets deleted"
    ```
 
-6. Delete IAM roles:
+6. Delete CloudWatch log groups:
 
    ```bash
-   # Detach policies and delete roles
+   # Delete Step Functions log group
+   aws logs delete-log-group \
+       --log-group-name /aws/stepfunctions/${STATE_MACHINE_NAME}
+
+   echo "✅ CloudWatch log groups deleted"
+   ```
+
+7. Delete IAM roles:
+
+   ```bash
+   # Detach policies and delete Lambda role
    aws iam detach-role-policy \
        --role-name ${LAMBDA_ROLE_NAME} \
        --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+   aws iam detach-role-policy \
+       --role-name ${LAMBDA_ROLE_NAME} \
+       --policy-arn arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
 
    aws iam delete-role-policy \
        --role-name ${LAMBDA_ROLE_NAME} \
@@ -796,9 +946,10 @@ echo "✅ S3 buckets created with encryption enabled"
    aws iam delete-role \
        --role-name ${LAMBDA_ROLE_NAME}
 
-   aws iam detach-role-policy \
+   # Delete Step Functions role
+   aws iam delete-role-policy \
        --role-name StepFunctions-${RANDOM_SUFFIX} \
-       --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+       --policy-name StepFunctionsExecution
 
    aws iam delete-role \
        --role-name StepFunctions-${RANDOM_SUFFIX}
@@ -812,7 +963,9 @@ Building serverless medical imaging pipelines with AWS HealthImaging and Step Fu
 
 The serverless approach provides significant advantages for medical imaging workflows, including automatic scaling based on workload, pay-per-use pricing that eliminates idle infrastructure costs, and built-in high availability across multiple Availability Zones. AWS HealthImaging's native DICOM support eliminates complex format conversions while providing both cloud-native and DICOMweb APIs for maximum compatibility. The service architecture follows [HIPAA compliance requirements](https://aws.amazon.com/compliance/hipaa-compliance/) with encryption at rest and in transit, detailed audit logging, and access controls.
 
-From an operational perspective, this solution reduces the total cost of ownership compared to traditional PACS infrastructure by eliminating hardware refresh cycles, reducing administrative overhead, and providing predictable scaling. The event-driven architecture ensures immediate processing of new images while Step Functions provides visual workflow monitoring and debugging capabilities. For production deployments, consider implementing additional features such as dead letter queues for failed processing, integration with Amazon Comprehend Medical for report analysis, and AWS X-Ray for distributed tracing as outlined in the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
+From an operational perspective, this solution reduces the total cost of ownership compared to traditional PACS infrastructure by eliminating hardware refresh cycles, reducing administrative overhead, and providing predictable scaling. The event-driven architecture ensures immediate processing of new images while Step Functions provides visual workflow monitoring and debugging capabilities. Enhanced monitoring through AWS X-Ray provides distributed tracing across the entire pipeline, enabling rapid troubleshooting and performance optimization. For production deployments, consider implementing additional features such as dead letter queues for failed processing, integration with Amazon Comprehend Medical for report analysis, and VPC endpoints for enhanced security as outlined in the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html).
+
+Performance optimization strategies include using Lambda Provisioned Concurrency for consistent response times, implementing S3 Transfer Acceleration for faster DICOM uploads, and leveraging Step Functions Express Workflows for high-volume, short-duration processing patterns. The solution architecture supports horizontal scaling to process thousands of concurrent medical images while maintaining sub-second response times for metadata extraction and analysis tasks.
 
 > **Warning**: When processing real patient data, ensure you have signed a Business Associate Addendum (BAA) with AWS and implement appropriate security controls including VPC endpoints, AWS CloudTrail logging, and multi-factor authentication for administrative access.
 
@@ -821,10 +974,10 @@ From an operational perspective, this solution reduces the total cost of ownersh
 Extend this solution by implementing these enhancements:
 
 1. Integrate Amazon Comprehend Medical to analyze radiology reports and extract clinical insights alongside image processing
-2. Implement parallel processing using Step Functions Map state to handle multiple images simultaneously
-3. Add Amazon SageMaker integration for custom medical AI/ML model inference on processed images
-4. Create a DICOM viewer web application using AWS Amplify that retrieves images via HealthImaging's DICOMweb APIs
-5. Implement automated compliance reporting using AWS Config rules to monitor HIPAA-related configurations
+2. Implement parallel processing using Step Functions Map state to handle multiple images simultaneously from batch uploads
+3. Add Amazon SageMaker integration for custom medical AI/ML model inference on processed images with automated model deployment
+4. Create a DICOM viewer web application using AWS Amplify that retrieves images via HealthImaging's DICOMweb APIs with real-time collaboration features
+5. Implement automated compliance reporting using AWS Config rules to monitor HIPAA-related configurations and generate audit reports
 
 ## Infrastructure Code
 

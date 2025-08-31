@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: VM Manager, Cloud Scheduler, Compute Engine, Cloud Monitoring
 estimated-time: 75 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: patch-management, automation, security, compliance, vm-manager, cloud-scheduler
 recipe-generator-version: 1.3
@@ -161,53 +161,7 @@ echo "✅ APIs enabled for VM Manager, Cloud Scheduler, and monitoring"
 
    The inventory data provides comprehensive visibility into your VM fleet's current state, including operating system versions, installed packages, and available updates. This information is crucial for patch compliance monitoring and planning.
 
-3. **Create Patch Deployment Configuration**:
-
-   Patch deployments in VM Manager define the scope, timing, and configuration for applying updates across your VM fleet. This step creates a flexible patch deployment that can target specific instance groups while providing customizable update windows and rollback capabilities.
-
-   ```bash
-   # Create patch deployment configuration file
-   cat > patch-deployment-config.yaml << EOF
-   patchDeployment:
-     name: "projects/${PROJECT_ID}/patchDeployments/monthly-security-patches"
-     description: "Monthly security patch deployment for production VMs"
-     instanceFilter:
-       instanceNamePrefixes:
-         - "patch-test-vm-"
-     patchConfig:
-       rebootConfig: REBOOT_IF_REQUIRED
-       preStep:
-         linuxExecStepConfig:
-           interpreter: SHELL
-           gcsObject:
-             bucket: "patch-scripts-${PROJECT_ID}"
-             object: "pre-patch-backup.sh"
-       postStep:
-         linuxExecStepConfig:
-           interpreter: SHELL
-           gcsObject:
-             bucket: "patch-scripts-${PROJECT_ID}"
-             object: "post-patch-validation.sh"
-     duration: "7200s"
-     recurringSchedule:
-       timeZone:
-         id: "America/New_York"
-       timeOfDay:
-         hours: 2
-         minutes: 0
-       frequency: MONTHLY
-       monthlySchedule:
-         weekDayOfMonth:
-           weekOrdinal: 2
-           dayOfWeek: SUNDAY
-   EOF
-   
-   echo "✅ Patch deployment configuration created"
-   ```
-
-   The configuration establishes a monthly patch schedule that runs on the second Sunday of each month at 2 AM, includes pre and post-patch scripts for backup and validation, and allows system reboots when required for patch installation.
-
-4. **Create Cloud Storage Bucket for Patch Scripts**:
+3. **Create Cloud Storage Bucket for Patch Scripts**:
 
    Pre and post-patch scripts stored in Cloud Storage enable automated backup creation and validation checks during the patch deployment process. This ensures data protection and verification of system functionality after patches are applied.
 
@@ -257,7 +211,7 @@ echo "✅ APIs enabled for VM Manager, Cloud Scheduler, and monitoring"
 
    The backup and validation scripts provide automated safeguards during the patch deployment process, ensuring data protection and system integrity verification after updates are applied.
 
-5. **Deploy Cloud Function for Patch Orchestration**:
+4. **Deploy Cloud Function for Patch Orchestration**:
 
    Cloud Functions provide serverless orchestration for patch deployments, enabling complex logic for targeting specific VM groups, handling failures, and integrating with monitoring systems. This approach offers greater flexibility than direct API calls from Cloud Scheduler.
 
@@ -268,9 +222,10 @@ echo "✅ APIs enabled for VM Manager, Cloud Scheduler, and monitoring"
    cat > main.py << 'EOF'
    import json
    import os
-   from google.cloud import compute_v1
    from google.cloud import osconfig_v1
+   import functions_framework
    
+   @functions_framework.http
    def trigger_patch_deployment(request):
        """Cloud Function to trigger VM patch deployment"""
        
@@ -311,13 +266,14 @@ echo "✅ APIs enabled for VM Manager, Cloud Scheduler, and monitoring"
    EOF
    
    cat > requirements.txt << 'EOF'
-   google-cloud-compute==1.14.1
-   google-cloud-os-config==1.17.1
+   google-cloud-os-config==1.20.1
+   functions-framework==3.8.1
    EOF
    
    # Deploy Cloud Function
    gcloud functions deploy ${FUNCTION_NAME} \
-     --runtime python39 \
+     --gen2 \
+     --runtime python312 \
      --trigger-http \
      --entry-point trigger_patch_deployment \
      --memory 256MB \
@@ -332,16 +288,21 @@ echo "✅ APIs enabled for VM Manager, Cloud Scheduler, and monitoring"
 
    The Cloud Function provides programmatic control over patch deployments, enabling custom logic for instance targeting, error handling, and integration with monitoring systems while maintaining serverless scalability.
 
-6. **Create Cloud Scheduler Job for Automated Patch Deployment**:
+5. **Create Cloud Scheduler Job for Automated Patch Deployment**:
 
    Cloud Scheduler provides reliable cron-like scheduling for patch deployments, ensuring consistent timing and retry capabilities. The scheduler integrates with Cloud Functions to trigger complex patch workflows while maintaining audit trails and error handling.
 
    ```bash
+   # Get Cloud Function URL
+   FUNCTION_URL=$(gcloud functions describe ${FUNCTION_NAME} \
+     --region=${REGION} \
+     --format="value(serviceConfig.uri)")
+   
    # Create Cloud Scheduler job
    gcloud scheduler jobs create http ${SCHEDULER_JOB_NAME} \
      --schedule="0 2 * * SUN" \
      --time-zone="America/New_York" \
-     --uri="https://${REGION}-${PROJECT_ID}.cloudfunctions.net/${FUNCTION_NAME}" \
+     --uri="${FUNCTION_URL}" \
      --http-method=POST \
      --headers="Content-Type=application/json" \
      --message-body='{"trigger":"scheduled-patch-deployment"}' \
@@ -352,7 +313,7 @@ echo "✅ APIs enabled for VM Manager, Cloud Scheduler, and monitoring"
 
    The scheduler job runs every Sunday at 2 AM Eastern Time, providing consistent patch deployment timing while allowing for maintenance windows that minimize business impact.
 
-7. **Configure Cloud Monitoring for Patch Compliance**:
+6. **Configure Cloud Monitoring for Patch Compliance**:
 
    Cloud Monitoring provides comprehensive visibility into patch deployment status, system health, and compliance metrics. Setting up monitoring dashboards and alerts ensures proactive management of patch deployment outcomes and system reliability.
 
@@ -367,13 +328,36 @@ echo "✅ APIs enabled for VM Manager, Cloud Scheduler, and monitoring"
            "width": 6,
            "height": 4,
            "widget": {
-             "title": "Patch Job Status",
+             "title": "VM Instance Uptime",
              "xyChart": {
                "dataSets": [
                  {
                    "timeSeriesQuery": {
                      "timeSeriesFilter": {
                        "filter": "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/up\"",
+                       "aggregation": {
+                         "alignmentPeriod": "300s",
+                         "perSeriesAligner": "ALIGN_MEAN"
+                       }
+                     }
+                   }
+                 }
+               ]
+             }
+           }
+         },
+         {
+           "width": 6,
+           "height": 4,
+           "yPos": 4,
+           "widget": {
+             "title": "OS Config Agent Status",
+             "xyChart": {
+               "dataSets": [
+                 {
+                   "timeSeriesQuery": {
+                     "timeSeriesFilter": {
+                       "filter": "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/guest/system/processes\"",
                        "aggregation": {
                          "alignmentPeriod": "300s",
                          "perSeriesAligner": "ALIGN_MEAN"
@@ -399,18 +383,18 @@ echo "✅ APIs enabled for VM Manager, Cloud Scheduler, and monitoring"
 
    The monitoring dashboard provides real-time visibility into patch deployment status, system health metrics, and compliance trends, enabling proactive management of your VM fleet's security posture.
 
-8. **Set Up Alert Policies for Patch Management**:
+7. **Set Up Alert Policies for Patch Management**:
 
    Alert policies ensure immediate notification of patch deployment failures, compliance violations, or system issues. This proactive monitoring approach enables rapid response to security vulnerabilities and operational problems.
 
    ```bash
-   # Create alert policy for patch deployment failures
+   # Create alert policy for VM instance downtime
    cat > alert-policy.yaml << EOF
-   displayName: "Patch Deployment Failure Alert"
+   displayName: "VM Instance Down Alert"
    documentation:
-     content: "Alert triggered when patch deployment fails on VM instances"
+     content: "Alert triggered when VM instances go down during patch operations"
    conditions:
-     - displayName: "Patch Job Failure"
+     - displayName: "VM Instance Down"
        conditionThreshold:
          filter: 'resource.type="gce_instance" AND metric.type="compute.googleapis.com/instance/up"'
          comparison: COMPARISON_LESS_THAN
@@ -550,7 +534,7 @@ echo "✅ APIs enabled for VM Manager, Cloud Scheduler, and monitoring"
    
    # Delete alert policies
    POLICY_ID=$(gcloud alpha monitoring policies list \
-     --filter="displayName:'Patch Deployment Failure Alert'" \
+     --filter="displayName:'VM Instance Down Alert'" \
      --format="value(name)")
    
    if [ ! -z "$POLICY_ID" ]; then
@@ -564,7 +548,6 @@ echo "✅ APIs enabled for VM Manager, Cloud Scheduler, and monitoring"
 
    ```bash
    # Remove local configuration files
-   rm -f patch-deployment-config.yaml
    rm -f dashboard-config.json
    rm -f alert-policy.yaml
    rm -f pre-patch-backup.sh
@@ -594,7 +577,7 @@ Extend this solution by implementing these enhancements:
 
 1. **Multi-Region Patch Deployment**: Implement cross-region patch coordination with staged rollouts and region-specific maintenance windows using Cloud Scheduler and Cloud Functions.
 
-2. **Advanced Compliance Reporting**: Create automated compliance reports using BigQuery and Data Studio to track patch deployment history, vulnerability remediation timelines, and regulatory compliance metrics.
+2. **Advanced Compliance Reporting**: Create automated compliance reports using BigQuery and Looker Studio to track patch deployment history, vulnerability remediation timelines, and regulatory compliance metrics.
 
 3. **Integration with ITSM Systems**: Develop webhook integrations with ServiceNow or Jira to automatically create change requests, track patch deployment status, and update incident management workflows.
 

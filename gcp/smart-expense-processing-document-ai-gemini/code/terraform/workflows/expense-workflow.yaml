@@ -1,0 +1,225 @@
+# Cloud Workflows Definition for Smart Expense Processing
+# Orchestrates Document AI extraction, Gemini validation, and database storage
+
+main:
+  params: [input]
+  steps:
+    # Step 1: Validate input parameters
+    - validate_input:
+        switch:
+          - condition: $${not("receipt_content" in input)}
+            raise: "Missing required parameter: receipt_content"
+          - condition: $${not("employee_email" in input)}
+            raise: "Missing required parameter: employee_email"
+          - condition: $${not("mime_type" in input)}
+            assign:
+              - input.mime_type: "image/jpeg"  # Default MIME type
+
+    # Step 2: Extract data from receipt using Document AI
+    - extract_receipt_data:
+        try:
+          call: http.post
+          args:
+            url: "https://${region}-documentai.googleapis.com/v1/projects/${project_id}/locations/${region}/processors/${processor_id}:process"
+            auth:
+              type: OAuth2
+            headers:
+              Content-Type: "application/json"
+            timeout: 60
+            body:
+              rawDocument:
+                content: $${input.receipt_content}
+                mimeType: $${input.mime_type}
+              fieldMask: "text,entities,pages.pageNumber"
+          result: extraction_result
+        except:
+          as: extraction_error
+          steps:
+            - log_extraction_error:
+                call: sys.log
+                args:
+                  text: $${"Document AI extraction failed: " + string(extraction_error)}
+                  severity: "ERROR"
+            - return_extraction_error:
+                return:
+                  status: "error"
+                  error_type: "document_extraction_failed"
+                  message: "Failed to extract data from receipt"
+                  details: $${extraction_error}
+
+    # Step 3: Parse and structure extracted data
+    - parse_extracted_data:
+        assign:
+          - entities: $${default(extraction_result.body.document.entities, [])}
+          - vendor_name: "Unknown Vendor"
+          - total_amount: "0.00"
+          - expense_date: ""
+          - line_items: []
+
+    # Step 4: Extract specific fields from Document AI entities
+    - process_entities:
+        for:
+          value: entity
+          in: $${entities}
+          steps:
+            - extract_entity_data:
+                switch:
+                  - condition: $${entity.type == "supplier_name"}
+                    assign:
+                      - vendor_name: $${entity.mentionText}
+                  - condition: $${entity.type == "total_amount"}
+                    assign:
+                      - total_amount: $${entity.mentionText}
+                  - condition: $${entity.type == "invoice_date"}
+                    assign:
+                      - expense_date: $${entity.mentionText}
+                  - condition: $${entity.type == "line_item"}
+                    assign:
+                      - line_items: $${list.concat(line_items, [entity.mentionText])}
+
+    # Step 5: Prepare expense data for validation
+    - prepare_expense_data:
+        assign:
+          - expense_data:
+              vendor_name: $${vendor_name}
+              total_amount: $${total_amount}
+              expense_date: $${expense_date}
+              category: $${default(input.category, "general")}
+              description: $${default(input.description, "")}
+              employee_email: $${input.employee_email}
+              line_items: $${line_items}
+              extracted_confidence: $${default(extraction_result.body.document.pages[0].blocks[0].confidence, 0.8)}
+
+    # Step 6: Validate expense using Gemini AI
+    - validate_with_gemini:
+        try:
+          call: http.post
+          args:
+            url: "${validator_url}"
+            headers:
+              Content-Type: "application/json"
+            timeout: 120
+            body: $${expense_data}
+          result: validation_result
+        except:
+          as: validation_error
+          steps:
+            - log_validation_error:
+                call: sys.log
+                args:
+                  text: $${"Gemini validation failed: " + string(validation_error)}
+                  severity: "WARNING"
+            - create_fallback_validation:
+                assign:
+                  - validation_result:
+                      body:
+                        approved: false
+                        confidence: 0.5
+                        policy_violations: ["Validation service unavailable"]
+                        recommendations: ["Manual review required"]
+                        risk_score: 50
+                        requires_manager_approval: true
+                        explanation: "Fallback validation due to service unavailability"
+
+    # Step 7: Determine approval workflow
+    - determine_approval_workflow:
+        assign:
+          - requires_approval: $${validation_result.body.requires_manager_approval or not validation_result.body.approved}
+          - approval_status: $${if(validation_result.body.approved and not requires_approval, "auto_approved", "pending_approval")}
+          - risk_level: $${if(validation_result.body.risk_score > 70, "high", if(validation_result.body.risk_score > 40, "medium", "low"))}
+
+    # Step 8: Store expense in database (simulated)
+    - store_expense_data:
+        try:
+          call: sys.log
+          args:
+            text: $${"Storing expense data for " + expense_data.employee_email + ": $" + string(expense_data.total_amount)}
+            severity: "INFO"
+            data:
+              expense_data: $${expense_data}
+              validation_result: $${validation_result.body}
+              approval_status: $${approval_status}
+              risk_level: $${risk_level}
+        except:
+          as: storage_error
+          steps:
+            - log_storage_error:
+                call: sys.log
+                args:
+                  text: $${"Failed to store expense data: " + string(storage_error)}
+                  severity: "ERROR"
+
+    # Step 9: Handle approval workflow
+    - process_approval_workflow:
+        switch:
+          - condition: $${approval_status == "auto_approved"}
+            steps:
+              - log_auto_approval:
+                  call: sys.log
+                  args:
+                    text: $${"Expense auto-approved for " + expense_data.employee_email}
+                    severity: "INFO"
+          - condition: $${approval_status == "pending_approval"}
+            steps:
+              - send_approval_notification:
+                  call: sys.log
+                  args:
+                    text: $${"Approval required for " + expense_data.employee_email + " - Risk level: " + risk_level}
+                    severity: "INFO"
+                    data:
+                      notification_type: "approval_required"
+                      expense_amount: $${expense_data.total_amount}
+                      employee: $${expense_data.employee_email}
+                      violations: $${validation_result.body.policy_violations}
+
+    # Step 10: Generate audit trail
+    - create_audit_trail:
+        assign:
+          - audit_record:
+              transaction_id: $${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+              timestamp: $${time.format(sys.now())}
+              employee_email: $${expense_data.employee_email}
+              vendor_name: $${expense_data.vendor_name}
+              amount: $${expense_data.total_amount}
+              category: $${expense_data.category}
+              extraction_confidence: $${expense_data.extracted_confidence}
+              validation_confidence: $${validation_result.body.confidence}
+              approval_status: $${approval_status}
+              risk_score: $${validation_result.body.risk_score}
+              policy_violations: $${validation_result.body.policy_violations}
+              processing_steps: ["document_extraction", "ai_validation", "approval_workflow"]
+
+    # Step 11: Return final result
+    - return_final_result:
+        return:
+          status: "success"
+          transaction_id: $${audit_record.transaction_id}
+          expense_data: $${expense_data}
+          validation_result: $${validation_result.body}
+          approval_status: $${approval_status}
+          risk_level: $${risk_level}
+          processing_summary:
+            extraction_success: true
+            validation_success: true
+            approval_required: $${requires_approval}
+            auto_approved: $${approval_status == "auto_approved"}
+          audit_trail: $${audit_record}
+          next_steps: $${if(requires_approval, ["Manager approval required", "Notification sent"], ["Expense processed successfully", "Ready for reimbursement"])}
+
+# Error handling workflow for critical failures
+handle_critical_error:
+  params: [error_details]
+  steps:
+    - log_critical_error:
+        call: sys.log
+        args:
+          text: $${"Critical error in expense processing: " + string(error_details)}
+          severity: "CRITICAL"
+    
+    - return_error_response:
+        return:
+          status: "critical_error"
+          error_details: $${error_details}
+          message: "Expense processing failed due to critical error"
+          timestamp: $${time.format(sys.now())}
+          recommended_action: "Contact system administrator"

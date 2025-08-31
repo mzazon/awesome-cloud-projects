@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud NetApp Volumes, Vertex AI Workbench, Cloud Storage, Compute Engine
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: data-science, machine-learning, high-performance-storage, vertex-ai, netapp, collaboration
 recipe-generator-version: 1.3
@@ -88,7 +88,7 @@ graph TB
 4. Familiarity with file system mounting and Linux commands
 5. Estimated cost: $50-150 per day depending on instance types and storage usage (NetApp Volumes: ~$0.35/GB/month, Vertex AI Workbench: ~$0.50/hour for standard instances)
 
-> **Note**: Cloud NetApp Volumes is currently available in select regions. Verify availability in your preferred region before proceeding. See the [Cloud NetApp Volumes documentation](https://cloud.google.com/netapp-volumes/docs) for current regional availability.
+> **Note**: Cloud NetApp Volumes is currently available in select regions. Verify availability in your preferred region before proceeding. See the [Cloud NetApp Volumes documentation](https://cloud.google.com/netapp/volumes/docs) for current regional availability.
 
 ## Preparation
 
@@ -160,9 +160,12 @@ echo "✅ APIs enabled for NetApp Volumes and Vertex AI Workbench"
    
    # Wait for storage pool creation to complete
    echo "Waiting for storage pool creation..."
-   gcloud netapp storage-pools describe ${STORAGE_POOL_NAME} \
+   while [[ $(gcloud netapp storage-pools describe ${STORAGE_POOL_NAME} \
        --location=${REGION} \
-       --format="value(state)" | grep -q "READY"
+       --format="value(state)") != "READY" ]]; do
+       echo "Storage pool is provisioning..."
+       sleep 30
+   done
    
    echo "✅ NetApp storage pool created with premium performance tier"
    ```
@@ -183,6 +186,15 @@ echo "✅ APIs enabled for NetApp Volumes and Vertex AI Workbench"
        --protocols=NFSV3 \
        --unix-permissions=0755 \
        --description="Shared volume for ML datasets and models"
+   
+   # Wait for volume creation to complete
+   echo "Waiting for volume creation..."
+   while [[ $(gcloud netapp volumes describe ${VOLUME_NAME} \
+       --location=${REGION} \
+       --format="value(state)") != "READY" ]]; do
+       echo "Volume is provisioning..."
+       sleep 30
+   done
    
    # Get volume details for mounting
    export VOLUME_IP=$(gcloud netapp volumes describe ${VOLUME_NAME} \
@@ -210,14 +222,15 @@ echo "✅ APIs enabled for NetApp Volumes and Vertex AI Workbench"
        --machine-type=n1-standard-4 \
        --accelerator-type=NVIDIA_TESLA_T4 \
        --accelerator-core-count=1 \
-       --boot-disk-size=100GB \
-       --boot-disk-type=SSD \
+       --boot-disk-size=100 \
+       --boot-disk-type=pd-ssd \
        --network=${NETWORK_NAME} \
        --subnet=${NETWORK_NAME}-subnet \
        --no-public-ip \
        --metadata="enable-oslogin=true" \
-       --image-family=tf-ent-2-11-cu113-notebooks \
-       --image-project=deeplearning-platform-release
+       --vm-image-family=tf-ent-2-11-cu113-notebooks \
+       --vm-image-project=deeplearning-platform-release \
+       --install-gpu-driver
    
    # Wait for instance to be ready
    echo "Waiting for Workbench instance to be ready..."
@@ -238,11 +251,6 @@ echo "✅ APIs enabled for NetApp Volumes and Vertex AI Workbench"
    Mounting the Cloud NetApp Volume to your Vertex AI Workbench instance creates a high-performance shared file system accessible from your Jupyter notebooks. This direct mounting approach eliminates data movement overhead and provides native file system performance for large dataset operations and model artifact storage.
 
    ```bash
-   # Get Workbench instance details
-   export WORKBENCH_EXTERNAL_IP=$(gcloud notebooks instances describe ${WORKBENCH_NAME} \
-       --location=${ZONE} \
-       --format="value(ipAddress)")
-   
    # Create mount point and mount NetApp volume via SSH
    gcloud compute ssh ${WORKBENCH_NAME} \
        --zone=${ZONE} \
@@ -364,7 +372,7 @@ echo "✅ APIs enabled for NetApp Volumes and Vertex AI Workbench"
    echo "✅ Cloud Storage integration configured for data pipeline"
    ```
 
-   This integration enables a efficient data lifecycle where active datasets reside on high-performance NetApp volumes for fast access during experimentation and training, while completed models and archived data are stored in Cloud Storage for long-term retention and cost optimization.
+   This integration enables an efficient data lifecycle where active datasets reside on high-performance NetApp volumes for fast access during experimentation and training, while completed models and archived data are stored in Cloud Storage for long-term retention and cost optimization.
 
 8. **Set Up Collaborative Notebook Environment**:
 
@@ -547,7 +555,7 @@ echo "✅ APIs enabled for NetApp Volumes and Vertex AI Workbench"
    # Unset environment variables
    unset PROJECT_ID REGION ZONE NETWORK_NAME STORAGE_POOL_NAME
    unset VOLUME_NAME WORKBENCH_NAME RANDOM_SUFFIX BUCKET_NAME
-   unset VOLUME_IP EXPORT_PATH WORKBENCH_EXTERNAL_IP JUPYTER_URL
+   unset VOLUME_IP EXPORT_PATH JUPYTER_URL
    
    echo "✅ Environment variables cleared"
    ```
@@ -560,7 +568,7 @@ The integration with Vertex AI Workbench creates a comprehensive managed environ
 
 From a cost optimization perspective, the hybrid approach of using NetApp Volumes for active data and Cloud Storage for archival creates an efficient data lifecycle management strategy. Teams can benefit from high-performance access during active development and training phases while automatically transitioning completed artifacts to more cost-effective long-term storage. The solution also supports advanced data protection scenarios through NetApp's snapshot capabilities, enabling quick recovery from data corruption or accidental deletion scenarios that are common in experimental data science environments.
 
-The architectural pattern established in this recipe scales effectively from individual data scientists to large enterprise teams. Organizations can extend this foundation by implementing additional governance layers, automated data pipelines, and integration with other Google Cloud AI/ML services like BigQuery ML, Dataflow, and Vertex AI Pipelines. For more information on scaling data science environments, see the [Google Cloud Architecture Center](https://cloud.google.com/architecture), [Vertex AI Workbench documentation](https://cloud.google.com/vertex-ai/docs/workbench), [Cloud NetApp Volumes best practices](https://cloud.google.com/netapp-volumes/docs/best-practices), and the [Google Cloud AI/ML solutions guide](https://cloud.google.com/solutions/ai-ml).
+The architectural pattern established in this recipe scales effectively from individual data scientists to large enterprise teams. Organizations can extend this foundation by implementing additional governance layers, automated data pipelines, and integration with other Google Cloud AI/ML services like BigQuery ML, Dataflow, and Vertex AI Pipelines. For more information on scaling data science environments, see the [Google Cloud Architecture Center](https://cloud.google.com/architecture), [Vertex AI Workbench documentation](https://cloud.google.com/vertex-ai/docs/workbench), [Cloud NetApp Volumes best practices](https://cloud.google.com/netapp/volumes/docs/best-practices), and the [Google Cloud AI/ML solutions guide](https://cloud.google.com/solutions/ai-ml).
 
 > **Tip**: Monitor your NetApp Volumes usage patterns using Cloud Monitoring to optimize performance tier selection and capacity planning. The Premium service level provides the highest performance but can be adjusted based on actual throughput requirements and cost considerations.
 

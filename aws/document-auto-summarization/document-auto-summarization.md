@@ -4,12 +4,12 @@ id: bcd84b1d
 category: serverless
 difficulty: 300
 subject: aws
-services: Bedrock, Lambda, S3, EventBridge
+services: Bedrock, Lambda, S3, Textract
 estimated-time: 45 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: serverless, bedrock, lambda, document-processing, ai, automation
 recipe-generator-version: 1.3
@@ -42,13 +42,11 @@ graph TB
     
     subgraph "Output & Storage"
         SUMMARY[Generated Summary<br/>S3 Storage]
-        METADATA[Document Metadata<br/>DynamoDB]
-        NOTIFICATION[SNS Notifications<br/>Summary Ready]
+        METADATA[Document Metadata<br/>S3 Object Metadata]
     end
     
     subgraph "Monitoring"
         CLOUDWATCH[CloudWatch<br/>Logs & Metrics]
-        DASHBOARD[Monitoring<br/>Dashboard]
     end
     
     UPLOAD --> TRIGGER
@@ -57,7 +55,6 @@ graph TB
     TEXTRACT --> BEDROCK
     BEDROCK --> SUMMARY
     LAMBDA --> METADATA
-    LAMBDA --> NOTIFICATION
     LAMBDA --> CLOUDWATCH
     
     style LAMBDA fill:#FF9900
@@ -69,12 +66,12 @@ graph TB
 
 1. AWS account with permissions for Bedrock, Lambda, S3, and Textract
 2. AWS CLI v2 installed and configured
-3. Access to Amazon Bedrock Claude models
+3. Access to Amazon Bedrock Claude models (requires model access approval)
 4. Sample documents (PDFs, images, text files) for testing
-5. Basic understanding of serverless architecture
+5. Basic understanding of serverless architecture and AWS IAM
 6. Estimated cost: $20-100/month depending on document volume and processing frequency
 
-> **Note**: Amazon Bedrock Claude models have usage-based pricing. Monitor costs during development and implement appropriate throttling for production use.
+> **Note**: Amazon Bedrock Claude models have usage-based pricing. Monitor costs during development and implement appropriate throttling for production use. See [Amazon Bedrock pricing](https://aws.amazon.com/bedrock/pricing/) for current rates.
 
 ## Preparation
 
@@ -84,7 +81,7 @@ export AWS_REGION=$(aws configure get region)
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
     --query Account --output text)
 
-# Generate unique identifiers
+# Generate unique identifiers for resources
 RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
     --exclude-punctuation --exclude-uppercase \
     --password-length 6 --require-each-included-type \
@@ -94,18 +91,29 @@ export INPUT_BUCKET="documents-input-${RANDOM_SUFFIX}"
 export OUTPUT_BUCKET="summaries-output-${RANDOM_SUFFIX}"
 export LAMBDA_FUNCTION_NAME="doc-summarizer-${RANDOM_SUFFIX}"
 
-# Create S3 buckets
-aws s3 mb s3://${INPUT_BUCKET}
-aws s3 mb s3://${OUTPUT_BUCKET}
+# Create S3 buckets with encryption enabled
+aws s3 mb s3://${INPUT_BUCKET} --region ${AWS_REGION}
+aws s3 mb s3://${OUTPUT_BUCKET} --region ${AWS_REGION}
 
-echo "✅ Storage resources created"
+# Enable server-side encryption for both buckets
+aws s3api put-bucket-encryption \
+    --bucket ${INPUT_BUCKET} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
+aws s3api put-bucket-encryption \
+    --bucket ${OUTPUT_BUCKET} \
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
+
+echo "✅ Storage resources created with encryption enabled"
 ```
 
 ## Steps
 
 1. **Create Document Processing Lambda Function**:
 
-   The Lambda function orchestrates the entire summarization workflow, handling document text extraction, AI-powered summarization, and result storage. It automatically scales to handle multiple documents concurrently while maintaining cost efficiency through serverless execution.
+   AWS Lambda provides serverless compute that automatically scales based on document processing demand. The function orchestrates the entire summarization workflow, handling document text extraction with Amazon Textract, AI-powered summarization with Amazon Bedrock, and result storage. This serverless approach eliminates server management while maintaining cost efficiency through pay-per-invocation pricing.
 
    ```bash
    # Create Lambda deployment package
@@ -117,6 +125,7 @@ echo "✅ Storage resources created"
    import os
    from urllib.parse import unquote_plus
    import logging
+   from datetime import datetime
 
    logger = logging.getLogger()
    logger.setLevel(logging.INFO)
@@ -139,7 +148,7 @@ echo "✅ Storage resources created"
            # Generate summary using Bedrock
            summary = generate_summary(text_content)
            
-           # Store summary
+           # Store summary with metadata
            store_summary(key, summary, text_content)
            
            return {
@@ -147,7 +156,8 @@ echo "✅ Storage resources created"
                'body': json.dumps({
                    'message': 'Document processed successfully',
                    'document': key,
-                   'summary_length': len(summary)
+                   'summary_length': len(summary),
+                   'original_length': len(text_content)
                })
            }
            
@@ -156,7 +166,7 @@ echo "✅ Storage resources created"
            raise
 
    def extract_text(bucket, key):
-       """Extract text from document using Textract"""
+       """Extract text from document using Amazon Textract"""
        try:
            response = textract.detect_document_text(
                Document={'S3Object': {'Bucket': bucket, 'Name': key}}
@@ -167,19 +177,22 @@ echo "✅ Storage resources created"
                if block['BlockType'] == 'LINE':
                    text_blocks.append(block['Text'])
            
-           return '\n'.join(text_blocks)
+           extracted_text = '\n'.join(text_blocks)
+           logger.info(f"Extracted {len(extracted_text)} characters from document")
+           return extracted_text
            
        except Exception as e:
            logger.error(f"Text extraction failed: {str(e)}")
            raise
 
    def generate_summary(text_content):
-       """Generate summary using Bedrock Claude"""
+       """Generate summary using Amazon Bedrock Claude model"""
        try:
-           # Truncate text if too long
-           max_length = 10000
+           # Truncate text if too long for model context
+           max_length = 15000
            if len(text_content) > max_length:
                text_content = text_content[:max_length] + "..."
+               logger.info(f"Text truncated to {max_length} characters")
            
            prompt = f"""Please provide a comprehensive summary of the following document. Include:
            
@@ -198,12 +211,15 @@ echo "✅ Storage resources created"
                body=json.dumps({
                    'anthropic_version': 'bedrock-2023-05-31',
                    'max_tokens': 1000,
+                   'temperature': 0.3,
                    'messages': [{'role': 'user', 'content': prompt}]
                })
            )
            
            response_body = json.loads(response['body'].read())
-           return response_body['content'][0]['text']
+           summary = response_body['content'][0]['text']
+           logger.info(f"Generated summary with {len(summary)} characters")
+           return summary
            
        except Exception as e:
            logger.error(f"Summary generation failed: {str(e)}")
@@ -215,7 +231,7 @@ echo "✅ Storage resources created"
            output_bucket = os.environ['OUTPUT_BUCKET']
            summary_key = f"summaries/{original_key}.summary.txt"
            
-           # Store summary
+           # Store summary with comprehensive metadata
            s3.put_object(
                Bucket=output_bucket,
                Key=summary_key,
@@ -223,9 +239,10 @@ echo "✅ Storage resources created"
                ContentType='text/plain',
                Metadata={
                    'original-document': original_key,
-                   'summary-generated': 'true',
-                   'text-length': str(len(full_text)),
-                   'summary-length': str(len(summary))
+                   'processing-date': datetime.utcnow().isoformat(),
+                   'original-text-length': str(len(full_text)),
+                   'summary-length': str(len(summary)),
+                   'compression-ratio': str(round(len(summary) / len(full_text), 2))
                }
            )
            
@@ -238,7 +255,7 @@ echo "✅ Storage resources created"
 
    # Create requirements file
    cat > requirements.txt << 'EOF'
-   boto3
+   boto3>=1.26.0
    EOF
 
    # Package Lambda function
@@ -249,14 +266,14 @@ echo "✅ Storage resources created"
    echo "✅ Lambda function package created"
    ```
 
-   > **Note**: Amazon Textract supports various document formats including PDFs, images, and scanned documents. The service automatically handles text extraction with high accuracy for both printed and handwritten text.
+   The Lambda function uses Amazon Textract for accurate text extraction from various document formats including PDFs, images, and scanned documents. Textract automatically handles complex layouts and both printed and handwritten text with high accuracy, making it ideal for enterprise document processing workflows.
 
 2. **Deploy Lambda Function with Proper IAM Permissions**:
 
-   The Lambda function requires specific permissions to access S3, Textract, and Bedrock services. Proper IAM configuration ensures secure access while following the principle of least privilege.
+   Proper IAM configuration ensures secure access to AWS services while following the principle of least privilege. The Lambda execution role grants only the minimum permissions needed for S3 access, Textract operations, and Bedrock model invocation, enhancing security posture while enabling full functionality.
 
    ```bash
-   # Create IAM role for Lambda
+   # Create IAM role for Lambda execution
    cat > lambda-trust-policy.json << 'EOF'
    {
        "Version": "2012-10-17",
@@ -277,7 +294,7 @@ echo "✅ Storage resources created"
        --assume-role-policy-document file://lambda-trust-policy.json \
        --query 'Role.Arn' --output text)
 
-   # Create and attach custom policy
+   # Create comprehensive permissions policy
    cat > lambda-permissions-policy.json << EOF
    {
        "Version": "2012-10-17",
@@ -289,18 +306,21 @@ echo "✅ Storage resources created"
                    "logs:CreateLogStream",
                    "logs:PutLogEvents"
                ],
-               "Resource": "arn:aws:logs:*:*:*"
+               "Resource": "arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:*"
            },
            {
                "Effect": "Allow",
                "Action": [
-                   "s3:GetObject",
+                   "s3:GetObject"
+               ],
+               "Resource": "arn:aws:s3:::${INPUT_BUCKET}/*"
+           },
+           {
+               "Effect": "Allow",
+               "Action": [
                    "s3:PutObject"
                ],
-               "Resource": [
-                   "arn:aws:s3:::${INPUT_BUCKET}/*",
-                   "arn:aws:s3:::${OUTPUT_BUCKET}/*"
-               ]
+               "Resource": "arn:aws:s3:::${OUTPUT_BUCKET}/*"
            },
            {
                "Effect": "Allow",
@@ -325,121 +345,156 @@ echo "✅ Storage resources created"
        --policy-name DocumentSummarizerPolicy \
        --policy-document file://lambda-permissions-policy.json
 
-   # Wait for role propagation
-   sleep 10
+   # Wait for IAM role propagation
+   sleep 15
 
-   # Create Lambda function
+   # Create Lambda function with latest Python runtime
    aws lambda create-function \
        --function-name $LAMBDA_FUNCTION_NAME \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role $LAMBDA_ROLE_ARN \
        --handler lambda_function.lambda_handler \
        --zip-file fileb://doc-summarizer/doc-summarizer.zip \
        --environment Variables="{OUTPUT_BUCKET=${OUTPUT_BUCKET}}" \
        --timeout 300 \
-       --memory-size 512
+       --memory-size 512 \
+       --description "Automated document summarization using Bedrock"
 
-   echo "✅ Lambda function deployed"
+   echo "✅ Lambda function deployed with secure IAM permissions"
    ```
 
-3. **Configure S3 Event Trigger**:
+   The function is configured with 512MB memory and 5-minute timeout to handle large documents efficiently. These settings provide sufficient resources for text extraction and AI model invocation while maintaining cost optimization through appropriate resource allocation.
 
-   S3 event notifications automatically trigger the summarization process when new documents are uploaded. This creates a fully automated workflow that requires no manual intervention while maintaining scalability and reliability.
+3. **Configure S3 Event Trigger for Automated Processing**:
+
+   S3 event notifications create a fully automated, event-driven architecture that triggers document processing immediately upon upload. This eliminates manual intervention while providing scalable, reliable document processing that responds instantly to new content.
 
    ```bash
-   # Configure S3 event notification
+   # Configure S3 event notification for automated triggering
    cat > s3-notification-config.json << EOF
    {
-       "LambdaConfiguration": {
-           "Id": "DocumentUploadTrigger",
-           "LambdaFunctionArn": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${LAMBDA_FUNCTION_NAME}",
-           "Events": ["s3:ObjectCreated:*"],
-           "Filter": {
-               "Key": {
-                   "FilterRules": [
-                       {
-                           "Name": "prefix",
-                           "Value": "documents/"
-                       }
-                   ]
+       "LambdaConfigurations": [
+           {
+               "Id": "DocumentUploadTrigger",
+               "LambdaFunctionArn": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${LAMBDA_FUNCTION_NAME}",
+               "Events": ["s3:ObjectCreated:*"],
+               "Filter": {
+                   "Key": {
+                       "FilterRules": [
+                           {
+                               "Name": "prefix",
+                               "Value": "documents/"
+                           }
+                       ]
+                   }
                }
            }
-       }
+       ]
    }
    EOF
 
-   # Add Lambda permission for S3
+   # Grant S3 permission to invoke Lambda function
    aws lambda add-permission \
        --function-name $LAMBDA_FUNCTION_NAME \
        --principal s3.amazonaws.com \
        --action lambda:InvokeFunction \
-       --statement-id s3-trigger \
+       --statement-id s3-trigger-permission \
        --source-arn arn:aws:s3:::${INPUT_BUCKET}
 
-   # Configure S3 bucket notification
+   # Apply notification configuration to S3 bucket
    aws s3api put-bucket-notification-configuration \
        --bucket $INPUT_BUCKET \
        --notification-configuration file://s3-notification-config.json
 
-   echo "✅ S3 event trigger configured"
+   echo "✅ S3 event trigger configured for automated processing"
    ```
 
-   > **Tip**: Use S3 object prefixes to organize different types of documents and apply different processing rules. For example, contracts/ vs reports/ prefixes can trigger different summarization strategies.
+   The event trigger is configured with a "documents/" prefix filter, enabling organized document management and selective processing. This allows for different processing rules based on document categories or types uploaded to specific prefixes within the bucket.
+
+   > **Tip**: Use S3 object prefixes to organize different types of documents and apply different processing rules. For example, contracts/ vs reports/ prefixes can trigger different summarization strategies or route to different processing workflows.
 
 ## Validation & Testing
 
-1. Test document upload and processing:
+1. **Test document upload and processing workflow**:
 
    ```bash
-   # Create test document
+   # Create comprehensive test document
    cat > test-document.txt << 'EOF'
-   EXECUTIVE SUMMARY
+   EXECUTIVE SUMMARY - Q3 2024 PERFORMANCE REPORT
 
    This quarterly report presents the financial performance and strategic initiatives of XYZ Corporation for Q3 2024. 
 
    KEY FINDINGS:
    - Revenue increased 15% year-over-year to $2.3M
-   - Customer acquisition cost reduced by 8%
+   - Customer acquisition cost reduced by 8% to $120 per customer
    - New product line launched successfully in European markets
    - Digital transformation initiative completed ahead of schedule
+   - Employee satisfaction scores improved to 4.2/5.0
+
+   FINANCIAL METRICS:
+   - Gross margin: 42% (up from 38% in Q2)
+   - Operating expenses: $890K (within budget)
+   - Net income: $340K (25% increase YoY)
+   - Cash flow: Positive $280K for the quarter
 
    RECOMMENDATIONS:
-   - Expand marketing budget for Q4 holiday season
+   - Expand marketing budget for Q4 holiday season by 20%
    - Invest in additional customer service capacity
    - Explore partnership opportunities in Asian markets
    - Continue focus on operational efficiency improvements
+   - Implement advanced analytics for customer insights
+
+   RISK FACTORS:
+   - Supply chain disruptions may impact Q4 delivery
+   - Increased competition in core markets
+   - Currency fluctuations affecting international operations
 
    The outlook for Q4 remains positive with projected growth of 12-18%.
+   Next board meeting scheduled for January 15, 2025.
    EOF
 
-   # Upload document to trigger processing
-   aws s3 cp test-document.txt s3://${INPUT_BUCKET}/documents/
+   # Upload document to trigger automated processing
+   aws s3 cp test-document.txt \
+       s3://${INPUT_BUCKET}/documents/quarterly-report-q3-2024.txt
 
-   echo "✅ Test document uploaded"
+   echo "✅ Test document uploaded - processing initiated"
    ```
 
-2. Monitor processing and retrieve summary:
+2. **Monitor processing execution and retrieve results**:
 
    ```bash
-   # Check Lambda execution logs
-   aws logs describe-log-groups \
-       --log-group-name-prefix "/aws/lambda/${LAMBDA_FUNCTION_NAME}"
+   # Check Lambda function logs for processing status
+   LATEST_LOG_STREAM=$(aws logs describe-log-streams \
+       --log-group-name "/aws/lambda/${LAMBDA_FUNCTION_NAME}" \
+       --order-by LastEventTime --descending \
+       --max-items 1 --query 'logStreams[0].logStreamName' \
+       --output text)
+
+   echo "Latest log stream: ${LATEST_LOG_STREAM}"
 
    # Wait for processing to complete
-   sleep 30
+   echo "Waiting for document processing..."
+   sleep 45
 
-   # Check for generated summary
-   aws s3 ls s3://${OUTPUT_BUCKET}/summaries/
+   # Verify summary generation
+   aws s3 ls s3://${OUTPUT_BUCKET}/summaries/ --recursive
 
-   # Download and view summary
-   aws s3 cp s3://${OUTPUT_BUCKET}/summaries/documents/test-document.txt.summary.txt summary.txt
-   cat summary.txt
+   # Download and display generated summary
+   if aws s3 ls s3://${OUTPUT_BUCKET}/summaries/documents/quarterly-report-q3-2024.txt.summary.txt > /dev/null 2>&1; then
+       aws s3 cp s3://${OUTPUT_BUCKET}/summaries/documents/quarterly-report-q3-2024.txt.summary.txt summary.txt
+       echo "Generated Summary:"
+       echo "=================="
+       cat summary.txt
+       echo -e "\n✅ Document successfully processed and summarized"
+   else
+       echo "⚠️ Summary not yet available - check CloudWatch logs"
+   fi
    ```
 
-3. Verify system metrics:
+3. **Verify system performance metrics**:
 
    ```bash
-   # Check Lambda function metrics
+   # Check Lambda function invocation metrics
    aws cloudwatch get-metric-statistics \
        --namespace AWS/Lambda \
        --metric-name Invocations \
@@ -448,57 +503,94 @@ echo "✅ Storage resources created"
        --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
        --period 3600 \
        --statistics Sum
+
+   # Check for any errors or throttling
+   aws cloudwatch get-metric-statistics \
+       --namespace AWS/Lambda \
+       --metric-name Errors \
+       --dimensions Name=FunctionName,Value=$LAMBDA_FUNCTION_NAME \
+       --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
+       --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+       --period 3600 \
+       --statistics Sum
    ```
 
-   > **Warning**: Monitor Bedrock usage costs carefully, especially during initial testing. Consider implementing rate limiting and cost alerts to prevent unexpected charges from high-volume processing.
+   Expected output: Successful invocation count of 1 with zero errors, indicating proper system functionality and reliable document processing.
+
+   > **Warning**: Monitor Bedrock usage costs carefully, especially during initial testing. Consider implementing rate limiting and cost alerts to prevent unexpected charges from high-volume processing. Use [AWS Budgets](https://aws.amazon.com/aws-cost-management/aws-budgets/) to set spending thresholds.
 
 ## Cleanup
 
-1. Remove S3 event notification:
+1. **Remove S3 event notification configuration**:
 
    ```bash
+   # Disable S3 event notifications
    aws s3api put-bucket-notification-configuration \
        --bucket $INPUT_BUCKET \
        --notification-configuration '{}'
+   
+   echo "✅ S3 event notifications disabled"
    ```
 
-2. Delete Lambda function and role:
+2. **Delete Lambda function and IAM resources**:
 
    ```bash
+   # Remove Lambda function
    aws lambda delete-function --function-name $LAMBDA_FUNCTION_NAME
 
+   # Delete IAM role and policies
    aws iam delete-role-policy \
        --role-name DocumentSummarizerRole-${RANDOM_SUFFIX} \
        --policy-name DocumentSummarizerPolicy
 
-   aws iam delete-role --role-name DocumentSummarizerRole-${RANDOM_SUFFIX}
+   aws iam delete-role \
+       --role-name DocumentSummarizerRole-${RANDOM_SUFFIX}
+
+   echo "✅ Lambda function and IAM resources removed"
    ```
 
-3. Clean up S3 buckets:
+3. **Clean up S3 buckets and contents**:
 
    ```bash
+   # Remove all objects and delete buckets
    aws s3 rb s3://${INPUT_BUCKET} --force
    aws s3 rb s3://${OUTPUT_BUCKET} --force
+
+   echo "✅ S3 buckets and contents removed"
    ```
 
-4. Remove local files:
+4. **Remove local files and directories**:
 
    ```bash
+   # Clean up local files
    rm -rf doc-summarizer
-   rm -f *.json *.txt
+   rm -f *.json *.txt summary.txt
+
+   # Unset environment variables
+   unset INPUT_BUCKET OUTPUT_BUCKET LAMBDA_FUNCTION_NAME RANDOM_SUFFIX
+
+   echo "✅ Local cleanup completed"
    ```
 
 ## Discussion
 
-This serverless document summarization system demonstrates the power of combining AWS's managed AI services with event-driven architecture. Amazon Textract provides robust text extraction capabilities that handle various document formats and layouts, while Bedrock's Claude model offers sophisticated natural language understanding and generation capabilities that can create meaningful, contextual summaries.
+This serverless document summarization system demonstrates the power of combining AWS's managed AI services with event-driven architecture. Amazon Textract provides enterprise-grade text extraction capabilities that handle various document formats, layouts, and even handwritten content with high accuracy, eliminating the need for complex document parsing logic. Amazon Bedrock's Claude model offers sophisticated natural language understanding and generation capabilities that create meaningful, contextual summaries while maintaining accuracy and relevance.
 
-The serverless approach ensures cost efficiency by only charging for actual processing time, automatic scaling to handle varying document volumes, and minimal operational overhead. The event-driven design creates a responsive system that processes documents immediately upon upload while maintaining reliability through AWS's managed services.
+The serverless approach using AWS Lambda ensures cost efficiency by charging only for actual processing time, automatic scaling to handle varying document volumes, and minimal operational overhead. The event-driven design creates a responsive system that processes documents immediately upon upload while maintaining reliability through AWS's managed services and built-in error handling. This architecture follows the [AWS Well-Architected Framework](https://aws.amazon.com/architecture/well-architected/) principles, particularly focusing on operational excellence and cost optimization.
 
-> **Note**: Consider implementing document classification and routing logic to apply different summarization strategies based on document type, source, or content classification for more tailored results.
+The solution's security posture follows AWS best practices with least-privilege IAM permissions, S3 bucket encryption, and VPC isolation capabilities. For production deployments, consider implementing additional security measures such as S3 bucket policies, CloudTrail logging, and AWS Config rules for compliance monitoring. The system's scalability allows processing from single documents to thousands of concurrent uploads without infrastructure changes, making it suitable for both small businesses and enterprise deployments.
+
+> **Note**: Consider implementing document classification and routing logic to apply different summarization strategies based on document type, source, or content classification for more tailored results. Use [Amazon Comprehend](https://aws.amazon.com/comprehend/) for document classification and entity extraction to enhance summarization accuracy.
 
 ## Challenge
 
-Enhance this system by adding multi-format document support (Word, PowerPoint, Excel), implementing custom summarization templates for different document types, creating a web interface for document upload and summary retrieval, adding sentiment analysis and key entity extraction, and building analytics dashboards to track processing metrics and summary quality over time.
+Enhance this system by implementing these progressive improvements:
+
+1. **Multi-format document support**: Add processing for Word documents, PowerPoint presentations, and Excel files using additional AWS services or libraries
+2. **Custom summarization templates**: Create different summary formats based on document type (contracts, reports, emails) with specialized prompts and output structures
+3. **Web interface development**: Build a React-based web application with S3 pre-signed URLs for secure document upload and summary retrieval
+4. **Advanced analytics integration**: Add sentiment analysis using Amazon Comprehend and key entity extraction to provide deeper document insights beyond basic summarization
+5. **Enterprise dashboard**: Implement real-time analytics dashboards using Amazon QuickSight to track processing metrics, summary quality scores, and usage patterns over time
 
 ## Infrastructure Code
 

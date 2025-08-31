@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: verified-permissions, api-gateway, cognito, lambda
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: authorization, api-security, cedar-policy, attribute-based-access-control, identity-management
 recipe-generator-version: 1.3
@@ -260,7 +260,6 @@ export DOCUMENTS_TABLE="Documents-${RANDOM_SUFFIX}"
    import jwt
    from jwt import PyJWKSClient
    import os
-   import urllib.request
 
    verifiedpermissions = boto3.client('verifiedpermissions')
    policy_store_id = os.environ['POLICY_STORE_ID']
@@ -420,7 +419,7 @@ export DOCUMENTS_TABLE="Documents-${RANDOM_SUFFIX}"
    # Create Lambda function
    AUTHORIZER_FUNCTION_ARN=$(aws lambda create-function \
        --function-name "DocManagement-Authorizer-${RANDOM_SUFFIX}" \
-       --runtime python3.9 \
+       --runtime python3.11 \
        --role "${LAMBDA_ROLE_ARN}" \
        --handler index.lambda_handler \
        --zip-file fileb://authorizer-function.zip \
@@ -471,7 +470,6 @@ export DOCUMENTS_TABLE="Documents-${RANDOM_SUFFIX}"
        --name "VerifiedPermissionsAuthorizer" \
        --type TOKEN \
        --authorizer-uri "arn:aws:apigateway:${AWS_REGION}:lambda:path/2015-03-31/functions/${AUTHORIZER_FUNCTION_ARN}/invocations" \
-       --authorizer-credentials "${LAMBDA_ROLE_ARN}" \
        --identity-source method.request.header.Authorization \
        --authorizer-result-ttl-in-seconds 300 \
        --query id --output text)
@@ -526,7 +524,7 @@ export DOCUMENTS_TABLE="Documents-${RANDOM_SUFFIX}"
                    return {
                        'statusCode': 200,
                        'headers': {'Content-Type': 'application/json'},
-                       'body': json.dumps(response['Item'])
+                       'body': json.dumps(response['Item'], default=str)
                    }
                else:
                    return {
@@ -540,7 +538,7 @@ export DOCUMENTS_TABLE="Documents-${RANDOM_SUFFIX}"
                return {
                    'statusCode': 200,
                    'headers': {'Content-Type': 'application/json'},
-                   'body': json.dumps(response['Items'])
+                   'body': json.dumps(response['Items'], default=str)
                }
                
            elif http_method == 'POST':
@@ -560,7 +558,7 @@ export DOCUMENTS_TABLE="Documents-${RANDOM_SUFFIX}"
                return {
                    'statusCode': 201,
                    'headers': {'Content-Type': 'application/json'},
-                   'body': json.dumps(document)
+                   'body': json.dumps(document, default=str)
                }
                
            elif http_method == 'PUT' and document_id:
@@ -580,7 +578,7 @@ export DOCUMENTS_TABLE="Documents-${RANDOM_SUFFIX}"
                return {
                    'statusCode': 200,
                    'headers': {'Content-Type': 'application/json'},
-                   'body': json.dumps(response['Attributes'])
+                   'body': json.dumps(response['Attributes'], default=str)
                }
                
            elif http_method == 'DELETE' and document_id:
@@ -612,7 +610,7 @@ export DOCUMENTS_TABLE="Documents-${RANDOM_SUFFIX}"
    # Create business logic Lambda function
    BUSINESS_FUNCTION_ARN=$(aws lambda create-function \
        --function-name "DocManagement-Business-${RANDOM_SUFFIX}" \
-       --runtime python3.9 \
+       --runtime python3.11 \
        --role "${LAMBDA_ROLE_ARN}" \
        --handler index.lambda_handler \
        --zip-file fileb://business-function.zip \

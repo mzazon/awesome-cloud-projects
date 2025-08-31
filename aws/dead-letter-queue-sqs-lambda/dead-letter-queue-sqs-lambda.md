@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: SQS, Lambda, CloudWatch
 estimated-time: 45 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: sqs, lambda, error-handling, dead-letter-queue, serverless, monitoring
 recipe-generator-version: 1.3
@@ -118,6 +118,14 @@ aws iam attach-role-policy \
     --role-name ${LAMBDA_ROLE_NAME} \
     --policy-arn arn:aws:iam::aws:policy/AmazonSQSFullAccess
 
+aws iam attach-role-policy \
+    --role-name ${LAMBDA_ROLE_NAME} \
+    --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+# Wait for role to be available
+echo "Waiting for IAM role to be available..."
+sleep 10
+
 echo "✅ IAM role created: ${LAMBDA_ROLE_NAME}"
 ```
 
@@ -207,7 +215,7 @@ def lambda_handler(event, context):
             # Simulate processing logic with intentional failures
             # In real scenarios, this would be actual business logic
             if random.random() < 0.3:  # 30% failure rate for demo
-                raise Exception(f"Processing failed for order {order_id}")
+                raise ValueError(f"Processing failed for order {order_id}")
             
             # Simulate successful processing
             logger.info(f"Successfully processed order: {order_id}")
@@ -221,7 +229,7 @@ def lambda_handler(event, context):
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}")
             # Let SQS handle the retry mechanism
-            raise e
+            raise
     
     return {
         'statusCode': 200,
@@ -236,7 +244,7 @@ EOF
    # Create Lambda function
    LAMBDA_ARN=$(aws lambda create-function \
        --function-name "order-processor-${RANDOM_SUFFIX}" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}" \
        --handler main_processor.lambda_handler \
        --zip-file fileb://main_processor.zip \
@@ -291,23 +299,26 @@ def lambda_handler(event, context):
             logger.info(f"Message attributes: {record.get('messageAttributes', {})}")
             
             # Create error metrics
-            cloudwatch = boto3.client('cloudwatch')
-            cloudwatch.put_metric_data(
-                Namespace='DLQ/Processing',
-                MetricData=[
-                    {
-                        'MetricName': 'FailedMessages',
-                        'Value': 1,
-                        'Unit': 'Count',
-                        'Dimensions': [
-                            {
-                                'Name': 'ErrorCategory',
-                                'Value': error_category
-                            }
-                        ]
-                    }
-                ]
-            )
+            try:
+                cloudwatch = boto3.client('cloudwatch')
+                cloudwatch.put_metric_data(
+                    Namespace='DLQ/Processing',
+                    MetricData=[
+                        {
+                            'MetricName': 'FailedMessages',
+                            'Value': 1,
+                            'Unit': 'Count',
+                            'Dimensions': [
+                                {
+                                    'Name': 'ErrorCategory',
+                                    'Value': error_category
+                                }
+                            ]
+                        }
+                    ]
+                )
+            except Exception as cw_error:
+                logger.warning(f"Failed to send CloudWatch metrics: {str(cw_error)}")
             
             # Determine if message should be retried
             if should_retry(message_body, error_count):
@@ -320,7 +331,7 @@ def lambda_handler(event, context):
                 
         except Exception as e:
             logger.error(f"Error processing DLQ message: {str(e)}")
-            raise e
+            raise
     
     return {
         'statusCode': 200,
@@ -372,6 +383,8 @@ def send_to_retry_queue(message_body):
             logger.info("Message sent to retry queue")
         except Exception as e:
             logger.error(f"Failed to send message to retry queue: {str(e)}")
+    else:
+        logger.error("MAIN_QUEUE_URL environment variable not set")
 EOF
 
    # Create deployment package
@@ -380,7 +393,7 @@ EOF
    # Create DLQ monitor Lambda function
    DLQ_MONITOR_ARN=$(aws lambda create-function \
        --function-name "dlq-monitor-${RANDOM_SUFFIX}" \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}" \
        --handler dlq_monitor.lambda_handler \
        --zip-file fileb://dlq_monitor.zip \
@@ -623,6 +636,10 @@ EOF
        --role-name ${LAMBDA_ROLE_NAME} \
        --policy-arn arn:aws:iam::aws:policy/AmazonSQSFullAccess
    
+   aws iam detach-role-policy \
+       --role-name ${LAMBDA_ROLE_NAME} \
+       --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+   
    # Delete role
    aws iam delete-role --role-name ${LAMBDA_ROLE_NAME}
    
@@ -645,9 +662,9 @@ Dead letter queues are essential for building resilient distributed systems, par
 
 The key architectural decision is the separation of concerns between the main processing logic and error handling. The main processor focuses on business logic while remaining simple and fast, while the DLQ monitor handles the complex error analysis and retry logic. This separation allows for independent scaling and maintenance of each component. The retry mechanism is particularly important as it distinguishes between transient failures (network timeouts, temporary service unavailability) and permanent failures (malformed data, business rule violations).
 
-The CloudWatch integration provides crucial observability into error patterns and system health. By categorizing errors and creating custom metrics, operations teams can identify systemic issues before they impact customers. The alarm configuration ensures that DLQ activity triggers immediate notifications, enabling rapid response to processing failures. For comprehensive monitoring strategies, consult the [SQS CloudWatch Monitoring documentation](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/monitoring-using-cloudwatch.html).
+The CloudWatch integration provides crucial observability into error patterns and system health. By categorizing errors and creating custom metrics, operations teams can identify systemic issues before they impact customers. The alarm configuration ensures that DLQ activity triggers immediate notifications, enabling rapid response to processing failures. This approach follows AWS Well-Architected Framework operational excellence principles by implementing comprehensive monitoring and automated alerting. For comprehensive monitoring strategies, consult the [SQS CloudWatch Monitoring documentation](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/monitoring-using-cloudwatch.html) and the [AWS Well-Architected Operational Excellence pillar](https://docs.aws.amazon.com/wellarchitected/latest/operational-excellence-pillar/welcome.html).
 
-> **Tip**: Set different maxReceiveCount values based on message criticality. High-value transactions might warrant more retry attempts, while low-priority messages can fail faster to reduce processing costs. For detailed guidance on DLQ configuration, refer to the [SQS Dead Letter Queue documentation](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html).
+> **Tip**: Set different maxReceiveCount values based on message criticality. High-value transactions might warrant more retry attempts, while low-priority messages can fail faster to reduce processing costs. This configuration approach helps optimize both system reliability and operational costs while following AWS cost optimization best practices. For detailed guidance on DLQ configuration, refer to the [SQS Dead Letter Queue documentation](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html).
 
 ## Challenge
 

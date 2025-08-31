@@ -1,0 +1,1178 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Enterprise API Integration with AgentCore Gateway and Step Functions - Complete serverless infrastructure for intelligent API integration workflows'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'api-integration'
+    Description: 'Base name for project resources'
+    AllowedPattern: '^[a-zA-Z0-9\-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+    Description: 'Environment for resource tagging and configuration'
+
+  LogLevel:
+    Type: String
+    Default: 'INFO'
+    AllowedValues:
+      - 'DEBUG'
+      - 'INFO'
+      - 'WARNING'
+      - 'ERROR'
+    Description: 'Log level for Lambda functions'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 3
+    MaxValue: 900
+    Description: 'Timeout in seconds for Lambda functions'
+
+  ApiGatewayThrottlingBurst:
+    Type: Number
+    Default: 5000
+    MinValue: 1
+    MaxValue: 5000
+    Description: 'API Gateway throttling burst limit'
+
+  ApiGatewayThrottlingRate:
+    Type: Number
+    Default: 2000
+    MinValue: 1
+    MaxValue: 10000
+    Description: 'API Gateway throttling rate limit'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'production']
+  IsNotProduction: !Not [!Equals [!Ref Environment, 'production']]
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: 'Lambda Configuration'
+        Parameters:
+          - LogLevel
+          - LambdaTimeout
+      - Label:
+          default: 'API Gateway Configuration'
+        Parameters:
+          - ApiGatewayThrottlingBurst
+          - ApiGatewayThrottlingRate
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      Environment:
+        default: 'Environment'
+      LogLevel:
+        default: 'Lambda Log Level'
+      LambdaTimeout:
+        default: 'Lambda Timeout (seconds)'
+
+Resources:
+  # ============================================================================
+  # IAM Roles for Lambda Functions
+  # ============================================================================
+  
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${AWS::AccountId}'
+      Description: 'IAM role for Lambda function execution with CloudWatch Logs access'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaCustomPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # Lambda Functions
+  # ============================================================================
+
+  ApiTransformerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-api-transformer'
+      Description: 'Transform API requests for enterprise system integration with multiple format support'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 512
+      ReservedConcurrencyLimit: !If [IsProduction, 50, 10]
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !Ref LogLevel
+          PROJECT_NAME: !Ref ProjectName
+      TracingConfig:
+        Mode: Active
+      Code:
+        ZipFile: |
+          import json
+          import urllib3
+          import os
+          import logging
+          from typing import Dict, Any
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+
+          # Initialize urllib3 PoolManager for HTTP requests
+          http = urllib3.PoolManager()
+
+          def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
+              """
+              Transform API requests for enterprise system integration
+              """
+              logger.info(f"Processing API transformation request: {json.dumps(event, default=str)}")
+              
+              try:
+                  # Extract request parameters
+                  api_type = event.get('api_type', 'generic')
+                  payload = event.get('payload', {})
+                  target_url = event.get('target_url')
+                  
+                  logger.info(f"Transforming request for API type: {api_type}")
+                  
+                  # Transform based on API type
+                  if api_type == 'erp':
+                      transformed_data = transform_erp_request(payload)
+                  elif api_type == 'crm':
+                      transformed_data = transform_crm_request(payload)
+                  elif api_type == 'inventory':
+                      transformed_data = transform_inventory_request(payload)
+                  else:
+                      transformed_data = payload
+                      logger.warning(f"Unknown API type: {api_type}, using generic transformation")
+                  
+                  # Simulate API call to target system (using mock response)
+                  # In production, this would make actual HTTP requests to enterprise APIs
+                  mock_response = {
+                      'success': True,
+                      'transaction_id': f"{api_type}-{payload.get('id', 'unknown')}",
+                      'processed_data': transformed_data,
+                      'status': 'completed',
+                      'timestamp': context.aws_request_id,
+                      'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                  }
+                  
+                  logger.info(f"Transformation completed successfully for transaction: {mock_response['transaction_id']}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'success': True,
+                          'data': mock_response,
+                          'status_code': 200
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error during API transformation: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'success': False,
+                          'error': str(e),
+                          'request_id': context.aws_request_id
+                      })
+                  }
+
+          def transform_erp_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+              """Transform requests for ERP system format"""
+              logger.debug("Applying ERP transformation rules")
+              return {
+                  'transaction_type': payload.get('type', 'query'),
+                  'data': payload.get('data', {}),
+                  'metadata': {
+                      'source': 'agentcore_gateway',
+                      'timestamp': payload.get('timestamp'),
+                      'system': 'erp'
+                  }
+              }
+
+          def transform_crm_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+              """Transform requests for CRM system format"""
+              logger.debug("Applying CRM transformation rules")
+              return {
+                  'operation': payload.get('action', 'read'),
+                  'entity': payload.get('entity', 'contact'),
+                  'attributes': payload.get('data', {}),
+                  'source_system': 'ai_agent',
+                  'system': 'crm'
+              }
+
+          def transform_inventory_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+              """Transform requests for Inventory system format"""
+              logger.debug("Applying Inventory transformation rules")
+              return {
+                  'operation_type': payload.get('type', 'query'),
+                  'inventory_data': payload.get('data', {}),
+                  'metadata': {
+                      'source': 'agentcore_gateway',
+                      'system': 'inventory',
+                      'timestamp': payload.get('timestamp')
+                  }
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Function
+          Value: ApiTransformer
+
+  DataValidatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-data-validator'
+      Description: 'Validate API request data according to enterprise rules with comprehensive validation types'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      ReservedConcurrencyLimit: !If [IsProduction, 30, 5]
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !Ref LogLevel
+          PROJECT_NAME: !Ref ProjectName
+      TracingConfig:
+        Mode: Active
+      Code:
+        ZipFile: |
+          import json
+          import re
+          import os
+          import logging
+          from typing import Dict, Any, List
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+
+          def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
+              """
+              Validate API request data according to enterprise rules
+              """
+              logger.info(f"Processing validation request: {json.dumps(event, default=str)}")
+              
+              try:
+                  data = event.get('data', {})
+                  validation_type = event.get('validation_type', 'standard')
+                  
+                  logger.info(f"Validating data with type: {validation_type}")
+                  
+                  # Perform validation based on type
+                  validation_result = validate_data(data, validation_type)
+                  
+                  if validation_result['is_valid']:
+                      logger.info("Data validation passed successfully")
+                  else:
+                      logger.warning(f"Data validation failed with errors: {validation_result['errors']}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'valid': validation_result['is_valid'],
+                          'errors': validation_result['errors'],
+                          'sanitized_data': validation_result['sanitized_data'],
+                          'validation_type': validation_type,
+                          'request_id': context.aws_request_id
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error during data validation: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'valid': False,
+                          'errors': [f"Validation error: {str(e)}"],
+                          'request_id': context.aws_request_id
+                      })
+                  }
+
+          def validate_data(data: Dict[str, Any], validation_type: str) -> Dict[str, Any]:
+              """Perform comprehensive data validation"""
+              errors = []
+              sanitized_data = {}
+              
+              logger.debug(f"Starting validation for type: {validation_type}")
+              
+              # Standard validation rules
+              if validation_type == 'standard':
+                  errors.extend(validate_required_fields(data))
+                  errors.extend(validate_data_types(data))
+                  sanitized_data = sanitize_data(data)
+              
+              # Financial data validation
+              elif validation_type == 'financial':
+                  errors.extend(validate_required_fields(data))
+                  errors.extend(validate_financial_data(data))
+                  sanitized_data = sanitize_financial_data(data)
+              
+              # Customer data validation
+              elif validation_type == 'customer':
+                  errors.extend(validate_required_fields(data))
+                  errors.extend(validate_customer_data(data))
+                  sanitized_data = sanitize_customer_data(data)
+              
+              # Inventory data validation
+              elif validation_type == 'inventory':
+                  errors.extend(validate_required_fields(data))
+                  errors.extend(validate_inventory_data(data))
+                  sanitized_data = sanitize_inventory_data(data)
+              
+              else:
+                  errors.append(f"Unknown validation type: {validation_type}")
+                  sanitized_data = data
+              
+              return {
+                  'is_valid': len(errors) == 0,
+                  'errors': errors,
+                  'sanitized_data': sanitized_data
+              }
+
+          def validate_required_fields(data: Dict[str, Any]) -> List[str]:
+              """Validate required field presence"""
+              errors = []
+              required_fields = ['id', 'type', 'data']
+              
+              for field in required_fields:
+                  if field not in data or data[field] is None:
+                      errors.append(f"Required field '{field}' is missing")
+              
+              return errors
+
+          def validate_data_types(data: Dict[str, Any]) -> List[str]:
+              """Validate data type constraints"""
+              errors = []
+              
+              if 'id' in data and not isinstance(data['id'], (str, int)):
+                  errors.append("Field 'id' must be string or integer")
+              
+              if 'type' in data and not isinstance(data['type'], str):
+                  errors.append("Field 'type' must be string")
+              
+              return errors
+
+          def validate_financial_data(data: Dict[str, Any]) -> List[str]:
+              """Validate financial-specific data"""
+              errors = []
+              
+              if 'amount' in data:
+                  try:
+                      amount = float(data['amount'])
+                      if amount < 0:
+                          errors.append("Amount cannot be negative")
+                      if amount > 1000000:
+                          errors.append("Amount exceeds maximum limit of $1,000,000")
+                  except (ValueError, TypeError):
+                      errors.append("Amount must be a valid number")
+              
+              if 'currency' in data and data['currency'] not in ['USD', 'EUR', 'GBP', 'JPY']:
+                  errors.append("Currency must be one of: USD, EUR, GBP, JPY")
+              
+              return errors
+
+          def validate_customer_data(data: Dict[str, Any]) -> List[str]:
+              """Validate customer-specific data"""
+              errors = []
+              
+              if 'email' in data:
+                  email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+                  if not re.match(email_pattern, data['email']):
+                      errors.append("Invalid email format")
+              
+              if 'phone' in data:
+                  phone_pattern = r'^\+?[\d\s\-\(\)]{10,}$'
+                  if not re.match(phone_pattern, str(data['phone'])):
+                      errors.append("Invalid phone number format")
+              
+              return errors
+
+          def validate_inventory_data(data: Dict[str, Any]) -> List[str]:
+              """Validate inventory-specific data"""
+              errors = []
+              
+              if 'quantity' in data:
+                  try:
+                      quantity = int(data['quantity'])
+                      if quantity < 0:
+                          errors.append("Quantity cannot be negative")
+                  except (ValueError, TypeError):
+                      errors.append("Quantity must be a valid integer")
+              
+              if 'sku' in data and not isinstance(data['sku'], str):
+                  errors.append("SKU must be a string")
+              
+              return errors
+
+          def sanitize_data(data: Dict[str, Any]) -> Dict[str, Any]:
+              """Sanitize and clean data"""
+              sanitized = {}
+              for key, value in data.items():
+                  if isinstance(value, str):
+                      sanitized[key] = value.strip()
+                  else:
+                      sanitized[key] = value
+              return sanitized
+
+          def sanitize_financial_data(data: Dict[str, Any]) -> Dict[str, Any]:
+              """Sanitize financial-specific data"""
+              sanitized = sanitize_data(data)
+              if 'amount' in sanitized:
+                  try:
+                      sanitized['amount'] = round(float(sanitized['amount']), 2)
+                  except (ValueError, TypeError):
+                      pass
+              return sanitized
+
+          def sanitize_customer_data(data: Dict[str, Any]) -> Dict[str, Any]:
+              """Sanitize customer-specific data"""
+              sanitized = sanitize_data(data)
+              if 'email' in sanitized:
+                  sanitized['email'] = sanitized['email'].lower()
+              return sanitized
+
+          def sanitize_inventory_data(data: Dict[str, Any]) -> Dict[str, Any]:
+              """Sanitize inventory-specific data"""
+              sanitized = sanitize_data(data)
+              if 'sku' in sanitized:
+                  sanitized['sku'] = sanitized['sku'].upper().strip()
+              return sanitized
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Function
+          Value: DataValidator
+
+  # ============================================================================
+  # IAM Role for Step Functions
+  # ============================================================================
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-execution-role-${AWS::AccountId}'
+      Description: 'IAM role for Step Functions execution with Lambda invocation permissions'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsLambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ApiTransformerFunction.Arn
+                  - !GetAtt DataValidatorFunction.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/stepfunctions/*'
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # Step Functions State Machine
+  # ============================================================================
+
+  ApiIntegrationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-api-orchestrator'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      StateMachineType: STANDARD
+      TracingConfiguration:
+        Enabled: true
+      LoggingConfiguration:
+        Level: !If [IsProduction, 'ERROR', 'ALL']
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Enterprise API Integration Orchestration with comprehensive error handling",
+          "StartAt": "ValidateInput",
+          "States": {
+            "ValidateInput": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ApiTransformerFunction.Arn}",
+                "Payload.$": "$"
+              },
+              "ResultPath": "$.validation_result",
+              "Next": "CheckValidation",
+              "TimeoutSeconds": 30,
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ValidationFailed",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "CheckValidation": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.validation_result.Payload.body",
+                  "StringMatches": "*\"valid\":true*",
+                  "Next": "RouteRequest"
+                }
+              ],
+              "Default": "ValidationFailed"
+            },
+            "RouteRequest": {
+              "Type": "Parallel",
+              "Branches": [
+                {
+                  "StartAt": "TransformForERP",
+                  "States": {
+                    "TransformForERP": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${ApiTransformerFunction.Arn}",
+                        "Payload": {
+                          "api_type": "erp",
+                          "payload.$": "$",
+                          "target_url": "https://example-erp.com/api/v1/process"
+                        }
+                      },
+                      "End": true,
+                      "TimeoutSeconds": 60,
+                      "Retry": [
+                        {
+                          "ErrorEquals": ["States.ALL"],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 2,
+                          "BackoffRate": 2.0
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "StartAt": "TransformForCRM",
+                  "States": {
+                    "TransformForCRM": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${ApiTransformerFunction.Arn}",
+                        "Payload": {
+                          "api_type": "crm",
+                          "payload.$": "$",
+                          "target_url": "https://example-crm.com/api/v2/entities"
+                        }
+                      },
+                      "End": true,
+                      "TimeoutSeconds": 60,
+                      "Retry": [
+                        {
+                          "ErrorEquals": ["States.ALL"],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 2,
+                          "BackoffRate": 2.0
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "StartAt": "TransformForInventory",
+                  "States": {
+                    "TransformForInventory": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${ApiTransformerFunction.Arn}",
+                        "Payload": {
+                          "api_type": "inventory",
+                          "payload.$": "$",
+                          "target_url": "https://example-inventory.com/api/v1/items"
+                        }
+                      },
+                      "End": true,
+                      "TimeoutSeconds": 60,
+                      "Retry": [
+                        {
+                          "ErrorEquals": ["States.ALL"],
+                          "IntervalSeconds": 3,
+                          "MaxAttempts": 2,
+                          "BackoffRate": 2.0
+                        }
+                      ]
+                    }
+                  }
+                }
+              ],
+              "Next": "AggregateResults",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ProcessingFailed",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "AggregateResults": {
+              "Type": "Pass",
+              "Parameters": {
+                "status": "success",
+                "results.$": "$",
+                "timestamp.$": "$$.State.EnteredTime",
+                "execution_arn.$": "$$.Execution.Name",
+                "environment": "${Environment}"
+              },
+              "End": true
+            },
+            "ValidationFailed": {
+              "Type": "Pass",
+              "Parameters": {
+                "status": "validation_failed",
+                "errors.$": "$.validation_result.Payload.errors",
+                "timestamp.$": "$$.State.EnteredTime",
+                "execution_arn.$": "$$.Execution.Name"
+              },
+              "End": true
+            },
+            "ProcessingFailed": {
+              "Type": "Pass",
+              "Parameters": {
+                "status": "processing_failed",
+                "error.$": "$.error",
+                "timestamp.$": "$$.State.EnteredTime",
+                "execution_arn.$": "$$.Execution.Name"
+              },
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Orchestration
+
+  # ============================================================================
+  # CloudWatch Log Groups
+  # ============================================================================
+
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${ProjectName}-api-orchestrator'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-enterprise-api-integration'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # IAM Role for API Gateway
+  # ============================================================================
+
+  ApiGatewayStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-apigateway-stepfunctions-role-${AWS::AccountId}'
+      Description: 'IAM role for API Gateway to invoke Step Functions state machine'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !GetAtt ApiIntegrationStateMachine.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource: !GetAtt ApiGatewayLogGroup.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # API Gateway Resources
+  # ============================================================================
+
+  EnterpriseApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-enterprise-api-integration'
+      Description: 'Enterprise API Integration with AgentCore Gateway - RESTful API for AI agent integration workflows'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: ApiGateway
+
+  # API Gateway Resources and Methods
+  IntegrateResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref EnterpriseApiGateway
+      ParentId: !GetAtt EnterpriseApiGateway.RootResourceId
+      PathPart: 'integrate'
+
+  IntegrateMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EnterpriseApiGateway
+      ResourceId: !Ref IntegrateResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      RequestValidatorId: !Ref RequestValidator
+      RequestModels:
+        application/json: !Ref IntegrationRequestModel
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:states:action/StartExecution'
+        Credentials: !GetAtt ApiGatewayStepFunctionsRole.Arn
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "input": "$util.escapeJavaScript($input.body)",
+              "stateMachineArn": "${ApiIntegrationStateMachine.Arn}"
+            }
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: |
+                {
+                  "executionArn": "$input.path('$.executionArn')",
+                  "startDate": "$input.path('$.startDate')",
+                  "status": "STARTED"
+                }
+          - StatusCode: 400
+            SelectionPattern: '4\d{2}'
+            ResponseTemplates:
+              application/json: |
+                {
+                  "error": "Bad Request",
+                  "message": "Invalid request format"
+                }
+          - StatusCode: 500
+            SelectionPattern: '5\d{2}'
+            ResponseTemplates:
+              application/json: |
+                {
+                  "error": "Internal Server Error",
+                  "message": "Failed to start execution"
+                }
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: !Ref IntegrationResponseModel
+        - StatusCode: 400
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+        - StatusCode: 500
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+
+  # Request/Response Models
+  IntegrationRequestModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref EnterpriseApiGateway
+      ContentType: application/json
+      Name: IntegrationRequest
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Integration Request Schema
+        type: object
+        required:
+          - id
+          - type
+          - data
+        properties:
+          id:
+            type: string
+            description: Unique request identifier
+          type:
+            type: string
+            enum: [erp, crm, inventory]
+            description: Target system type
+          data:
+            type: object
+            description: Request payload data
+            properties:
+              amount:
+                type: number
+                description: Transaction amount (for financial data)
+              email:
+                type: string
+                description: Email address (for customer data)
+              quantity:
+                type: integer
+                description: Quantity (for inventory data)
+          validation_type:
+            type: string
+            enum: [standard, financial, customer, inventory]
+            description: Validation rules to apply
+
+  IntegrationResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref EnterpriseApiGateway
+      ContentType: application/json
+      Name: IntegrationResponse
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Integration Response Schema
+        type: object
+        properties:
+          executionArn:
+            type: string
+            description: Step Functions execution ARN
+          status:
+            type: string
+            description: Execution status
+          startDate:
+            type: string
+            description: Execution start timestamp
+
+  ErrorResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref EnterpriseApiGateway
+      ContentType: application/json
+      Name: ErrorResponse
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Error Response Schema
+        type: object
+        properties:
+          error:
+            type: string
+            description: Error type
+          message:
+            type: string
+            description: Error message
+
+  RequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref EnterpriseApiGateway
+      Name: RequestValidator
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  # API Gateway Usage Plan and Throttling
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub '${ProjectName}-usage-plan'
+      Description: 'Usage plan for enterprise API integration with throttling and quota limits'
+      Throttle:
+        BurstLimit: !Ref ApiGatewayThrottlingBurst
+        RateLimit: !Ref ApiGatewayThrottlingRate
+      Quota:
+        Limit: !If [IsProduction, 100000, 10000]
+        Period: DAY
+      ApiStages:
+        - ApiId: !Ref EnterpriseApiGateway
+          Stage: !Ref ApiDeployment
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - IntegrateMethod
+    Properties:
+      RestApiId: !Ref EnterpriseApiGateway
+      StageName: !Ref Environment
+      StageDescription: !Sub 'Deployment for ${Environment} environment'
+
+  # API Gateway Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref EnterpriseApiGateway
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      Description: !Sub 'Stage for ${Environment} environment with comprehensive logging and monitoring'
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: >
+          {
+            "requestId": "$context.requestId",
+            "ip": "$context.identity.sourceIp",
+            "caller": "$context.identity.caller",
+            "user": "$context.identity.user",
+            "requestTime": "$context.requestTime",
+            "httpMethod": "$context.httpMethod",
+            "resourcePath": "$context.resourcePath",
+            "status": "$context.status",
+            "protocol": "$context.protocol",
+            "responseLength": "$context.responseLength",
+            "requestTime": "$context.requestTime",
+            "responseTime": "$context.responseTime",
+            "error": "$context.error.message",
+            "integrationError": "$context.integration.error"
+          }
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: !If [IsProduction, 'ERROR', 'INFO']
+          DataTraceEnabled: !If [IsNotProduction, true, false]
+          MetricsEnabled: true
+          ThrottlingBurstLimit: !Ref ApiGatewayThrottlingBurst
+          ThrottlingRateLimit: !Ref ApiGatewayThrottlingRate
+      TracingEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # CloudWatch Alarms for Monitoring
+  # ============================================================================
+
+  ApiGateway4XXErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-gateway-4xx-errors'
+      AlarmDescription: 'API Gateway 4XX error rate is too high'
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ProjectName}-enterprise-api-integration'
+        - Name: Stage
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+
+  ApiGateway5XXErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-gateway-5xx-errors'
+      AlarmDescription: 'API Gateway 5XX error rate is too high'
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ProjectName}-enterprise-api-integration'
+        - Name: Stage
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+
+  StepFunctionsFailedExecutionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-stepfunctions-failed-executions'
+      AlarmDescription: 'Step Functions execution failure rate is too high'
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref ApiIntegrationStateMachine
+      TreatMissingData: notBreaching
+
+# ============================================================================
+# Outputs
+# ============================================================================
+
+Outputs:
+  ApiGatewayUrl:
+    Description: 'API Gateway endpoint URL for enterprise integration'
+    Value: !Sub 'https://${EnterpriseApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/integrate'
+    Export:
+      Name: !Sub '${ProjectName}-api-gateway-url'
+
+  ApiGatewayId:
+    Description: 'API Gateway REST API ID'
+    Value: !Ref EnterpriseApiGateway
+    Export:
+      Name: !Sub '${ProjectName}-api-gateway-id'
+
+  StateMachineArn:
+    Description: 'Step Functions state machine ARN for orchestration'
+    Value: !Ref ApiIntegrationStateMachine
+    Export:
+      Name: !Sub '${ProjectName}-state-machine-arn'
+
+  ApiTransformerFunctionArn:
+    Description: 'API Transformer Lambda function ARN'
+    Value: !GetAtt ApiTransformerFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-api-transformer-arn'
+
+  DataValidatorFunctionArn:
+    Description: 'Data Validator Lambda function ARN'
+    Value: !GetAtt DataValidatorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-data-validator-arn'
+
+  ProjectName:
+    Description: 'Project name used for resource naming'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${ProjectName}-project-name'
+
+  Environment:
+    Description: 'Environment configuration'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${ProjectName}-environment'
+
+  ApiDocumentationUrl:
+    Description: 'OpenAPI specification URL for AgentCore Gateway integration'
+    Value: !Sub 'https://${EnterpriseApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-api-documentation-url'
+
+  UsagePlanId:
+    Description: 'API Gateway Usage Plan ID for throttling and quotas'
+    Value: !Ref ApiUsagePlan
+    Export:
+      Name: !Sub '${ProjectName}-usage-plan-id'
+
+  CloudWatchDashboardUrl:
+    Description: 'CloudWatch dashboard URL for monitoring (manual setup required)'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-dashboard'

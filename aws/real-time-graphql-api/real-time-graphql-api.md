@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: AppSync, DynamoDB, Cognito
 estimated-time: 40 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-25
 passed-qa: null
 tags: serverless, appsync, graphql, dynamodb, cognito, real-time, api, authentication, mobile
 recipe-generator-version: 1.3
@@ -24,6 +24,8 @@ Your development team is building modern web and mobile applications that requir
 ## Solution
 
 Create a fully managed GraphQL API using AWS AppSync that connects to DynamoDB as a data source and integrates with Amazon Cognito for authentication. This solution provides type-safe schema definitions, real-time subscriptions via WebSockets, automatic data synchronization, and fine-grained access control. AppSync eliminates the need to write and maintain GraphQL server code while offering built-in features like caching, offline support, and conflict resolution.
+
+## Architecture Diagram
 
 ```mermaid
 graph TB
@@ -71,9 +73,10 @@ graph TB
 2. AWS CLI v2 installed and configured with appropriate permissions
 3. Basic understanding of GraphQL concepts (queries, mutations, subscriptions)
 4. Familiarity with JSON data structures and NoSQL databases
-5. Node.js or Python environment for testing client connections
+5. Python 3.x environment for testing client connections
+6. Estimated cost: $5-10 for testing resources (includes DynamoDB, AppSync requests, and Cognito operations)
 
-> **Note**: AppSync charges for requests, data transfer, and caching. Review [AppSync pricing](https://aws.amazon.com/appsync/pricing/) to understand costs.
+> **Note**: AppSync charges for requests, data transfer, and caching. Review [AppSync pricing](https://aws.amazon.com/appsync/pricing/) to understand costs before proceeding.
 
 ## Preparation
 
@@ -83,13 +86,13 @@ Set up environment variables and create the foundational authentication infrastr
 # Set environment variables
 export AWS_REGION=$(aws configure get region)
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
-	--query Account --output text)
+    --query Account --output text)
 
 # Generate unique names to avoid conflicts
 RANDOM_STRING=$(aws secretsmanager get-random-password \
-	--exclude-punctuation --exclude-uppercase \
-	--password-length 6 --require-each-included-type \
-	--output text --query RandomPassword)
+    --exclude-punctuation --exclude-uppercase \
+    --password-length 6 --require-each-included-type \
+    --output text --query RandomPassword)
 
 export API_NAME="blog-api-${RANDOM_STRING}"
 export TABLE_NAME="BlogPosts-${RANDOM_STRING}"
@@ -105,19 +108,19 @@ Create a Cognito User Pool for authentication:
 ```bash
 # Create Cognito User Pool
 USER_POOL_ID=$(aws cognito-idp create-user-pool \
-	--pool-name $USER_POOL_NAME \
-	--policies 'PasswordPolicy={MinimumLength=8,RequireUppercase=true,RequireLowercase=true,RequireNumbers=true,RequireSymbols=false}' \
-	--auto-verified-attributes email \
-	--username-attributes email \
-	--query 'UserPool.Id' --output text)
+    --pool-name $USER_POOL_NAME \
+    --policies 'PasswordPolicy={MinimumLength=8,RequireUppercase=true,RequireLowercase=true,RequireNumbers=true,RequireSymbols=false}' \
+    --auto-verified-attributes email \
+    --username-attributes email \
+    --query 'UserPool.Id' --output text)
 
 # Create User Pool Client
 USER_POOL_CLIENT_ID=$(aws cognito-idp create-user-pool-client \
-	--user-pool-id $USER_POOL_ID \
-	--client-name "${API_NAME}-client" \
-	--generate-secret \
-	--explicit-auth-flows ADMIN_NO_SRP_AUTH \
-	--query 'UserPoolClient.ClientId' --output text)
+    --user-pool-id $USER_POOL_ID \
+    --client-name "${API_NAME}-client" \
+    --generate-secret \
+    --explicit-auth-flows ADMIN_NO_SRP_AUTH \
+    --query 'UserPoolClient.ClientId' --output text)
 
 export USER_POOL_ID
 export USER_POOL_CLIENT_ID
@@ -134,17 +137,28 @@ echo "✅ User Pool Client created: $USER_POOL_CLIENT_ID"
    ```bash
    # Create DynamoDB table with GSI for author queries
    aws dynamodb create-table \
-   	--table-name $TABLE_NAME \
-   	--attribute-definitions \
-   		AttributeName=id,AttributeType=S \
-   		AttributeName=author,AttributeType=S \
-   		AttributeName=createdAt,AttributeType=S \
-   	--key-schema \
-   		AttributeName=id,KeyType=HASH \
-   	--global-secondary-indexes \
-   		IndexName=AuthorIndex,KeySchema=\[AttributeName=author,KeyType=HASH\],\[AttributeName=createdAt,KeyType=RANGE\],Projection=\{ProjectionType=ALL\},ProvisionedThroughput=\{ReadCapacityUnits=5,WriteCapacityUnits=5\} \
-   	--provisioned-throughput \
-   		ReadCapacityUnits=5,WriteCapacityUnits=5
+       --table-name $TABLE_NAME \
+       --attribute-definitions \
+           AttributeName=id,AttributeType=S \
+           AttributeName=author,AttributeType=S \
+           AttributeName=createdAt,AttributeType=S \
+       --key-schema \
+           AttributeName=id,KeyType=HASH \
+       --global-secondary-indexes \
+           "[{
+               \"IndexName\": \"AuthorIndex\",
+               \"KeySchema\": [
+                   {\"AttributeName\": \"author\", \"KeyType\": \"HASH\"},
+                   {\"AttributeName\": \"createdAt\", \"KeyType\": \"RANGE\"}
+               ],
+               \"Projection\": {\"ProjectionType\": \"ALL\"},
+               \"ProvisionedThroughput\": {
+                   \"ReadCapacityUnits\": 5,
+                   \"WriteCapacityUnits\": 5
+               }
+           }]" \
+       --provisioned-throughput \
+           ReadCapacityUnits=5,WriteCapacityUnits=5
 
    # Wait for table to be active
    echo "Waiting for DynamoDB table to be active..."
@@ -163,19 +177,19 @@ echo "✅ User Pool Client created: $USER_POOL_CLIENT_ID"
    ```bash
    # Create AppSync GraphQL API
    API_ID=$(aws appsync create-graphql-api \
-   	--name $API_NAME \
-   	--authentication-type AMAZON_COGNITO_USER_POOLS \
-   	--user-pool-config userPoolId=$USER_POOL_ID,awsRegion=$AWS_REGION,defaultAction=ALLOW \
-   	--query 'graphqlApi.apiId' --output text)
+       --name $API_NAME \
+       --authentication-type AMAZON_COGNITO_USER_POOLS \
+       --user-pool-config userPoolId=$USER_POOL_ID,awsRegion=$AWS_REGION,defaultAction=ALLOW \
+       --query 'graphqlApi.apiId' --output text)
 
    export API_ID
    echo "✅ AppSync API created: $API_ID"
 
    # Get API details
    API_ENDPOINT=$(aws appsync get-graphql-api --api-id $API_ID \
-   	--query 'graphqlApi.uris.GRAPHQL' --output text)
+       --query 'graphqlApi.uris.GRAPHQL' --output text)
    REALTIME_ENDPOINT=$(aws appsync get-graphql-api --api-id $API_ID \
-   	--query 'graphqlApi.uris.REALTIME' --output text)
+       --query 'graphqlApi.uris.REALTIME' --output text)
 
    export API_ENDPOINT
    export REALTIME_ENDPOINT
@@ -253,15 +267,15 @@ EOF
 
    # Upload schema to AppSync
    aws appsync start-schema-creation \
-   	--api-id $API_ID \
-   	--definition fileb://schema.graphql
+       --api-id $API_ID \
+       --definition fileb://schema.graphql
 
    echo "Waiting for schema creation to complete..."
    sleep 10
 
    # Check schema creation status
    SCHEMA_STATUS=$(aws appsync get-schema-creation-status --api-id $API_ID \
-   	--query 'status' --output text)
+       --query 'status' --output text)
 
    while [ "$SCHEMA_STATUS" = "PROCESSING" ]; do
        echo "Schema creation in progress..."
@@ -299,9 +313,9 @@ EOF
 EOF
 
    SERVICE_ROLE_ARN=$(aws iam create-role \
-   	--role-name AppSyncDynamoDBRole-${RANDOM_STRING} \
-   	--assume-role-policy-document file://appsync-service-role-trust-policy.json \
-   	--query 'Role.Arn' --output text)
+       --role-name AppSyncDynamoDBRole-${RANDOM_STRING} \
+       --assume-role-policy-document file://appsync-service-role-trust-policy.json \
+       --query 'Role.Arn' --output text)
 
    # Create policy for DynamoDB access
    cat > appsync-dynamodb-policy.json << EOF
@@ -328,9 +342,9 @@ EOF
 EOF
 
    aws iam put-role-policy \
-   	--role-name AppSyncDynamoDBRole-${RANDOM_STRING} \
-   	--policy-name DynamoDBAccess \
-   	--policy-document file://appsync-dynamodb-policy.json
+       --role-name AppSyncDynamoDBRole-${RANDOM_STRING} \
+       --policy-name DynamoDBAccess \
+       --policy-document file://appsync-dynamodb-policy.json
 
    export SERVICE_ROLE_ARN
    echo "✅ Service role created: $SERVICE_ROLE_ARN"
@@ -341,11 +355,11 @@ EOF
    # Create DynamoDB data source
    DATA_SOURCE_NAME="BlogPostsDataSource"
    aws appsync create-data-source \
-   	--api-id $API_ID \
-   	--name $DATA_SOURCE_NAME \
-   	--type AMAZON_DYNAMODB \
-   	--dynamodb-config tableName=$TABLE_NAME,awsRegion=$AWS_REGION \
-   	--service-role-arn $SERVICE_ROLE_ARN
+       --api-id $API_ID \
+       --name $DATA_SOURCE_NAME \
+       --type AMAZON_DYNAMODB \
+       --dynamodb-config tableName=$TABLE_NAME,awsRegion=$AWS_REGION \
+       --service-role-arn $SERVICE_ROLE_ARN
 
    echo "✅ DynamoDB data source created: $DATA_SOURCE_NAME"
    ```
@@ -376,12 +390,12 @@ $util.toJson($ctx.result)
 EOF
 
    aws appsync create-resolver \
-   	--api-id $API_ID \
-   	--type-name Query \
-   	--field-name getBlogPost \
-   	--data-source-name $DATA_SOURCE_NAME \
-   	--request-mapping-template file://get-blog-post-request.vtl \
-   	--response-mapping-template file://get-blog-post-response.vtl
+       --api-id $API_ID \
+       --type-name Query \
+       --field-name getBlogPost \
+       --data-source-name $DATA_SOURCE_NAME \
+       --request-mapping-template file://get-blog-post-request.vtl \
+       --response-mapping-template file://get-blog-post-response.vtl
 
    # Create resolver for createBlogPost mutation
    cat > create-blog-post-request.vtl << 'EOF'
@@ -413,12 +427,12 @@ $util.toJson($ctx.result)
 EOF
 
    aws appsync create-resolver \
-   	--api-id $API_ID \
-   	--type-name Mutation \
-   	--field-name createBlogPost \
-   	--data-source-name $DATA_SOURCE_NAME \
-   	--request-mapping-template file://create-blog-post-request.vtl \
-   	--response-mapping-template file://create-blog-post-response.vtl
+       --api-id $API_ID \
+       --type-name Mutation \
+       --field-name createBlogPost \
+       --data-source-name $DATA_SOURCE_NAME \
+       --request-mapping-template file://create-blog-post-request.vtl \
+       --response-mapping-template file://create-blog-post-response.vtl
 
    # Create resolver for listBlogPosts query
    cat > list-blog-posts-request.vtl << 'EOF'
@@ -429,7 +443,7 @@ EOF
     "limit": $ctx.args.limit,
     #end
     #if($ctx.args.nextToken)
-    "nextToken": "$ctx.args.nextToken",
+    "nextToken": "$ctx.args.nextToken"
     #end
 }
 EOF
@@ -439,20 +453,20 @@ EOF
     $util.error($ctx.error.message, $ctx.error.type)
 #end
 {
-    "items": $util.toJson($ctx.result.items),
+    "items": $util.toJson($ctx.result.items)
     #if($ctx.result.nextToken)
-    "nextToken": "$ctx.result.nextToken"
+    ,"nextToken": "$ctx.result.nextToken"
     #end
 }
 EOF
 
    aws appsync create-resolver \
-   	--api-id $API_ID \
-   	--type-name Query \
-   	--field-name listBlogPosts \
-   	--data-source-name $DATA_SOURCE_NAME \
-   	--request-mapping-template file://list-blog-posts-request.vtl \
-   	--response-mapping-template file://list-blog-posts-response.vtl
+       --api-id $API_ID \
+       --type-name Query \
+       --field-name listBlogPosts \
+       --data-source-name $DATA_SOURCE_NAME \
+       --request-mapping-template file://list-blog-posts-request.vtl \
+       --response-mapping-template file://list-blog-posts-response.vtl
 
    # Create resolver for listBlogPostsByAuthor query
    cat > list-by-author-request.vtl << 'EOF'
@@ -477,12 +491,12 @@ EOF
 EOF
 
    aws appsync create-resolver \
-   	--api-id $API_ID \
-   	--type-name Query \
-   	--field-name listBlogPostsByAuthor \
-   	--data-source-name $DATA_SOURCE_NAME \
-   	--request-mapping-template file://list-by-author-request.vtl \
-   	--response-mapping-template file://list-blog-posts-response.vtl
+       --api-id $API_ID \
+       --type-name Query \
+       --field-name listBlogPostsByAuthor \
+       --data-source-name $DATA_SOURCE_NAME \
+       --request-mapping-template file://list-by-author-request.vtl \
+       --response-mapping-template file://list-blog-posts-response.vtl
 
    echo "✅ GraphQL resolvers created successfully"
    ```
@@ -501,19 +515,19 @@ EOF
    TEMP_PASSWORD="TempPass123!"
 
    aws cognito-idp admin-create-user \
-   	--user-pool-id $USER_POOL_ID \
-   	--username $TEST_USERNAME \
-   	--user-attributes Name=email,Value=$TEST_USERNAME Name=email_verified,Value=true \
-   	--temporary-password $TEMP_PASSWORD \
-   	--message-action SUPPRESS
+       --user-pool-id $USER_POOL_ID \
+       --username $TEST_USERNAME \
+       --user-attributes Name=email,Value=$TEST_USERNAME Name=email_verified,Value=true \
+       --temporary-password $TEMP_PASSWORD \
+       --message-action SUPPRESS
 
    # Set permanent password
    NEW_PASSWORD="BlogUser123!"
    aws cognito-idp admin-set-user-password \
-   	--user-pool-id $USER_POOL_ID \
-   	--username $TEST_USERNAME \
-   	--password $NEW_PASSWORD \
-   	--permanent
+       --user-pool-id $USER_POOL_ID \
+       --username $TEST_USERNAME \
+       --password $NEW_PASSWORD \
+       --permanent
 
    export TEST_USERNAME
    export NEW_PASSWORD
@@ -530,21 +544,19 @@ EOF
    ```bash
    # Add API key as additional authorization
    aws appsync update-graphql-api \
-   	--api-id $API_ID \
-   	--name $API_NAME \
-   	--authentication-type AMAZON_COGNITO_USER_POOLS \
-   	--user-pool-config userPoolId=$USER_POOL_ID,awsRegion=$AWS_REGION,defaultAction=ALLOW \
-   	--additional-authentication-providers authenticationType=API_KEY
+       --api-id $API_ID \
+       --name $API_NAME \
+       --authentication-type AMAZON_COGNITO_USER_POOLS \
+       --user-pool-config userPoolId=$USER_POOL_ID,awsRegion=$AWS_REGION,defaultAction=ALLOW \
+       --additional-authentication-providers authenticationType=API_KEY
 
    # Create API key for testing
-   API_KEY_ID=$(aws appsync create-api-key \
-   	--api-id $API_ID \
-   	--description "Test API Key" \
-   	--expires $(date -d "+30 days" +%s) \
-   	--query 'apiKey.id' --output text)
+   API_KEY_RESPONSE=$(aws appsync create-api-key \
+       --api-id $API_ID \
+       --description "Test API Key" \
+       --expires $(date -d "+30 days" +%s))
 
-   API_KEY=$(aws appsync list-api-keys --api-id $API_ID \
-   	--query 'apiKeys[0].id' --output text)
+   API_KEY=$(echo $API_KEY_RESPONSE | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
 
    export API_KEY
    echo "✅ API Key created for testing: $API_KEY"
@@ -641,8 +653,8 @@ def test_api():
     
     # Test 1: Create a blog post (requires authentication)
     create_mutation = '''
-    mutation CreatePost($input: CreateBlogPostInput!) {
-        createBlogPost(input: $input) {
+    mutation CreatePost(\$input: CreateBlogPostInput!) {
+        createBlogPost(input: \$input) {
             id
             title
             content
@@ -701,116 +713,116 @@ EOF
 
 1. Test the GraphQL schema using the AppSync console:
 
-```bash
-echo "GraphQL API Details:"
-echo "API ID: $API_ID"
-echo "GraphQL Endpoint: $API_ENDPOINT"
-echo "Real-time Endpoint: $REALTIME_ENDPOINT"
-echo "Region: $AWS_REGION"
-echo ""
-echo "Test User Credentials:"
-echo "Username: $TEST_USERNAME"
-echo "Password: $NEW_PASSWORD"
-echo "API Key: $API_KEY"
-```
+   ```bash
+   echo "GraphQL API Details:"
+   echo "API ID: $API_ID"
+   echo "GraphQL Endpoint: $API_ENDPOINT"
+   echo "Real-time Endpoint: $REALTIME_ENDPOINT"
+   echo "Region: $AWS_REGION"
+   echo ""
+   echo "Test User Credentials:"
+   echo "Username: $TEST_USERNAME"
+   echo "Password: $NEW_PASSWORD"
+   echo "API Key: $API_KEY"
+   ```
 
 2. Run the Python test client to verify API functionality:
 
-```bash
-# Ensure boto3 and requests are installed
-pip3 install boto3 requests
+   ```bash
+   # Ensure boto3 and requests are installed
+   pip3 install boto3 requests
 
-# Run the test client
-python3 test_client.py
-```
+   # Run the test client
+   python3 test_client.py
+   ```
 
-Expected output should show successful creation and listing of blog posts.
+   Expected output should show successful creation and listing of blog posts.
 
 3. Test real-time subscriptions using the AppSync console:
 
-Navigate to the AppSync console → Your API → Queries tab, and run:
+   Navigate to the AppSync console → Your API → Queries tab, and run:
 
-```graphql
-subscription OnCreateBlogPost {
-    onCreateBlogPost {
-        id
-        title
-        author
-        createdAt
-    }
-}
-```
+   ```graphql
+   subscription OnCreateBlogPost {
+       onCreateBlogPost {
+           id
+           title
+           author
+           createdAt
+       }
+   }
+   ```
 
-Then in another tab, create a blog post:
+   Then in another tab, create a blog post:
 
-```graphql
-mutation CreatePost {
-    createBlogPost(input: {
-        title: "Real-time Test Post"
-        content: "Testing real-time subscriptions"
-        published: true
-    }) {
-        id
-        title
-        author
-    }
-}
-```
+   ```graphql
+   mutation CreatePost {
+       createBlogPost(input: {
+           title: "Real-time Test Post"
+           content: "Testing real-time subscriptions"
+           published: true
+       }) {
+           id
+           title
+           author
+       }
+   }
+   ```
 
 4. Verify data persistence in DynamoDB:
 
-```bash
-aws dynamodb scan --table-name $TABLE_NAME \
-	--query 'Items[*]' --output table
-```
+   ```bash
+   aws dynamodb scan --table-name $TABLE_NAME \
+       --query 'Items[*]' --output table
+   ```
 
-> **Tip**: Use the AppSync console's built-in GraphQL query explorer to test your API interactively. It provides syntax highlighting, auto-completion, and real-time subscription testing.
+> **Tip**: Use the AppSync console's built-in GraphQL query explorer to test your API interactively. It provides syntax highlighting, auto-completion, and real-time subscription testing capabilities.
 
 ## Cleanup
 
 1. Delete AppSync API and associated resources:
 
-```bash
-# Delete AppSync API (this removes resolvers and data sources)
-aws appsync delete-graphql-api --api-id $API_ID
-echo "✅ AppSync API deleted"
-```
+   ```bash
+   # Delete AppSync API (this removes resolvers and data sources)
+   aws appsync delete-graphql-api --api-id $API_ID
+   echo "✅ AppSync API deleted"
+   ```
 
 2. Delete DynamoDB table:
 
-```bash
-aws dynamodb delete-table --table-name $TABLE_NAME
-echo "✅ DynamoDB table deleted"
-```
+   ```bash
+   aws dynamodb delete-table --table-name $TABLE_NAME
+   echo "✅ DynamoDB table deleted"
+   ```
 
 3. Delete Cognito User Pool:
 
-```bash
-aws cognito-idp delete-user-pool --user-pool-id $USER_POOL_ID
-echo "✅ Cognito User Pool deleted"
-```
+   ```bash
+   aws cognito-idp delete-user-pool --user-pool-id $USER_POOL_ID
+   echo "✅ Cognito User Pool deleted"
+   ```
 
 4. Delete IAM role and policies:
 
-```bash
-aws iam delete-role-policy \
-	--role-name AppSyncDynamoDBRole-${RANDOM_STRING} \
-	--policy-name DynamoDBAccess
+   ```bash
+   aws iam delete-role-policy \
+       --role-name AppSyncDynamoDBRole-${RANDOM_STRING} \
+       --policy-name DynamoDBAccess
 
-aws iam delete-role --role-name AppSyncDynamoDBRole-${RANDOM_STRING}
-echo "✅ IAM role deleted"
-```
+   aws iam delete-role --role-name AppSyncDynamoDBRole-${RANDOM_STRING}
+   echo "✅ IAM role deleted"
+   ```
 
 5. Clean up local files:
 
-```bash
-rm -f schema.graphql
-rm -f appsync-service-role-trust-policy.json
-rm -f appsync-dynamodb-policy.json
-rm -f *.vtl
-rm -f test_client.py
-echo "✅ Local files cleaned up"
-```
+   ```bash
+   rm -f schema.graphql
+   rm -f appsync-service-role-trust-policy.json
+   rm -f appsync-dynamodb-policy.json
+   rm -f *.vtl
+   rm -f test_client.py
+   echo "✅ Local files cleaned up"
+   ```
 
 ## Discussion
 
@@ -820,11 +832,13 @@ The integration with Amazon Cognito demonstrates AppSync's robust authentication
 
 Real-time capabilities through GraphQL subscriptions represent one of AppSync's most powerful features. Traditional real-time implementations require complex WebSocket management, connection handling, and message broadcasting logic. AppSync abstracts this complexity, automatically managing WebSocket connections and providing optimized delivery of subscription data. The `@aws_subscribe` directive makes it simple to define which mutations trigger subscription notifications, enabling features like live comments, real-time dashboards, and collaborative editing without additional infrastructure.
 
-> **Note**: When designing GraphQL schemas, consider data access patterns carefully. Unlike REST APIs where you design endpoints around resources, GraphQL schemas should be designed around the data requirements of your client applications.
+Performance optimization follows the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles, particularly focusing on performance efficiency and cost optimization. AppSync provides built-in caching mechanisms that can significantly reduce database queries and improve response times. The service also supports automatic scaling based on request volume, ensuring consistent performance under varying load conditions.
+
+> **Note**: When designing GraphQL schemas, consider data access patterns carefully. Unlike REST APIs where you design endpoints around resources, GraphQL schemas should be designed around the data requirements of your client applications. This approach leads to more efficient queries and better overall system performance.
 
 ## Challenge
 
-Extend this recipe by implementing advanced features such as custom business logic using Lambda resolvers, implementing field-level authorization using custom directives, adding full-text search capabilities by integrating with Amazon OpenSearch Service, and creating a mobile application using AWS Amplify that leverages the GraphQL API with offline synchronization. Additionally, implement monitoring and alerting using CloudWatch metrics to track API performance, error rates, and usage patterns.
+Extend this recipe by implementing advanced features such as custom business logic using Lambda resolvers for complex data transformations, implementing field-level authorization using custom directives to control data access based on user roles, adding full-text search capabilities by integrating with Amazon OpenSearch Service for advanced content discovery, and creating a mobile application using AWS Amplify that leverages the GraphQL API with offline synchronization capabilities. Additionally, implement comprehensive monitoring and alerting using CloudWatch metrics to track API performance, error rates, and usage patterns, and consider implementing [DataLoader patterns](https://github.com/graphql/dataloader) to optimize N+1 query problems in your resolvers.
 
 ## Infrastructure Code
 

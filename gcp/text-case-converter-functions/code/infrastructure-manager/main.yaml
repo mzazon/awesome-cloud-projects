@@ -1,0 +1,455 @@
+# Google Cloud Infrastructure Manager Configuration
+# Text Case Converter API with Cloud Functions
+# 
+# This configuration deploys a serverless text case conversion API using Google Cloud Functions
+# that provides various text formatting capabilities including uppercase, lowercase, camelCase,
+# snake_case, kebab-case, and more.
+#
+# Architecture Components:
+# - Cloud Function (2nd Gen) for text processing logic
+# - IAM service accounts with least-privilege permissions
+# - Cloud Logging for function execution monitoring
+# - HTTP trigger for public API access
+#
+# Prerequisites:
+# - Google Cloud project with billing enabled
+# - Cloud Functions API enabled
+# - Cloud Build API enabled
+# - Cloud Logging API enabled
+
+# Metadata for Infrastructure Manager deployment
+apiVersion: krm.dev/v1alpha1
+kind: ProviderConfigReference
+metadata:
+  name: gcp-provider-config
+
+---
+# Variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    default: "text-converter-project"
+  
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+  
+  function_name:
+    description: "Name of the Cloud Function"
+    type: string
+    default: "text-case-converter"
+  
+  function_description:
+    description: "Description of the Cloud Function"
+    type: string
+    default: "HTTP Cloud Function for text case conversion supporting multiple formats"
+  
+  runtime:
+    description: "Python runtime version for Cloud Functions"
+    type: string
+    default: "python311"
+  
+  memory:
+    description: "Memory allocation for the function in MB"
+    type: string
+    default: "128Mi"
+  
+  timeout:
+    description: "Function timeout in seconds"
+    type: string
+    default: "60s"
+  
+  max_instance_count:
+    description: "Maximum number of function instances"
+    type: number
+    default: 100
+  
+  min_instance_count:
+    description: "Minimum number of function instances"
+    type: number
+    default: 0
+
+---
+# Google Cloud APIs that need to be enabled
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: cloudfunctions-api
+spec:
+  projectRef:
+    external: ${project_id}
+  serviceId: cloudfunctions.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: cloudbuild-api
+spec:
+  projectRef:
+    external: ${project_id}
+  serviceId: cloudbuild.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: logging-api
+spec:
+  projectRef:
+    external: ${project_id}
+  serviceId: logging.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: artifactregistry-api
+spec:
+  projectRef:
+    external: ${project_id}
+  serviceId: artifactregistry.googleapis.com
+
+---
+# Service Account for Cloud Function execution
+# Follows principle of least privilege with minimal required permissions
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMServiceAccount
+metadata:
+  name: text-converter-function-sa
+spec:
+  projectRef:
+    external: ${project_id}
+  accountId: text-converter-function-sa
+  displayName: "Text Case Converter Function Service Account"
+  description: "Service account for text case converter Cloud Function with minimal required permissions"
+
+---
+# IAM Policy Binding for Cloud Function service account
+# Grants the Cloud Functions Invoker role for function execution
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: function-sa-logging-writer
+spec:
+  member: serviceAccount:text-converter-function-sa@${project_id}.iam.gserviceaccount.com
+  role: roles/logging.logWriter
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: ${project_id}
+
+---
+# Cloud Storage bucket for storing function source code
+# Used by Infrastructure Manager for function deployment
+apiVersion: storage.cnrm.cloud.google.com/v1beta1
+kind: StorageBucket
+metadata:
+  name: text-converter-function-source
+spec:
+  projectRef:
+    external: ${project_id}
+  location: ${region}
+  uniformBucketLevelAccess: true  # Enable uniform bucket-level access for security
+  versioning:
+    enabled: true  # Enable versioning for source code management
+  lifecycle:
+    rule:
+      - action:
+          type: Delete
+        condition:
+          age: 30  # Delete old versions after 30 days to manage costs
+          withState: ARCHIVED
+      - action:
+          type: SetStorageClass
+          storageClass: NEARLINE
+        condition:
+          age: 7  # Move to Nearline storage after 7 days for cost optimization
+  labels:
+    purpose: "function-source-storage"
+    environment: "production"
+
+---
+# Cloud Storage bucket object containing the function source code
+# This would contain the Python code for text case conversion
+apiVersion: storage.cnrm.cloud.google.com/v1beta1
+kind: StorageBucketObject
+metadata:
+  name: function-source-zip
+spec:
+  bucketRef:
+    name: text-converter-function-source
+  name: "source.zip"
+  # In a real deployment, this would reference the actual source code archive
+  # For this template, we're providing inline source code
+  content: |
+    # This represents the zipped source code archive
+    # In actual deployment, you would upload the function source code here
+    # The source code includes main.py and requirements.txt from the recipe
+
+---
+# Cloud Function (2nd Generation) Resource
+# Implements the text case conversion API with HTTP trigger
+apiVersion: cloudfunctions.cnrm.cloud.google.com/v1beta1
+kind: CloudFunctionsFunction
+metadata:
+  name: ${function_name}
+spec:
+  projectRef:
+    external: ${project_id}
+  location: ${region}
+  description: ${function_description}
+  
+  # Build configuration for the function
+  buildConfig:
+    runtime: ${runtime}
+    entryPoint: "text_case_converter"  # Entry point function name from main.py
+    source:
+      storageSource:
+        bucketRef:
+          name: text-converter-function-source
+        object: "source.zip"
+    environmentVariables:
+      GOOGLE_FUNCTION_SOURCE: "main.py"
+  
+  # Service configuration for function execution
+  serviceConfig:
+    maxInstanceCount: ${max_instance_count}
+    minInstanceCount: ${min_instance_count}
+    availableMemory: ${memory}
+    timeoutSeconds: 60
+    
+    # Service account configuration
+    serviceAccountEmailRef:
+      name: text-converter-function-sa
+    
+    # Environment variables for function runtime
+    environmentVariables:
+      FUNCTION_REGION: ${region}
+      FUNCTION_NAME: ${function_name}
+      LOG_LEVEL: "INFO"
+    
+    # Ingress and egress settings for security
+    ingressSettings: "ALLOW_ALL"  # Allow public HTTP access
+    vpcConnector: ""  # No VPC connector needed for this simple function
+    
+    # Security settings
+    availableCpu: "0.1"  # Fractional CPU allocation for cost optimization
+    
+  # Labels for resource organization and billing
+  labels:
+    component: "text-processing"
+    environment: "production"
+    version: "v1"
+    cost-center: "engineering"
+
+---
+# IAM Policy for Cloud Function invocation
+# Allows unauthenticated access for public API usage
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: function-public-invoker
+spec:
+  member: allUsers
+  role: roles/cloudfunctions.invoker
+  resourceRef:
+    apiVersion: cloudfunctions.cnrm.cloud.google.com/v1beta1
+    kind: CloudFunctionsFunction
+    name: ${function_name}
+
+---
+# Cloud Logging Log Sink for function monitoring and debugging
+# Creates structured logging for better observability
+apiVersion: logging.cnrm.cloud.google.com/v1beta1
+kind: LoggingLogSink
+metadata:
+  name: function-log-sink
+spec:
+  projectRef:
+    external: ${project_id}
+  destination: logging.googleapis.com/projects/${project_id}/logs/cloud-function-logs
+  description: "Log sink for text case converter function monitoring and debugging"
+  filter: |
+    resource.type="cloud_function"
+    resource.labels.function_name="${function_name}"
+    severity>=INFO
+  includeChildren: true
+
+---
+# Cloud Monitoring Alert Policy for function errors
+# Monitors function execution and alerts on high error rates
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringAlertPolicy
+metadata:
+  name: function-error-alert-policy
+spec:
+  projectRef:
+    external: ${project_id}
+  displayName: "Text Converter Function Error Alert"
+  documentation:
+    content: "Alert triggered when text case converter function error rate exceeds threshold"
+    mimeType: "text/markdown"
+  
+  conditions:
+    - displayName: "Function Error Rate"
+      conditionThreshold:
+        filter: |
+          resource.type="cloud_function"
+          resource.label.function_name="${function_name}"
+          metric.type="cloudfunctions.googleapis.com/function/execution_count"
+          metric.label.status!="ok"
+        comparison: "COMPARISON_GREATER_THAN"
+        thresholdValue: 5  # Alert if more than 5 errors
+        duration: "300s"  # Within 5 minutes
+        aggregations:
+          - alignmentPeriod: "60s"
+            perSeriesAligner: "ALIGN_RATE"
+            crossSeriesReducer: "REDUCE_SUM"
+  
+  # Notification channels would be configured separately
+  alertStrategy:
+    autoClose: "86400s"  # Auto-close alerts after 24 hours
+  
+  enabled: true
+
+---
+# Cloud Monitoring Dashboard for function metrics
+# Provides visualization of function performance and usage
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringDashboard
+metadata:
+  name: text-converter-dashboard
+spec:
+  projectRef:
+    external: ${project_id}
+  displayName: "Text Case Converter Function Dashboard"
+  
+  # Dashboard configuration with key metrics
+  mosaicLayout:
+    tiles:
+      - width: 6
+        height: 4
+        widget:
+          title: "Function Invocations"
+          xyChart:
+            dataSets:
+              - timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: |
+                      resource.type="cloud_function"
+                      resource.label.function_name="${function_name}"
+                      metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                    aggregation:
+                      alignmentPeriod: "60s"
+                      perSeriesAligner: "ALIGN_RATE"
+                      crossSeriesReducer: "REDUCE_SUM"
+                targetAxis: "Y1"
+            yAxis:
+              label: "Invocations per second"
+      
+      - width: 6
+        height: 4
+        xPos: 6
+        widget:
+          title: "Function Duration"
+          xyChart:
+            dataSets:
+              - timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: |
+                      resource.type="cloud_function"
+                      resource.label.function_name="${function_name}"
+                      metric.type="cloudfunctions.googleapis.com/function/execution_times"
+                    aggregation:
+                      alignmentPeriod: "60s"
+                      perSeriesAligner: "ALIGN_MEAN"
+                      crossSeriesReducer: "REDUCE_MEAN"
+                targetAxis: "Y1"
+            yAxis:
+              label: "Duration (ms)"
+      
+      - width: 12
+        height: 4
+        yPos: 4
+        widget:
+          title: "Function Error Rate"
+          xyChart:
+            dataSets:
+              - timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: |
+                      resource.type="cloud_function"
+                      resource.label.function_name="${function_name}"
+                      metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                      metric.label.status!="ok"
+                    aggregation:
+                      alignmentPeriod: "60s"
+                      perSeriesAligner: "ALIGN_RATE"
+                      crossSeriesReducer: "REDUCE_SUM"
+                targetAxis: "Y1"
+            yAxis:
+              label: "Errors per second"
+
+---
+# Output values for integration and validation
+outputs:
+  function_name:
+    description: "Name of the deployed Cloud Function"
+    value: ${function_name}
+  
+  function_url:
+    description: "HTTP trigger URL for the Cloud Function"
+    value: "https://${region}-${project_id}.cloudfunctions.net/${function_name}"
+  
+  function_service_account:
+    description: "Service account used by the function"
+    value: "text-converter-function-sa@${project_id}.iam.gserviceaccount.com"
+  
+  source_bucket:
+    description: "Cloud Storage bucket containing function source"
+    value: "text-converter-function-source"
+  
+  log_sink_name:
+    description: "Name of the log sink for function monitoring"
+    value: "function-log-sink"
+  
+  dashboard_url:
+    description: "URL to the monitoring dashboard"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/text-converter-dashboard?project=${project_id}"
+  
+  estimated_monthly_cost:
+    description: "Estimated monthly cost for moderate usage (USD)"
+    value: "$0.10 - $5.00 depending on invocation volume"
+
+---
+# Resource dependencies and deployment order
+# Infrastructure Manager will handle dependency resolution automatically
+# but this documents the intended deployment sequence:
+#
+# 1. Enable required APIs (cloudfunctions, cloudbuild, logging)
+# 2. Create IAM service account with minimal permissions
+# 3. Create Cloud Storage bucket for source code
+# 4. Upload function source code to storage bucket
+# 5. Deploy Cloud Function with proper configuration
+# 6. Set up public access IAM policy
+# 7. Configure monitoring and alerting
+# 8. Create monitoring dashboard for observability
+#
+# Security Best Practices Implemented:
+# - Principle of least privilege for service account permissions
+# - Uniform bucket-level access for Cloud Storage
+# - Structured logging for audit trails
+# - Resource tagging for cost allocation and governance
+# - Function timeout limits to prevent runaway executions
+# - Memory and CPU limits for cost optimization
+# - Monitoring and alerting for operational visibility
+#
+# Cost Optimization Features:
+# - Minimum instance count of 0 (scale to zero when not in use)
+# - Memory allocation optimized for text processing (128MB)
+# - Storage lifecycle policies for source code management
+# - Fractional CPU allocation for cost efficiency
+# - Automatic function timeout to prevent excessive charges

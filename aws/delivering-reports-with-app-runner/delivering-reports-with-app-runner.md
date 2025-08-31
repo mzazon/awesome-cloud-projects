@@ -6,10 +6,10 @@ difficulty: 200
 subject: aws
 services: App Runner, SES, EventBridge Scheduler, CloudWatch
 estimated-time: 90 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: email, reports, scheduling, containers, automation
 recipe-generator-version: 1.3
@@ -194,7 +194,7 @@ echo "✅ Environment configured with unique suffix: ${RANDOM_SUFFIX}"
    ```bash
    # Create Dockerfile for containerization
    cat > Dockerfile << 'EOF'
-   FROM python:3.9-slim
+   FROM python:3.11-slim
    
    WORKDIR /app
    
@@ -210,8 +210,8 @@ echo "✅ Environment configured with unique suffix: ${RANDOM_SUFFIX}"
    
    # Create requirements.txt
    cat > requirements.txt << 'EOF'
-   Flask==2.3.3
-   boto3==1.34.0
+   Flask==3.0.0
+   boto3==1.35.0
    EOF
    
    # Create App Runner configuration
@@ -223,7 +223,7 @@ echo "✅ Environment configured with unique suffix: ${RANDOM_SUFFIX}"
        build:
          - pip install -r requirements.txt
    run:
-     runtime-version: 3.9
+     runtime-version: 3.11
      command: python app.py
      network:
        port: 8000
@@ -402,7 +402,7 @@ echo "✅ Environment configured with unique suffix: ${RANDOM_SUFFIX}"
 
 7. **Create IAM Role for EventBridge Scheduler**:
 
-   EventBridge Scheduler requires specific permissions to invoke your App Runner service via HTTP requests. This role enables the scheduler to authenticate and make HTTP POST requests to your application's report generation endpoint, ensuring secure and reliable automated execution.
+   EventBridge Scheduler requires specific permissions to invoke HTTP endpoints. This role enables the scheduler to authenticate and make HTTP POST requests to your application's report generation endpoint, ensuring secure and reliable automated execution. Note that for HTTP targets, minimal permissions are required since the scheduler invokes external HTTP endpoints.
 
    ```bash
    # Create trust policy for EventBridge Scheduler
@@ -421,7 +421,7 @@ echo "✅ Environment configured with unique suffix: ${RANDOM_SUFFIX}"
    }
    EOF
    
-   # Create permissions policy for HTTP invocation
+   # Create minimal permissions policy for HTTP invocation
    cat > scheduler-permissions-policy.json << 'EOF'
    {
        "Version": "2012-10-17",
@@ -429,9 +429,11 @@ echo "✅ Environment configured with unique suffix: ${RANDOM_SUFFIX}"
            {
                "Effect": "Allow",
                "Action": [
-                   "events:InvokeFunction"
+                   "logs:CreateLogGroup",
+                   "logs:CreateLogStream",
+                   "logs:PutLogEvents"
                ],
-               "Resource": "*"
+               "Resource": "arn:aws:logs:*:*:*"
            }
        ]
    }
@@ -561,7 +563,7 @@ echo "✅ Environment configured with unique suffix: ${RANDOM_SUFFIX}"
    curl -s https://${SERVICE_URL}/health | jq '.'
    ```
 
-   Expected output: `{"status": "healthy", "timestamp": "2025-07-12T10:00:00.000000"}`
+   Expected output: `{"status": "healthy", "timestamp": "2025-07-23T10:00:00.000000"}`
 
 2. **Manually Trigger Report Generation**:
 
@@ -685,20 +687,21 @@ echo "✅ Environment configured with unique suffix: ${RANDOM_SUFFIX}"
 
 This recipe demonstrates how to build a comprehensive email reporting system using AWS serverless services that automatically scales based on demand while maintaining cost efficiency. AWS App Runner provides the ideal platform for containerized applications by abstracting away infrastructure management while still offering the flexibility of containers. The service automatically handles load balancing, health checks, and scaling, making it perfect for applications that need to run continuously but with variable traffic patterns.
 
-The integration between EventBridge Scheduler and App Runner showcases modern event-driven architecture patterns where scheduled events trigger application functionality without requiring dedicated server resources. EventBridge Scheduler offers significant advantages over traditional cron jobs by providing built-in retry mechanisms, flexible time windows, and integration with AWS IAM for security. This approach eliminates the need to manage scheduling infrastructure while providing enterprise-grade reliability and monitoring capabilities.
+The integration between EventBridge Scheduler and App Runner showcases modern event-driven architecture patterns where scheduled events trigger application functionality without requiring dedicated server resources. EventBridge Scheduler offers significant advantages over traditional cron jobs by providing built-in retry mechanisms, flexible time windows, and integration with AWS IAM for security. This approach eliminates the need to manage scheduling infrastructure while providing enterprise-grade reliability and monitoring capabilities. For HTTP targets, EventBridge Scheduler requires minimal IAM permissions since it's invoking external endpoints rather than AWS services.
 
 Amazon SES provides enterprise-grade email delivery capabilities with built-in reputation management, bounce handling, and delivery optimization. The service automatically handles email authentication protocols like SPF, DKIM, and DMARC, ensuring high deliverability rates. When combined with CloudWatch monitoring, you can track email sending metrics, delivery rates, and bounce rates to optimize your email reporting strategy. This integration enables proactive monitoring and alerting for email delivery issues.
 
 The CloudWatch integration demonstrates how to implement comprehensive observability for serverless applications. By combining application logs, custom metrics, and automated alarms, you can maintain visibility into system performance and quickly identify issues. This approach follows AWS Well-Architected Framework principles by implementing operational excellence through automated monitoring and alerting, ensuring your email reporting system remains reliable and performant.
 
-> **Tip**: Consider implementing email template management using Amazon SES templates for more sophisticated report formatting and personalization capabilities.
+> **Tip**: Consider implementing email template management using Amazon SES templates for more sophisticated report formatting and personalization capabilities. Also, App Runner now supports Python 3.11 which provides improved performance and security features.
 
 *Documentation Sources:*
 - [AWS App Runner Developer Guide](https://docs.aws.amazon.com/apprunner/latest/dg/getting-started.html)
 - [Amazon SES Developer Guide](https://docs.aws.amazon.com/ses/latest/DeveloperGuide/send-email.html)
-- [EventBridge Scheduler User Guide](https://docs.aws.amazon.com/eventbridge/latest/userguide/using-eventbridge-scheduler.html)
+- [EventBridge Scheduler User Guide](https://docs.aws.amazon.com/scheduler/latest/UserGuide/what-is-scheduler.html)
 - [Amazon CloudWatch User Guide](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/WhatIsCloudWatch.html)
 - [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html)
+- [EventBridge Scheduler Managing Targets](https://docs.aws.amazon.com/scheduler/latest/UserGuide/managing-targets.html)
 
 ## Challenge
 

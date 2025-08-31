@@ -1,0 +1,526 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Infrastructure as Code for AWS CLI Setup and First Commands recipe.
+  This template creates the foundational infrastructure to support AWS CLI learning
+  including S3 bucket with encryption, IAM user for CLI access, and necessary
+  permissions for hands-on AWS CLI practice.
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - BucketPrefix
+          - EnableVersioning
+          - EnableLogging
+      - Label:
+          default: "IAM Configuration"
+        Parameters:
+          - CreateIAMUser
+          - IAMUserName
+          - EnableConsoleAccess
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      BucketPrefix:
+        default: "S3 Bucket Prefix"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      EnableLogging:
+        default: "Enable Access Logging"
+      CreateIAMUser:
+        default: "Create IAM User"
+      IAMUserName:
+        default: "IAM User Name"
+      EnableConsoleAccess:
+        default: "Enable Console Access"
+
+# Input Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-cli-tutorial
+    Description: Name of the project used for resource naming and tagging
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 32
+
+  Environment:
+    Type: String
+    Default: development
+    Description: Environment designation for resource tagging and naming
+    AllowedValues:
+      - development
+      - staging
+      - production
+    ConstraintDescription: Must be development, staging, or production
+
+  BucketPrefix:
+    Type: String
+    Default: my-first-cli-bucket
+    Description: Prefix for the S3 bucket name (timestamp will be appended)
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 40
+
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    Description: Enable S3 object versioning for the tutorial bucket
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableLogging:
+    Type: String
+    Default: 'false'
+    Description: Enable S3 access logging (requires additional S3 bucket for logs)
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  CreateIAMUser:
+    Type: String
+    Default: 'true'
+    Description: Create an IAM user for CLI access (set to false if using existing credentials)
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  IAMUserName:
+    Type: String
+    Default: aws-cli-tutorial-user
+    Description: Name for the IAM user (only used if CreateIAMUser is true)
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+    MinLength: 3
+    MaxLength: 64
+
+  EnableConsoleAccess:
+    Type: String
+    Default: 'false'
+    Description: Enable AWS Console access for the IAM user (creates login profile)
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+# Conditions for conditional resource creation
+Conditions:
+  CreateIAMUserCondition: !Equals [!Ref CreateIAMUser, 'true']
+  EnableVersioningCondition: !Equals [!Ref EnableVersioning, 'true']
+  EnableLoggingCondition: !Equals [!Ref EnableLogging, 'true']
+  EnableConsoleAccessCondition: !And
+    - !Condition CreateIAMUserCondition
+    - !Equals [!Ref EnableConsoleAccess, 'true']
+
+# Resources
+Resources:
+  # S3 Bucket for CLI Tutorial
+  TutorialBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 
+        - '${BucketPrefix}-${Timestamp}-${AWS::AccountId}'
+        - BucketPrefix: !Ref BucketPrefix
+          Timestamp: !Select [0, !Split ['.', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration: !If
+        - EnableVersioningCondition
+        - Status: Enabled
+        - !Ref AWS::NoValue
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration: !If
+        - EnableLoggingCondition
+        - DestinationBucketName: !Ref LoggingBucket
+          LogFilePrefix: access-logs/
+        - !Ref AWS::NoValue
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-tutorial-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: AWS CLI Tutorial
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # S3 Bucket for Access Logs (conditional)
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableLoggingCondition
+    Properties:
+      BucketName: !Sub 
+        - '${BucketPrefix}-logs-${Timestamp}-${AWS::AccountId}'
+        - BucketPrefix: !Ref BucketPrefix
+          Timestamp: !Select [0, !Split ['.', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-access-logs-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: S3 Access Logging
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Log Group for S3 Events
+  S3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-tutorial-bucket'
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-s3-log-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: S3 Event Logging
+
+  # IAM User for CLI Access (conditional)
+  CLITutorialUser:
+    Type: AWS::IAM::User
+    Condition: CreateIAMUserCondition
+    Properties:
+      UserName: !Ref IAMUserName
+      Path: /
+      LoginProfile: !If
+        - EnableConsoleAccessCondition
+        - Password: !Sub '${ProjectName}-TempPass123!'
+          PasswordResetRequired: true
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Ref IAMUserName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: AWS CLI Tutorial Access
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # IAM Policy for S3 and Basic AWS Operations
+  CLITutorialPolicy:
+    Type: AWS::IAM::Policy
+    Condition: CreateIAMUserCondition
+    Properties:
+      PolicyName: !Sub '${ProjectName}-cli-tutorial-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # S3 permissions for tutorial bucket
+          - Sid: S3TutorialBucketAccess
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+              - s3:GetBucketVersioning
+              - s3:GetBucketEncryption
+              - s3:GetBucketLogging
+            Resource: !GetAtt TutorialBucket.Arn
+          - Sid: S3TutorialObjectAccess
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:GetObjectVersion
+              - s3:GetObjectMetadata
+              - s3:PutObjectMetadata
+            Resource: !Sub '${TutorialBucket.Arn}/*'
+          # Basic S3 list permissions
+          - Sid: S3ListBuckets
+            Effect: Allow
+            Action:
+              - s3:ListAllMyBuckets
+              - s3:GetBucketLocation
+            Resource: '*'
+          # STS permissions for identity verification
+          - Sid: STSGetCallerIdentity
+            Effect: Allow
+            Action:
+              - sts:GetCallerIdentity
+            Resource: '*'
+          # CloudWatch Logs permissions for tutorial
+          - Sid: CloudWatchLogsAccess
+            Effect: Allow
+            Action:
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !GetAtt S3LogGroup.Arn
+          # IAM permissions to view own user info
+          - Sid: IAMReadOwnUser
+            Effect: Allow
+            Action:
+              - iam:GetUser
+              - iam:ListAttachedUserPolicies
+              - iam:ListUserPolicies
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/${IAMUserName}'
+      Users:
+        - !Ref CLITutorialUser
+
+  # Access Key for CLI User (conditional)
+  CLIUserAccessKey:
+    Type: AWS::IAM::AccessKey
+    Condition: CreateIAMUserCondition
+    Properties:
+      UserName: !Ref CLITutorialUser
+      Status: Active
+
+  # Store Access Key in Systems Manager Parameter Store
+  AccessKeyParameter:
+    Type: AWS::SSM::Parameter
+    Condition: CreateIAMUserCondition
+    Properties:
+      Name: !Sub '/${ProjectName}/cli-tutorial/access-key-id'
+      Type: String
+      Value: !Ref CLIUserAccessKey
+      Description: Access Key ID for AWS CLI Tutorial User
+      Tags:
+        Name: !Sub '${ProjectName}-access-key-parameter'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: AWS CLI Tutorial Credentials
+
+  # Store Secret Key in Systems Manager Parameter Store (SecureString)
+  SecretKeyParameter:
+    Type: AWS::SSM::Parameter
+    Condition: CreateIAMUserCondition
+    Properties:
+      Name: !Sub '/${ProjectName}/cli-tutorial/secret-access-key'
+      Type: SecureString
+      Value: !GetAtt CLIUserAccessKey.SecretAccessKey
+      Description: Secret Access Key for AWS CLI Tutorial User (encrypted)
+      Tags:
+        Name: !Sub '${ProjectName}-secret-key-parameter'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: AWS CLI Tutorial Credentials
+
+  # CloudFormation Custom Resource for Bucket Name Generation
+  BucketNameFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-bucket-name-generator'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt BucketNameFunctionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          from datetime import datetime
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      # Generate timestamp-based unique identifier
+                      timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+                      bucket_name = f"{event['ResourceProperties']['BucketPrefix']}-{timestamp}"
+                      
+                      response_data = {
+                          'BucketName': bucket_name,
+                          'Timestamp': timestamp
+                      }
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # IAM Role for Lambda Function
+  BucketNameFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-bucket-name-function-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-bucket-name-function-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# Stack Outputs
+Outputs:
+  # S3 Bucket Information
+  TutorialBucketName:
+    Description: Name of the S3 bucket created for CLI tutorial
+    Value: !Ref TutorialBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TutorialBucketName'
+
+  TutorialBucketArn:
+    Description: ARN of the S3 bucket created for CLI tutorial
+    Value: !GetAtt TutorialBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TutorialBucketArn'
+
+  TutorialBucketRegion:
+    Description: Region where the S3 bucket was created
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-TutorialBucketRegion'
+
+  # IAM User Information (conditional outputs)
+  IAMUserName:
+    Description: Name of the IAM user created for CLI access
+    Condition: CreateIAMUserCondition
+    Value: !Ref CLITutorialUser
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMUserName'
+
+  IAMUserArn:
+    Description: ARN of the IAM user created for CLI access
+    Condition: CreateIAMUserCondition
+    Value: !GetAtt CLITutorialUser.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMUserArn'
+
+  AccessKeyId:
+    Description: Access Key ID for the CLI user (retrieve secret from Parameter Store)
+    Condition: CreateIAMUserCondition
+    Value: !Ref CLIUserAccessKey
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessKeyId'
+
+  AccessKeyParameterName:
+    Description: Systems Manager Parameter name containing the Access Key ID
+    Condition: CreateIAMUserCondition
+    Value: !Ref AccessKeyParameter
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessKeyParameterName'
+
+  SecretKeyParameterName:
+    Description: Systems Manager Parameter name containing the Secret Access Key (encrypted)
+    Condition: CreateIAMUserCondition
+    Value: !Ref SecretKeyParameter
+    Export:
+      Name: !Sub '${AWS::StackName}-SecretKeyParameterName'
+
+  # Logging Information
+  LoggingBucketName:
+    Description: Name of the S3 bucket used for access logging
+    Condition: EnableLoggingCondition
+    Value: !Ref LoggingBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LoggingBucketName'
+
+  S3LogGroupName:
+    Description: CloudWatch Log Group for S3 events
+    Value: !Ref S3LogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-S3LogGroupName'
+
+  # CLI Configuration Commands
+  CLIConfigurationCommand:
+    Description: Command to retrieve credentials from Parameter Store for CLI configuration
+    Condition: CreateIAMUserCondition
+    Value: !Sub |
+      # Retrieve credentials from AWS Systems Manager Parameter Store
+      export AWS_ACCESS_KEY_ID=$(aws ssm get-parameter --name "/${ProjectName}/cli-tutorial/access-key-id" --query "Parameter.Value" --output text)
+      export AWS_SECRET_ACCESS_KEY=$(aws ssm get-parameter --name "/${ProjectName}/cli-tutorial/secret-access-key" --with-decryption --query "Parameter.Value" --output text)
+      
+      # Configure AWS CLI
+      aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+      aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+      aws configure set default.region ${AWS::Region}
+      aws configure set default.output json
+
+  # Tutorial Commands
+  TutorialCommands:
+    Description: Sample commands to get started with the tutorial infrastructure
+    Value: !Sub |
+      # Set environment variables for tutorial
+      export AWS_REGION=${AWS::Region}
+      export BUCKET_NAME=${TutorialBucket}
+      export AWS_ACCOUNT_ID=${AWS::AccountId}
+      
+      # Verify CLI configuration
+      aws sts get-caller-identity
+      aws s3 ls s3://${TutorialBucket}/
+      
+      # Upload a test file
+      echo "Hello from CloudFormation infrastructure!" > test-file.txt
+      aws s3 cp test-file.txt s3://${TutorialBucket}/
+      
+      # List objects with metadata
+      aws s3api list-objects-v2 --bucket ${TutorialBucket}
+      
+      # Download the file
+      aws s3 cp s3://${TutorialBucket}/test-file.txt downloaded-test.txt
+
+  # Security Notes
+  SecurityReminder:
+    Description: Important security reminders for credential management
+    Value: |
+      SECURITY REMINDERS:
+      1. Access keys are stored securely in AWS Systems Manager Parameter Store
+      2. Secret access key is encrypted using AWS KMS
+      3. IAM user has minimal permissions for tutorial purposes only
+      4. Remember to rotate access keys regularly in production environments
+      5. Consider using IAM roles and temporary credentials for production workloads
+      6. Delete this stack when tutorial is complete to remove all resources

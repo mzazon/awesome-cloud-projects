@@ -1,0 +1,712 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simple File Validation with S3 and Lambda - Automated serverless file validation system that triggers on S3 uploads'
+
+# ========================================
+# METADATA
+# ========================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Naming Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "File Validation Configuration"
+        Parameters:
+          - MaxFileSize
+          - AllowedFileExtensions
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - EnableVersioning
+          - EnableServerAccessLogging
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      MaxFileSize:
+        default: "Maximum File Size (MB)"
+      AllowedFileExtensions:
+        default: "Allowed File Extensions"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      EnableServerAccessLogging:
+        default: "Enable S3 Access Logging"
+
+# ========================================
+# PARAMETERS
+# ========================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'file-validation'
+    Description: 'Name of the project used for resource naming'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name (dev, test, prod)'
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: 'Must be one of: dev, test, staging, prod'
+
+  MaxFileSize:
+    Type: Number
+    Default: 10
+    Description: 'Maximum allowed file size in megabytes'
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: 'Must be between 1 and 100 MB'
+
+  AllowedFileExtensions:
+    Type: CommaDelimitedList
+    Default: '.txt,.pdf,.jpg,.jpeg,.png,.doc,.docx'
+    Description: 'Comma-separated list of allowed file extensions (include the dot)'
+    ConstraintDescription: 'Must be a comma-separated list of file extensions starting with a dot'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    Description: 'Lambda function timeout in seconds'
+    MinValue: 3
+    MaxValue: 900
+    ConstraintDescription: 'Must be between 3 and 900 seconds'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: 'Lambda function memory size in MB'
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    ConstraintDescription: 'Must be one of the allowed Lambda memory sizes'
+
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    Description: 'Enable versioning on S3 buckets for data protection'
+    AllowedValues: ['true', 'false']
+
+  EnableServerAccessLogging:
+    Type: String
+    Default: 'false'
+    Description: 'Enable S3 server access logging (requires additional bucket)'
+    AllowedValues: ['true', 'false']
+
+# ========================================
+# CONDITIONS
+# ========================================
+Conditions:
+  EnableVersioningCondition: !Equals [!Ref EnableVersioning, 'true']
+  EnableAccessLoggingCondition: !Equals [!Ref EnableServerAccessLogging, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+# ========================================
+# RESOURCES
+# ========================================
+Resources:
+  # S3 Bucket for Initial File Uploads
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-upload-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioningCondition, 'Enabled', 'Suspended']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: DeleteOldVersions
+            Status: !If [EnableVersioningCondition, 'Enabled', 'Disabled']
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      LoggingConfiguration: !If
+        - EnableAccessLoggingCondition
+        - DestinationBucketName: !Ref AccessLogsBucket
+          LogFilePrefix: 'upload-bucket-logs/'
+        - !Ref AWS::NoValue
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt FileValidationFunction.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-upload-bucket-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'File Upload and Processing'
+
+  # S3 Bucket for Valid Files
+  ValidFilesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-valid-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioningCondition, 'Enabled', 'Suspended']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              Days: 30
+              StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: !If [IsProductionEnvironment, 'Enabled', 'Disabled']
+            Transition:
+              Days: 90
+              StorageClass: GLACIER
+      LoggingConfiguration: !If
+        - EnableAccessLoggingCondition
+        - DestinationBucketName: !Ref AccessLogsBucket
+          LogFilePrefix: 'valid-files-logs/'
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-valid-files-bucket-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Validated File Storage'
+
+  # S3 Bucket for Quarantined Files
+  QuarantineBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-quarantine-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioningCondition, 'Enabled', 'Suspended']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: DeleteQuarantinedFiles
+            Status: Enabled
+            ExpirationInDays: !If [IsProductionEnvironment, 90, 30]
+      LoggingConfiguration: !If
+        - EnableAccessLoggingCondition
+        - DestinationBucketName: !Ref AccessLogsBucket
+          LogFilePrefix: 'quarantine-logs/'
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-quarantine-bucket-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Quarantined File Storage'
+
+  # S3 Bucket for Access Logs (Optional)
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableAccessLoggingCondition
+    Properties:
+      BucketName: !Sub '${ProjectName}-access-logs-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAccessLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-access-logs-bucket-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'S3 Access Logs Storage'
+
+  # IAM Role for Lambda Function
+  FileValidationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub '${UploadBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${ValidFilesBucket}/*'
+                  - !Sub '${QuarantineBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt UploadBucket.Arn
+                  - !GetAtt ValidFilesBucket.Arn
+                  - !GetAtt QuarantineBucket.Arn
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-file-validator-${Environment}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Function for File Validation
+  FileValidationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-file-validator-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt FileValidationLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          VALID_BUCKET_NAME: !Ref ValidFilesBucket
+          QUARANTINE_BUCKET_NAME: !Ref QuarantineBucket
+          MAX_FILE_SIZE: !Sub '${MaxFileSize}'
+          ALLOWED_EXTENSIONS: !Join [',', !Ref AllowedFileExtensions]
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import urllib.parse
+          import os
+          from datetime import datetime
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          s3_client = boto3.client('s3')
+          
+          # Configuration from environment variables
+          MAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE', '10')) * 1024 * 1024  # Convert MB to bytes
+          ALLOWED_EXTENSIONS = [ext.strip() for ext in os.environ.get('ALLOWED_EXTENSIONS', '.txt,.pdf,.jpg,.jpeg,.png,.doc,.docx').split(',')]
+          VALID_BUCKET_NAME = os.environ['VALID_BUCKET_NAME']
+          QUARANTINE_BUCKET_NAME = os.environ['QUARANTINE_BUCKET_NAME']
+          ENVIRONMENT = os.environ.get('ENVIRONMENT', 'dev')
+          PROJECT_NAME = os.environ.get('PROJECT_NAME', 'file-validation')
+          
+          def lambda_handler(event, context):
+              """Main Lambda handler function for file validation"""
+              logger.info(f"Received event: {json.dumps(event, default=str)}")
+              
+              try:
+                  for record in event['Records']:
+                      process_s3_record(record)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'File validation completed successfully',
+                          'environment': ENVIRONMENT,
+                          'project': PROJECT_NAME
+                      })
+                  }
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  raise
+          
+          def process_s3_record(record):
+              """Process individual S3 record"""
+              # Extract S3 information
+              bucket_name = record['s3']['bucket']['name']
+              object_key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+              object_size = record['s3']['object']['size']
+              
+              logger.info(f"Processing file: {object_key}, Size: {object_size} bytes")
+              
+              # Validate file
+              validation_result = validate_file(object_key, object_size)
+              
+              # Determine destination bucket
+              if validation_result['valid']:
+                  destination_bucket = VALID_BUCKET_NAME
+                  logger.info(f"✅ File {object_key} is valid")
+              else:
+                  destination_bucket = QUARANTINE_BUCKET_NAME
+                  logger.warning(f"❌ File {object_key} is invalid: {validation_result['reason']}")
+              
+              # Move file to appropriate bucket
+              move_file(bucket_name, object_key, destination_bucket, validation_result)
+          
+          def validate_file(filename, file_size):
+              """Validate file based on size and extension"""
+              # Check file size
+              if file_size > MAX_FILE_SIZE:
+                  return {
+                      'valid': False,
+                      'reason': f'File size {file_size} bytes exceeds maximum {MAX_FILE_SIZE} bytes ({MAX_FILE_SIZE/1024/1024:.1f} MB)'
+                  }
+              
+              # Check for empty files
+              if file_size == 0:
+                  return {
+                      'valid': False,
+                      'reason': 'File is empty (0 bytes)'
+                  }
+              
+              # Check file extension
+              if '.' not in filename:
+                  return {
+                      'valid': False,
+                      'reason': 'File has no extension'
+                  }
+              
+              file_extension = '.' + filename.lower().split('.')[-1]
+              if file_extension not in ALLOWED_EXTENSIONS:
+                  return {
+                      'valid': False,
+                      'reason': f'File extension {file_extension} not in allowed list: {ALLOWED_EXTENSIONS}'
+                  }
+              
+              return {
+                  'valid': True,
+                  'reason': 'File passed all validation checks',
+                  'file_extension': file_extension,
+                  'file_size_mb': round(file_size / 1024 / 1024, 2)
+              }
+          
+          def move_file(source_bucket, object_key, destination_bucket, validation_result):
+              """Move file from source to destination bucket"""
+              try:
+                  # Create destination key with date organization
+                  current_date = datetime.now()
+                  destination_key = f"{current_date.strftime('%Y/%m/%d')}/{object_key}"
+                  
+                  # Add metadata tags
+                  metadata = {
+                      'validation-status': 'valid' if validation_result['valid'] else 'invalid',
+                      'validation-reason': validation_result['reason'],
+                      'processed-timestamp': current_date.isoformat(),
+                      'environment': ENVIRONMENT,
+                      'project': PROJECT_NAME
+                  }
+                  
+                  if validation_result['valid']:
+                      metadata.update({
+                          'file-extension': validation_result.get('file_extension', ''),
+                          'file-size-mb': str(validation_result.get('file_size_mb', 0))
+                      })
+                  
+                  # Copy file to destination bucket with metadata
+                  copy_source = {'Bucket': source_bucket, 'Key': object_key}
+                  s3_client.copy_object(
+                      CopySource=copy_source,
+                      Bucket=destination_bucket,
+                      Key=destination_key,
+                      Metadata=metadata,
+                      MetadataDirective='REPLACE',
+                      TaggingDirective='REPLACE',
+                      Tagging=f"validation-status={'valid' if validation_result['valid'] else 'invalid'}&environment={ENVIRONMENT}&project={PROJECT_NAME}"
+                  )
+                  
+                  # Delete original file from upload bucket
+                  s3_client.delete_object(
+                      Bucket=source_bucket,
+                      Key=object_key
+                  )
+                  
+                  logger.info(f"Successfully moved {object_key} to {destination_bucket}/{destination_key} and deleted original")
+                  
+              except Exception as e:
+                  logger.error(f"Error moving file {object_key}: {str(e)}")
+                  raise
+      Description: !Sub 'File validation function for ${ProjectName} in ${Environment} environment'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-file-validator-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Permission for S3 to Invoke Function
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FileValidationFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt UploadBucket.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  # CloudWatch Log Group for Lambda Function
+  FileValidationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${FileValidationFunction}'
+      RetentionInDays: !If [IsProductionEnvironment, 30, 14]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for Lambda Errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: 'Monitor Lambda function errors for file validation'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FileValidationFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-error-alarm-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for Lambda Duration
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProductionEnvironment
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: 'Monitor Lambda function duration for performance'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Sub '${LambdaTimeout}000'  # Convert seconds to milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FileValidationFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-duration-alarm-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ========================================
+# OUTPUTS
+# ========================================
+Outputs:
+  UploadBucketName:
+    Description: 'Name of the S3 bucket for file uploads'
+    Value: !Ref UploadBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-UploadBucket'
+
+  UploadBucketArn:
+    Description: 'ARN of the S3 bucket for file uploads'
+    Value: !GetAtt UploadBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-UploadBucketArn'
+
+  ValidFilesBucketName:
+    Description: 'Name of the S3 bucket for valid files'
+    Value: !Ref ValidFilesBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ValidFilesBucket'
+
+  ValidFilesBucketArn:
+    Description: 'ARN of the S3 bucket for valid files'
+    Value: !GetAtt ValidFilesBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ValidFilesBucketArn'
+
+  QuarantineBucketName:
+    Description: 'Name of the S3 bucket for quarantined files'
+    Value: !Ref QuarantineBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-QuarantineBucket'
+
+  QuarantineBucketArn:
+    Description: 'ARN of the S3 bucket for quarantined files'
+    Value: !GetAtt QuarantineBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QuarantineBucketArn'
+
+  AccessLogsBucketName:
+    Condition: EnableAccessLoggingCondition
+    Description: 'Name of the S3 bucket for access logs'
+    Value: !Ref AccessLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessLogsBucket'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function for file validation'
+    Value: !Ref FileValidationFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function for file validation'
+    Value: !GetAtt FileValidationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaRoleArn:
+    Description: 'ARN of the IAM role for the Lambda function'
+    Value: !GetAtt FileValidationLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRole'
+
+  CloudWatchLogGroupName:
+    Description: 'Name of the CloudWatch log group for Lambda'
+    Value: !Ref FileValidationLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  LambdaErrorAlarmName:
+    Description: 'Name of the CloudWatch alarm for Lambda errors'
+    Value: !Ref LambdaErrorAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorAlarm'
+
+  LambdaDurationAlarmName:
+    Condition: IsProductionEnvironment
+    Description: 'Name of the CloudWatch alarm for Lambda duration'
+    Value: !Ref LambdaDurationAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-DurationAlarm'
+
+  # Deployment Information
+  StackName:
+    Description: 'Name of this CloudFormation stack'
+    Value: !Ref AWS::StackName
+
+  Region:
+    Description: 'AWS region where resources are deployed'
+    Value: !Ref AWS::Region
+
+  Environment:
+    Description: 'Environment name for this deployment'
+    Value: !Ref Environment
+
+  ProjectName:
+    Description: 'Project name for this deployment'
+    Value: !Ref ProjectName
+
+  # Usage Instructions
+  UploadTestCommand:
+    Description: 'AWS CLI command to upload a test file'
+    Value: !Sub 'aws s3 cp test-file.txt s3://${UploadBucket}/'
+
+  ListValidFilesCommand:
+    Description: 'AWS CLI command to list valid files'
+    Value: !Sub 'aws s3 ls s3://${ValidFilesBucket}/ --recursive'
+
+  ListQuarantinedFilesCommand:
+    Description: 'AWS CLI command to list quarantined files'
+    Value: !Sub 'aws s3 ls s3://${QuarantineBucket}/ --recursive'
+
+  ViewLambdaLogsCommand:
+    Description: 'AWS CLI command to view Lambda function logs'
+    Value: !Sub 'aws logs tail /aws/lambda/${FileValidationFunction} --follow'

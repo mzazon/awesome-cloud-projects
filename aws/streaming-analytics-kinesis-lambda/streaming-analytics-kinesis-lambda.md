@@ -1,22 +1,21 @@
 ---
 title: Streaming Analytics with Kinesis and Lambda
 id: d04d87a2
-category: compute
+category: analytics
 difficulty: 300
 subject: aws
-services: lambda,kinesis
+services: kinesis, lambda, dynamodb, cloudwatch
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
-tags: lambda,kinesis,serverless,analytics
+tags: lambda, kinesis, serverless, analytics, streaming
 recipe-generator-version: 1.3
 ---
 
 # Streaming Analytics with Kinesis and Lambda
-
 
 ## Problem
 
@@ -25,6 +24,8 @@ Your organization needs to process high-volume streams of data in real-time for 
 ## Solution
 
 Build a serverless real-time analytics pipeline using Amazon Kinesis Data Streams for data ingestion, AWS Lambda for stream processing, and Amazon DynamoDB for storing processed results. This architecture provides automatic scaling, high durability, and eliminates server management while processing thousands of records per second with sub-second latency.
+
+## Architecture Diagram
 
 ```mermaid
 graph TD
@@ -61,39 +62,56 @@ graph TD
     DDB --> DASH
     CW --> ALERT
     LOGS --> ALERT
+    
+    style KDS fill:#FF9900
+    style LAMBDA fill:#FF9900
+    style DDB fill:#3F8624
 ```
 
 ## Prerequisites
 
-- AWS account with administrator access
-- Basic understanding of streaming data concepts and JSON data formats
-- Familiarity with Lambda functions and event-driven architectures
-- AWS CLI version 2 installed and configured with appropriate permissions
-- Python 3.9+ installed locally for testing (optional)
-- Estimated cost: $5-15 for full recipe execution depending on data volume
+1. AWS account with administrator access for Lambda, Kinesis, DynamoDB, and IAM services
+2. Basic understanding of streaming data concepts and JSON data formats
+3. Familiarity with Lambda functions and event-driven architectures
+4. AWS CLI version 2 installed and configured with appropriate permissions
+5. Python 3.11+ installed locally for testing (optional)
+6. Estimated cost: $5-15 for full recipe execution depending on data volume
+
+> **Note**: This recipe follows AWS Well-Architected Framework principles for security, reliability, and cost optimization. Review the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) for additional guidance.
 
 ## Preparation
 
 Let's set up the foundational components for our real-time analytics pipeline:
 
 ```bash
-# Set environment variables
-export KINESIS_STREAM_NAME="real-time-analytics-stream"
-export LAMBDA_FUNCTION_NAME="kinesis-stream-processor"
-export DYNAMODB_TABLE_NAME="analytics-results"
-export IAM_ROLE_NAME="kinesis-lambda-processor-role"
+# Set AWS environment variables
+export AWS_REGION=$(aws configure get region)
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+    --query Account --output text)
+
+# Generate unique identifiers for resources
+RANDOM_SUFFIX=$(aws secretsmanager get-random-password \
+    --exclude-punctuation --exclude-uppercase \
+    --password-length 6 --require-each-included-type \
+    --output text --query RandomPassword)
+
+# Set environment variables for resource names
+export KINESIS_STREAM_NAME="analytics-stream-${RANDOM_SUFFIX}"
+export LAMBDA_FUNCTION_NAME="kinesis-processor-${RANDOM_SUFFIX}"
+export DYNAMODB_TABLE_NAME="analytics-results-${RANDOM_SUFFIX}"
+export IAM_ROLE_NAME="kinesis-lambda-role-${RANDOM_SUFFIX}"
 
 # Create DynamoDB table for storing processed analytics
 aws dynamodb create-table \
-	--table-name $DYNAMODB_TABLE_NAME \
-	--attribute-definitions \
-		AttributeName=eventId,AttributeType=S \
-		AttributeName=timestamp,AttributeType=N \
-	--key-schema \
-		AttributeName=eventId,KeyType=HASH \
-		AttributeName=timestamp,KeyType=RANGE \
-	--billing-mode PAY_PER_REQUEST \
-	--stream-specification StreamEnabled=false
+    --table-name $DYNAMODB_TABLE_NAME \
+    --attribute-definitions \
+        AttributeName=eventId,AttributeType=S \
+        AttributeName=timestamp,AttributeType=N \
+    --key-schema \
+        AttributeName=eventId,KeyType=HASH \
+        AttributeName=timestamp,KeyType=RANGE \
+    --billing-mode PAY_PER_REQUEST \
+    --stream-specification StreamEnabled=false
 
 # Wait for table to become active
 echo "Waiting for DynamoDB table to become active..."
@@ -124,7 +142,9 @@ cat << 'EOF' > lambda-kinesis-policy.json
                 "kinesis:ListStreams",
                 "kinesis:SubscribeToShard"
             ],
-            "Resource": "*"
+            "Resource": [
+                "arn:aws:kinesis:*:*:stream/*"
+            ]
         },
         {
             "Effect": "Allow",
@@ -135,7 +155,9 @@ cat << 'EOF' > lambda-kinesis-policy.json
                 "dynamodb:Query",
                 "dynamodb:Scan"
             ],
-            "Resource": "*"
+            "Resource": [
+                "arn:aws:dynamodb:*:*:table/*"
+            ]
         },
         {
             "Effect": "Allow",
@@ -166,21 +188,25 @@ EOF
 
 # Create IAM role for Lambda function
 aws iam create-role \
-	--role-name $IAM_ROLE_NAME \
-	--assume-role-policy-document file://lambda-trust-policy.json
+    --role-name $IAM_ROLE_NAME \
+    --assume-role-policy-document file://lambda-trust-policy.json
 
 # Attach custom policy to role
 aws iam put-role-policy \
-	--role-name $IAM_ROLE_NAME \
-	--policy-name KinesisLambdaProcessorPolicy \
-	--policy-document file://lambda-kinesis-policy.json
+    --role-name $IAM_ROLE_NAME \
+    --policy-name KinesisLambdaProcessorPolicy \
+    --policy-document file://lambda-kinesis-policy.json
+
+# Wait for role to propagate
+sleep 10
 
 # Get and export the role ARN
 LAMBDA_ROLE_ARN=$(aws iam get-role \
-	--role-name $IAM_ROLE_NAME \
-	--query 'Role.Arn' --output text)
+    --role-name $IAM_ROLE_NAME \
+    --query 'Role.Arn' --output text)
 export LAMBDA_ROLE_ARN
 
+echo "✅ AWS environment configured"
 echo "Lambda role ARN: $LAMBDA_ROLE_ARN"
 ```
 
@@ -193,8 +219,8 @@ echo "Lambda role ARN: $LAMBDA_ROLE_ARN"
    ```bash
    # Create Kinesis Data Stream with multiple shards for scalability
    aws kinesis create-stream \
-   	--stream-name $KINESIS_STREAM_NAME \
-   	--shard-count 2
+       --stream-name $KINESIS_STREAM_NAME \
+       --shard-count 2
    
    # Wait for stream to become active
    echo "Waiting for Kinesis stream to become active..."
@@ -202,6 +228,8 @@ echo "Lambda role ARN: $LAMBDA_ROLE_ARN"
    
    # Get stream details
    aws kinesis describe-stream --stream-name $KINESIS_STREAM_NAME
+   
+   echo "✅ Kinesis stream created successfully"
    ```
 
    The stream is now active and ready to receive data from multiple sources. With 2 shards, our pipeline can handle up to 2,000 records per second and 2 MB/second of data ingestion. Each shard provides 1,000 records/second write capacity and can support up to 5 reads per second with 2 MB/second throughput per consumer.
@@ -215,11 +243,12 @@ echo "Lambda role ARN: $LAMBDA_ROLE_ARN"
    mkdir lambda-processor
    cd lambda-processor
 
-cat << 'EOF' > lambda_function.py
+   cat << 'EOF' > lambda_function.py
 import json
 import boto3
 import base64
 import time
+import os
 from datetime import datetime
 from decimal import Decimal
 
@@ -227,8 +256,9 @@ from decimal import Decimal
 dynamodb = boto3.resource('dynamodb')
 cloudwatch = boto3.client('cloudwatch')
 
-# Get table reference
-table = dynamodb.Table('analytics-results')
+# Get table reference from environment variable
+table_name = os.environ['DYNAMODB_TABLE']
+table = dynamodb.Table(table_name)
 
 def lambda_handler(event, context):
     """
@@ -390,10 +420,12 @@ def send_custom_metrics(processed_data):
         # Don't raise exception to avoid processing failure
 EOF
 
-# Create deployment package
-zip -r ../lambda-processor.zip .
-cd ..
-```
+   # Create deployment package
+   zip -r ../lambda-processor.zip .
+   cd ..
+   
+   echo "✅ Lambda function code created"
+   ```
 
    The Lambda function code implements a robust event processing pattern that handles JSON data extraction, analytics calculations, and error management. The function processes events in batches, which improves efficiency and reduces DynamoDB write costs. By implementing idempotent processing logic and comprehensive error handling, the function ensures reliable data processing even when events are delivered multiple times or processing failures occur.
 
@@ -404,21 +436,22 @@ cd ..
    ```bash
    # Create Lambda function
    aws lambda create-function \
-   	--function-name $LAMBDA_FUNCTION_NAME \
-   	--runtime python3.9 \
-   	--role $LAMBDA_ROLE_ARN \
-   	--handler lambda_function.lambda_handler \
-   	--zip-file fileb://lambda-processor.zip \
-   	--timeout 300 \
-   	--memory-size 512 \
-   	--environment Variables="{DYNAMODB_TABLE=$DYNAMODB_TABLE_NAME}"
+       --function-name $LAMBDA_FUNCTION_NAME \
+       --runtime python3.11 \
+       --role $LAMBDA_ROLE_ARN \
+       --handler lambda_function.lambda_handler \
+       --zip-file fileb://lambda-processor.zip \
+       --timeout 300 \
+       --memory-size 512 \
+       --environment Variables="{DYNAMODB_TABLE=$DYNAMODB_TABLE_NAME}"
    
    # Get Lambda function ARN
    LAMBDA_FUNCTION_ARN=$(aws lambda get-function \
-   	--function-name $LAMBDA_FUNCTION_NAME \
-   	--query 'Configuration.FunctionArn' --output text)
+       --function-name $LAMBDA_FUNCTION_NAME \
+       --query 'Configuration.FunctionArn' --output text)
    export LAMBDA_FUNCTION_ARN
    
+   echo "✅ Lambda function deployed successfully"
    echo "Lambda function ARN: $LAMBDA_FUNCTION_ARN"
    ```
 
@@ -431,18 +464,20 @@ cd ..
    ```bash
    # Get Kinesis stream ARN
    KINESIS_STREAM_ARN=$(aws kinesis describe-stream \
-   	--stream-name $KINESIS_STREAM_NAME \
-   	--query 'StreamDescription.StreamARN' --output text)
+       --stream-name $KINESIS_STREAM_NAME \
+       --query 'StreamDescription.StreamARN' --output text)
    
    # Create event source mapping
    aws lambda create-event-source-mapping \
-   	--function-name $LAMBDA_FUNCTION_NAME \
-   	--event-source-arn $KINESIS_STREAM_ARN \
-   	--starting-position LATEST \
-   	--batch-size 100 \
-   	--maximum-batching-window-in-seconds 5
+       --function-name $LAMBDA_FUNCTION_NAME \
+       --event-source-arn $KINESIS_STREAM_ARN \
+       --starting-position LATEST \
+       --batch-size 100 \
+       --maximum-batching-window-in-seconds 5
    
    export KINESIS_STREAM_ARN
+   
+   echo "✅ Event source mapping created successfully"
    ```
 
    The event source mapping is now active and will begin processing new events arriving in the Kinesis stream. The configuration optimizes for both latency and throughput by batching up to 100 records or waiting a maximum of 5 seconds before triggering Lambda execution. This balanced approach ensures near real-time processing while maximizing cost efficiency through reduced invocation frequency.
@@ -523,7 +558,8 @@ def send_events_to_kinesis(stream_name, events):
             print(f"Error sending event: {str(e)}")
 
 if __name__ == "__main__":
-    stream_name = "real-time-analytics-stream"
+    import os
+    stream_name = os.environ.get('KINESIS_STREAM_NAME', 'analytics-stream')
     
     print("Generating and sending sample events...")
     
@@ -537,11 +573,13 @@ if __name__ == "__main__":
     print("\nCompleted sending test events!")
 EOF
 
-# Generate requirements file for Python script
-cat << 'EOF' > requirements.txt
-boto3>=1.26.0
+   # Generate requirements file for Python script
+   cat << 'EOF' > requirements.txt
+boto3>=1.34.0
 EOF
-```
+
+   echo "✅ Data producer script created"
+   ```
 
    The data producer is now ready to generate realistic test events that will flow through our entire analytics pipeline. The script creates diverse event types with varying data structures, mimicking real-world scenarios where different user actions generate different payload formats and processing requirements.
 
@@ -552,187 +590,197 @@ EOF
    ```bash
    # Create CloudWatch alarm for Lambda errors
    aws cloudwatch put-metric-alarm \
-   	--alarm-name "KinesisLambdaProcessorErrors" \
-   	--alarm-description "Monitor Lambda processing errors" \
-   	--metric-name Errors \
-   	--namespace AWS/Lambda \
-   	--statistic Sum \
-   	--period 300 \
-   	--threshold 1 \
-   	--comparison-operator GreaterThanOrEqualToThreshold \
-   	--evaluation-periods 1 \
-   	--dimensions Name=FunctionName,Value=$LAMBDA_FUNCTION_NAME
+       --alarm-name "KinesisLambdaProcessorErrors-${RANDOM_SUFFIX}" \
+       --alarm-description "Monitor Lambda processing errors" \
+       --metric-name Errors \
+       --namespace AWS/Lambda \
+       --statistic Sum \
+       --period 300 \
+       --threshold 1 \
+       --comparison-operator GreaterThanOrEqualToThreshold \
+       --evaluation-periods 1 \
+       --dimensions Name=FunctionName,Value=$LAMBDA_FUNCTION_NAME
    
    # Create CloudWatch alarm for DynamoDB throttling
    aws cloudwatch put-metric-alarm \
-   	--alarm-name "DynamoDBThrottling" \
-   	--alarm-description "Monitor DynamoDB throttling events" \
-   	--metric-name ThrottledRequests \
-   	--namespace AWS/DynamoDB \
-   	--statistic Sum \
-   	--period 300 \
-   	--threshold 1 \
-   	--comparison-operator GreaterThanOrEqualToThreshold \
-   	--evaluation-periods 1 \
-   	--dimensions Name=TableName,Value=$DYNAMODB_TABLE_NAME
+       --alarm-name "DynamoDBThrottling-${RANDOM_SUFFIX}" \
+       --alarm-description "Monitor DynamoDB throttling events" \
+       --metric-name ThrottledRequests \
+       --namespace AWS/DynamoDB \
+       --statistic Sum \
+       --period 300 \
+       --threshold 1 \
+       --comparison-operator GreaterThanOrEqualToThreshold \
+       --evaluation-periods 1 \
+       --dimensions Name=TableName,Value=$DYNAMODB_TABLE_NAME
+   
+   echo "✅ CloudWatch alarms configured"
    ```
 
    CloudWatch alarms are now actively monitoring our pipeline for critical error conditions. These alarms will trigger when Lambda functions encounter processing errors or when DynamoDB experiences throttling events, enabling immediate response to operational issues that could impact data processing reliability.
 
 ## Validation & Testing
 
-1. Test the pipeline by sending sample data to the Kinesis stream:
+1. **Test the pipeline by sending sample data to the Kinesis stream**:
 
-```bash
-# Install Python dependencies and run the data producer
-pip3 install boto3
+   ```bash
+   # Install Python dependencies and run the data producer
+   pip3 install boto3
+   
+   # Send test events
+   python3 data_producer.py
+   ```
 
-# Send test events
-python3 data_producer.py
-```
+2. **Verify that Lambda is processing the Kinesis records**:
 
-2. Verify that Lambda is processing the Kinesis records:
+   ```bash
+   # Check Lambda function logs
+   aws logs describe-log-groups \
+       --log-group-name-prefix "/aws/lambda/$LAMBDA_FUNCTION_NAME"
+   
+   # Get recent log events
+   LOG_GROUP_NAME="/aws/lambda/$LAMBDA_FUNCTION_NAME"
+   aws logs filter-log-events \
+       --log-group-name $LOG_GROUP_NAME \
+       --start-time $(date -d '10 minutes ago' +%s)000
+   ```
 
-```bash
-# Check Lambda function logs
-aws logs describe-log-groups \
-	--log-group-name-prefix "/aws/lambda/$LAMBDA_FUNCTION_NAME"
+   Expected log output should show:
+   ```
+   Received X records from Kinesis
+   Successfully processed X records, 0 failed
+   ```
 
-# Get recent log events (replace LOG_GROUP_NAME with actual name)
-LOG_GROUP_NAME="/aws/lambda/$LAMBDA_FUNCTION_NAME"
-aws logs filter-log-events \
-	--log-group-name $LOG_GROUP_NAME \
-	--start-time $(date -d '10 minutes ago' +%s)000
-```
+3. **Verify that processed data is stored in DynamoDB**:
 
-Expected log output should show:
-```
-Received X records from Kinesis
-Successfully processed X records, 0 failed
-```
+   ```bash
+   # Scan DynamoDB table to see processed records
+   aws dynamodb scan \
+       --table-name $DYNAMODB_TABLE_NAME \
+       --max-items 5
+   
+   # Query for specific event types
+   aws dynamodb scan \
+       --table-name $DYNAMODB_TABLE_NAME \
+       --filter-expression "eventType = :et" \
+       --expression-attribute-values '{":et":{"S":"page_view"}}' \
+       --max-items 3
+   ```
 
-3. Verify that processed data is stored in DynamoDB:
+4. **Check CloudWatch metrics for the analytics pipeline**:
 
-```bash
-# Scan DynamoDB table to see processed records
-aws dynamodb scan \
-	--table-name $DYNAMODB_TABLE_NAME \
-	--max-items 5
-
-# Query for specific event types
-aws dynamodb scan \
-	--table-name $DYNAMODB_TABLE_NAME \
-	--filter-expression "eventType = :et" \
-	--expression-attribute-values '{":et":{"S":"page_view"}}' \
-	--max-items 3
-```
+   ```bash
+   # View custom metrics in CloudWatch
+   aws cloudwatch get-metric-statistics \
+       --namespace RealTimeAnalytics \
+       --metric-name EventsProcessed \
+       --start-time $(date -d '1 hour ago' -u +%Y-%m-%dT%H:%M:%S) \
+       --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+       --period 300 \
+       --statistics Sum
+   
+   # Check Lambda invocation metrics
+   aws cloudwatch get-metric-statistics \
+       --namespace AWS/Lambda \
+       --metric-name Invocations \
+       --dimensions Name=FunctionName,Value=$LAMBDA_FUNCTION_NAME \
+       --start-time $(date -d '1 hour ago' -u +%Y-%m-%dT%H:%M:%S) \
+       --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+       --period 300 \
+       --statistics Sum
+   ```
 
 > **Note**: Kinesis stream processing operates on eventual consistency principles. The sequence number ordering within each shard ensures data integrity, but cross-shard ordering is not guaranteed. For applications requiring strict global ordering, consider using a single shard or implementing application-level sequencing logic.
 
 > **Tip**: If you don't see records immediately, wait 1-2 minutes for the asynchronous processing to complete. Lambda processes Kinesis records in batches, so there may be a slight delay.
 
-4. Check CloudWatch metrics for the analytics pipeline:
-
-```bash
-# View custom metrics in CloudWatch
-aws cloudwatch get-metric-statistics \
-	--namespace RealTimeAnalytics \
-	--metric-name EventsProcessed \
-	--start-time $(date -d '1 hour ago' -u +%Y-%m-%dT%H:%M:%S) \
-	--end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
-	--period 300 \
-	--statistics Sum
-
-# Check Lambda invocation metrics
-aws cloudwatch get-metric-statistics \
-	--namespace AWS/Lambda \
-	--metric-name Invocations \
-	--dimensions Name=FunctionName,Value=$LAMBDA_FUNCTION_NAME \
-	--start-time $(date -d '1 hour ago' -u +%Y-%m-%dT%H:%M:%S) \
-	--end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
-	--period 300 \
-	--statistics Sum
-```
-
 ## Cleanup
 
-1. Delete the event source mapping:
+1. **Delete the event source mapping**:
 
-```bash
-# List event source mappings
-EVENT_SOURCE_UUID=$(aws lambda list-event-source-mappings \
-	--function-name $LAMBDA_FUNCTION_NAME \
-	--query 'EventSourceMappings[0].UUID' --output text)
+   ```bash
+   # List event source mappings
+   EVENT_SOURCE_UUID=$(aws lambda list-event-source-mappings \
+       --function-name $LAMBDA_FUNCTION_NAME \
+       --query 'EventSourceMappings[0].UUID' --output text)
+   
+   # Delete the mapping
+   if [ "$EVENT_SOURCE_UUID" != "None" ] && [ "$EVENT_SOURCE_UUID" != "null" ]; then
+       aws lambda delete-event-source-mapping --uuid $EVENT_SOURCE_UUID
+       echo "✅ Deleted event source mapping"
+   fi
+   ```
 
-# Delete the mapping
-if [ "$EVENT_SOURCE_UUID" != "None" ]; then
-	aws lambda delete-event-source-mapping --uuid $EVENT_SOURCE_UUID
-fi
-```
+2. **Delete the Lambda function**:
 
-2. Delete the Lambda function:
+   ```bash
+   aws lambda delete-function --function-name $LAMBDA_FUNCTION_NAME
+   echo "✅ Deleted Lambda function"
+   ```
 
-```bash
-aws lambda delete-function --function-name $LAMBDA_FUNCTION_NAME
-```
+3. **Delete the Kinesis Data Stream**:
 
-3. Delete the Kinesis Data Stream:
+   ```bash
+   aws kinesis delete-stream --stream-name $KINESIS_STREAM_NAME
+   echo "✅ Deleted Kinesis stream"
+   ```
 
-```bash
-aws kinesis delete-stream --stream-name $KINESIS_STREAM_NAME
-```
+4. **Delete the DynamoDB table**:
 
-4. Delete the DynamoDB table:
+   ```bash
+   aws dynamodb delete-table --table-name $DYNAMODB_TABLE_NAME
+   echo "✅ Deleted DynamoDB table"
+   ```
 
-```bash
-aws dynamodb delete-table --table-name $DYNAMODB_TABLE_NAME
-```
+5. **Delete IAM role and policies**:
 
-5. Delete IAM role and policies:
+   ```bash
+   # Delete role policy
+   aws iam delete-role-policy \
+       --role-name $IAM_ROLE_NAME \
+       --policy-name KinesisLambdaProcessorPolicy
+   
+   # Delete role
+   aws iam delete-role --role-name $IAM_ROLE_NAME
+   echo "✅ Deleted IAM role and policies"
+   ```
 
-```bash
-# Delete role policy
-aws iam delete-role-policy \
-	--role-name $IAM_ROLE_NAME \
-	--policy-name KinesisLambdaProcessorPolicy
+6. **Delete CloudWatch alarms**:
 
-# Delete role
-aws iam delete-role --role-name $IAM_ROLE_NAME
-```
+   ```bash
+   aws cloudwatch delete-alarms \
+       --alarm-names "KinesisLambdaProcessorErrors-${RANDOM_SUFFIX}" \
+           "DynamoDBThrottling-${RANDOM_SUFFIX}"
+   echo "✅ Deleted CloudWatch alarms"
+   ```
 
-6. Delete CloudWatch alarms:
+7. **Clean up local files**:
 
-```bash
-aws cloudwatch delete-alarms \
-	--alarm-names "KinesisLambdaProcessorErrors" "DynamoDBThrottling"
-```
-
-7. Clean up local files:
-
-```bash
-rm -rf lambda-processor/
-rm lambda-processor.zip
-rm lambda-kinesis-policy.json
-rm lambda-trust-policy.json
-rm data_producer.py
-rm requirements.txt
-```
+   ```bash
+   rm -rf lambda-processor/
+   rm lambda-processor.zip
+   rm lambda-kinesis-policy.json
+   rm lambda-trust-policy.json
+   rm data_producer.py
+   rm requirements.txt
+   echo "✅ Cleaned up local files"
+   ```
 
 ## Discussion
 
-Real-time analytics pipelines enable organizations to react to business events as they happen, providing immediate insights for decision-making and operational improvements. This serverless architecture using Kinesis Data Streams and Lambda offers several key advantages over traditional streaming solutions.
+Real-time analytics pipelines enable organizations to react to business events as they happen, providing immediate insights for decision-making and operational improvements. This serverless architecture using Kinesis Data Streams and Lambda offers several key advantages over traditional streaming solutions following AWS Well-Architected Framework principles.
 
-The event-driven nature of Lambda ensures you only pay for actual processing time, making this solution cost-effective for variable workloads. Kinesis Data Streams provides durable, scalable ingestion with automatic sharding, while DynamoDB offers microsecond-latency data access for real-time queries. The combination eliminates the need to manage streaming infrastructure like Apache Kafka clusters or Spark streaming jobs.
+The event-driven nature of Lambda ensures you only pay for actual processing time, making this solution cost-effective for variable workloads. Kinesis Data Streams provides durable, scalable ingestion with automatic sharding, while DynamoDB offers microsecond-latency data access for real-time queries. The combination eliminates the need to manage streaming infrastructure like Apache Kafka clusters or Spark streaming jobs, significantly reducing operational overhead.
 
 This pattern excels in scenarios requiring immediate response to user behavior, such as personalization engines, fraud detection systems, or operational monitoring dashboards. Financial services companies use similar architectures for real-time transaction monitoring, while e-commerce platforms leverage them for recommendation engines and inventory management. The built-in integration between these AWS services reduces complexity and improves reliability compared to self-managed alternatives.
 
-For production implementations, consider implementing dead letter queues for failed processing, using Kinesis Analytics for complex stream processing, and leveraging AWS X-Ray for distributed tracing across the pipeline. The architecture scales automatically but monitoring shard utilization and Lambda concurrency limits ensures optimal performance under high load conditions.
+For production implementations, consider implementing dead letter queues for failed processing, using Kinesis Analytics for complex stream processing, and leveraging AWS X-Ray for distributed tracing across the pipeline. The architecture scales automatically but monitoring shard utilization and Lambda concurrency limits ensures optimal performance under high load conditions. Review the [AWS Lambda Developer Guide](https://docs.aws.amazon.com/lambda/latest/dg/with-kinesis.html) for additional Kinesis integration patterns and best practices.
 
-> Warning: Lambda event source mappings process each event at least once, and duplicate processing of records can occur. Always implement idempotent processing logic to handle potential duplicate events gracefully.
+> **Warning**: Lambda event source mappings process each event at least once, and duplicate processing of records can occur. Always implement idempotent processing logic to handle potential duplicate events gracefully.
 
 ## Challenge
 
-Extend this pipeline to implement real-time anomaly detection by adding a second Lambda function that analyzes processed metrics in DynamoDB using statistical analysis or machine learning models. Create CloudWatch custom metrics for detected anomalies and implement automated notifications using Amazon SNS when unusual patterns are identified. Additionally, implement data retention policies using DynamoDB TTL to automatically expire old analytics data and optimize storage costs.
+Extend this pipeline to implement real-time anomaly detection by adding a second Lambda function that analyzes processed metrics in DynamoDB using statistical analysis or machine learning models. Create CloudWatch custom metrics for detected anomalies and implement automated notifications using Amazon SNS when unusual patterns are identified. Additionally, implement data retention policies using DynamoDB TTL to automatically expire old analytics data and optimize storage costs. Consider integrating with [Amazon Kinesis Analytics](https://docs.aws.amazon.com/kinesisanalytics/latest/dev/what-is.html) for advanced stream processing capabilities.
 
 ## Infrastructure Code
 

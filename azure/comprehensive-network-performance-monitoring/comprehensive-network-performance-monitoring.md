@@ -4,12 +4,12 @@ id: 8b2a4e7c
 category: networking
 difficulty: 200
 subject: azure
-services: Azure Network Watcher, Application Insights, Azure Monitor, Log Analytics
+services: Network Watcher, Application Insights, Azure Monitor, Log Analytics
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: networking, monitoring, performance, diagnostics, observability
 recipe-generator-version: 1.3
@@ -238,149 +238,108 @@ echo "✅ Network Watcher enabled in region: ${LOCATION}"
        --name ${DEST_VM_NAME} \
        --query id --output tsv)
    
-   # Create connection monitor configuration
+   # Create connection monitor using Azure CLI v2 commands
    export CONNECTION_MONITOR_NAME="cm-network-performance-${RANDOM_SUFFIX}"
    
-   cat > connection-monitor-config.json << EOF
-   {
-       "location": "${LOCATION}",
-       "properties": {
-           "endpoints": [
-               {
-                   "name": "source-endpoint",
-                   "type": "AzureVM",
-                   "resourceId": "${SOURCE_VM_ID}"
-               },
-               {
-                   "name": "dest-endpoint",
-                   "type": "AzureVM",
-                   "resourceId": "${DEST_VM_ID}"
-               },
-               {
-                   "name": "external-endpoint",
-                   "type": "ExternalAddress",
-                   "address": "www.microsoft.com"
-               }
-           ],
-           "testConfigurations": [
-               {
-                   "name": "tcp-test",
-                   "testFrequencySec": 30,
-                   "protocol": "TCP",
-                   "tcpConfiguration": {
-                       "port": 80,
-                       "disableTraceRoute": false
-                   },
-                   "successThreshold": {
-                       "checksFailedPercent": 20,
-                       "roundTripTimeMs": 1000
-                   }
-               },
-               {
-                   "name": "icmp-test",
-                   "testFrequencySec": 60,
-                   "protocol": "ICMP",
-                   "icmpConfiguration": {
-                       "disableTraceRoute": false
-                   },
-                   "successThreshold": {
-                       "checksFailedPercent": 10,
-                       "roundTripTimeMs": 500
-                   }
-               }
-           ],
-           "testGroups": [
-               {
-                   "name": "vm-to-vm-tests",
-                   "sources": ["source-endpoint"],
-                   "destinations": ["dest-endpoint"],
-                   "testConfigurations": ["tcp-test", "icmp-test"]
-               },
-               {
-                   "name": "vm-to-external-tests",
-                   "sources": ["source-endpoint"],
-                   "destinations": ["external-endpoint"],
-                   "testConfigurations": ["tcp-test", "icmp-test"]
-               }
-           ],
-           "outputs": [
-               {
-                   "type": "Workspace",
-                   "workspaceSettings": {
-                       "workspaceResourceId": "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${LOG_ANALYTICS_WORKSPACE}"
-                   }
-               }
-           ]
-       }
-   }
-   EOF
-   
-   # Create connection monitor
-   az rest \
-       --method PUT \
-       --uri "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_${LOCATION}/connectionMonitors/${CONNECTION_MONITOR_NAME}?api-version=2021-05-01" \
-       --body @connection-monitor-config.json
+   az network watcher connection-monitor create \
+       --name ${CONNECTION_MONITOR_NAME} \
+       --location ${LOCATION} \
+       --endpoint-source-name "source-endpoint" \
+       --endpoint-source-resource-id ${SOURCE_VM_ID} \
+       --endpoint-dest-name "dest-endpoint" \
+       --endpoint-dest-resource-id ${DEST_VM_ID} \
+       --test-config-name "tcp-test" \
+       --test-config-frequency 30 \
+       --test-config-protocol TCP \
+       --test-config-tcp-port 80 \
+       --test-config-preferred-ip-version IPv4 \
+       --test-group-name "vm-to-vm-tests" \
+       --output-type Workspace \
+       --workspace-ids ${LOG_ANALYTICS_WORKSPACE}
    
    echo "✅ Connection Monitor created: ${CONNECTION_MONITOR_NAME}"
+   
+   # Add external endpoint test
+   az network watcher connection-monitor endpoint add \
+       --connection-monitor ${CONNECTION_MONITOR_NAME} \
+       --location ${LOCATION} \
+       --name "external-endpoint" \
+       --type ExternalAddress \
+       --address "www.microsoft.com"
+   
+   # Add test configuration for ICMP
+   az network watcher connection-monitor test-configuration add \
+       --connection-monitor ${CONNECTION_MONITOR_NAME} \
+       --location ${LOCATION} \
+       --name "icmp-test" \
+       --test-frequency 60 \
+       --protocol ICMP \
+       --preferred-ip-version IPv4 \
+       --threshold-checks-failed-percent 10 \
+       --threshold-round-trip-time-ms 500
+   
+   # Add test group for external connectivity
+   az network watcher connection-monitor test-group add \
+       --connection-monitor ${CONNECTION_MONITOR_NAME} \
+       --location ${LOCATION} \
+       --name "vm-to-external-tests" \
+       --test-configurations "tcp-test" "icmp-test" \
+       --sources "source-endpoint" \
+       --destinations "external-endpoint"
+   
+   echo "✅ External endpoint tests configured"
    ```
 
    The Connection Monitor is now actively testing network connectivity between the configured endpoints every 30-60 seconds. It measures TCP and ICMP connectivity, round-trip times, and packet loss while automatically storing results in the Log Analytics workspace for analysis and alerting.
 
-4. **Configure Network Insights and Custom Metrics**:
+4. **Configure Network Monitoring Alerts**:
 
-   Network Insights provides a visual topology view and performance metrics dashboard for network resources. By enabling custom metrics collection, you can monitor specific network performance indicators and create correlations between network behavior and application performance. This step enhances observability by providing both graphical and programmatic access to network monitoring data.
+   Azure Monitor alerts provide proactive notification when network performance degrades beyond acceptable thresholds. By creating metric-based alerts for connection monitor data, administrators can respond quickly to network issues before they impact users. The alerts use Log Analytics queries to analyze connection monitor results and trigger notifications based on configurable conditions.
 
    ```bash
-   # Create custom metrics for network monitoring
-   az monitor metrics alert create \
+   # Create action group for network alerts
+   az monitor action-group create \
+       --name "NetworkAlerts" \
+       --resource-group ${RESOURCE_GROUP} \
+       --short-name "NetAlert" \
+       --email-receiver name="Admin" email="admin@company.com"
+   
+   echo "✅ Network monitoring action group created"
+   
+   # Create scheduled query alert for high latency
+   az monitor scheduled-query create \
        --name "High Network Latency Alert" \
        --resource-group ${RESOURCE_GROUP} \
-       --condition "avg NetworkLatency > 1000" \
+       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${LOG_ANALYTICS_WORKSPACE}" \
+       --condition "avg(AverageRoundtripMs) > 1000" \
+       --condition-query "NWConnectionMonitorTestResult | where TimeGenerated > ago(5m) | summarize avg(AverageRoundtripMs) by bin(TimeGenerated, 1m)" \
        --description "Alert when network latency exceeds 1000ms" \
-       --evaluation-frequency 1m \
-       --window-size 5m \
-       --severity 2
+       --evaluation-frequency "PT1M" \
+       --window-size "PT5M" \
+       --severity 2 \
+       --action-groups ${RESOURCE_GROUP}/providers/microsoft.insights/actionGroups/NetworkAlerts \
+       --auto-mitigation
    
-   # Create network availability alert
-   az monitor metrics alert create \
+   echo "✅ High latency alert created"
+   
+   # Create scheduled query alert for connectivity failures
+   az monitor scheduled-query create \
        --name "Network Connectivity Failure" \
        --resource-group ${RESOURCE_GROUP} \
-       --condition "avg NetworkConnectivity < 100" \
-       --description "Alert when network connectivity drops below 100%" \
-       --evaluation-frequency 1m \
-       --window-size 5m \
-       --severity 1
+       --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.OperationalInsights/workspaces/${LOG_ANALYTICS_WORKSPACE}" \
+       --condition "min(TestResult) == 0" \
+       --condition-query "NWConnectionMonitorTestResult | where TimeGenerated > ago(5m) | summarize min(TestResult) by bin(TimeGenerated, 1m)" \
+       --description "Alert when network connectivity fails" \
+       --evaluation-frequency "PT1M" \
+       --window-size "PT5M" \
+       --severity 1 \
+       --action-groups ${RESOURCE_GROUP}/providers/microsoft.insights/actionGroups/NetworkAlerts \
+       --auto-mitigation
    
-   echo "✅ Network monitoring alerts configured"
-   
-   # Create workbook for network performance visualization
-   cat > network-performance-workbook.json << EOF
-   {
-       "version": "Notebook/1.0",
-       "items": [
-           {
-               "type": 1,
-               "content": {
-                   "json": "# Network Performance Monitoring Dashboard\n\nThis dashboard provides comprehensive network performance metrics collected from Azure Network Watcher and Application Insights."
-               }
-           },
-           {
-               "type": 3,
-               "content": {
-                   "version": "KqlItem/1.0",
-                   "query": "NetworkMonitoring\n| where TimeGenerated > ago(1h)\n| summarize AvgLatency = avg(LatencyMs), AvgPacketLoss = avg(PacketLossPercent) by bin(TimeGenerated, 5m)\n| render timechart",
-                   "size": 0,
-                   "title": "Network Latency and Packet Loss Trends"
-               }
-           }
-       ]
-   }
-   EOF
-   
-   echo "✅ Network performance workbook template created"
+   echo "✅ Connectivity failure alert created"
    ```
 
-   Network monitoring alerts are now configured to proactively notify administrators when network performance degrades beyond acceptable thresholds. The custom workbook provides a centralized dashboard for visualizing network trends and performance metrics.
+   Network monitoring alerts are now configured to proactively notify administrators when network performance degrades beyond acceptable thresholds. The alerts use Log Analytics queries to analyze real-time connection monitor data and trigger appropriate responses.
 
 5. **Integrate Application Insights with Network Metrics**:
 
@@ -412,9 +371,9 @@ echo "✅ Network Watcher enabled in region: ${LOCATION}"
    # Create Log Analytics query for network-application correlation
    cat > network-app-correlation-query.kusto << EOF
    // Network Performance Impact on Application Response Time
-   let NetworkData = NetworkMonitoring
+   let NetworkData = NWConnectionMonitorTestResult
    | where TimeGenerated > ago(1h)
-   | summarize AvgLatency = avg(LatencyMs), AvgPacketLoss = avg(PacketLossPercent) by bin(TimeGenerated, 5m);
+   | summarize AvgLatency = avg(AverageRoundtripMs), AvgPacketLoss = avg(LossPercentage) by bin(TimeGenerated, 5m);
    
    let AppData = requests
    | where timestamp > ago(1h)
@@ -428,14 +387,31 @@ echo "✅ Network Watcher enabled in region: ${LOCATION}"
    
    echo "✅ Application Insights network correlation configured"
    
-   # Create action group for network alerts
-   az monitor action-group create \
-       --name "NetworkAlerts" \
-       --resource-group ${RESOURCE_GROUP} \
-       --short-name "NetAlert" \
-       --email-receiver name="Admin" email="admin@company.com"
+   # Create workbook for network performance visualization
+   cat > network-performance-workbook.json << EOF
+   {
+       "version": "Notebook/1.0",
+       "items": [
+           {
+               "type": 1,
+               "content": {
+                   "json": "# Network Performance Monitoring Dashboard\n\nThis dashboard provides comprehensive network performance metrics collected from Azure Network Watcher and Application Insights."
+               }
+           },
+           {
+               "type": 3,
+               "content": {
+                   "version": "KqlItem/1.0",
+                   "query": "NWConnectionMonitorTestResult\n| where TimeGenerated > ago(1h)\n| summarize AvgLatency = avg(AverageRoundtripMs), AvgPacketLoss = avg(LossPercentage) by bin(TimeGenerated, 5m)\n| render timechart",
+                   "size": 0,
+                   "title": "Network Latency and Packet Loss Trends"
+               }
+           }
+       ]
+   }
+   EOF
    
-   echo "✅ Network monitoring action group created"
+   echo "✅ Network performance workbook template created"
    ```
 
    Application Insights is now configured to collect and correlate network performance data with application telemetry. The custom queries enable analysis of how network latency and packet loss impact application response times and user experience.
@@ -475,7 +451,7 @@ echo "✅ Network Watcher enabled in region: ${LOCATION}"
        --name ${NSG_NAME} \
        --query id --output tsv)
    
-   # Configure NSG flow logs
+   # Configure NSG flow logs with updated command
    az network watcher flow-log create \
        --resource-group NetworkWatcherRG \
        --name "flow-log-${RANDOM_SUFFIX}" \
@@ -522,9 +498,9 @@ echo "✅ Network Watcher enabled in region: ${LOCATION}"
 
    ```bash
    # Check connection monitor status
-   az rest \
-       --method GET \
-       --uri "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_${LOCATION}/connectionMonitors/${CONNECTION_MONITOR_NAME}?api-version=2021-05-01" \
+   az network watcher connection-monitor show \
+       --name ${CONNECTION_MONITOR_NAME} \
+       --location ${LOCATION} \
        --query "properties.provisioningState"
    
    echo "Expected output: 'Succeeded'"
@@ -550,7 +526,7 @@ echo "✅ Network Watcher enabled in region: ${LOCATION}"
    # Query connection monitor results
    az monitor log-analytics query \
        --workspace ${WORKSPACE_ID} \
-       --analytics-query "NetworkMonitoring | where TimeGenerated > ago(10m) | summarize by TestName, SourceName, DestinationName, TestResult"
+       --analytics-query "NWConnectionMonitorTestResult | where TimeGenerated > ago(10m) | summarize by TestName, SourceName, DestinationName, TestResult"
    
    echo "Expected output: Recent network test results"
    ```
@@ -572,9 +548,9 @@ echo "✅ Network Watcher enabled in region: ${LOCATION}"
 
    ```bash
    # Delete connection monitor
-   az rest \
-       --method DELETE \
-       --uri "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_${LOCATION}/connectionMonitors/${CONNECTION_MONITOR_NAME}?api-version=2021-05-01"
+   az network watcher connection-monitor delete \
+       --name ${CONNECTION_MONITOR_NAME} \
+       --location ${LOCATION}
    
    echo "✅ Connection monitor deleted"
    ```
@@ -583,11 +559,11 @@ echo "✅ Network Watcher enabled in region: ${LOCATION}"
 
    ```bash
    # Delete alerts
-   az monitor metrics alert delete \
+   az monitor scheduled-query delete \
        --name "High Network Latency Alert" \
        --resource-group ${RESOURCE_GROUP}
    
-   az monitor metrics alert delete \
+   az monitor scheduled-query delete \
        --name "Network Connectivity Failure" \
        --resource-group ${RESOURCE_GROUP}
    

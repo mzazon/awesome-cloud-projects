@@ -4,12 +4,12 @@ id: 57da0219
 category: analytics
 difficulty: 300
 subject: aws
-services: kinesis,data,firehose,lambda,s3,opensearch
+services: Kinesis, Lambda, S3, OpenSearch
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: kinesis,firehose,real-time,streaming,lambda,s3,opensearch,analytics
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ E-commerce companies process millions of real-time events daily from web applica
 
 ## Solution
 
-Amazon Kinesis Data Firehose provides a fully managed solution for real-time data streaming that automatically scales to handle massive throughput while delivering data to multiple destinations. This serverless approach combines real-time data transformation using Lambda functions with automatic format conversion, compression, and intelligent buffering. The solution delivers processed data to S3 for long-term analytics, OpenSearch for real-time search and dashboards, and Redshift for data warehousing, all while providing comprehensive monitoring and error handling.
+Amazon Kinesis Data Firehose provides a fully managed solution for real-time data streaming that automatically scales to handle massive throughput while delivering data to multiple destinations. This serverless approach combines real-time data transformation using Lambda functions with automatic format conversion, compression, and intelligent buffering. The solution delivers processed data to S3 for long-term analytics, OpenSearch for real-time search and dashboards, all while providing comprehensive monitoring and error handling.
 
 ## Architecture Diagram
 
@@ -45,7 +45,6 @@ graph TB
     subgraph "Storage & Analytics"
         S3[S3 Data Lake]
         OPENSEARCH[OpenSearch Service]
-        REDSHIFT[Redshift Warehouse]
     end
     
     subgraph "Monitoring"
@@ -63,7 +62,6 @@ graph TB
     TRANSFORM --> BUFFER
     BUFFER --> S3
     BUFFER --> OPENSEARCH
-    BUFFER --> REDSHIFT
     
     FIREHOSE --> CW
     TRANSFORM --> ERRORS
@@ -73,12 +71,11 @@ graph TB
     style TRANSFORM fill:#FF9900
     style S3 fill:#569A31
     style OPENSEARCH fill:#005EB8
-    style REDSHIFT fill:#8C4FFF
 ```
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for Kinesis Data Firehose, Lambda, S3, OpenSearch, and Redshift
+1. AWS account with appropriate permissions for Kinesis Data Firehose, Lambda, S3, and OpenSearch
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Basic knowledge of JSON data formats and Lambda functions
 4. Understanding of streaming data concepts and analytics workflows
@@ -104,27 +101,20 @@ export FIREHOSE_STREAM_NAME="realtime-data-stream-${RANDOM_SUFFIX}"
 export S3_BUCKET_NAME="firehose-data-bucket-${RANDOM_SUFFIX}"
 export LAMBDA_FUNCTION_NAME="firehose-transform-${RANDOM_SUFFIX}"
 export OPENSEARCH_DOMAIN="firehose-search-${RANDOM_SUFFIX}"
-export REDSHIFT_CLUSTER="firehose-warehouse-${RANDOM_SUFFIX}"
 export IAM_ROLE_NAME="FirehoseDeliveryRole-${RANDOM_SUFFIX}"
 
 # Create S3 bucket for data storage
 aws s3 mb s3://${S3_BUCKET_NAME} --region ${AWS_REGION}
 
-# Create directory structure for different data types
-aws s3api put-object \
+# Enable versioning and encryption for security
+aws s3api put-bucket-versioning \
     --bucket ${S3_BUCKET_NAME} \
-    --key raw-data/ \
-    --body /dev/null
+    --versioning-configuration Status=Enabled
 
-aws s3api put-object \
+aws s3api put-bucket-encryption \
     --bucket ${S3_BUCKET_NAME} \
-    --key transformed-data/ \
-    --body /dev/null
-
-aws s3api put-object \
-    --bucket ${S3_BUCKET_NAME} \
-    --key error-data/ \
-    --body /dev/null
+    --server-side-encryption-configuration \
+    'Rules=[{ApplyServerSideEncryptionByDefault:{SSEAlgorithm:AES256}}]'
 
 echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
 ```
@@ -215,6 +205,9 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
        --policy-name FirehoseDeliveryPolicy \
        --policy-document file://firehose-permissions-policy.json
    
+   # Wait for role propagation
+   sleep 10
+   
    # Get the role ARN
    export FIREHOSE_ROLE_ARN=$(aws iam get-role \
        --role-name ${IAM_ROLE_NAME} \
@@ -241,11 +234,11 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
        output = []
        
        for record in event['records']:
-           # Decode the data
-           compressed_payload = base64.b64decode(record['data'])
-           uncompressed_payload = compressed_payload.decode('utf-8')
-           
            try:
+               # Decode the data
+               compressed_payload = base64.b64decode(record['data'])
+               uncompressed_payload = compressed_payload.decode('utf-8')
+               
                # Parse JSON data
                data = json.loads(uncompressed_payload)
                
@@ -274,7 +267,7 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
                error_data = {
                    'recordId': record['recordId'],
                    'error': str(e),
-                   'original_data': uncompressed_payload,
+                   'original_data': uncompressed_payload if 'uncompressed_payload' in locals() else '',
                    'timestamp': datetime.utcnow().isoformat()
                }
                
@@ -295,12 +288,12 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
    # Create Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME} \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME} \
        --handler transform_function.lambda_handler \
        --zip-file fileb://transform_function.zip \
        --timeout 300 \
-       --memory-size 128
+       --memory-size 256
    
    # Get Lambda function ARN
    export LAMBDA_FUNCTION_ARN=$(aws lambda get-function \
@@ -320,9 +313,9 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
    # Create OpenSearch domain for real-time analytics
    aws opensearch create-domain \
        --domain-name ${OPENSEARCH_DOMAIN} \
-       --engine-version OpenSearch_1.3 \
+       --engine-version OpenSearch_2.11 \
        --cluster-config InstanceType=t3.small.search,InstanceCount=1 \
-       --ebs-options EBSEnabled=true,VolumeType=gp2,VolumeSize=20 \
+       --ebs-options EBSEnabled=true,VolumeType=gp3,VolumeSize=20 \
        --access-policies '{
            "Version": "2012-10-17",
            "Statement": [
@@ -336,11 +329,13 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
                }
            ]
        }' \
-       --domain-endpoint-options EnforceHTTPS=true
+       --domain-endpoint-options EnforceHTTPS=true \
+       --node-to-node-encryption-options Enabled=true \
+       --encryption-at-rest-options Enabled=true
    
    # Wait for domain to be active
    echo "⏳ Waiting for OpenSearch domain to be active..."
-   aws opensearch wait domain-status \
+   aws opensearch wait domain-available \
        --domain-name ${OPENSEARCH_DOMAIN}
    
    # Get domain endpoint
@@ -426,8 +421,6 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
 
    The primary delivery stream is active and configured for reliable data delivery to S3 with automatic compression and format optimization. This establishes the foundation for cost-effective data lake storage while ensuring data durability and enabling efficient downstream analytics processing.
 
-> **Warning**: Monitor buffer settings carefully in production. Smaller buffers reduce latency but increase API costs, while larger buffers optimize costs but may increase end-to-end latency for time-sensitive analytics.
-
 5. **Configure OpenSearch Destination for Real-Time Analytics**:
 
    Creating a separate delivery stream for OpenSearch enables parallel data delivery with different buffering strategies optimized for search use cases. OpenSearch requires smaller, more frequent updates to maintain near real-time search capabilities, while S3 storage benefits from larger, less frequent writes for cost optimization. This dual-stream approach maximizes both search performance and storage efficiency.
@@ -507,10 +500,10 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
    Comprehensive monitoring ensures reliable data pipeline operations and enables proactive issue resolution before business impact occurs. CloudWatch alarms provide automated detection of delivery failures, transformation errors, and performance degradation, enabling rapid response to operational issues. This observability layer is crucial for maintaining SLA commitments and ensuring data pipeline reliability.
 
    ```bash
-   # Create CloudWatch alarms for monitoring
+   # Create CloudWatch alarms for monitoring delivery failures
    aws cloudwatch put-metric-alarm \
        --alarm-name "${FIREHOSE_STREAM_NAME}-DeliveryErrors" \
-       --alarm-description "Monitor Firehose delivery errors" \
+       --alarm-description "Monitor Firehose S3 delivery errors" \
        --metric-name DeliveryToS3.Records \
        --namespace AWS/KinesisFirehose \
        --statistic Sum \
@@ -519,7 +512,7 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
        --comparison-operator GreaterThanThreshold \
        --dimensions Name=DeliveryStreamName,Value=${FIREHOSE_STREAM_NAME} \
        --evaluation-periods 2 \
-       --alarm-actions arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:firehose-alerts
+       --treat-missing-data notBreaching
    
    # Create alarm for Lambda transformation errors
    aws cloudwatch put-metric-alarm \
@@ -532,7 +525,8 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
        --threshold 5 \
        --comparison-operator GreaterThanThreshold \
        --dimensions Name=FunctionName,Value=${LAMBDA_FUNCTION_NAME} \
-       --evaluation-periods 2
+       --evaluation-periods 2 \
+       --treat-missing-data notBreaching
    
    # Create alarm for OpenSearch delivery failures
    aws cloudwatch put-metric-alarm \
@@ -545,12 +539,15 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
        --threshold 0 \
        --comparison-operator GreaterThanThreshold \
        --dimensions Name=DeliveryStreamName,Value=${FIREHOSE_STREAM_NAME}-opensearch \
-       --evaluation-periods 2
+       --evaluation-periods 2 \
+       --treat-missing-data notBreaching
    
    echo "✅ Created CloudWatch monitoring alarms"
    ```
 
    The monitoring infrastructure is now active and will alert on critical issues affecting data delivery reliability. This observability framework enables operations teams to maintain high availability and quickly troubleshoot issues that could impact business intelligence and analytics workflows.
+
+> **Warning**: Monitor buffer settings carefully in production. Smaller buffers reduce latency but increase API costs, while larger buffers optimize costs but may increase end-to-end latency for time-sensitive analytics.
 
 7. **Test Data Ingestion and Processing**:
 
@@ -566,14 +563,14 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
            "event_type": "purchase",
            "amount": 150.50,
            "product_id": "prod456",
-           "timestamp": "2024-01-15T10:30:00Z"
+           "timestamp": "2025-01-15T10:30:00Z"
        },
        {
            "event_id": "evt002",
            "user_id": "user456",
            "event_type": "view",
            "product_id": "prod789",
-           "timestamp": "2024-01-15T10:31:00Z"
+           "timestamp": "2025-01-15T10:31:00Z"
        },
        {
            "event_id": "evt003",
@@ -581,7 +578,7 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
            "event_type": "purchase",
            "amount": 75.25,
            "product_id": "prod123",
-           "timestamp": "2024-01-15T10:32:00Z"
+           "timestamp": "2025-01-15T10:32:00Z"
        }
    ]
    EOF
@@ -593,14 +590,14 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
    for event in $(jq -c '.[]' sample-events.json); do
        aws firehose put-record \
            --delivery-stream-name ${FIREHOSE_STREAM_NAME} \
-           --record Data="$(echo $event | base64)"
+           --record Data="$(echo $event | base64 -w 0)"
    done
    
    # Send to OpenSearch stream
    for event in $(jq -c '.[]' sample-events.json); do
        aws firehose put-record \
            --delivery-stream-name ${FIREHOSE_STREAM_NAME}-opensearch \
-           --record Data="$(echo $event | base64)"
+           --record Data="$(echo $event | base64 -w 0)"
    done
    
    echo "✅ Sent test data to Firehose streams"
@@ -609,8 +606,8 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
    aws firehose put-record-batch \
        --delivery-stream-name ${FIREHOSE_STREAM_NAME} \
        --records '[
-           {"Data": "eyJldmVudF9pZCI6ImV2dDAwNCIsInVzZXJfaWQiOiJ1c2VyMDAxIiwiZXZlbnRfdHlwZSI6ImFkZF90b19jYXJ0IiwicHJvZHVjdF9pZCI6InByb2Q5OTkiLCJ0aW1lc3RhbXAiOiIyMDI0LTAxLTE1VDEwOjMzOjAwWiJ9"},
-           {"Data": "eyJldmVudF9pZCI6ImV2dDAwNSIsInVzZXJfaWQiOiJ1c2VyMDAyIiwiZXZlbnRfdHlwZSI6InJlbW92ZV9mcm9tX2NhcnQiLCJwcm9kdWN0X2lkIjoicHJvZDg4OCIsInRpbWVzdGFtcCI6IjIwMjQtMDEtMTVUMTA6MzQ6MDBaIn0="}
+           {"Data": "eyJldmVudF9pZCI6ImV2dDAwNCIsInVzZXJfaWQiOiJ1c2VyMDAxIiwiZXZlbnRfdHlwZSI6ImFkZF90b19jYXJ0IiwicHJvZHVjdF9pZCI6InByb2Q5OTkiLCJ0aW1lc3RhbXAiOiIyMDI1LTAxLTE1VDEwOjMzOjAwWiJ9"},
+           {"Data": "eyJldmVudF9pZCI6ImV2dDAwNSIsInVzZXJfaWQiOiJ1c2VyMDAyIiwiZXZlbnRfdHlwZSI6InJlbW92ZV9mcm9tX2NhcnQiLCJwcm9kdWN0X2lkIjoicHJvZDg4OCIsInRpbWVzdGFtcCI6IjIwMjUtMDEtMTVUMTA6MzQ6MDBaIn0="}
        ]'
    
    echo "✅ Sent batch records to Firehose"
@@ -637,12 +634,13 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
    cat > error_handler.py << 'EOF'
    import json
    import boto3
+   import os
    
    def lambda_handler(event, context):
        sqs = boto3.client('sqs')
        
        for record in event['Records']:
-           if record['eventName'] == 'ERROR':
+           if record.get('eventName') == 'ERROR':
                # Send failed record to DLQ
                sqs.send_message(
                    QueueUrl=os.environ['DLQ_URL'],
@@ -652,16 +650,18 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
        return {'statusCode': 200}
    EOF
    
-   # Create error handling Lambda
+   # Create error handling Lambda deployment package
    zip error_handler.zip error_handler.py
    
+   # Create error handling Lambda function
    aws lambda create-function \
        --function-name ${LAMBDA_FUNCTION_NAME}-error-handler \
-       --runtime python3.9 \
+       --runtime python3.12 \
        --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME} \
        --handler error_handler.lambda_handler \
        --zip-file fileb://error_handler.zip \
-       --environment Variables="{DLQ_URL=${DLQ_URL}}"
+       --environment Variables="{DLQ_URL=${DLQ_URL}}" \
+       --timeout 60
    
    echo "✅ Created error handling infrastructure"
    ```
@@ -716,12 +716,16 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
 4. **Test OpenSearch Data Indexing**:
 
    ```bash
-   # Check OpenSearch indices
-   curl -X GET "https://${OPENSEARCH_ENDPOINT}/_cat/indices?v"
+   # Check OpenSearch indices (requires authentication)
+   curl -X GET "https://${OPENSEARCH_ENDPOINT}/_cat/indices?v" \
+       -u admin:password \
+       --insecure
    
    # Query sample data
    curl -X GET "https://${OPENSEARCH_ENDPOINT}/realtime-events/_search?pretty" \
        -H "Content-Type: application/json" \
+       -u admin:password \
+       --insecure \
        -d '{"query": {"match_all": {}}}'
    ```
 
@@ -837,29 +841,29 @@ echo "✅ Created S3 bucket: ${S3_BUCKET_NAME}"
 
 ## Discussion
 
-Amazon Kinesis Data Firehose provides a powerful, fully managed solution for real-time data processing that eliminates the complexity of building and maintaining streaming infrastructure. The serverless architecture automatically handles scaling, buffering, and delivery while providing built-in transformations through Lambda functions. This approach offers significant advantages over traditional batch processing by reducing latency from hours to minutes and providing near real-time insights for business operations.
+Amazon Kinesis Data Firehose provides a powerful, fully managed solution for real-time data processing that eliminates the complexity of building and maintaining streaming infrastructure. The serverless architecture automatically handles scaling, buffering, and delivery while providing built-in transformations through Lambda functions. This approach offers significant advantages over traditional batch processing by reducing latency from hours to minutes and providing near real-time insights for business operations, following the [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) principles of operational excellence and performance efficiency.
 
 The integration with multiple destinations demonstrates Firehose's flexibility in supporting diverse analytics use cases. S3 storage with automatic Parquet conversion enables cost-effective long-term storage and fast querying with tools like Amazon Athena. OpenSearch integration provides real-time search capabilities for operational dashboards and monitoring applications. The built-in error handling and retry mechanisms ensure data reliability, while CloudWatch monitoring provides comprehensive visibility into stream performance and health.
 
-Key architectural decisions include using Lambda for data transformation, which provides flexibility for enrichment, filtering, and format conversion while maintaining serverless scalability. The buffering configuration balances between latency and cost efficiency, with smaller buffers providing lower latency at the cost of more frequent S3 puts. The Parquet format conversion significantly reduces storage costs and improves query performance for analytics workloads.
+Key architectural decisions include using Lambda for data transformation, which provides flexibility for enrichment, filtering, and format conversion while maintaining serverless scalability. The buffering configuration balances between latency and cost efficiency, with smaller buffers providing lower latency at the cost of more frequent S3 puts. The Parquet format conversion significantly reduces storage costs and improves query performance for analytics workloads. Security is implemented through IAM roles with least privilege access, encryption at rest and in transit, and VPC endpoints for secure data transfer.
 
-> **Tip**: Configure buffer sizes based on your latency requirements and cost constraints. Smaller buffers (1-5 MB) provide lower latency but higher costs, while larger buffers (64-128 MB) optimize for cost but increase latency.
+> **Tip**: Configure buffer sizes based on your latency requirements and cost constraints. Smaller buffers (1-5 MB) provide lower latency but higher costs, while larger buffers (64-128 MB) optimize for cost but increase latency. Monitor CloudWatch metrics to find the optimal balance for your use case.
 
-For production deployments, consider implementing comprehensive monitoring with custom metrics, setting up automated alerting for failed deliveries, and establishing data quality checks within transformation functions. The dead letter queue pattern ensures failed records are captured for manual investigation and replay, maintaining data integrity across the pipeline.
+For production deployments, consider implementing comprehensive monitoring with custom metrics, setting up automated alerting for failed deliveries, and establishing data quality checks within transformation functions. The dead letter queue pattern ensures failed records are captured for manual investigation and replay, maintaining data integrity across the pipeline. Additional considerations include implementing data partitioning strategies, setting up cross-region replication for disaster recovery, and integrating with AWS Config for compliance monitoring as detailed in the [Kinesis Data Firehose Developer Guide](https://docs.aws.amazon.com/firehose/latest/dev/what-is-this-service.html).
 
 ## Challenge
 
 Extend this solution by implementing these enhancements:
 
-1. **Multi-Format Support**: Modify the Lambda transformation function to handle multiple input formats (JSON, CSV, Avro) and convert them to a standardized output schema with data validation and cleansing rules.
+1. **Multi-Format Support**: Modify the Lambda transformation function to handle multiple input formats (JSON, CSV, Avro) and convert them to a standardized output schema with data validation and cleansing rules using AWS Glue Data Catalog for schema registry.
 
-2. **Real-Time Alerting**: Implement Amazon SNS notifications for delivery failures, transformation errors, and data quality issues, with integration to Slack or PagerDuty for operations teams.
+2. **Real-Time Alerting**: Implement Amazon SNS notifications for delivery failures, transformation errors, and data quality issues, with integration to Slack or PagerDuty for operations teams using EventBridge rules.
 
-3. **Advanced Analytics Integration**: Add Amazon Redshift as a destination for data warehousing, configure automatic table creation, and implement incremental data loading patterns with COPY commands.
+3. **Advanced Analytics Integration**: Add Amazon Redshift as a destination for data warehousing, configure automatic table creation, and implement incremental data loading patterns with COPY commands and staging tables.
 
-4. **Cross-Region Replication**: Set up cross-region replication for disaster recovery by creating secondary Firehose streams in different AWS regions with S3 cross-region replication.
+4. **Cross-Region Replication**: Set up cross-region replication for disaster recovery by creating secondary Firehose streams in different AWS regions with S3 cross-region replication and Route 53 health checks.
 
-5. **Machine Learning Integration**: Integrate with Amazon SageMaker for real-time inference on streaming data, using the transformed data to trigger ML model predictions and store results back to the data lake.
+5. **Machine Learning Integration**: Integrate with Amazon SageMaker for real-time inference on streaming data, using the transformed data to trigger ML model predictions and store results back to the data lake for continuous learning.
 
 ## Infrastructure Code
 

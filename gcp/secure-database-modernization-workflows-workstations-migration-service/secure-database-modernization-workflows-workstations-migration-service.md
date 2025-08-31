@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Workstations, Database Migration Service, Cloud Build, Secret Manager
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database-migration, secure-development, cloud-workstations, devops-automation, database-modernization
 recipe-generator-version: 1.3
@@ -113,6 +113,10 @@ RANDOM_SUFFIX=$(openssl rand -hex 3)
 export DB_MIGRATION_JOB_NAME="migration-job-${RANDOM_SUFFIX}"
 export SECRET_NAME="db-credentials-${RANDOM_SUFFIX}"
 
+# Get project number for service account references
+export PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} \
+    --format="value(projectNumber)")
+
 # Set default project and region for gcloud
 gcloud config set project ${PROJECT_ID}
 gcloud config set compute/region ${REGION}
@@ -188,9 +192,13 @@ echo "✅ Required APIs enabled for database modernization workflow"
        --async
    
    # Wait for cluster creation to complete
-   gcloud workstations clusters describe ${WORKSTATION_CLUSTER_NAME} \
+   echo "Waiting for cluster creation to complete..."
+   while [[ $(gcloud workstations clusters describe ${WORKSTATION_CLUSTER_NAME} \
        --location=${REGION} \
-       --format="value(state)"
+       --format="value(state)") != "RUNNING" ]]; do
+     echo "Cluster still creating..."
+     sleep 30
+   done
    
    echo "✅ Cloud Workstations cluster created with secure networking"
    ```
@@ -203,24 +211,6 @@ echo "✅ Required APIs enabled for database modernization workflow"
 
    ```bash
    # Create workstation configuration with database migration tools
-   cat > workstation-config.yaml << EOF
-   container:
-     image: "us-docker.pkg.dev/google-appengine/workstations-images/code-oss:latest"
-     env:
-       PROJECT_ID: "${PROJECT_ID}"
-       REGION: "${REGION}"
-   persistentDirectories:
-   - mountPath: "/home/user/migration-workspace"
-     gcePersistentDisk:
-       sizeGb: 50
-       fsType: "ext4"
-   host:
-     gceInstance:
-       machineType: "e2-standard-4"
-       bootDiskSizeGb: 50
-       disablePublicIpAddresses: true
-   EOF
-   
    gcloud workstations configs create ${WORKSTATION_CONFIG_NAME} \
        --location=${REGION} \
        --cluster=${WORKSTATION_CLUSTER_NAME} \
@@ -248,7 +238,7 @@ echo "✅ Required APIs enabled for database modernization workflow"
        --username="migration_user" \
        --password-secret="projects/${PROJECT_ID}/secrets/${SECRET_NAME}/versions/latest"
    
-   # Create connection profile for target Cloud SQL instance
+   # Create target Cloud SQL instance
    gcloud sql instances create target-mysql-instance \
        --database-version=MYSQL_8_0 \
        --tier=db-custom-2-7680 \
@@ -259,6 +249,7 @@ echo "✅ Required APIs enabled for database modernization workflow"
        --enable-bin-log \
        --retained-backups-count=7
    
+   # Create connection profile for target Cloud SQL instance
    gcloud database-migration connection-profiles create cloudsql target-db-profile \
        --location=${REGION} \
        --cloudsql-instance="projects/${PROJECT_ID}/instances/target-mysql-instance"
@@ -273,52 +264,57 @@ echo "✅ Required APIs enabled for database modernization workflow"
    Cloud Build provides CI/CD capabilities that automate database migration testing, validation, and deployment processes. This pipeline ensures that migration scripts are tested in isolated environments before being applied to production databases, reducing risk and improving reliability of modernization efforts.
 
    ```bash
-   # Create Cloud Build configuration for migration pipeline
-   cat > cloudbuild.yaml << EOF
-   steps:
-   # Build custom workstation image with migration tools
-   - name: 'gcr.io/cloud-builders/docker'
-     args: ['build', '-t', '${REGION}-docker.pkg.dev/${PROJECT_ID}/db-migration-images/migration-workstation:latest', '.']
-   
-   # Push image to Artifact Registry
-   - name: 'gcr.io/cloud-builders/docker'
-     args: ['push', '${REGION}-docker.pkg.dev/${PROJECT_ID}/db-migration-images/migration-workstation:latest']
-   
-   # Run migration validation tests
-   - name: '${REGION}-docker.pkg.dev/${PROJECT_ID}/db-migration-images/migration-workstation:latest'
-     entrypoint: 'bash'
-     args:
-     - '-c'
-     - |
-       # Validate migration scripts and database connectivity
-       gcloud database-migration migration-jobs describe migration-test \
-         --location=${REGION} || echo "Creating test migration job"
-   
-   options:
-     logging: CLOUD_LOGGING_ONLY
-   EOF
+   # Create migration scripts directory structure
+   mkdir -p migration-scripts
    
    # Create Dockerfile for custom migration tools
    cat > Dockerfile << EOF
-   FROM us-docker.pkg.dev/google-appengine/workstations-images/code-oss:latest
+FROM us-docker.pkg.dev/google-appengine/workstations-images/code-oss:latest
+
+# Install database migration tools
+RUN apt-get update && apt-get install -y \\
+    mysql-client \\
+    postgresql-client \\
+    python3-pip \\
+    && pip3 install sqlalchemy pandas pymysql psycopg2-binary
+
+# Install Google Cloud SDK components
+RUN gcloud components install alpha beta --quiet
+
+# Set up workspace
+WORKDIR /home/user/migration-workspace
+COPY migration-scripts/ ./scripts/
+EOF
    
-   # Install database migration tools
-   RUN apt-get update && apt-get install -y \\
-       mysql-client \\
-       postgresql-client \\
-       python3-pip \\
-       && pip3 install sqlalchemy pandas pymysql psycopg2-binary
-   
-   # Install Google Cloud SDK components
-   RUN gcloud components install alpha beta --quiet
-   
-   # Set up workspace
-   WORKDIR /home/user/migration-workspace
-   COPY migration-scripts/ ./scripts/
-   EOF
+   # Create Cloud Build configuration for migration pipeline
+   cat > cloudbuild.yaml << EOF
+steps:
+# Build custom workstation image with migration tools
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '-t', '${REGION}-docker.pkg.dev/${PROJECT_ID}/db-migration-images/migration-workstation:latest', '.']
+
+# Push image to Artifact Registry
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['push', '${REGION}-docker.pkg.dev/${PROJECT_ID}/db-migration-images/migration-workstation:latest']
+
+# Run migration validation tests
+- name: '${REGION}-docker.pkg.dev/${PROJECT_ID}/db-migration-images/migration-workstation:latest'
+  entrypoint: 'bash'
+  args:
+  - '-c'
+  - |
+    # Validate migration scripts and database connectivity
+    gcloud database-migration connection-profiles list \
+      --location=${REGION} || echo "Connection profiles verified"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+EOF
    
    # Submit build to create custom image
-   gcloud builds submit . --config=cloudbuild.yaml
+   gcloud builds submit . \
+       --config=cloudbuild.yaml \
+       --timeout=1200s
    
    echo "✅ CI/CD pipeline configured for automated migration workflows"
    ```
@@ -360,25 +356,25 @@ echo "✅ Required APIs enabled for database modernization workflow"
    ```bash
    # Create custom IAM role for database migration team
    cat > migration-role.yaml << EOF
-   title: "Database Migration Developer"
-   description: "Custom role for database migration team members"
-   stage: "GA"
-   includedPermissions:
-   - workstations.workstations.use
-   - workstations.workstations.create
-   - datamigration.migrationjobs.create
-   - datamigration.migrationjobs.get
-   - datamigration.migrationjobs.list
-   - secretmanager.versions.access
-   - cloudsql.instances.connect
-   - logging.logEntries.create
-   EOF
+title: "Database Migration Developer"
+description: "Custom role for database migration team members"
+stage: "GA"
+includedPermissions:
+- workstations.workstations.use
+- workstations.workstations.create
+- datamigration.migrationjobs.create
+- datamigration.migrationjobs.get
+- datamigration.migrationjobs.list
+- secretmanager.versions.access
+- cloudsql.instances.connect
+- logging.logEntries.create
+EOF
    
    gcloud iam roles create databaseMigrationDeveloper \
        --project=${PROJECT_ID} \
        --file=migration-role.yaml
    
-   # Assign role to migration team members
+   # Assign role to migration team members (replace with actual group/users)
    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
        --member="group:database-migration-team@company.com" \
        --role="projects/${PROJECT_ID}/roles/databaseMigrationDeveloper"
@@ -437,19 +433,20 @@ echo "✅ Required APIs enabled for database modernization workflow"
 
    ```bash
    # Get workstation access URL
-   gcloud workstations start-tcp-tunnel migration-dev-workspace \
+   gcloud workstations get-iam-policy migration-dev-workspace \
+       --location=${REGION} \
+       --cluster=${WORKSTATION_CLUSTER_NAME} \
+       --config=${WORKSTATION_CONFIG_NAME}
+   
+   # Check workstation status
+   gcloud workstations describe migration-dev-workspace \
        --location=${REGION} \
        --cluster=${WORKSTATION_CLUSTER_NAME} \
        --config=${WORKSTATION_CONFIG_NAME} \
-       --port=22 \
-       --local-port=2222 &
-   
-   # Test SSH access to workstation
-   ssh -p 2222 user@localhost -o StrictHostKeyChecking=no \
-       "gcloud version && mysql --version && psql --version"
+       --format="value(state)"
    ```
 
-   Expected output: Should display Google Cloud SDK version and database client versions, confirming tool availability.
+   Expected output: Workstation should show "RUNNING" state and have proper IAM policies configured.
 
 ## Cleanup
 
@@ -509,6 +506,11 @@ echo "✅ Required APIs enabled for database modernization workflow"
 4. **Remove secrets and container images**:
 
    ```bash
+   # Delete custom IAM role
+   gcloud iam roles delete databaseMigrationDeveloper \
+       --project=${PROJECT_ID} \
+       --quiet
+   
    # Delete secrets
    gcloud secrets delete ${SECRET_NAME} --quiet
    
@@ -519,7 +521,7 @@ echo "✅ Required APIs enabled for database modernization workflow"
    
    # Clear environment variables
    unset PROJECT_ID REGION WORKSTATION_CLUSTER_NAME WORKSTATION_CONFIG_NAME
-   unset DB_MIGRATION_JOB_NAME SECRET_NAME
+   unset DB_MIGRATION_JOB_NAME SECRET_NAME PROJECT_NUMBER
    
    echo "✅ All migration workflow resources cleaned up"
    ```

@@ -1,0 +1,772 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Multi-Tenant Resource Sharing with VPC Lattice and RAM - Complete infrastructure template'
+
+# ============================================================================
+# METADATA
+# ============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - AllowedCidrBlocks
+      - Label:
+          default: "Database Configuration"
+        Parameters:
+          - DBInstanceClass
+          - DBAllocatedStorage
+          - DBMasterUsername
+          - DBMasterPassword
+          - DBBackupRetentionPeriod
+      - Label:
+          default: "Multi-Tenant Configuration"
+        Parameters:
+          - TenantTeams
+          - ResourceSharePrincipals
+          - OrganizationId
+      - Label:
+          default: "Monitoring and Audit"
+        Parameters:
+          - EnableCloudTrail
+          - CloudTrailLogRetentionDays
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+    ParameterLabels:
+      VpcId:
+        default: "VPC for Service Network"
+      SubnetIds:
+        default: "Database Subnet IDs"
+      AllowedCidrBlocks:
+        default: "Allowed IP Ranges"
+      DBInstanceClass:
+        default: "Database Instance Type"
+      DBAllocatedStorage:
+        default: "Database Storage (GB)"
+      DBMasterUsername:
+        default: "Database Admin Username"
+      DBMasterPassword:
+        default: "Database Admin Password"
+      TenantTeams:
+        default: "Authorized Team Names"
+      ResourceSharePrincipals:
+        default: "Resource Share Recipients"
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+      Environment:
+        default: "Environment Name"
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  # Network Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where resources will be deployed and associated with VPC Lattice service network
+    
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs for RDS deployment (minimum 2 subnets in different AZs required)
+    
+  AllowedCidrBlocks:
+    Type: CommaDelimitedList
+    Default: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+    Description: CIDR blocks allowed to access shared resources through VPC Lattice
+    
+  # Database Configuration
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.r5.large
+      - db.r5.xlarge
+    Description: RDS instance class for the shared database
+    
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    Description: Storage allocation for RDS instance in GB
+    
+  DBMasterUsername:
+    Type: String
+    Default: admin
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9]*$"
+    Description: Master username for RDS instance
+    
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: "^[a-zA-Z0-9!@#$%^&*()_+-=]*$"
+    Description: Master password for RDS instance (8-41 characters)
+    
+  DBBackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+    Description: Number of days to retain automated backups
+    
+  # Multi-Tenant Configuration
+  TenantTeams:
+    Type: CommaDelimitedList
+    Default: "TeamA,TeamB"
+    Description: List of team names that will have access to shared resources
+    
+  ResourceSharePrincipals:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: AWS account IDs or organizational unit ARNs to share resources with (leave empty for same account)
+    
+  OrganizationId:
+    Type: String
+    Default: ""
+    Description: AWS Organization ID for resource sharing (optional)
+    
+  # Monitoring and Audit
+  EnableCloudTrail:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable CloudTrail for audit logging
+    
+  CloudTrailLogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: CloudWatch Logs retention period for CloudTrail logs
+    
+  # Resource Naming
+  ResourcePrefix:
+    Type: String
+    Default: "multitenant"
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9-]*$"
+    Description: Prefix for resource naming
+    
+  Environment:
+    Type: String
+    Default: "dev"
+    AllowedValues: ["dev", "test", "staging", "prod"]
+    Description: Environment name for resource tagging
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  # CloudTrail conditions
+  CreateCloudTrail: !Equals [!Ref EnableCloudTrail, "true"]
+  
+  # Resource sharing conditions
+  HasResourceSharePrincipals: !Not [!Equals [!Join ["", !Ref ResourceSharePrincipals], ""]]
+  HasOrganizationId: !Not [!Equals [!Ref OrganizationId, ""]]
+  
+  # Environment conditions
+  IsProduction: !Equals [!Ref Environment, "prod"]
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+  # ========================================
+  # VPC LATTICE RESOURCES
+  # ========================================
+  
+  # VPC Lattice Service Network
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub "${ResourcePrefix}-service-network-${Environment}"
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-service-network-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Multi-tenant resource sharing"
+        - Key: ManagedBy
+          Value: "CloudFormation"
+
+  # VPC Association with Service Network
+  ServiceNetworkVpcAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      VpcIdentifier: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-vpc-association-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ========================================
+  # DATABASE RESOURCES
+  # ========================================
+  
+  # DB Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub "${ResourcePrefix}-db-subnet-group-${Environment}"
+      DBSubnetGroupDescription: "Subnet group for shared multi-tenant database"
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-db-subnet-group-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Shared database networking"
+
+  # Security Group for RDS
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ResourcePrefix}-database-sg-${Environment}"
+      GroupDescription: "Security group for shared multi-tenant database"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: "MySQL/Aurora access from within security group"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "All outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-database-sg-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Database access control"
+
+  # RDS Instance
+  SharedDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: !If [IsProduction, "Snapshot", "Delete"]
+    Properties:
+      DBInstanceIdentifier: !Sub "${ResourcePrefix}-shared-db-${Environment}"
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: mysql
+      EngineVersion: "8.0.35"
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp2
+      StorageEncrypted: true
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      BackupRetentionPeriod: !Ref DBBackupRetentionPeriod
+      DeletionProtection: !If [IsProduction, true, false]
+      EnablePerformanceInsights: !If [IsProduction, true, false]
+      PerformanceInsightsRetentionPeriod: !If [IsProduction, 7, !Ref "AWS::NoValue"]
+      MonitoringInterval: !If [IsProduction, 60, 0]
+      MonitoringRoleArn: !If 
+        - IsProduction
+        - !GetAtt EnhancedMonitoringRole.Arn
+        - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-shared-database-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Multi-tenant shared resource"
+        - Key: Backup
+          Value: "automated"
+
+  # Enhanced Monitoring Role (for production)
+  EnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Condition: IsProduction
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-rds-monitoring-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-rds-monitoring-role-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ========================================
+  # VPC LATTICE RESOURCE CONFIGURATION
+  # ========================================
+  
+  # Resource Configuration for RDS
+  DatabaseResourceConfiguration:
+    Type: AWS::VpcLattice::ResourceConfiguration
+    DependsOn: SharedDatabase
+    Properties:
+      Name: !Sub "${ResourcePrefix}-database-config-${Environment}"
+      Type: SINGLE
+      ResourceGatewayIdentifier: !Ref VpcId
+      ResourceConfigurationDefinition:
+        IpResource:
+          IpAddress: !GetAtt SharedDatabase.Endpoint.Address
+      PortRanges:
+        - "3306"
+      Protocol: TCP
+      AllowAssociationToShareableServiceNetwork: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-database-config-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Database service registration"
+
+  # Associate Resource Configuration with Service Network
+  ResourceConfigurationAssociation:
+    Type: AWS::VpcLattice::ResourceConfigurationAssociation
+    Properties:
+      ResourceConfigurationIdentifier: !Ref DatabaseResourceConfiguration
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-resource-association-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ========================================
+  # IAM ROLES FOR TENANTS
+  # ========================================
+  
+  # IAM Role for Team A
+  TeamADatabaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-TeamA-DatabaseAccess-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "sts:ExternalId": "TeamA-Access"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/VPCLatticeServicesInvokeAccess
+      Tags:
+        - Key: Team
+          Value: "TeamA"
+        - Key: Purpose
+          Value: "DatabaseAccess"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-TeamA-role-${Environment}"
+
+  # IAM Role for Team B
+  TeamBDatabaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-TeamB-DatabaseAccess-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "sts:ExternalId": "TeamB-Access"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/VPCLatticeServicesInvokeAccess
+      Tags:
+        - Key: Team
+          Value: "TeamB"
+        - Key: Purpose
+          Value: "DatabaseAccess"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-TeamB-role-${Environment}"
+
+  # VPC Lattice Service Role
+  VPCLatticeServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-VPCLatticeServiceRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-lattice.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-VPCLatticeServiceRole-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "VPC Lattice service operations"
+
+  # ========================================
+  # VPC LATTICE AUTHENTICATION POLICY
+  # ========================================
+  
+  # Authentication Policy for Service Network
+  ServiceNetworkAuthPolicy:
+    Type: AWS::VpcLattice::AuthPolicy
+    Properties:
+      ResourceIdentifier: !Ref ServiceNetwork
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "vpc-lattice-svcs:Invoke"
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "aws:PrincipalTag/Team": !Ref TenantTeams
+              DateGreaterThan:
+                "aws:CurrentTime": "2025-01-01T00:00:00Z"
+              IpAddress:
+                "aws:SourceIp": !Ref AllowedCidrBlocks
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "vpc-lattice-svcs:Invoke"
+            Resource: "*"
+
+  # ========================================
+  # AWS RAM RESOURCE SHARE
+  # ========================================
+  
+  # Resource Share for Service Network
+  ServiceNetworkResourceShare:
+    Type: AWS::RAM::ResourceShare
+    Condition: HasResourceSharePrincipals
+    Properties:
+      Name: !Sub "${ResourcePrefix}-service-network-share-${Environment}"
+      ResourceArns:
+        - !GetAtt ServiceNetwork.Arn
+      Principals: !Ref ResourceSharePrincipals
+      AllowExternalPrincipals: !If [HasOrganizationId, false, true]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-service-network-share-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Multi-tenant resource sharing"
+
+  # ========================================
+  # CLOUDTRAIL FOR AUDIT LOGGING
+  # ========================================
+  
+  # S3 Bucket for CloudTrail Logs
+  CloudTrailLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateCloudTrail
+    Properties:
+      BucketName: !Sub "${ResourcePrefix}-audit-logs-${AWS::AccountId}-${Environment}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-audit-logs-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "CloudTrail audit logging"
+
+  # S3 Bucket Policy for CloudTrail
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateCloudTrail
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${CloudTrailLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": "bucket-owner-full-control"
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Ref CloudTrailLogsBucket
+
+  # CloudWatch Logs Group for CloudTrail
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateCloudTrail
+    Properties:
+      LogGroupName: !Sub "/aws/cloudtrail/${ResourcePrefix}-audit-trail-${Environment}"
+      RetentionInDays: !Ref CloudTrailLogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-cloudtrail-logs-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudTrail Role for CloudWatch Logs
+  CloudTrailLogRole:
+    Type: AWS::IAM::Role
+    Condition: CreateCloudTrail
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailLogPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                Resource: !GetAtt CloudTrailLogGroup.Arn
+
+  # CloudTrail
+  VPCLatticeAuditTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: CreateCloudTrail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${ResourcePrefix}-audit-trail-${Environment}"
+      S3BucketName: !Ref CloudTrailLogsBucket
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogRole.Arn
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources: []
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-audit-trail-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "VPC Lattice and RAM audit logging"
+
+  # ========================================
+  # MONITORING AND ALARMS
+  # ========================================
+  
+  # CloudWatch Alarm for Database CPU
+  DatabaseCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-database-cpu-${Environment}"
+      AlarmDescription: "Database CPU utilization is too high"
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref SharedDatabase
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-database-cpu-alarm-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for Database Connections
+  DatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-database-connections-${Environment}"
+      AlarmDescription: "Database connection count is too high"
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref SharedDatabase
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-database-connections-alarm-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  # VPC Lattice Outputs
+  ServiceNetworkId:
+    Description: "VPC Lattice Service Network ID"
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceNetworkId"
+
+  ServiceNetworkArn:
+    Description: "VPC Lattice Service Network ARN"
+    Value: !GetAtt ServiceNetwork.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceNetworkArn"
+
+  ServiceNetworkName:
+    Description: "VPC Lattice Service Network Name"
+    Value: !GetAtt ServiceNetwork.Name
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceNetworkName"
+
+  # Database Outputs
+  DatabaseEndpoint:
+    Description: "RDS Database Endpoint"
+    Value: !GetAtt SharedDatabase.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-DatabaseEndpoint"
+
+  DatabasePort:
+    Description: "RDS Database Port"
+    Value: !GetAtt SharedDatabase.Endpoint.Port
+    Export:
+      Name: !Sub "${AWS::StackName}-DatabasePort"
+
+  DatabaseInstanceId:
+    Description: "RDS Database Instance ID"
+    Value: !Ref SharedDatabase
+    Export:
+      Name: !Sub "${AWS::StackName}-DatabaseInstanceId"
+
+  # Resource Configuration Outputs
+  ResourceConfigurationId:
+    Description: "VPC Lattice Resource Configuration ID"
+    Value: !Ref DatabaseResourceConfiguration
+    Export:
+      Name: !Sub "${AWS::StackName}-ResourceConfigurationId"
+
+  ResourceConfigurationArn:
+    Description: "VPC Lattice Resource Configuration ARN"
+    Value: !GetAtt DatabaseResourceConfiguration.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ResourceConfigurationArn"
+
+  # IAM Role Outputs
+  TeamADatabaseRoleArn:
+    Description: "Team A Database Access Role ARN"
+    Value: !GetAtt TeamADatabaseRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TeamADatabaseRoleArn"
+
+  TeamBDatabaseRoleArn:
+    Description: "Team B Database Access Role ARN"
+    Value: !GetAtt TeamBDatabaseRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TeamBDatabaseRoleArn"
+
+  # Resource Share Outputs
+  ResourceShareArn:
+    Condition: HasResourceSharePrincipals
+    Description: "AWS RAM Resource Share ARN"
+    Value: !GetAtt ServiceNetworkResourceShare.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ResourceShareArn"
+
+  # CloudTrail Outputs
+  CloudTrailArn:
+    Condition: CreateCloudTrail
+    Description: "CloudTrail ARN for audit logging"
+    Value: !GetAtt VPCLatticeAuditTrail.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailArn"
+
+  CloudTrailBucket:
+    Condition: CreateCloudTrail
+    Description: "S3 Bucket for CloudTrail logs"
+    Value: !Ref CloudTrailLogsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailBucket"
+
+  # Security Group Outputs
+  DatabaseSecurityGroupId:
+    Description: "Database Security Group ID"
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-DatabaseSecurityGroupId"
+
+  # Connection Information
+  DatabaseConnectionString:
+    Description: "Database connection string template"
+    Value: !Sub "mysql://${DBMasterUsername}:${DBMasterPassword}@${SharedDatabase.Endpoint.Address}:${SharedDatabase.Endpoint.Port}/mysql"
+    Export:
+      Name: !Sub "${AWS::StackName}-DatabaseConnectionString"
+
+  # Instructions
+  NextSteps:
+    Description: "Next steps for configuration"
+    Value: !Sub |
+      1. Associate additional VPCs with Service Network ID: ${ServiceNetwork}
+      2. Configure tenant applications to use database endpoint: ${SharedDatabase.Endpoint.Address}
+      3. Assume team roles (TeamA: ${TeamADatabaseRole.Arn}, TeamB: ${TeamBDatabaseRole.Arn}) for access
+      4. Monitor audit logs in CloudTrail: ${VPCLatticeAuditTrail.Arn}
+      5. Review authentication policies for fine-grained access control

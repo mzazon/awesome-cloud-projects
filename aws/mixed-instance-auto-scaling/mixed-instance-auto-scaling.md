@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: EC2, Auto Scaling, CloudWatch
 estimated-time: 60 minutes
-recipe-version: 1.2
+recipe-version: 1.3
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: compute, auto-scaling, spot-instances, cost-optimization, high-availability
 recipe-generator-version: 1.3
@@ -38,7 +38,7 @@ graph TB
     subgraph "Instance Selection Strategy"
         ATTRIBUTE[Attribute-Based<br/>Selection]
         MANUAL[Manual Instance<br/>Type Selection]
-        ALLOCATION[Allocation Strategy<br/>Diversified/Lowest-Price]
+        ALLOCATION[Allocation Strategy<br/>Price-Capacity-Optimized]
     end
     
     subgraph "Instance Types and Purchase Options"
@@ -136,7 +136,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
 
 1. **Create security group for Auto Scaling group instances**:
 
-   Security groups act as virtual firewalls that control inbound and outbound traffic to your instances. This step creates rules that allow web traffic while maintaining security best practices.
+   Security groups act as virtual firewalls that control inbound and outbound traffic to your instances. This step creates rules that allow web traffic while maintaining security best practices according to the [AWS Security Group best practices](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/security-group-rules-reference.html).
 
    ```bash
    # Create security group with appropriate rules for web applications
@@ -172,7 +172,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
 
 2. **Create IAM role for EC2 instances**:
 
-   EC2 instances need IAM roles to interact with other AWS services securely. This role enables CloudWatch monitoring and Systems Manager access for better instance management.
+   EC2 instances need IAM roles to interact with other AWS services securely. This role enables CloudWatch monitoring and Systems Manager access for better instance management, following the [principle of least privilege](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html#grant-least-privilege).
 
    ```bash
    # Create trust policy that allows EC2 service to assume this role
@@ -228,7 +228,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
 
 3. **Create user data script for instance initialization**:
 
-   User data scripts run when instances launch, allowing you to install software, configure services, and customize the environment. This script sets up a web server that displays instance information.
+   User data scripts run when instances launch, allowing you to install software, configure services, and customize the environment. This script sets up a web server that displays instance information and follows [EC2 user data best practices](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/user-data.html).
 
    ```bash
    # Create comprehensive user data script for instance setup
@@ -329,16 +329,18 @@ echo "Subnet IDs: ${SUBNET_IDS}"
    [Launch templates](https://docs.aws.amazon.com/autoscaling/ec2/userguide/launch-templates.html) define the configuration for your instances and serve as the foundation for all instances, with the mixed instance policy providing variations. Launch templates support versioning, allowing you to maintain multiple configurations and roll back changes if needed, making them essential for production environments where consistency is critical.
 
    ```bash
-   # Get latest Amazon Linux 2 AMI for current region
+   # Get latest Amazon Linux 2023 AMI for current region
    AMI_ID=$(aws ec2 describe-images \
        --owners amazon \
-       --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" \
+       --filters "Name=name,Values=al2023-ami-*-x86_64" \
                "Name=state,Values=available" \
        --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
        --output text)
    
    echo "Using AMI: ${AMI_ID}"
    ```
+
+   The launch template includes [IMDSv2 enforcement](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html) for enhanced security, which requires session tokens for metadata access and prevents SSRF attacks.
 
    ```bash
    # Create launch template with security and monitoring configurations
@@ -389,7 +391,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
 
 5. **Create Auto Scaling group with mixed instance policy**:
 
-   The [mixed instance policy](https://docs.aws.amazon.com/autoscaling/ec2/userguide/mixed-instances-groups-set-up-overview.html) is the core of cost optimization, allowing the Auto Scaling group to use different instance types and purchase options while maintaining your desired capacity. This configuration enables automatic failover between instance types and purchase options, ensuring optimal cost and availability balance.
+   The [mixed instance policy](https://docs.aws.amazon.com/autoscaling/ec2/userguide/mixed-instances-groups-set-up-overview.html) is the core of cost optimization, allowing the Auto Scaling group to use different instance types and purchase options while maintaining your desired capacity. This configuration uses the latest `price-capacity-optimized` allocation strategy, which AWS recommends for the best balance of cost and availability.
 
    ```bash
    # Create comprehensive Auto Scaling group configuration
@@ -440,8 +442,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
                "OnDemandAllocationStrategy": "prioritized",
                "OnDemandBaseCapacity": 1,
                "OnDemandPercentageAboveBaseCapacity": 20,
-               "SpotAllocationStrategy": "diversified",
-               "SpotInstancePools": 4,
+               "SpotAllocationStrategy": "price-capacity-optimized",
                "SpotMaxPrice": ""
            }
        },
@@ -473,7 +474,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
    echo "  - Min: 2, Max: 10, Desired: 4"
    echo "  - On-Demand base: 1 instance"
    echo "  - On-Demand percentage above base: 20%"
-   echo "  - Spot allocation: diversified across 4 pools"
+   echo "  - Spot allocation: price-capacity-optimized"
    ```
 
 6. **Enable capacity rebalancing for Spot Instance management**:
@@ -491,7 +492,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
 
 7. **Create CloudWatch scaling policies**:
 
-   Scaling policies automatically adjust capacity based on metrics like CPU utilization or network traffic, ensuring your application can handle varying loads while optimizing costs.
+   [Target tracking scaling policies](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-scaling-target-tracking.html) automatically adjust capacity based on metrics like CPU utilization or network traffic, ensuring your application can handle varying loads while optimizing costs.
 
    ```bash
    # Create target tracking scaling policy for CPU utilization
@@ -536,7 +537,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
 
 8. **Set up SNS notifications for scaling events**:
 
-   SNS notifications keep you informed about scaling activities, allowing you to monitor the behavior of your Auto Scaling group and respond to any issues quickly.
+   [SNS notifications](https://docs.aws.amazon.com/autoscaling/ec2/userguide/configuring-notifications.html) keep you informed about scaling activities, allowing you to monitor the behavior of your Auto Scaling group and respond to any issues quickly.
 
    ```bash
    # Create SNS topic for Auto Scaling notifications
@@ -561,7 +562,7 @@ echo "Subnet IDs: ${SUBNET_IDS}"
 
 9. **Create Application Load Balancer for the Auto Scaling group**:
 
-   An Application Load Balancer distributes incoming traffic across healthy instances, provides health checking, and integrates with Auto Scaling for seamless capacity management.
+   An [Application Load Balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html) distributes incoming traffic across healthy instances, provides health checking, and integrates with Auto Scaling for seamless capacity management.
 
    ```bash
    # Create Application Load Balancer in multiple subnets
@@ -846,9 +847,11 @@ echo "Subnet IDs: ${SUBNET_IDS}"
 
 Mixed instance type Auto Scaling groups represent a sophisticated approach to cost optimization that can deliver substantial savings while maintaining high availability. By combining Spot Instances with On-Demand capacity, organizations can achieve 60-90% cost reductions compared to traditional On-Demand only deployments. The key to success lies in proper diversification across instance types and Availability Zones, which reduces the impact of Spot Instance interruptions.
 
-The [allocation strategies](https://docs.aws.amazon.com/autoscaling/ec2/userguide/allocation-strategies.html) play a crucial role in balancing cost and availability. The "diversified" strategy for Spot Instances spreads capacity across multiple instance pools, reducing the likelihood of simultaneous interruptions. Meanwhile, the "prioritized" strategy for On-Demand instances ensures critical base capacity uses the most suitable instance types. Capacity rebalancing further enhances resilience by proactively replacing at-risk Spot Instances before interruption.
+The updated [allocation strategies](https://docs.aws.amazon.com/autoscaling/ec2/userguide/allocation-strategies.html) now recommend using `price-capacity-optimized` for Spot Instances, which considers both price and capacity to select the pools least likely to be interrupted with the lowest possible price. This strategy provides better availability than the older `diversified` approach while maintaining cost benefits. The "prioritized" strategy for On-Demand instances ensures critical base capacity uses the most suitable instance types, particularly beneficial when using Reserved Instances or Savings Plans.
 
-Instance weighting allows for sophisticated capacity management where different instance sizes contribute proportionally to the Auto Scaling group's capacity. This enables seamless scaling across heterogeneous instance types while maintaining consistent application performance. The integration with Application Load Balancers ensures that traffic is distributed evenly regardless of the underlying instance diversity. For optimal Spot Instance selection, monitor interruption rates in your chosen regions and instance types using the [AWS Spot Instance Advisor](https://aws.amazon.com/ec2/spot/instance-advisor/) to select instance types with lower interruption rates for critical workloads.
+[Capacity rebalancing](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-fleet-capacity-rebalance.html) further enhances resilience by proactively replacing at-risk Spot Instances before interruption. This feature works by monitoring EC2 Spot Instance interruption signals and automatically launching replacement instances, reducing the impact on running applications. Instance weighting allows for sophisticated capacity management where different instance sizes contribute proportionally to the Auto Scaling group's capacity, enabling seamless scaling across heterogeneous instance types while maintaining consistent application performance. For optimal Spot Instance selection, monitor interruption rates using the [AWS Spot Instance Advisor](https://aws.amazon.com/ec2/spot/instance-advisor/) to select instance types with lower interruption rates for critical workloads.
+
+> **Tip**: Use the latest Amazon Linux 2023 AMI for better performance and security features compared to Amazon Linux 2. The updated AMI includes improved security defaults and optimized performance for modern workloads.
 
 ## Challenge
 

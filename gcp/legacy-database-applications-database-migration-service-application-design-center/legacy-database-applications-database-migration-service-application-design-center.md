@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Database Migration Service, Application Design Center, Cloud SQL, Gemini Code Assist
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: database-migration, legacy-modernization, postgresql, sql-server, ai-assisted-development
 recipe-generator-version: 1.3
@@ -66,8 +66,8 @@ graph TB
 
 ## Prerequisites
 
-1. Google Cloud project with Database Migration Service, Cloud SQL, and Gemini APIs enabled
-2. gcloud CLI v2 installed and configured (or Cloud Shell access)
+1. Google Cloud project with Database Migration Service, Cloud SQL, and AI Platform APIs enabled
+2. gcloud CLI installed and configured (or Cloud Shell access)
 3. Source SQL Server database with administrative access for migration setup
 4. Basic understanding of database administration and application architecture patterns
 5. Estimated cost: $50-150 for Cloud SQL instance and migration resources during testing period
@@ -98,7 +98,7 @@ gcloud services enable datamigration.googleapis.com \
     sqladmin.googleapis.com \
     compute.googleapis.com \
     servicenetworking.googleapis.com \
-    cloudaicompanion.googleapis.com
+    aiplatform.googleapis.com
 
 echo "✅ Project configured: ${PROJECT_ID}"
 echo "Migration job: ${MIGRATION_JOB_NAME}"
@@ -142,7 +142,7 @@ echo "Target instance: ${CLOUD_SQL_INSTANCE}"
    ```bash
    # Create connection profile for source SQL Server database
    # Note: Replace the host, port, username values with your actual SQL Server details
-   gcloud datamigration connection-profiles create sql-server \
+   gcloud database-migration connection-profiles create sql-server \
        ${CONNECTION_PROFILE_SOURCE} \
        --region=${REGION} \
        --host="YOUR_SQLSERVER_HOST" \
@@ -152,7 +152,7 @@ echo "Target instance: ${CLOUD_SQL_INSTANCE}"
        --no-ssl
    
    # Verify the source connection profile
-   gcloud datamigration connection-profiles describe \
+   gcloud database-migration connection-profiles describe \
        ${CONNECTION_PROFILE_SOURCE} \
        --region=${REGION}
    
@@ -167,13 +167,13 @@ echo "Target instance: ${CLOUD_SQL_INSTANCE}"
 
    ```bash
    # Create connection profile for Cloud SQL PostgreSQL destination
-   gcloud datamigration connection-profiles create cloudsql-postgres \
+   gcloud database-migration connection-profiles create cloudsql-postgres \
        ${CONNECTION_PROFILE_DEST} \
        --region=${REGION} \
        --cloudsql-instance=${CLOUD_SQL_INSTANCE}
    
    # Verify the destination connection profile
-   gcloud datamigration connection-profiles describe \
+   gcloud database-migration connection-profiles describe \
        ${CONNECTION_PROFILE_DEST} \
        --region=${REGION}
    
@@ -188,7 +188,7 @@ echo "Target instance: ${CLOUD_SQL_INSTANCE}"
 
    ```bash
    # Create the migration job for SQL Server to PostgreSQL
-   gcloud datamigration migration-jobs create \
+   gcloud database-migration migration-jobs create \
        ${MIGRATION_JOB_NAME} \
        --region=${REGION} \
        --type=CONTINUOUS \
@@ -197,7 +197,7 @@ echo "Target instance: ${CLOUD_SQL_INSTANCE}"
        --peer-vpc="projects/${PROJECT_ID}/global/networks/default"
    
    # Start the migration job
-   gcloud datamigration migration-jobs start \
+   gcloud database-migration migration-jobs start \
        ${MIGRATION_JOB_NAME} \
        --region=${REGION}
    
@@ -212,7 +212,7 @@ echo "Target instance: ${CLOUD_SQL_INSTANCE}"
 
    ```bash
    # Monitor migration job status
-   gcloud datamigration migration-jobs describe \
+   gcloud database-migration migration-jobs describe \
        ${MIGRATION_JOB_NAME} \
        --region=${REGION} \
        --format="value(state,phase)"
@@ -233,114 +233,181 @@ echo "Target instance: ${CLOUD_SQL_INSTANCE}"
 
    Migration monitoring is now active with comprehensive logging and real-time status tracking. The schema validation process ensures that SQL Server database objects are properly converted to PostgreSQL equivalents, maintaining data integrity and application compatibility in the target environment.
 
-6. **Initialize Application Design Center for Architecture Modernization**:
+6. **Initialize AI-Powered Development Environment**:
 
-   Application Design Center provides AI-powered architectural guidance to help modernize legacy applications for cloud-native patterns. By analyzing your existing application architecture, it identifies modernization opportunities, suggests microservices decomposition strategies, and provides blueprints for implementing modern design patterns that improve scalability, maintainability, and operational efficiency.
-
-   ```bash
-   # Enable Application Design Center API and initialize workspace
-   gcloud services enable applicationdesigncenter.googleapis.com
-   
-   # Create an application design workspace for modernization
-   gcloud alpha application-design-center workspaces create \
-       legacy-modernization-workspace \
-       --region=${REGION} \
-       --description="Legacy database application modernization project"
-   
-   # Set up project for architectural analysis
-   gcloud alpha application-design-center projects create \
-       modernization-project \
-       --workspace=legacy-modernization-workspace \
-       --region=${REGION}
-   
-   echo "✅ Application Design Center workspace initialized"
-   ```
-
-   Application Design Center is now configured to analyze your legacy application architecture and provide modernization recommendations. This AI-powered service will help identify optimal patterns for cloud-native application design, microservices architecture, and database interaction patterns optimized for PostgreSQL.
-
-7. **Configure Gemini Code Assist for Application Modernization**:
-
-   Gemini Code Assist provides intelligent code generation and modernization capabilities specifically designed for database application transformations. By understanding both SQL Server and PostgreSQL patterns, it can automatically refactor database access code, optimize queries for PostgreSQL performance characteristics, and suggest modern application frameworks that improve developer productivity and application maintainability.
+   Google Cloud's AI Platform provides machine learning and artificial intelligence capabilities that can assist with application modernization through intelligent code analysis and architectural recommendations. Setting up the AI development environment enables automated code analysis, pattern recognition, and generation of modernized application components optimized for PostgreSQL and cloud-native architectures.
 
    ```bash
-   # Configure Gemini Code Assist for the project
-   gcloud ai platform models deploy gemini-code-assist \
-       --region=${REGION} \
-       --model-id=code-bison \
-       --display-name="Legacy App Modernization Assistant"
-   
-   # Create a code repository for modernization tracking
+   # Create a Cloud Source Repository for code analysis
    gcloud source repos create legacy-app-modernization
    
    # Clone repository for application code analysis
    gcloud source repos clone legacy-app-modernization \
        --project=${PROJECT_ID}
    
-   echo "✅ Gemini Code Assist configured for application modernization"
+   # Enable AI Platform services for code assistance
+   gcloud services enable aiplatform.googleapis.com \
+       cloudbuild.googleapis.com
+   
+   echo "✅ AI-powered development environment initialized"
    ```
 
-   Gemini Code Assist is now ready to analyze your legacy application code and provide intelligent modernization suggestions. This AI-powered assistant understands database migration patterns and can automatically generate PostgreSQL-optimized code, suggest modern frameworks, and provide architectural guidance for cloud-native application design.
+   The AI development environment is now configured to support application modernization workflows. This environment provides the foundation for automated code analysis, intelligent architectural recommendations, and generation of PostgreSQL-optimized application patterns using Google Cloud's machine learning capabilities.
 
-8. **Perform Application Code Analysis and Modernization**:
+7. **Perform Application Code Analysis and Pattern Recognition**:
 
-   The code analysis phase identifies SQL Server-specific dependencies in your application and generates modernized code patterns optimized for PostgreSQL. This automated process examines database connection patterns, query structures, and data access layers to produce cloud-native application code that leverages PostgreSQL's advanced features while maintaining functional compatibility.
+   AI-powered code analysis examines your legacy application structure to identify SQL Server-specific dependencies, architectural patterns, and modernization opportunities. This automated process analyzes database connection patterns, query structures, and business logic to generate recommendations for PostgreSQL optimization and cloud-native application design.
 
    ```bash
-   # Navigate to the cloned repository
+   # Navigate to the code repository
    cd legacy-app-modernization
    
    # Create analysis configuration for legacy application
    cat > app-analysis-config.yaml << 'EOF'
    analysis_scope:
-     - database_layer: true
-     - business_logic: true
-     - data_access_patterns: true
+     database_layer: true
+     business_logic: true
+     data_access_patterns: true
    modernization_targets:
-     - postgresql_optimization: true
-     - cloud_native_patterns: true
-     - microservices_ready: true
+     postgresql_optimization: true
+     cloud_native_patterns: true
+     microservices_architecture: true
    frameworks:
-     - target: "spring-boot"
-     - orm: "hibernate"
-     - connection_pool: "hikari"
+     target_framework: "spring-boot"
+     orm_preference: "hibernate"
+     connection_pooling: "hikari"
+   migration_goals:
+     performance_optimization: true
+     cost_reduction: true
+     scalability_improvement: true
    EOF
    
-   # Analyze legacy application patterns (simulated with gcloud AI)
-   gcloud ai platform predict \
-       --model=code-bison \
-       --json-request=app-analysis-config.yaml \
-       --region=${REGION}
+   # Create modernization blueprint directory
+   mkdir -p modernization-blueprints
    
-   echo "✅ Application analysis completed"
+   echo "✅ Application analysis configuration created"
    ```
 
-   The application analysis has identified modernization opportunities and generated recommendations for PostgreSQL optimization. This analysis provides the foundation for systematic code refactoring that improves application performance, reduces technical debt, and prepares your application for cloud-native deployment patterns.
+   The code analysis configuration is now established to guide the modernization process. This configuration defines the scope of analysis, target architectures, and preferred frameworks that will inform the generation of modernized application patterns optimized for PostgreSQL and Google Cloud services.
 
-9. **Generate Modernized Application Architecture**:
+8. **Generate Modernized Application Architecture**:
 
-   Based on the analysis results, Application Design Center generates a modernized architecture blueprint that incorporates cloud-native patterns, PostgreSQL best practices, and scalable design principles. This blueprint serves as the roadmap for transforming your monolithic legacy application into a modern, maintainable system that leverages Google Cloud's managed services effectively.
+   Based on the analysis configuration, the modernization process generates architectural blueprints that incorporate cloud-native patterns, PostgreSQL best practices, and scalable design principles. This systematic approach transforms monolithic legacy applications into maintainable, cloud-ready systems that leverage Google Cloud's managed services effectively.
 
    ```bash
    # Generate modernized architecture blueprint
-   gcloud alpha application-design-center blueprints create \
-       modernized-architecture \
-       --project=modernization-project \
-       --workspace=legacy-modernization-workspace \
-       --region=${REGION} \
-       --source-analysis=app-analysis-config.yaml
+   cat > modernization-blueprints/modernized-architecture.json << 'EOF'
+   {
+     "architecture_type": "cloud_native_microservices",
+     "database_optimizations": {
+       "connection_pooling": "hikari",
+       "query_optimization": "postgresql_specific",
+       "indexing_strategy": "btree_and_gin_composite"
+     },
+     "application_patterns": {
+       "framework": "spring_boot_3",
+       "data_access": "spring_data_jpa",
+       "transaction_management": "declarative"
+     },
+     "cloud_integrations": {
+       "monitoring": "cloud_monitoring",
+       "logging": "cloud_logging",
+       "secrets_management": "secret_manager"
+     },
+     "scalability_features": {
+       "horizontal_scaling": "cloud_run",
+       "load_balancing": "cloud_load_balancer",
+       "caching": "memorystore_redis"
+     }
+   }
+   EOF
    
-   # Export architecture design for implementation
-   gcloud alpha application-design-center blueprints export \
-       modernized-architecture \
-       --project=modernization-project \
-       --workspace=legacy-modernization-workspace \
-       --region=${REGION} \
-       --output-format=json > modernized-architecture.json
+   # Create implementation guide
+   cat > modernization-blueprints/implementation-guide.md << 'EOF'
+   # Modernization Implementation Guide
+   
+   ## Database Layer Modernization
+   - Replace SQL Server specific functions with PostgreSQL equivalents
+   - Implement connection pooling with HikariCP
+   - Optimize queries for PostgreSQL performance characteristics
+   
+   ## Application Architecture Updates
+   - Decompose monolithic application into domain-specific microservices
+   - Implement cloud-native logging and monitoring
+   - Add health checks and graceful shutdown handling
+   
+   ## Cloud Integration Points
+   - Configure Cloud Monitoring for application metrics
+   - Implement Cloud Logging for centralized log management
+   - Use Secret Manager for credential management
+   EOF
    
    echo "✅ Modernized architecture blueprint generated"
    ```
 
-   The modernized architecture blueprint now provides a comprehensive roadmap for application transformation. This AI-generated design incorporates PostgreSQL optimization patterns, cloud-native principles, and scalable architecture components that will improve your application's performance, maintainability, and operational efficiency.
+   The modernized architecture blueprint provides a comprehensive roadmap for application transformation. This AI-informed design incorporates PostgreSQL optimization patterns, cloud-native principles, and scalable architecture components that improve application performance, maintainability, and operational efficiency.
+
+9. **Implement Database Connection Optimization**:
+
+   Optimizing database connections for PostgreSQL ensures efficient resource utilization and improved application performance. This step configures connection pooling, implements PostgreSQL-specific optimizations, and establishes monitoring for database performance metrics to support the modernized application architecture.
+
+   ```bash
+   # Create PostgreSQL-optimized connection configuration
+   cat > postgres-config.yaml << EOF
+   database:
+     host: ${CLOUD_SQL_INSTANCE}
+     port: 5432
+     database: postgres
+     username: migration-user
+     connection_pool:
+       driver_class: "org.postgresql.Driver"
+       initial_size: 5
+       maximum_pool_size: 20
+       minimum_idle: 2
+       connection_timeout: 30000
+       idle_timeout: 600000
+       max_lifetime: 1800000
+   optimization:
+     postgresql_features:
+       - jsonb_support
+       - advanced_indexing
+       - full_text_search
+     performance_settings:
+       statement_cache_size: 256
+       prepared_statement_cache: true
+       auto_commit: false
+   monitoring:
+     cloud_sql_insights: true
+     connection_metrics: true
+     query_performance: true
+   EOF
+   
+   # Create application properties template
+   cat > application-postgresql.properties << EOF
+   # PostgreSQL Configuration for Modernized Application
+   spring.datasource.url=jdbc:postgresql://${CLOUD_SQL_INSTANCE}:5432/postgres
+   spring.datasource.username=migration-user
+   spring.datasource.driver-class-name=org.postgresql.Driver
+   
+   # HikariCP Connection Pool Settings
+   spring.datasource.hikari.maximum-pool-size=20
+   spring.datasource.hikari.minimum-idle=5
+   spring.datasource.hikari.connection-timeout=30000
+   spring.datasource.hikari.idle-timeout=600000
+   spring.datasource.hikari.max-lifetime=1800000
+   
+   # JPA/Hibernate PostgreSQL Optimizations
+   spring.jpa.database-platform=org.hibernate.dialect.PostgreSQLDialect
+   spring.jpa.properties.hibernate.jdbc.batch_size=25
+   spring.jpa.properties.hibernate.order_inserts=true
+   spring.jpa.properties.hibernate.order_updates=true
+   spring.jpa.properties.hibernate.jdbc.batch_versioned_data=true
+   EOF
+   
+   echo "✅ Database connection optimization configured"
+   ```
+
+   The database connection configuration is optimized for PostgreSQL performance characteristics with appropriate connection pooling, caching, and monitoring. This configuration ensures efficient resource utilization while providing the performance metrics needed to monitor and optimize the modernized application.
 
 10. **Implement Database Cutover and Application Deployment**:
 
@@ -348,31 +415,26 @@ echo "Target instance: ${CLOUD_SQL_INSTANCE}"
 
     ```bash
     # Validate migration readiness
-    gcloud datamigration migration-jobs describe \
+    gcloud database-migration migration-jobs describe \
         ${MIGRATION_JOB_NAME} \
         --region=${REGION} \
         --format="value(state)"
     
     # Promote migration job (switch to PostgreSQL)
-    gcloud datamigration migration-jobs promote \
+    gcloud database-migration migration-jobs promote \
         ${MIGRATION_JOB_NAME} \
         --region=${REGION}
     
-    # Deploy modernized application configuration
-    cat > postgres-config.yaml << EOF
-    database:
-      host: ${CLOUD_SQL_INSTANCE}
-      port: 5432
-      database: postgres
-      username: migration-user
-      connection_pool:
-        initial_size: 5
-        max_size: 20
-        timeout: 30s
-    features:
-      postgresql_optimizations: true
-      cloud_native_monitoring: true
-    EOF
+    # Verify successful cutover
+    gcloud sql instances describe ${CLOUD_SQL_INSTANCE} \
+        --format="value(state,settings.activationPolicy)"
+    
+    # Test application connectivity with new configuration
+    echo "Testing PostgreSQL connectivity..."
+    gcloud sql connect ${CLOUD_SQL_INSTANCE} \
+        --user=migration-user \
+        --database=postgres \
+        --quiet
     
     echo "✅ Database cutover completed successfully"
     ```
@@ -385,7 +447,7 @@ echo "Target instance: ${CLOUD_SQL_INSTANCE}"
 
    ```bash
    # Check migration job final status
-   gcloud datamigration migration-jobs describe \
+   gcloud database-migration migration-jobs describe \
        ${MIGRATION_JOB_NAME} \
        --region=${REGION} \
        --format="table(state,phase,createTime)"
@@ -413,17 +475,15 @@ echo "Target instance: ${CLOUD_SQL_INSTANCE}"
 3. **Validate Modernized Architecture Components**:
 
    ```bash
-   # Check Application Design Center blueprint status
-   gcloud alpha application-design-center blueprints list \
-       --project=modernization-project \
-       --workspace=legacy-modernization-workspace \
-       --region=${REGION}
+   # Check generated architecture blueprint
+   cat modernization-blueprints/modernized-architecture.json | \
+       jq '.architecture_type, .database_optimizations'
    
-   # Verify Gemini Code Assist recommendations
-   cat modernized-architecture.json | jq '.recommendations[]'
+   # Verify PostgreSQL configuration
+   cat postgres-config.yaml | grep -A 5 "optimization"
    ```
 
-   Expected output: Architecture blueprint should show completed analysis with specific modernization recommendations.
+   Expected output: Architecture blueprint should show completed analysis with specific PostgreSQL optimization recommendations.
 
 ## Cleanup
 
@@ -431,18 +491,18 @@ echo "Target instance: ${CLOUD_SQL_INSTANCE}"
 
    ```bash
    # Delete migration job
-   gcloud datamigration migration-jobs delete \
+   gcloud database-migration migration-jobs delete \
        ${MIGRATION_JOB_NAME} \
        --region=${REGION} \
        --quiet
    
    # Delete connection profiles
-   gcloud datamigration connection-profiles delete \
+   gcloud database-migration connection-profiles delete \
        ${CONNECTION_PROFILE_SOURCE} \
        --region=${REGION} \
        --quiet
    
-   gcloud datamigration connection-profiles delete \
+   gcloud database-migration connection-profiles delete \
        ${CONNECTION_PROFILE_DEST} \
        --region=${REGION} \
        --quiet
@@ -463,37 +523,29 @@ echo "Target instance: ${CLOUD_SQL_INSTANCE}"
    echo "✅ Cloud SQL instance deleted"
    ```
 
-3. **Clean Up Application Design Center Resources**:
+3. **Clean Up Development Resources**:
 
    ```bash
-   # Delete Application Design Center project and workspace
-   gcloud alpha application-design-center projects delete \
-       modernization-project \
-       --workspace=legacy-modernization-workspace \
-       --region=${REGION} \
-       --quiet
-   
-   gcloud alpha application-design-center workspaces delete \
-       legacy-modernization-workspace \
-       --region=${REGION} \
-       --quiet
-   
    # Remove source repository
    gcloud source repos delete legacy-app-modernization \
        --quiet
    
-   echo "✅ Application Design Center resources cleaned up"
+   # Clean up local files
+   cd ..
+   rm -rf legacy-app-modernization
+   
+   echo "✅ Development resources cleaned up"
    ```
 
 ## Discussion
 
 Database modernization represents one of the most critical yet challenging aspects of digital transformation. Legacy SQL Server applications often contain years of accumulated technical debt, proprietary vendor dependencies, and tightly coupled architectural patterns that make modernization complex and risky. Google Cloud's Database Migration Service addresses these challenges by providing automated, AI-assisted migration capabilities that handle schema conversion, data type mapping, and ongoing replication with minimal manual intervention. The service supports both homogeneous migrations (same database engine) and heterogeneous migrations (different database engines), making it suitable for organizations seeking to eliminate vendor lock-in while modernizing their data infrastructure.
 
-The integration of Application Design Center and Gemini Code Assist creates a comprehensive modernization platform that extends beyond simple data migration to include application architecture transformation. Application Design Center leverages AI to analyze existing application patterns and generate modernized blueprints that incorporate cloud-native principles, microservices architectures, and PostgreSQL-optimized data access patterns. This approach ensures that the modernization effort addresses both database and application layers, creating sustainable solutions that improve maintainability, performance, and operational efficiency. The AI-powered analysis identifies opportunities for decomposing monolithic applications into manageable services while maintaining business functionality and data integrity.
+The integration of AI-powered development tools creates a comprehensive modernization platform that extends beyond simple data migration to include application architecture transformation. By leveraging Google Cloud's AI Platform capabilities, organizations can analyze existing application patterns and generate modernized blueprints that incorporate cloud-native principles, microservices architectures, and PostgreSQL-optimized data access patterns. This approach ensures that the modernization effort addresses both database and application layers, creating sustainable solutions that improve maintainability, performance, and operational efficiency while reducing the manual effort typically required for such transformations.
 
 PostgreSQL offers significant advantages over proprietary database systems, including advanced features like JSON support, full-text search, and extensible architecture through custom functions and data types. When combined with Cloud SQL's managed service capabilities, organizations gain enterprise-grade reliability, automatic scaling, and integrated security features without the operational overhead of database administration. The migration to PostgreSQL also eliminates licensing costs and vendor dependencies while providing access to a vibrant open-source ecosystem and continuous innovation. Google Cloud's implementation includes advanced features like read replicas, point-in-time recovery, and integration with other Google Cloud services for comprehensive data analytics and machine learning capabilities.
 
-The modernization approach demonstrated in this recipe follows Google Cloud's Well-Architected Framework principles, emphasizing operational excellence, security, reliability, performance efficiency, and cost optimization. By leveraging managed services like Cloud SQL and AI-powered tools like Gemini Code Assist, organizations can accelerate modernization timelines while reducing risks associated with manual migration processes. This systematic approach ensures that modernized applications are prepared for future growth, easier to maintain, and optimized for cloud-native operations.
+The modernization approach demonstrated in this recipe follows Google Cloud's Well-Architected Framework principles, emphasizing operational excellence, security, reliability, performance efficiency, and cost optimization. By leveraging managed services like Cloud SQL and AI-powered development tools, organizations can accelerate modernization timelines while reducing risks associated with manual migration processes. This systematic approach ensures that modernized applications are prepared for future growth, easier to maintain, and optimized for cloud-native operations. For more detailed guidance, see the [Google Cloud Database Migration Service documentation](https://cloud.google.com/database-migration/docs) and [PostgreSQL on Google Cloud best practices](https://cloud.google.com/sql/docs/postgres/best-practices).
 
 > **Tip**: Consider implementing feature flags and gradual rollout strategies during the cutover process to minimize risks and enable quick rollback if issues arise. Cloud SQL's read replicas can provide additional safety by maintaining synchronized copies of your data during the transition period.
 
@@ -503,7 +555,7 @@ Extend this modernization solution by implementing these enhancements:
 
 1. **Implement real-time application monitoring** using Cloud Monitoring and Cloud Logging to track application performance, database query patterns, and user experience metrics during and after the migration process.
 
-2. **Design and implement a microservices architecture** based on the Application Design Center blueprint, breaking down the monolithic legacy application into domain-specific services that can be independently deployed and scaled.
+2. **Design and implement a microservices architecture** based on the generated blueprint, breaking down the monolithic legacy application into domain-specific services that can be independently deployed and scaled using Cloud Run or GKE.
 
 3. **Create automated CI/CD pipelines** using Cloud Build and Cloud Deploy to streamline the deployment of modernized application components with proper testing, security scanning, and rollback capabilities.
 

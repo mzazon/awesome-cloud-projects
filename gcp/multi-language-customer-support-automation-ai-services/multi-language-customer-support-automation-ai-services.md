@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Speech-to-Text, Cloud Translation, Cloud Natural Language, Cloud Text-to-Speech
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: ai, machine-learning, natural-language-processing, multilingual, customer-support, automation
 recipe-generator-version: 1.3
@@ -48,7 +48,7 @@ graph TB
         STORAGE[Cloud Storage]
     end
     
-    subgraph "Data & Analytics"
+    subgraph "Data & Analytics"  
         FIRESTORE[Firestore]
         LOGGING[Cloud Logging]
         MONITORING[Cloud Monitoring]
@@ -90,7 +90,7 @@ graph TB
 4. Familiarity with Cloud Functions and serverless architecture concepts
 5. Estimated cost: $20-50 for testing (includes API calls, storage, and compute resources)
 
-> **Note**: This solution uses Google Cloud AI APIs with pay-per-use pricing. Review the [Cloud AI pricing documentation](https://cloud.google.com/ai-platform/pricing) to understand costs for your expected usage volume.
+> **Note**: This solution uses Google Cloud AI APIs with pay-per-use pricing. Review the pricing documentation for [Speech-to-Text](https://cloud.google.com/speech-to-text/pricing), [Translation](https://cloud.google.com/translate/pricing), [Natural Language](https://cloud.google.com/natural-language/pricing), and [Text-to-Speech](https://cloud.google.com/text-to-speech/pricing) to understand costs for your expected usage volume.
 
 ## Preparation
 
@@ -121,6 +121,7 @@ gcloud services enable workflows.googleapis.com
 gcloud services enable firestore.googleapis.com
 gcloud services enable logging.googleapis.com
 gcloud services enable monitoring.googleapis.com
+gcloud services enable cloudbuild.googleapis.com
 
 # Create Cloud Storage bucket for audio files
 gsutil mb -p ${PROJECT_ID} \
@@ -217,18 +218,10 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    }
    EOF
    
-   # Test translation capabilities
-   gcloud ml translate translate-text \
-       --source-language=auto \
-       --target-language=en \
-       --format=text \
-       --zone=${REGION} \
-       "Bonjour, j'ai besoin d'aide avec ma commande"
-   
    # Upload translation configuration
    gsutil cp translation-config.json gs://${BUCKET_NAME}/config/
    
-   echo "✅ Translation service configured and tested"
+   echo "✅ Translation service configured"
    ```
 
    The translation service is now configured with comprehensive language support and automatic language detection. This enables the system to process customer inquiries in their native language and provide responses in the appropriate language, creating a more natural and accessible customer experience.
@@ -263,12 +256,6 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
      ]
    }
    EOF
-   
-   # Test sentiment analysis
-   echo "I'm really frustrated with this product!" | \
-   gcloud ml language analyze-sentiment \
-       --content-file=- \
-       --format="value(documentSentiment.score,documentSentiment.magnitude)"
    
    # Upload sentiment configuration
    gsutil cp sentiment-config.json gs://${BUCKET_NAME}/config/
@@ -317,12 +304,6 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    }
    EOF
    
-   # Test text-to-speech
-   gcloud ml text-to-speech synthesize \
-       --text="Hello, how can I help you today?" \
-       --output-file=test-output.mp3 \
-       --voice=en-US-Neural2-J
-   
    # Upload TTS configuration
    gsutil cp tts-config.json gs://${BUCKET_NAME}/config/
    
@@ -342,14 +323,14 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    
    # Create requirements.txt
    cat << EOF > requirements.txt
-   functions-framework>=3.0.0
-   google-cloud-speech>=2.20.0
-   google-cloud-translate>=3.11.0
-   google-cloud-language>=2.10.0
-   google-cloud-texttospeech>=2.14.0
-   google-cloud-firestore>=2.11.0
-   google-cloud-storage>=2.10.0
-   flask>=2.3.0
+   functions-framework>=3.2.0
+   google-cloud-speech>=2.21.0
+   google-cloud-translate>=3.12.0
+   google-cloud-language>=2.11.0
+   google-cloud-texttospeech>=2.16.0
+   google-cloud-firestore>=2.13.0
+   google-cloud-storage>=2.12.0
+   flask>=2.3.3
    EOF
    
    # Create main.py
@@ -357,6 +338,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    import functions_framework
    import json
    import logging
+   import os
    from google.cloud import speech
    from google.cloud import translate_v2 as translate
    from google.cloud import language_v1
@@ -380,6 +362,9 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
        try:
            # Parse request
            request_json = request.get_json()
+           if not request_json or 'audio_data' not in request_json:
+               return {'error': 'Invalid request format'}, 400
+               
            audio_data = base64.b64decode(request_json['audio_data'])
            customer_id = request_json.get('customer_id', 'anonymous')
            session_id = request_json.get('session_id', 'default')
@@ -400,7 +385,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
                return {'error': 'No speech detected'}, 400
            
            transcript = response.results[0].alternatives[0].transcript
-           detected_language = response.results[0].language_code
+           detected_language = response.results[0].language_code if hasattr(response.results[0], 'language_code') else 'en-US'
            
            # Step 2: Sentiment Analysis
            document = language_v1.Document(
@@ -416,11 +401,12 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
            sentiment_magnitude = sentiment_response.document_sentiment.magnitude
            
            # Step 3: Translation (if needed)
-           if detected_language != 'en':
+           detected_lang_code = detected_language.split('-')[0] if '-' in detected_language else detected_language
+           if detected_lang_code != 'en':
                translation = translate_client.translate(
                    transcript,
                    target_language='en',
-                   source_language=detected_language
+                   source_language=detected_lang_code
                )
                translated_text = translation['translatedText']
            else:
@@ -428,17 +414,17 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
            
            # Step 4: Generate response based on sentiment
            if sentiment_score < -0.2:
-               response_text = f"I understand your frustration. Let me help you resolve this issue immediately."
+               response_text = "I understand your frustration. Let me help you resolve this issue immediately."
            elif sentiment_score > 0.2:
-               response_text = f"Thank you for your positive feedback! How can I assist you further?"
+               response_text = "Thank you for your positive feedback! How can I assist you further?"
            else:
-               response_text = f"I understand your concern. Let me help you with that."
+               response_text = "I understand your concern. Let me help you with that."
            
            # Step 5: Translate response back to customer language
-           if detected_language != 'en':
+           if detected_lang_code != 'en':
                response_translation = translate_client.translate(
                    response_text,
-                   target_language=detected_language,
+                   target_language=detected_lang_code,
                    source_language='en'
                )
                final_response = response_translation['translatedText']
@@ -467,7 +453,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
                )
            }
            
-           voice = voice_config.get(detected_language[:2], voice_config['en'])
+           voice = voice_config.get(detected_lang_code, voice_config['en'])
            audio_config = texttospeech.AudioConfig(
                audio_encoding=texttospeech.AudioEncoding.MP3
            )
@@ -510,11 +496,12 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    
    # Deploy the function
    gcloud functions deploy ${FUNCTION_NAME} \
-       --runtime python39 \
+       --gen2 \
+       --runtime python311 \
        --trigger-http \
        --allow-unauthenticated \
        --region=${REGION} \
-       --memory=512MB \
+       --memory=1Gi \
        --timeout=60s \
        --set-env-vars="BUCKET_NAME=${BUCKET_NAME}"
    
@@ -605,64 +592,15 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    Cloud Monitoring provides comprehensive observability for the multilingual support system. Monitoring tracks API usage, response times, error rates, and sentiment trends. Alerting ensures rapid response to issues and helps maintain service quality. This operational visibility is crucial for maintaining high-quality customer support.
 
    ```bash
-   # Create monitoring dashboard
-   cat << EOF > monitoring-dashboard.json
-   {
-     "displayName": "Multilingual Support Dashboard",
-     "mosaicLayout": {
-       "tiles": [
-         {
-           "width": 6,
-           "height": 4,
-           "widget": {
-             "title": "Function Invocations",
-             "xyChart": {
-               "dataSets": [
-                 {
-                   "timeSeriesQuery": {
-                     "timeSeriesFilter": {
-                       "filter": "resource.type=\"cloud_function\" AND resource.labels.function_name=\"${FUNCTION_NAME}\"",
-                       "aggregation": {
-                         "alignmentPeriod": "60s",
-                         "perSeriesAligner": "ALIGN_RATE"
-                       }
-                     }
-                   }
-                 }
-               ]
-             }
-           }
-         },
-         {
-           "width": 6,
-           "height": 4,
-           "yPos": 4,
-           "widget": {
-             "title": "Sentiment Score Distribution",
-             "xyChart": {
-               "dataSets": [
-                 {
-                   "timeSeriesQuery": {
-                     "timeSeriesFilter": {
-                       "filter": "resource.type=\"cloud_function\" AND metric.type=\"logging.googleapis.com/user/sentiment_score\"",
-                       "aggregation": {
-                         "alignmentPeriod": "300s",
-                         "perSeriesAligner": "ALIGN_MEAN"
-                       }
-                     }
-                   }
-                 }
-               ]
-             }
-           }
-         }
-       ]
-     }
-   }
-   EOF
+   # Create log-based metric for sentiment tracking
+   gcloud logging metrics create sentiment_score \
+       --description="Track customer sentiment scores" \
+       --log-filter="resource.type=\"cloud_function\" AND jsonPayload.sentiment_score EXISTS" \
+       --value-extractor="EXTRACT(jsonPayload.sentiment_score)"
    
-   # Create alerting policy
-   cat << EOF > alert-policy.json
+   # Create alerting policy for negative sentiment
+   gcloud alpha monitoring policies create \
+       --policy-from-file=<(cat << EOF
    {
      "displayName": "High Negative Sentiment Alert",
      "conditions": [
@@ -682,18 +620,13 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
          }
        }
      ],
-     "notificationChannels": [],
      "alertStrategy": {
        "autoClose": "1800s"
-     }
+     },
+     "enabled": true
    }
    EOF
-   
-   # Create log-based metric for sentiment tracking
-   gcloud logging metrics create sentiment_score \
-       --description="Track customer sentiment scores" \
-       --log-filter="resource.type=\"cloud_function\" AND jsonPayload.sentiment_score exists" \
-       --value-extractor="EXTRACT(jsonPayload.sentiment_score)"
+   )
    
    echo "✅ Monitoring and alerting configured"
    ```
@@ -705,50 +638,60 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
 1. **Test Speech-to-Text Processing**:
 
    ```bash
-   # Create test audio file (or use existing)
+   # Download a test audio file
    curl -o test-audio.wav \
-       "https://cloud.google.com/speech-to-text/docs/samples/brooklyn.wav"
+       "https://storage.googleapis.com/cloud-samples-data/speech/brooklyn.wav"
    
-   # Test speech recognition
-   gcloud ml speech recognize test-audio.wav \
-       --language-code=en-US \
-       --format=json
+   # Test speech recognition using client libraries (Python example)
+   python3 -c "
+   from google.cloud import speech
+   client = speech.SpeechClient()
+   with open('test-audio.wav', 'rb') as audio_file:
+       content = audio_file.read()
+   audio = speech.RecognitionAudio(content=content)
+   config = speech.RecognitionConfig(
+       encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+       sample_rate_hertz=16000,
+       language_code='en-US'
+   )
+   response = client.recognize(config=config, audio=audio)
+   for result in response.results:
+       print('Transcript: {}'.format(result.alternatives[0].transcript))
+   "
    ```
 
-   Expected output: JSON response with transcript and confidence scores
+   Expected output: Transcript of the audio file content
 
 2. **Test Multi-Language Translation**:
 
    ```bash
-   # Test translation capabilities
-   gcloud ml translate translate-text \
-       --source-language=es \
-       --target-language=en \
-       --format=text \
-       "Necesito ayuda con mi pedido urgentemente"
-   
-   # Test language detection
-   gcloud ml translate detect-language \
-       --format=json \
-       "Bonjour, comment allez-vous?"
+   # Test translation using Python client library
+   python3 -c "
+   from google.cloud import translate_v2 as translate
+   client = translate.Client()
+   result = client.translate('Necesito ayuda con mi pedido urgentemente', source_language='es', target_language='en')
+   print('Original: Necesito ayuda con mi pedido urgentemente')
+   print('Translation: {}'.format(result['translatedText']))
+   "
    ```
 
-   Expected output: Translated text and detected language information
+   Expected output: Translated text from Spanish to English
 
 3. **Test Sentiment Analysis**:
 
    ```bash
-   # Test positive sentiment
-   echo "I love this product! It's amazing!" | \
-   gcloud ml language analyze-sentiment \
-       --content-file=- \
-       --format=json
-   
-   # Test negative sentiment
-   echo "This is terrible! I'm very disappointed!" | \
-   gcloud ml language analyze-sentiment \
-       --content-file=- \
-       --format=json
+   # Test sentiment analysis using Python client library  
+   python3 -c "
+   from google.cloud import language_v1
+   client = language_v1.LanguageServiceClient()
+   text = 'I love this product! It is amazing!'
+   document = language_v1.Document(content=text, type_=language_v1.Document.Type.PLAIN_TEXT)
+   response = client.analyze_sentiment(request={'document': document})
+   sentiment = response.document_sentiment
+   print('Text: {}'.format(text))
+   print('Sentiment score: {}'.format(sentiment.score))
+   print('Sentiment magnitude: {}'.format(sentiment.magnitude))
+   "
    ```
 
    Expected output: Sentiment scores ranging from -1.0 to 1.0
@@ -756,7 +699,7 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
 4. **Test End-to-End Function**:
 
    ```bash
-   # Create test payload
+   # Create test payload with base64 encoded audio
    cat << EOF > test-payload.json
    {
      "audio_data": "$(base64 -w 0 test-audio.wav)",
@@ -825,8 +768,8 @@ echo "✅ Storage bucket created: ${BUCKET_NAME}"
    rm -rf multilang-function/
    rm -f speech-config.json translation-config.json
    rm -f sentiment-config.json tts-config.json
-   rm -f support-workflow.yaml monitoring-dashboard.json
-   rm -f alert-policy.json test-payload.json test-audio.wav
+   rm -f support-workflow.yaml
+   rm -f test-payload.json test-audio.wav
    
    echo "✅ Local files cleaned up"
    ```

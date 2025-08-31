@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Firebase Authentication, Cloud SQL, Cloud Tasks, Cloud Scheduler
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-7-23
 passed-qa: null
 tags: user-management, automation, retention, analytics, lifecycle
 recipe-generator-version: 1.3
@@ -122,7 +122,7 @@ echo "✅ Required APIs enabled successfully"
    # Initialize Firebase project
    firebase projects:addfirebase ${PROJECT_ID}
    
-   # Configure Firebase Authentication
+   # Configure Firebase Authentication (enable in Firebase Console)
    gcloud alpha firestore databases create \
        --location=${REGION} \
        --type=firestore-native
@@ -176,7 +176,7 @@ echo "✅ Required APIs enabled successfully"
    -- User engagement tracking table
    CREATE TABLE user_engagement (
        id SERIAL PRIMARY KEY,
-       firebase_uid VARCHAR(128) NOT NULL,
+       firebase_uid VARCHAR(128) NOT NULL UNIQUE,
        email VARCHAR(255),
        last_login TIMESTAMP WITH TIME ZONE,
        session_count INTEGER DEFAULT 0,
@@ -443,6 +443,7 @@ echo "✅ Required APIs enabled successfully"
    COPY package*.json ./
    RUN npm ci --only=production
    COPY . .
+   EXPOSE 8080
    CMD ["node", "index.js"]
    EOF
    
@@ -698,8 +699,9 @@ echo "✅ Required APIs enabled successfully"
    # Check Firebase project configuration
    firebase projects:list
    
-   # Verify Authentication is enabled
-   gcloud firebase products:enable --project=${PROJECT_ID}
+   # Verify project is connected to Firebase
+   gcloud projects describe ${PROJECT_ID} \
+       --format="value(projectId)"
    ```
 
    Expected output: Project listed with Firebase Authentication enabled
@@ -777,11 +779,11 @@ echo "✅ Required APIs enabled successfully"
 
    ```bash
    # Delete Firebase Functions
-   cd firebase-functions
+   cd firebase-functions/functions
    firebase functions:delete onUserCreate --project=${PROJECT_ID} --force
    firebase functions:delete onUserSignIn --project=${PROJECT_ID} --force
    firebase functions:delete onUserDelete --project=${PROJECT_ID} --force
-   cd ..
+   cd ../..
    
    echo "✅ Firebase Functions deleted"
    ```
@@ -861,7 +863,7 @@ Extend this user lifecycle management system by implementing these advanced capa
 
 2. **Add personalized retention campaigns** with dynamic content generation based on user preferences, activity history, and engagement patterns using Cloud Natural Language API for content optimization.
 
-3. **Create real-time engagement dashboards** using Looker Studio or Data Studio with live data connections to Cloud SQL for executive reporting and operational monitoring.
+3. **Create real-time engagement dashboards** using Looker Studio with live data connections to Cloud SQL for executive reporting and operational monitoring.
 
 4. **Integrate multi-channel communication** by adding SMS notifications via Cloud Messaging, push notifications through Firebase Cloud Messaging, and email campaigns through third-party services.
 

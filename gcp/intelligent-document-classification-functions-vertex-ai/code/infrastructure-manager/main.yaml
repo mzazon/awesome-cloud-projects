@@ -1,0 +1,456 @@
+# Infrastructure Manager configuration for Intelligent Document Classification
+# This configuration deploys a complete serverless document classification system
+# using Cloud Functions, Vertex AI, and Cloud Storage
+
+# Configuration metadata
+metadata:
+  name: intelligent-document-classification
+  description: "Serverless document classification using Cloud Functions and Vertex AI"
+  labels:
+    recipe: "intelligent-document-classification-functions-vertex-ai"
+    provider: "gcp"
+    category: "ai"
+
+# Global variables for consistent naming and configuration
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    validation:
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+  
+  region:
+    type: string
+    description: "Google Cloud region for deployments"
+    default: "us-central1"
+    validation:
+      values: ["us-central1", "us-east1", "us-west1", "europe-west1", "asia-southeast1"]
+  
+  environment:
+    type: string
+    description: "Environment identifier (dev, staging, prod)"
+    default: "dev"
+    validation:
+      values: ["dev", "staging", "prod"]
+  
+  random_suffix:
+    type: string
+    description: "Random suffix for globally unique resource names"
+    default: "${random_id.suffix.hex}"
+
+# Random ID generator for unique resource naming
+resources:
+  - name: suffix
+    type: random_id
+    properties:
+      byte_length: 3
+
+# Enable required Google Cloud APIs
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudfunctions.googleapis.com
+      
+  - name: aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/aiplatform.googleapis.com
+      
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/storage.googleapis.com
+      
+  - name: logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/logging.googleapis.com
+      
+  - name: monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/monitoring.googleapis.com
+
+# Cloud Storage bucket for document ingestion
+  - name: inbox-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: doc-inbox-${var.environment}-${var.random_suffix}
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      # Enable object lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30  # Delete files older than 30 days
+      # Configure public access prevention
+      publicAccessPrevention: enforced
+      # Enable versioning for data protection
+      versioning:
+        enabled: true
+    metadata:
+      dependsOn:
+        - storage-api
+
+# Cloud Storage bucket for classified documents
+  - name: classified-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: doc-classified-${var.environment}-${var.random_suffix}
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      # Enable object lifecycle management for long-term storage
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30  # Move to NEARLINE after 30 days
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 365  # Move to COLDLINE after 1 year
+      # Configure public access prevention
+      publicAccessPrevention: enforced
+      # Enable versioning for data protection
+      versioning:
+        enabled: true
+    metadata:
+      dependsOn:
+        - storage-api
+
+# Create folder structure in classified bucket using placeholder objects
+  - name: contracts-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: ${ref.classified-bucket.name}
+      name: contracts/.keep
+      contentType: text/plain
+    metadata:
+      dependsOn:
+        - classified-bucket
+
+  - name: invoices-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: ${ref.classified-bucket.name}
+      name: invoices/.keep
+      contentType: text/plain
+    metadata:
+      dependsOn:
+        - classified-bucket
+
+  - name: reports-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: ${ref.classified-bucket.name}
+      name: reports/.keep
+      contentType: text/plain
+    metadata:
+      dependsOn:
+        - classified-bucket
+
+  - name: other-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: ${ref.classified-bucket.name}
+      name: other/.keep
+      contentType: text/plain
+    metadata:
+      dependsOn:
+        - classified-bucket
+
+# Service Account for Cloud Function with least privilege permissions
+  - name: doc-classifier-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: doc-classifier-sa-${var.random_suffix}
+      project: ${var.project_id}
+      serviceAccount:
+        displayName: "Document Classifier Service Account"
+        description: "Service account for document classification Cloud Function"
+
+# IAM binding for Vertex AI access
+  - name: vertex-ai-user-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/aiplatform.user
+            members:
+              - serviceAccount:${ref.doc-classifier-service-account.email}
+    metadata:
+      dependsOn:
+        - doc-classifier-service-account
+
+# IAM binding for Storage Object Admin access
+  - name: storage-object-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:${ref.doc-classifier-service-account.email}
+    metadata:
+      dependsOn:
+        - doc-classifier-service-account
+
+# Cloud Function source code archive
+  - name: function-source-archive
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: ${ref.classified-bucket.name}
+      name: function-source.zip
+      # Note: In production, this would be uploaded separately or managed through CI/CD
+      # For this Infrastructure Manager template, the source code should be prepared externally
+    metadata:
+      dependsOn:
+        - classified-bucket
+
+# Cloud Function for document classification
+  - name: classify-documents-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/${var.project_id}/locations/${var.region}
+      functionId: classify-documents-${var.environment}-${var.random_suffix}
+      function:
+        name: projects/${var.project_id}/locations/${var.region}/functions/classify-documents-${var.environment}-${var.random_suffix}
+        description: "Serverless document classification using Vertex AI"
+        # Source code configuration
+        sourceArchiveUrl: gs://${ref.classified-bucket.name}/function-source.zip
+        # Entry point for the Cloud Function
+        entryPoint: classify_document
+        # Runtime environment
+        runtime: python312
+        # Function timeout (9 minutes max for Cloud Functions)
+        timeout: 540s
+        # Memory allocation for function execution
+        availableMemoryMb: 512
+        # Maximum number of concurrent executions
+        maxInstances: 100
+        # Service account for function execution
+        serviceAccountEmail: ${ref.doc-classifier-service-account.email}
+        # Environment variables for function configuration
+        environmentVariables:
+          CLASSIFIED_BUCKET: ${ref.classified-bucket.name}
+          INBOX_BUCKET: ${ref.inbox-bucket.name}
+          VERTEX_AI_REGION: ${var.region}
+          VERTEX_AI_PROJECT: ${var.project_id}
+        # Event trigger configuration for Cloud Storage
+        eventTrigger:
+          eventType: google.storage.object.finalize
+          resource: projects/_/buckets/${ref.inbox-bucket.name}
+          failurePolicy:
+            retry: {}
+        # Security and networking configuration
+        ingressSettings: ALLOW_INTERNAL_ONLY
+        # Labels for resource management
+        labels:
+          environment: ${var.environment}
+          function-type: document-classifier
+          managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - aiplatform-api
+        - doc-classifier-service-account
+        - inbox-bucket
+        - classified-bucket
+        - vertex-ai-user-binding
+        - storage-object-admin-binding
+        - function-source-archive
+
+# Cloud Logging sink for function logs (optional - for centralized logging)
+  - name: function-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/${var.project_id}
+      sinkId: doc-classifier-logs-${var.random_suffix}
+      sink:
+        name: projects/${var.project_id}/sinks/doc-classifier-logs-${var.random_suffix}
+        description: "Log sink for document classifier function"
+        destination: storage.googleapis.com/${ref.classified-bucket.name}/logs
+        filter: 'resource.type="cloud_function" resource.labels.function_name="${ref.classify-documents-function.name}"'
+        # Include all log levels for comprehensive monitoring
+        includeChildren: true
+    metadata:
+      dependsOn:
+        - logging-api
+        - classify-documents-function
+        - classified-bucket
+
+# Cloud Monitoring alert policy for function errors
+  - name: function-error-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${var.project_id}
+      alertPolicy:
+        displayName: "Document Classifier Function Errors"
+        documentation:
+          content: "Alert when document classification function experiences errors"
+          mimeType: text/markdown
+        # Define conditions that trigger the alert
+        conditions:
+          - displayName: "Function error rate"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" resource.label.function_name="${ref.classify-documents-function.name}" metric.type="cloudfunctions.googleapis.com/function/execution_count"'
+              comparison: COMPARISON_GT
+              thresholdValue: 5
+              duration: 300s  # 5 minutes
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+                  groupByFields:
+                    - resource.label.function_name
+        # Alert is enabled by default
+        enabled: true
+        # Combine multiple conditions with OR logic
+        combiner: OR
+        # Labels for alert management
+        userLabels:
+          environment: ${var.environment}
+          component: document-classifier
+    metadata:
+      dependsOn:
+        - monitoring-api
+        - classify-documents-function
+
+# Cloud Monitoring dashboard for system observability
+  - name: classification-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/${var.project_id}
+      dashboard:
+        displayName: "Document Classification System Dashboard"
+        # Dashboard configuration with multiple widgets
+        mosaicLayout:
+          tiles:
+            # Function execution count widget
+            - width: 6
+              height: 4
+              widget:
+                title: "Function Executions"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="cloud_function" resource.label.function_name="${ref.classify-documents-function.name}" metric.type="cloudfunctions.googleapis.com/function/execution_count"'
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                  yAxis:
+                    label: "Executions per minute"
+            # Function execution time widget
+            - width: 6
+              height: 4
+              xPos: 6
+              widget:
+                title: "Function Execution Time"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="cloud_function" resource.label.function_name="${ref.classify-documents-function.name}" metric.type="cloudfunctions.googleapis.com/function/execution_times"'
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_MEAN
+                  yAxis:
+                    label: "Duration (ms)"
+            # Storage bucket objects widget
+            - width: 12
+              height: 4
+              yPos: 4
+              widget:
+                title: "Classified Documents Count"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="gcs_bucket" resource.label.bucket_name="${ref.classified-bucket.name}" metric.type="storage.googleapis.com/storage/object_count"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_SUM
+                  yAxis:
+                    label: "Object count"
+    metadata:
+      dependsOn:
+        - monitoring-api
+        - classify-documents-function
+        - classified-bucket
+
+# Output values for verification and integration
+outputs:
+  - name: inbox_bucket_name
+    description: "Name of the document inbox bucket"
+    value: ${ref.inbox-bucket.name}
+    
+  - name: classified_bucket_name
+    description: "Name of the classified documents bucket"
+    value: ${ref.classified-bucket.name}
+    
+  - name: function_name
+    description: "Name of the classification Cloud Function"
+    value: ${ref.classify-documents-function.name}
+    
+  - name: function_url
+    description: "HTTPS trigger URL for the Cloud Function"
+    value: ${ref.classify-documents-function.httpsTrigger.url}
+    
+  - name: service_account_email
+    description: "Email of the service account used by the function"
+    value: ${ref.doc-classifier-service-account.email}
+    
+  - name: project_id
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+    
+  - name: region
+    description: "Deployment region"
+    value: ${var.region}
+    
+  - name: dashboard_url
+    description: "URL to the monitoring dashboard"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/${ref.classification-dashboard.name}?project=${var.project_id}"
+
+# Deployment notes and instructions
+# 
+# To deploy this infrastructure:
+# 1. Ensure you have Infrastructure Manager enabled in your project
+# 2. Prepare the Cloud Function source code and upload to Cloud Storage
+# 3. Update the function-source-archive resource with the correct source location
+# 4. Run: gcloud infra-manager deployments create DEPLOYMENT_NAME --location=REGION --config-file=main.yaml
+#
+# Prerequisites:
+# - Google Cloud project with billing enabled
+# - Infrastructure Manager API enabled
+# - Appropriate IAM permissions for resource creation
+# - Cloud Function source code prepared and archived
+#
+# Security considerations:
+# - Service account follows least privilege principle
+# - Storage buckets have public access prevention enabled
+# - Function has internal-only ingress for security
+# - Comprehensive monitoring and alerting configured
+#
+# Cost optimization features:
+# - Lifecycle policies for storage cost management
+# - Appropriate function memory allocation
+# - Auto-scaling configuration for cost efficiency
+# - Resource labels for cost tracking and management

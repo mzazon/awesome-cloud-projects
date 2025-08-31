@@ -1,0 +1,974 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cross-Account Database Sharing with VPC Lattice and RDS
+  
+  This template creates a comprehensive solution for sharing RDS databases across AWS accounts
+  using VPC Lattice resource configurations. It includes VPC infrastructure, RDS database,
+  VPC Lattice service network, resource gateway, resource configuration, and monitoring.
+
+# ======================================
+# METADATA
+# ======================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Database Configuration"
+        Parameters:
+          - DatabaseInstanceClass
+          - DatabaseEngine
+          - DatabaseMasterUsername
+          - DatabaseMasterPassword
+          - DatabaseAllocatedStorage
+          - DatabaseBackupRetentionPeriod
+      - Label:
+          default: "VPC Lattice Configuration"
+        Parameters:
+          - ServiceNetworkName
+          - ResourceConfigurationName
+          - ResourceGatewayName
+          - AllowAssociationToShareableServiceNetwork
+      - Label:
+          default: "Cross-Account Sharing"
+        Parameters:
+          - ConsumerAccountId
+          - ExternalId
+          - ResourceShareName
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VPCCidr
+          - PrivateSubnetACidr
+          - PrivateSubnetBCidr
+          - GatewaySubnetCidr
+          - CreateVPCInfrastructure
+      - Label:
+          default: "Monitoring and Logging"
+        Parameters:
+          - EnableVPCFlowLogs
+          - EnableCloudWatchDashboard
+          - CloudWatchLogRetentionDays
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+
+# ======================================
+# PARAMETERS
+# ======================================
+Parameters:
+  # Database Configuration
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.t3.xlarge
+      - db.t3.2xlarge
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+    Description: The instance class for the RDS database
+
+  DatabaseEngine:
+    Type: String
+    Default: mysql
+    AllowedValues:
+      - mysql
+      - postgres
+      - mariadb
+    Description: The database engine for the RDS instance
+
+  DatabaseMasterUsername:
+    Type: String
+    Default: admin
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters
+    Description: The master username for the RDS database
+
+  DatabaseMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '[a-zA-Z0-9!@#$%^&*()_+=-]*'
+    ConstraintDescription: Must be 8-41 characters with alphanumeric and special characters
+    Description: The master password for the RDS database
+
+  DatabaseAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 65536
+    Description: The allocated storage size for the RDS database (GB)
+
+  DatabaseBackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 0
+    MaxValue: 35
+    Description: The number of days to retain automated backups (0 to disable)
+
+  # VPC Lattice Configuration
+  ServiceNetworkName:
+    Type: String
+    Default: database-sharing-network
+    MinLength: 3
+    MaxLength: 40
+    AllowedPattern: '[a-zA-Z0-9-_]*'
+    Description: Name for the VPC Lattice service network
+
+  ResourceConfigurationName:
+    Type: String
+    Default: rds-resource-config
+    MinLength: 3
+    MaxLength: 40
+    AllowedPattern: '[a-zA-Z0-9-_]*'
+    Description: Name for the VPC Lattice resource configuration
+
+  ResourceGatewayName:
+    Type: String
+    Default: rds-gateway
+    MinLength: 3
+    MaxLength: 40
+    AllowedPattern: '[a-zA-Z0-9-_]*'
+    Description: Name for the VPC Lattice resource gateway
+
+  AllowAssociationToShareableServiceNetwork:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Allow association to shareable service network
+
+  # Cross-Account Sharing
+  ConsumerAccountId:
+    Type: String
+    AllowedPattern: '[0-9]{12}'
+    ConstraintDescription: Must be a valid 12-digit AWS account ID
+    Description: The AWS account ID that will consume the shared database
+
+  ExternalId:
+    Type: String
+    Default: unique-external-id-12345
+    MinLength: 2
+    MaxLength: 1224
+    Description: External ID for cross-account role assumption (security best practice)
+
+  ResourceShareName:
+    Type: String
+    Default: DatabaseResourceShare
+    MinLength: 1
+    MaxLength: 255
+    Description: Name for the AWS RAM resource share
+
+  # Network Configuration
+  VPCCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\/([0-9]|[1-2][0-9]|3[0-2])$'
+    Description: CIDR block for the VPC
+
+  PrivateSubnetACidr:
+    Type: String
+    Default: 10.0.1.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\/([0-9]|[1-2][0-9]|3[0-2])$'
+    Description: CIDR block for the first private subnet
+
+  PrivateSubnetBCidr:
+    Type: String
+    Default: 10.0.2.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\/([0-9]|[1-2][0-9]|3[0-2])$'
+    Description: CIDR block for the second private subnet
+
+  GatewaySubnetCidr:
+    Type: String
+    Default: 10.0.3.0/28
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\/([0-9]|[1-2][0-9]|3[0-2])$'
+    Description: CIDR block for the resource gateway subnet (must be /28)
+
+  CreateVPCInfrastructure:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create VPC infrastructure or use existing
+
+  # Monitoring and Logging
+  EnableVPCFlowLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable VPC Flow Logs for network monitoring
+
+  EnableCloudWatchDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Create CloudWatch dashboard for monitoring
+
+  CloudWatchLogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: CloudWatch Logs retention period in days
+
+  # Resource Naming
+  ResourcePrefix:
+    Type: String
+    Default: database-sharing
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '[a-zA-Z0-9-]*'
+    Description: Prefix for resource names
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment designation for resource tagging
+
+# ======================================
+# CONDITIONS
+# ======================================
+Conditions:
+  CreateVPC: !Equals [!Ref CreateVPCInfrastructure, 'true']
+  EnableDashboard: !Equals [!Ref EnableCloudWatchDashboard, 'true']
+  EnableFlowLogs: !Equals [!Ref EnableVPCFlowLogs, 'true']
+  IsMySQLEngine: !Equals [!Ref DatabaseEngine, 'mysql']
+  IsPostgreSQLEngine: !Equals [!Ref DatabaseEngine, 'postgres']
+  IsMariaDBEngine: !Equals [!Ref DatabaseEngine, 'mariadb']
+
+# ======================================
+# MAPPINGS
+# ======================================
+Mappings:
+  DatabasePortMapping:
+    mysql:
+      Port: 3306
+    postgres:
+      Port: 5432
+    mariadb:
+      Port: 3306
+
+# ======================================
+# RESOURCES
+# ======================================
+Resources:
+
+  # ======================================
+  # VPC INFRASTRUCTURE
+  # ======================================
+
+  # Main VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Condition: CreateVPC
+    Properties:
+      CidrBlock: !Ref VPCCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database sharing with VPC Lattice
+
+  # Internet Gateway for public connectivity
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateVPC
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Attach Internet Gateway to VPC
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateVPC
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Private Subnet A (for RDS Multi-AZ requirement)
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-private-subnet-a'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: Private
+
+  # Private Subnet B (for RDS Multi-AZ requirement)
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-private-subnet-b'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: Private
+
+  # Gateway Subnet (for VPC Lattice Resource Gateway)
+  GatewaySubnet:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref GatewaySubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-gateway-subnet'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: Gateway
+
+  # Route Table for Private Subnets
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateVPC
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-private-rt'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Associate Private Subnet A with Route Table
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVPC
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetA
+
+  # Associate Private Subnet B with Route Table
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVPC
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetB
+
+  # Associate Gateway Subnet with Route Table
+  GatewaySubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVPC
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref GatewaySubnet
+
+  # ======================================
+  # SECURITY GROUPS
+  # ======================================
+
+  # Security Group for RDS Database
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for shared RDS database
+      VpcId: !If [CreateVPC, !Ref VPC, !Ref 'AWS::NoValue']
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !FindInMap [DatabasePortMapping, !Ref DatabaseEngine, Port]
+          ToPort: !FindInMap [DatabasePortMapping, !Ref DatabaseEngine, Port]
+          CidrIp: !Ref VPCCidr
+          Description: Allow database access from VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-db-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: RDS database security
+
+  # Security Group for VPC Lattice Resource Gateway
+  ResourceGatewaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for VPC Lattice resource gateway
+      VpcId: !If [CreateVPC, !Ref VPC, !Ref 'AWS::NoValue']
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          CidrIp: !Ref VPCCidr
+          Description: Allow all traffic from VPC for resource gateway
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-gateway-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: VPC Lattice resource gateway security
+
+  # ======================================
+  # RDS DATABASE
+  # ======================================
+
+  # DB Subnet Group for RDS
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for shared RDS database
+      SubnetIds:
+        - !If [CreateVPC, !Ref PrivateSubnetA, !Ref 'AWS::NoValue']
+        - !If [CreateVPC, !Ref PrivateSubnetB, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-db-subnet-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # RDS Database Instance
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ResourcePrefix}-database'
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      Engine: !Ref DatabaseEngine
+      MasterUsername: !Ref DatabaseMasterUsername
+      MasterUserPassword: !Ref DatabaseMasterPassword
+      AllocatedStorage: !Ref DatabaseAllocatedStorage
+      StorageType: gp2
+      StorageEncrypted: true
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      BackupRetentionPeriod: !Ref DatabaseBackupRetentionPeriod
+      MultiAZ: false  # Set to true for production workloads
+      PubliclyAccessible: false
+      DeletionProtection: false  # Set to true for production workloads
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RDSEnhancedMonitoringRole.Arn
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      AutoMinorVersionUpgrade: true
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-database'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Shared database for cross-account access
+
+  # IAM Role for RDS Enhanced Monitoring
+  RDSEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-rds-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole'
+      Path: /
+
+  # ======================================
+  # VPC LATTICE RESOURCES
+  # ======================================
+
+  # VPC Lattice Service Network
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Properties:
+      Name: !Sub '${ResourcePrefix}-${ServiceNetworkName}'
+      AuthType: AWS_IAM
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-${ServiceNetworkName}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Cross-account database sharing
+
+  # VPC Lattice Service Network VPC Association
+  ServiceNetworkVpcAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Properties:
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      VpcIdentifier: !If [CreateVPC, !Ref VPC, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-sn-vpc-association'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # VPC Lattice Resource Gateway
+  ResourceGateway:
+    Type: AWS::VpcLattice::ResourceGateway
+    Properties:
+      Name: !Sub '${ResourcePrefix}-${ResourceGatewayName}'
+      VpcIdentifier: !If [CreateVPC, !Ref VPC, !Ref 'AWS::NoValue']
+      SubnetIds:
+        - !If [CreateVPC, !Ref GatewaySubnet, !Ref 'AWS::NoValue']
+      SecurityGroupIds:
+        - !Ref ResourceGatewaySecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-${ResourceGatewayName}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database resource gateway
+
+  # VPC Lattice Resource Configuration
+  ResourceConfiguration:
+    Type: AWS::VpcLattice::ResourceConfiguration
+    Properties:
+      Name: !Sub '${ResourcePrefix}-${ResourceConfigurationName}'
+      Type: SINGLE
+      ResourceGatewayIdentifier: !Ref ResourceGateway
+      ResourceConfigurationDefinition:
+        IpResource:
+          IpAddress: !GetAtt Database.Endpoint.Address
+      Protocol: TCP
+      PortRanges:
+        - !FindInMap [DatabasePortMapping, !Ref DatabaseEngine, Port]
+      AllowAssociationToShareableServiceNetwork: !Ref AllowAssociationToShareableServiceNetwork
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-${ResourceConfigurationName}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: RDS database resource configuration
+
+  # VPC Lattice Resource Configuration Association
+  ResourceConfigurationAssociation:
+    Type: AWS::VpcLattice::ResourceConfigurationAssociation
+    Properties:
+      ResourceConfigurationIdentifier: !Ref ResourceConfiguration
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-resource-config-association'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ======================================
+  # IAM ROLES AND POLICIES
+  # ======================================
+
+  # Cross-Account IAM Role for Database Access
+  CrossAccountDatabaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-CrossAccountDatabaseRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${ConsumerAccountId}:root'
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref ExternalId
+      Policies:
+        - PolicyName: DatabaseAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'vpc-lattice:Invoke'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vpc-lattice/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-CrossAccountDatabaseRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Cross-account database access via VPC Lattice
+
+  # Service Network Authentication Policy
+  ServiceNetworkAuthPolicy:
+    Type: AWS::VpcLattice::AuthPolicy
+    Properties:
+      ResourceIdentifier: !Ref ServiceNetwork
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt CrossAccountDatabaseRole.Arn
+            Action: 'vpc-lattice:Invoke'
+            Resource: '*'
+
+  # ======================================
+  # AWS RAM RESOURCE SHARE
+  # ======================================
+
+  # AWS RAM Resource Share for Cross-Account Sharing
+  ResourceShare:
+    Type: AWS::RAM::ResourceShare
+    Properties:
+      Name: !Sub '${ResourcePrefix}-${ResourceShareName}'
+      ResourceArns:
+        - !Sub 'arn:aws:vpc-lattice:${AWS::Region}:${AWS::AccountId}:resourceconfiguration/${ResourceConfiguration}'
+      Principals:
+        - !Ref ConsumerAccountId
+      AllowExternalPrincipals: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-${ResourceShareName}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Cross-account database resource sharing
+
+  # ======================================
+  # MONITORING AND LOGGING
+  # ======================================
+
+  # CloudWatch Log Group for VPC Lattice
+  VPCLatticeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vpc-lattice/servicenetwork/${ServiceNetwork}'
+      RetentionInDays: !Ref CloudWatchLogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-vpc-lattice-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for VPC Flow Logs
+  VPCFlowLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableFlowLogs
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/flowlogs/${ResourcePrefix}'
+      RetentionInDays: !Ref CloudWatchLogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-vpc-flow-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for VPC Flow Logs
+  VPCFlowLogsRole:
+    Type: AWS::IAM::Role
+    Condition: EnableFlowLogs
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: CloudWatchLogPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: '*'
+
+  # VPC Flow Logs
+  VPCFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Condition: EnableFlowLogs
+    Properties:
+      ResourceType: VPC
+      ResourceIds:
+        - !If [CreateVPC, !Ref VPC, !Ref 'AWS::NoValue']
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VPCFlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+      LogFormat: '${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${windowstart} ${windowend} ${action} ${flowlogstatus}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-vpc-flow-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDashboard
+    Properties:
+      DashboardName: !Sub '${ResourcePrefix}-DatabaseSharingMonitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/VpcLattice", "RequestCount", "ServiceNetwork", "${ServiceNetwork}"],
+                  [".", "ResponseTime", ".", "."],
+                  [".", "ActiveConnectionCount", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "VPC Lattice Database Access Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${Database}"],
+                  [".", "DatabaseConnections", ".", "."],
+                  [".", "FreeableMemory", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "RDS Database Performance Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/vpc-lattice/servicenetwork/${ServiceNetwork}' | fields @timestamp, @message\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "VPC Lattice Access Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# ======================================
+# OUTPUTS
+# ======================================
+Outputs:
+  # VPC Information
+  VPCId:
+    Description: ID of the VPC
+    Value: !If [CreateVPC, !Ref VPC, 'N/A - Using existing VPC']
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  VPCCidrBlock:
+    Description: CIDR block of the VPC
+    Value: !If [CreateVPC, !Ref VPCCidr, 'N/A - Using existing VPC']
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-CIDR'
+
+  # Database Information
+  DatabaseInstanceId:
+    Description: RDS Database Instance Identifier
+    Value: !Ref Database
+    Export:
+      Name: !Sub '${AWS::StackName}-Database-ID'
+
+  DatabaseEndpoint:
+    Description: RDS Database Connection Endpoint
+    Value: !GetAtt Database.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-Database-Endpoint'
+
+  DatabasePort:
+    Description: RDS Database Port
+    Value: !GetAtt Database.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-Database-Port'
+
+  DatabaseEngine:
+    Description: RDS Database Engine
+    Value: !Ref DatabaseEngine
+    Export:
+      Name: !Sub '${AWS::StackName}-Database-Engine'
+
+  # VPC Lattice Information
+  ServiceNetworkId:
+    Description: VPC Lattice Service Network ID
+    Value: !Ref ServiceNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetwork-ID'
+
+  ServiceNetworkArn:
+    Description: VPC Lattice Service Network ARN
+    Value: !GetAtt ServiceNetwork.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceNetwork-ARN'
+
+  ResourceGatewayId:
+    Description: VPC Lattice Resource Gateway ID
+    Value: !Ref ResourceGateway
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceGateway-ID'
+
+  ResourceConfigurationId:
+    Description: VPC Lattice Resource Configuration ID
+    Value: !Ref ResourceConfiguration
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceConfiguration-ID'
+
+  ResourceConfigurationArn:
+    Description: VPC Lattice Resource Configuration ARN
+    Value: !GetAtt ResourceConfiguration.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceConfiguration-ARN'
+
+  # Cross-Account Access Information
+  CrossAccountRoleArn:
+    Description: ARN of the cross-account IAM role for database access
+    Value: !GetAtt CrossAccountDatabaseRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CrossAccountRole-ARN'
+
+  ResourceShareArn:
+    Description: AWS RAM Resource Share ARN
+    Value: !Ref ResourceShare
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceShare-ARN'
+
+  ExternalId:
+    Description: External ID for cross-account role assumption
+    Value: !Ref ExternalId
+    Export:
+      Name: !Sub '${AWS::StackName}-ExternalID'
+
+  # Monitoring Information
+  VPCLatticeLogGroup:
+    Description: CloudWatch Log Group for VPC Lattice logs
+    Value: !Ref VPCLatticeLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCLattice-LogGroup'
+
+  DashboardURL:
+    Condition: EnableDashboard
+    Description: CloudWatch Dashboard URL for monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-DatabaseSharingMonitoring'
+    Export:
+      Name: !Sub '${AWS::StackName}-Dashboard-URL'
+
+  # Connection Information for Consumer Account
+  ConsumerConnectionInfo:
+    Description: Information needed by the consumer account to connect
+    Value: !Sub |
+      Service Network ID: ${ServiceNetwork}
+      Resource Configuration ARN: ${ResourceConfiguration}
+      Cross-Account Role ARN: ${CrossAccountDatabaseRole.Arn}
+      External ID: ${ExternalId}
+      Database Endpoint: ${Database.Endpoint.Address}
+      Database Port: ${Database.Endpoint.Port}
+      Resource Share ARN: ${ResourceShare}
+    Export:
+      Name: !Sub '${AWS::StackName}-Consumer-Connection-Info'
+
+  # Security Information
+  DatabaseSecurityGroupId:
+    Description: Security Group ID for the RDS database
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Database-SecurityGroup-ID'
+
+  ResourceGatewaySecurityGroupId:
+    Description: Security Group ID for the VPC Lattice resource gateway
+    Value: !Ref ResourceGatewaySecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceGateway-SecurityGroup-ID'
+
+  # Deployment Summary
+  DeploymentSummary:
+    Description: Summary of deployed resources for cross-account database sharing
+    Value: !Sub |
+      Successfully deployed cross-account database sharing solution:
+      - RDS Database: ${Database} (${DatabaseEngine})
+      - VPC Lattice Service Network: ${ServiceNetwork}
+      - Resource Gateway: ${ResourceGateway}
+      - Resource Configuration: ${ResourceConfiguration}
+      - Cross-Account Role: ${CrossAccountDatabaseRole.Arn}
+      - Resource Share: ${ResourceShare}
+      
+      Next steps:
+      1. Consumer account (${ConsumerAccountId}) should accept the resource share
+      2. Consumer account should create VPC association with the service network
+      3. Consumer account should assume the cross-account role using External ID: ${ExternalId}
+      4. Test database connectivity through VPC Lattice

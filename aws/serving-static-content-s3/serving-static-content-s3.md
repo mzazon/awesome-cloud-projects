@@ -5,11 +5,11 @@ category: storage
 difficulty: 200
 subject: aws
 services: s3, cloudfront, acm, route53
-estimated-time: 30 minutes
-recipe-version: 1.1
+estimated-time: 45 minutes
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: storage,hosting,website,cloudfront,s3,serverless,beginner
 recipe-generator-version: 1.3
@@ -19,11 +19,13 @@ recipe-generator-version: 1.3
 
 ## Problem
 
-Your organization needs to host static website content (HTML, CSS, JavaScript, images) that is accessible globally with low latency. The website requires HTTPS support for security, and you want to minimize infrastructure management overhead while keeping costs low. Traditional web hosting solutions using EC2 instances require ongoing maintenance, patching, and scaling configurations, which your team wants to avoid. Additionally, you need a solution that provides high availability and scales automatically with traffic spikes.
+Your organization needs to host static website content (HTML, CSS, JavaScript, images) that is accessible globally with low latency and enhanced security. The website requires HTTPS support for compliance, and you want to minimize infrastructure management overhead while keeping costs low. Traditional web hosting solutions using EC2 instances require ongoing maintenance, patching, and scaling configurations, which your team wants to avoid. Additionally, you need a solution that provides high availability, automatic scaling during traffic spikes, and protection against unauthorized direct access to your content storage.
 
 ## Solution
 
-Implement a serverless static website hosting solution using Amazon S3 to store content and Amazon CloudFront to deliver it globally with low latency. This architecture uses S3 for cost-effective, durable storage of all website files, while CloudFront's global content delivery network caches content at edge locations close to users. The solution includes HTTPS support through AWS Certificate Manager and optional custom domain configuration with Route 53. This approach eliminates server management, automatically scales to handle traffic spikes, and significantly reduces latency for global visitors.
+Implement a serverless static website hosting solution using Amazon S3 for cost-effective, durable storage and Amazon CloudFront for global content delivery with enhanced security. This architecture uses S3 as a private origin with CloudFront's Origin Access Control (OAC) to ensure content can only be accessed through the CDN, not directly from S3. CloudFront's global edge network caches content at over 400 locations worldwide, dramatically reducing latency for users. The solution includes automatic HTTPS encryption through AWS Certificate Manager and optional custom domain configuration with Route 53. This approach eliminates server management, automatically scales to handle traffic spikes, and provides built-in DDoS protection through AWS Shield Standard.
+
+## Architecture Diagram
 
 ```mermaid
 graph LR
@@ -36,10 +38,10 @@ graph LR
     
     USER -->|1. Request website| DNS
     DNS -->|2. Direct to CloudFront| CDN
-    CDN -->|3. HTTPS Request| USER
+    CDN -->|3. HTTPS Response| USER
     CERT -.->|SSL Certificate| CDN
-    CDN -->|4. Request content| BUCKET
-    OAC -.->|Secure access| CDN
+    CDN -->|4. Secure request via OAC| BUCKET
+    OAC -.->|SigV4 authentication| CDN
     BUCKET -->|5. Return files| CDN
     CDN -->|6. Deliver cached content| USER
     
@@ -52,14 +54,14 @@ graph LR
 
 ## Prerequisites
 
-1. AWS account with permissions to create S3 buckets, CloudFront distributions, and IAM policies
+1. AWS account with permissions to create S3 buckets, CloudFront distributions, ACM certificates, and IAM policies
 2. AWS CLI v2 installed and configured with appropriate credentials
 3. Basic website files (HTML, CSS, JavaScript) ready to upload
-4. Domain name (optional, for custom domain setup)
-5. Basic understanding of DNS if using a custom domain
-6. Estimated monthly cost for a small website: S3 storage (~$0.023/GB), CloudFront data transfer (~$0.085/GB), Request pricing (minimal)
+4. Domain name registered (optional, for custom domain setup)
+5. Basic understanding of DNS configuration if using a custom domain
+6. Estimated monthly cost for a small website: S3 storage (~$0.023/GB), CloudFront data transfer (~$0.085/GB for first 10TB), Request pricing (minimal for static sites)
 
-> **Note**: This recipe can be completed using the AWS Management Console instead of CLI if preferred. We provide CLI commands for automation and reproducibility.
+> **Note**: This recipe uses AWS best practices including Origin Access Control (OAC) instead of the legacy Origin Access Identity (OAI). OAC provides enhanced security with short-term credentials and supports all AWS regions including those launched after December 2022.
 
 ## Preparation
 
@@ -111,7 +113,7 @@ if [ ! -d "website" ]; then
     mkdir -p website
     
     # Create index.html
-    cat > website/index.html << EOF
+    cat > website/index.html << 'EOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -125,6 +127,7 @@ if [ ! -d "website" ]; then
         <h1>Hello from Amazon S3 and CloudFront!</h1>
         <p>This static website is served from Amazon S3 and delivered via CloudFront.</p>
         <p>The current time is: <span id="current-time"></span></p>
+        <p><small>Secured with Origin Access Control (OAC)</small></p>
     </div>
     <script src="script.js"></script>
 </body>
@@ -132,40 +135,53 @@ if [ ! -d "website" ]; then
 EOF
     
     # Create styles.css
-    cat > website/styles.css << EOF
+    cat > website/styles.css << 'EOF'
 body {
-    font-family: Arial, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     line-height: 1.6;
     margin: 0;
     padding: 0;
-    background-color: #f4f4f4;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
     display: flex;
     justify-content: center;
     align-items: center;
-    height: 100vh;
+    min-height: 100vh;
 }
 
 .container {
     max-width: 800px;
-    margin: 0 auto;
-    padding: 30px;
+    margin: 20px;
+    padding: 40px;
     background-color: white;
-    border-radius: 8px;
-    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    border-radius: 12px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
     text-align: center;
 }
 
 h1 {
     color: #ff9900;
+    margin-bottom: 20px;
+}
+
+p {
+    color: #333;
+    margin-bottom: 15px;
+}
+
+small {
+    color: #666;
 }
 EOF
     
     # Create script.js
-    cat > website/script.js << EOF
+    cat > website/script.js << 'EOF'
 document.addEventListener('DOMContentLoaded', function() {
     function updateTime() {
         const now = new Date();
-        document.getElementById('current-time').textContent = now.toLocaleTimeString();
+        const timeElement = document.getElementById('current-time');
+        if (timeElement) {
+            timeElement.textContent = now.toLocaleTimeString();
+        }
     }
     
     updateTime();
@@ -174,7 +190,7 @@ document.addEventListener('DOMContentLoaded', function() {
 EOF
     
     # Create error.html
-    cat > website/error.html << EOF
+    cat > website/error.html << 'EOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -187,7 +203,7 @@ EOF
     <div class="container">
         <h1>404 - Page Not Found</h1>
         <p>The page you're looking for doesn't exist.</p>
-        <p><a href="/">Return to homepage</a></p>
+        <p><a href="/" style="color: #ff9900; text-decoration: none;">Return to homepage</a></p>
     </div>
 </body>
 </html>
@@ -199,12 +215,12 @@ fi
 
 ## Steps
 
-1. **Create S3 buckets for website content and logs**:
+1. **Create S3 bucket for website content with security best practices**:
 
-   Amazon S3 (Simple Storage Service) provides the foundation of our static website hosting architecture with 99.999999999% (11 9's) durability and virtually unlimited scalability. We'll create two buckets: one for hosting website content and another for storing CloudFront access logs. S3's regional storage ensures high availability while keeping costs low, as you only pay for actual storage used without any minimum fees or upfront commitments.
+   Amazon S3 provides the foundation for our static website hosting with 99.999999999% (11 9's) durability and virtually unlimited scalability. We'll create a private S3 bucket that will serve as the origin for CloudFront, following AWS security best practices by keeping the bucket private and using Origin Access Control (OAC) for secure access. This approach ensures that content can only be accessed through CloudFront, preventing direct public access to your S3 bucket.
 
    ```bash
-   # Create main website bucket
+   # Create main website bucket (private by default)
    aws s3api create-bucket \
        --bucket $BUCKET_NAME \
        --region $AWS_REGION \
@@ -212,13 +228,20 @@ fi
            echo "--create-bucket-configuration LocationConstraint=$AWS_REGION"; 
        fi)
    
-   # Create bucket for access logs
+   # Create bucket for CloudFront access logs
    aws s3api create-bucket \
        --bucket $LOGS_BUCKET_NAME \
        --region $AWS_REGION \
        $(if [ "$AWS_REGION" != "us-east-1" ]; then 
            echo "--create-bucket-configuration LocationConstraint=$AWS_REGION"; 
        fi)
+   
+   # Ensure public access is blocked (default for new buckets)
+   aws s3api put-public-access-block \
+       --bucket $BUCKET_NAME \
+       --public-access-block-configuration \
+           "BlockPublicAcls=true,IgnorePublicAcls=true,\
+           BlockPublicPolicy=true,RestrictPublicBuckets=true"
    
    # Block public access for logs bucket
    aws s3api put-public-access-block \
@@ -227,87 +250,80 @@ fi
            "BlockPublicAcls=true,IgnorePublicAcls=true,\
            BlockPublicPolicy=true,RestrictPublicBuckets=true"
    
-   # Enable static website hosting on the main bucket
-   aws s3 website \
-       $BUCKET_NAME \
-       --index-document index.html \
-       --error-document error.html
+   # Set bucket ownership to BucketOwnerEnforced (required for OAC)
+   aws s3api put-bucket-ownership-controls \
+       --bucket $BUCKET_NAME \
+       --ownership-controls Rules='[{ObjectOwnership=BucketOwnerEnforced}]'
    
-   echo "✅ Created S3 buckets for website and logs"
+   echo "✅ Created private S3 bucket with security best practices"
    ```
 
-   The S3 buckets are now established as the storage foundation for your website. The main bucket will serve as the origin for CloudFront, while the logs bucket will capture detailed access information for analytics and monitoring. Static website hosting is enabled on the main bucket, allowing it to serve index.html as the default document and error.html for 404 errors.
+   The S3 bucket is now configured as a secure, private origin that follows AWS security best practices. By keeping the bucket private and configuring BucketOwnerEnforced ownership, we ensure that only CloudFront can access the content through the Origin Access Control mechanism we'll configure next.
 
-2. **Upload website content with proper MIME types**:
+2. **Upload website content with optimized content types and cache headers**:
 
-   Proper content-type headers are crucial for web browsers to correctly interpret and display your website files. S3 automatically detects some file types, but explicitly setting content-types ensures optimal browser rendering and prevents security issues. This step demonstrates best practices for organizing and uploading different file types while maintaining proper HTTP headers for performance and security.
+   Proper content-type headers and cache-control settings are crucial for optimal performance and security. S3 automatically detects some file types, but explicitly setting content-types and cache headers ensures optimal browser rendering, prevents security issues, and maximizes CloudFront cache efficiency. This step demonstrates best practices for content optimization.
 
    ```bash
-   # Upload website files with proper content types
-   aws s3 sync website/ s3://$BUCKET_NAME/ \
-       --include "*" \
-       --exclude "*.html" \
-       --exclude "*.css" \
-       --exclude "*.js" \
-       --exclude "*.json" \
-       --exclude "*.xml" \
-       --exclude "*.svg" \
-       --exclude "*.jpg" \
-       --exclude "*.jpeg" \
-       --exclude "*.png" \
-       --exclude "*.gif"
-   
-   # Upload HTML files with correct content-type
+   # Upload HTML files with cache headers optimized for content updates
    aws s3 sync website/ s3://$BUCKET_NAME/ \
        --exclude "*" \
        --include "*.html" \
-       --content-type "text/html"
+       --content-type "text/html; charset=utf-8" \
+       --cache-control "public, max-age=0, must-revalidate"
    
-   # Upload CSS files with correct content-type
+   # Upload CSS files with longer cache duration
    aws s3 sync website/ s3://$BUCKET_NAME/ \
        --exclude "*" \
        --include "*.css" \
-       --content-type "text/css"
+       --content-type "text/css; charset=utf-8" \
+       --cache-control "public, max-age=31536000"
    
-   # Upload JavaScript files with correct content-type
+   # Upload JavaScript files with longer cache duration
    aws s3 sync website/ s3://$BUCKET_NAME/ \
        --exclude "*" \
        --include "*.js" \
-       --content-type "application/javascript"
+       --content-type "application/javascript; charset=utf-8" \
+       --cache-control "public, max-age=31536000"
    
-   # Upload image files with correct content-types (if any)
+   # Upload image files with optimized cache headers
    aws s3 sync website/ s3://$BUCKET_NAME/ \
-       --exclude "*" \
-       --include "*.jpg" --include "*.jpeg" \
-       --content-type "image/jpeg"
-   
-   aws s3 sync website/ s3://$BUCKET_NAME/ \
-       --exclude "*" \
-       --include "*.png" \
-       --content-type "image/png"
+       --exclude "*" --include "*.jpg" --include "*.jpeg" \
+       --content-type "image/jpeg" \
+       --cache-control "public, max-age=31536000"
    
    aws s3 sync website/ s3://$BUCKET_NAME/ \
-       --exclude "*" \
-       --include "*.gif" \
-       --content-type "image/gif"
+       --exclude "*" --include "*.png" \
+       --content-type "image/png" \
+       --cache-control "public, max-age=31536000"
    
-   echo "✅ Uploaded website content to S3 bucket"
+   aws s3 sync website/ s3://$BUCKET_NAME/ \
+       --exclude "*" --include "*.gif" \
+       --content-type "image/gif" \
+       --cache-control "public, max-age=31536000"
+   
+   # Upload any remaining files
+   aws s3 sync website/ s3://$BUCKET_NAME/ \
+       --exclude "*.html" --exclude "*.css" --exclude "*.js" \
+       --exclude "*.jpg" --exclude "*.jpeg" --exclude "*.png" --exclude "*.gif"
+   
+   echo "✅ Uploaded website content with optimized cache headers"
    ```
 
-   Your website files are now stored in S3 with appropriate content-type headers, ensuring browsers render them correctly. The systematic upload approach by file type guarantees proper MIME type assignment, which is essential for security (preventing XSS attacks) and performance (enabling browser caching and compression).
+   Your website files are now stored in S3 with appropriate content-type headers and cache-control settings. HTML files are configured for immediate cache invalidation to allow quick content updates, while static assets (CSS, JS, images) have longer cache durations for optimal performance.
 
-   > **Warning**: Always ensure your S3 bucket remains private and is not configured for public access. The Origin Access Control and bucket policy provide the security layer that prevents direct access while allowing CloudFront to serve your content.
+   > **Tip**: The cache-control headers set on S3 objects work in conjunction with CloudFront caching. HTML files use `must-revalidate` to ensure content freshness, while static assets use long cache durations since they're typically versioned or change infrequently.
 
-3. **Create Origin Access Control for secure CloudFront access**:
+3. **Create Origin Access Control for enhanced security**:
 
-   Origin Access Control (OAC) is AWS's modern security mechanism that replaces the legacy Origin Access Identity (OAI). OAC uses AWS Signature Version 4 (SigV4) for authentication, providing enhanced security and support for additional AWS services. This security layer ensures that your S3 bucket content can only be accessed through CloudFront, preventing direct public access to your S3 bucket while maintaining the performance benefits of CloudFront's global edge network.
+   Origin Access Control (OAC) is AWS's modern security mechanism that replaces the legacy Origin Access Identity (OAI). OAC uses AWS Signature Version 4 (SigV4) for authentication, provides enhanced security with short-term credentials, and supports all AWS regions including those launched after December 2022. This security layer ensures your S3 bucket content can only be accessed through CloudFront.
 
    ```bash
-   # Create Origin Access Control
+   # Create Origin Access Control with recommended settings
    OAC_ID=$(aws cloudfront create-origin-access-control \
        --origin-access-control-config '{
-           "Name": "S3OriginAccessControl",
-           "Description": "OAC for S3 static website",
+           "Name": "'${BUCKET_NAME}'-OAC",
+           "Description": "OAC for S3 static website bucket",
            "SigningProtocol": "sigv4",
            "SigningBehavior": "always",
            "OriginAccessControlOriginType": "s3"
@@ -316,28 +332,31 @@ fi
        --output text)
    
    echo "✅ Created Origin Access Control: $OAC_ID"
+   echo "OAC will use SigV4 signing for enhanced security"
    ```
 
-   The Origin Access Control is now configured and ready to secure the connection between CloudFront and your S3 bucket. This critical security component ensures that users cannot bypass CloudFront to access your content directly from S3, maintaining both security and allowing you to leverage CloudFront's caching, compression, and global distribution capabilities.
+   The Origin Access Control is now configured with AWS best practices, including "always" signing behavior which ensures all requests between CloudFront and S3 use secure SigV4 authentication. This provides superior security compared to the legacy OAI approach and supports modern AWS features.
 
-4. **Set up SSL certificate for HTTPS encryption**:
+4. **Request SSL certificate for HTTPS encryption**:
 
-   AWS Certificate Manager (ACM) provides free SSL/TLS certificates for securing your website with HTTPS encryption. For CloudFront distributions, certificates must be requested in the us-east-1 region regardless of where your other resources are located. The DNS validation method automatically proves domain ownership by adding a CNAME record to your DNS configuration, ensuring secure certificate issuance without manual verification steps.
+   AWS Certificate Manager (ACM) provides free SSL/TLS certificates that automatically renew. For CloudFront distributions, certificates must be requested in the us-east-1 region regardless of your other resources' location. DNS validation is the recommended method as it automatically proves domain ownership and enables automation.
 
    ```bash
    if [ "$SETUP_DOMAIN" = "y" ]; then
-       # Request a certificate in us-east-1 (required for CloudFront)
+       # Request certificate in us-east-1 (required for CloudFront)
        CERT_ARN=$(aws acm request-certificate \
            --domain-name $DOMAIN_NAME \
+           --subject-alternative-names "www.$DOMAIN_NAME" \
            --validation-method DNS \
            --region us-east-1 \
            --query 'CertificateArn' \
            --output text)
        
        echo "✅ Requested SSL certificate: $CERT_ARN"
+       echo "Certificate includes both apex and www subdomain"
        
        # Get validation record details
-       sleep 5  # Brief pause to ensure certificate details are available
+       sleep 5
        
        VALIDATION_RECORD=$(aws acm describe-certificate \
            --certificate-arn $CERT_ARN \
@@ -371,42 +390,42 @@ fi
                --output text)
            
            echo "✅ Added validation record to Route 53"
-           echo "Waiting for validation to complete (this may take several minutes)..."
+           echo "Waiting for certificate validation..."
            
-           # Wait for certificate validation
+           # Wait for certificate validation (typically 2-5 minutes)
            aws acm wait certificate-validated \
                --certificate-arn $CERT_ARN \
                --region us-east-1
                
-           echo "✅ Certificate validated successfully"
+           echo "✅ Certificate validated and ready for use"
        else
-           echo "Please add this CNAME record to your DNS provider to validate the certificate:"
+           echo "Please add this CNAME record to your DNS provider:"
            echo "Name: $VALIDATION_NAME"
            echo "Value: $VALIDATION_VALUE"
-           echo "Then wait for validation to complete before proceeding"
-           read -p "Press Enter once the certificate is validated... "
+           echo "Certificate will be validated automatically once DNS record is added"
+           read -p "Press Enter once the certificate shows 'Issued' status..."
        fi
    fi
    ```
 
-   The SSL certificate is now requested and validated, providing the cryptographic foundation for secure HTTPS connections. This certificate will automatically encrypt all data in transit between your users and CloudFront edge locations, meeting modern security requirements and improving SEO rankings. ACM handles certificate renewal automatically, eliminating ongoing maintenance overhead.
+   The SSL certificate is now requested and configured for automatic validation. ACM handles certificate renewal automatically, eliminating ongoing maintenance. The certificate includes both the apex domain and www subdomain for comprehensive coverage.
 
-5. **Create CloudFront distribution for global content delivery**:
+5. **Create CloudFront distribution with optimized settings**:
 
-   CloudFront is AWS's global content delivery network (CDN) with over 400 edge locations worldwide. This distribution will cache your website content at edge locations closest to your users, dramatically reducing latency and improving user experience. The configuration includes compression, HTTPS redirection, custom error pages, and cost optimization through PriceClass_100 (North America and Europe edge locations only).
+   CloudFront is AWS's global content delivery network with over 400 edge locations worldwide. This distribution configuration includes modern security settings, optimal caching policies, compression, and cost optimization through PriceClass_100 (North America and Europe). The configuration uses AWS managed cache policies for optimal performance.
 
    ```bash
-   # Define CloudFront configuration based on domain setup
+   # Create CloudFront distribution configuration
    if [ "$SETUP_DOMAIN" = "y" ]; then
        DISTRIBUTION_CONFIG='{
            "CallerReference": "'${RANDOM_STRING}'",
-           "Comment": "Distribution for '${DOMAIN_NAME}'",
+           "Comment": "Static website for '${DOMAIN_NAME}' with OAC",
            "DefaultRootObject": "index.html",
            "Origins": {
                "Quantity": 1,
                "Items": [
                    {
-                       "Id": "S3Origin",
+                       "Id": "S3-'${BUCKET_NAME}'",
                        "DomainName": "'${BUCKET_NAME}'.s3.'${AWS_REGION}'.amazonaws.com",
                        "S3OriginConfig": {
                            "OriginAccessIdentity": ""
@@ -416,7 +435,7 @@ fi
                ]
            },
            "DefaultCacheBehavior": {
-               "TargetOriginId": "S3Origin",
+               "TargetOriginId": "S3-'${BUCKET_NAME}'",
                "ViewerProtocolPolicy": "redirect-to-https",
                "AllowedMethods": {
                    "Quantity": 2,
@@ -430,19 +449,25 @@ fi
                "Compress": true
            },
            "Aliases": {
-               "Quantity": 1,
-               "Items": ["'${DOMAIN_NAME}'"]
+               "Quantity": 2,
+               "Items": ["'${DOMAIN_NAME}'", "www.'${DOMAIN_NAME}'"]
            },
            "ViewerCertificate": {
                "ACMCertificateArn": "'${CERT_ARN}'",
                "SSLSupportMethod": "sni-only",
-               "MinimumProtocolVersion": "TLSv1.2_2021"
+               "MinimumProtocolVersion": "TLSv1.2_2019"
            },
            "CustomErrorResponses": {
-               "Quantity": 1,
+               "Quantity": 2,
                "Items": [
                    {
                        "ErrorCode": 404,
+                       "ResponsePagePath": "/error.html",
+                       "ResponseCode": "404",
+                       "ErrorCachingMinTTL": 300
+                   },
+                   {
+                       "ErrorCode": 403,
                        "ResponsePagePath": "/error.html",
                        "ResponseCode": "404",
                        "ErrorCachingMinTTL": 300
@@ -450,18 +475,19 @@ fi
                ]
            },
            "Enabled": true,
-           "PriceClass": "PriceClass_100"
+           "PriceClass": "PriceClass_100",
+           "HttpVersion": "http2and3"
        }'
    else
        DISTRIBUTION_CONFIG='{
            "CallerReference": "'${RANDOM_STRING}'",
-           "Comment": "Distribution for S3 static website",
+           "Comment": "Static website with OAC security",
            "DefaultRootObject": "index.html",
            "Origins": {
                "Quantity": 1,
                "Items": [
                    {
-                       "Id": "S3Origin",
+                       "Id": "S3-'${BUCKET_NAME}'",
                        "DomainName": "'${BUCKET_NAME}'.s3.'${AWS_REGION}'.amazonaws.com",
                        "S3OriginConfig": {
                            "OriginAccessIdentity": ""
@@ -471,7 +497,7 @@ fi
                ]
            },
            "DefaultCacheBehavior": {
-               "TargetOriginId": "S3Origin",
+               "TargetOriginId": "S3-'${BUCKET_NAME}'",
                "ViewerProtocolPolicy": "redirect-to-https",
                "AllowedMethods": {
                    "Quantity": 2,
@@ -485,10 +511,16 @@ fi
                "Compress": true
            },
            "CustomErrorResponses": {
-               "Quantity": 1,
+               "Quantity": 2,
                "Items": [
                    {
                        "ErrorCode": 404,
+                       "ResponsePagePath": "/error.html",
+                       "ResponseCode": "404",
+                       "ErrorCachingMinTTL": 300
+                   },
+                   {
+                       "ErrorCode": 403,
                        "ResponsePagePath": "/error.html",
                        "ResponseCode": "404",
                        "ErrorCachingMinTTL": 300
@@ -496,11 +528,12 @@ fi
                ]
            },
            "Enabled": true,
-           "PriceClass": "PriceClass_100"
+           "PriceClass": "PriceClass_100",
+           "HttpVersion": "http2and3"
        }'
    fi
    
-   # Save the distribution config to a file
+   # Save configuration and create distribution
    echo $DISTRIBUTION_CONFIG > distribution-config.json
    
    # Create CloudFront distribution
@@ -509,23 +542,24 @@ fi
        --query 'Distribution.Id' \
        --output text)
    
-   DISTRIBUTION_DOMAIN=$(aws cloudfront describe-distribution \
+   DISTRIBUTION_DOMAIN=$(aws cloudfront get-distribution \
        --id $DISTRIBUTION_ID \
        --query 'Distribution.DomainName' \
        --output text)
    
    echo "✅ Created CloudFront distribution: $DISTRIBUTION_ID"
    echo "CloudFront domain: $DISTRIBUTION_DOMAIN"
+   echo "Distribution supports HTTP/2 and HTTP/3 for optimal performance"
    ```
 
-   Your CloudFront distribution is now created and will begin deploying to edge locations worldwide. This process typically takes 5-15 minutes to complete. Once deployed, users will access your website through CloudFront's optimized network, benefiting from edge caching, automatic compression, and geographic proximity to reduce load times significantly.
+   Your CloudFront distribution is now created with modern performance and security settings. The distribution uses the CachingOptimized managed policy (ID: 658327ea-f89d-4fab-a63d-7e88639e58f6) for optimal cache efficiency and supports HTTP/2 and HTTP/3 protocols for the best possible performance.
 
-6. **Configure S3 bucket policy for secure CloudFront access**:
+6. **Configure S3 bucket policy to allow secure CloudFront access**:
 
-   The bucket policy implements the principle of least privilege by granting CloudFront read-only access to your S3 bucket contents while blocking all other access. This policy uses the CloudFront service principal and includes a condition that verifies the request originates from your specific distribution, preventing unauthorized access even if someone discovers your bucket name.
+   The bucket policy implements the principle of least privilege by granting CloudFront service principal read-only access while using a condition to ensure requests originate only from your specific distribution. This prevents unauthorized access even if someone discovers your bucket name.
 
    ```bash
-   # Create bucket policy for CloudFront access
+   # Create bucket policy for secure CloudFront access
    cat > bucket-policy.json << EOF
    {
        "Version": "2012-10-17",
@@ -553,24 +587,26 @@ fi
        --bucket $BUCKET_NAME \
        --policy file://bucket-policy.json
    
-   echo "✅ Applied bucket policy for CloudFront access"
+   echo "✅ Applied secure bucket policy with SourceArn condition"
+   echo "Bucket is now accessible only through CloudFront distribution $DISTRIBUTION_ID"
    ```
 
-   The S3 bucket policy is now active, completing the secure integration between S3 and CloudFront. This configuration ensures that your website content remains protected while allowing CloudFront to serve it efficiently. Users cannot access your content directly from S3, forcing all traffic through CloudFront where you can apply caching, security headers, and access controls.
+   The S3 bucket policy is now active, completing the secure integration between S3 and CloudFront. The SourceArn condition ensures that only your specific CloudFront distribution can access the bucket content, providing defense against confused deputy attacks.
 
-7. **Create Route 53 DNS record for custom domain**:
+7. **Configure DNS records for custom domain**:
 
-   Route 53 alias records provide several advantages over traditional CNAME records when pointing to AWS resources. Alias records respond to DNS queries with the IP address of the CloudFront distribution, eliminating additional DNS lookups and providing better performance. They also support apex domain names (like example.com) and are free of charge, unlike standard DNS queries.
+   Route 53 alias records provide optimal performance for CloudFront distributions by resolving directly to CloudFront IP addresses without additional DNS lookups. We'll create records for both the apex domain and www subdomain for comprehensive coverage.
 
    ```bash
    if [ "$SETUP_DOMAIN" = "y" ] && [[ "$HOSTED_ZONE_ID" != "None" && "$HOSTED_ZONE_ID" != "null" ]]; then
        # Wait for CloudFront distribution to deploy
-       echo "Waiting for CloudFront distribution to deploy... This may take 5-10 minutes."
+       echo "Waiting for CloudFront distribution to deploy..."
+       echo "This typically takes 5-15 minutes for global propagation"
        aws cloudfront wait distribution-deployed \
            --id $DISTRIBUTION_ID
        
-       # Create Route 53 record pointing to CloudFront
-       CHANGE_ID=$(aws route53 change-resource-record-sets \
+       # Create A record for apex domain
+       CHANGE_ID_APEX=$(aws route53 change-resource-record-sets \
            --hosted-zone-id $HOSTED_ZONE_ID \
            --change-batch '{
                "Changes": [{
@@ -589,97 +625,155 @@ fi
            --query 'ChangeInfo.Id' \
            --output text)
        
-       echo "✅ Created Route 53 record for $DOMAIN_NAME pointing to CloudFront"
-       echo "Record change status: $CHANGE_ID"
+       # Create A record for www subdomain
+       CHANGE_ID_WWW=$(aws route53 change-resource-record-sets \
+           --hosted-zone-id $HOSTED_ZONE_ID \
+           --change-batch '{
+               "Changes": [{
+                   "Action": "UPSERT",
+                   "ResourceRecordSet": {
+                       "Name": "www.'"$DOMAIN_NAME"'",
+                       "Type": "A",
+                       "AliasTarget": {
+                           "HostedZoneId": "Z2FDTNDATAQYW2",
+                           "DNSName": "'"$DISTRIBUTION_DOMAIN"'",
+                           "EvaluateTargetHealth": false
+                       }
+                   }
+               }]
+           }' \
+           --query 'ChangeInfo.Id' \
+           --output text)
+       
+       echo "✅ Created Route 53 records for both apex and www domains"
+       echo "Apex domain change: $CHANGE_ID_APEX"
+       echo "WWW subdomain change: $CHANGE_ID_WWW"
    elif [ "$SETUP_DOMAIN" = "y" ]; then
-       echo "To use your custom domain with CloudFront:"
-       echo "1. Create an A record in your DNS provider"
-       echo "2. Point it to your CloudFront distribution: $DISTRIBUTION_DOMAIN"
+       echo "To configure your custom domain:"
+       echo "1. Create A records in your DNS provider"
+       echo "2. Point both $DOMAIN_NAME and www.$DOMAIN_NAME to: $DISTRIBUTION_DOMAIN"
+       echo "3. Use ALIAS/ANAME records if supported, otherwise use CNAME for www"
    fi
    ```
 
-   Your custom domain is now properly configured to route traffic to your CloudFront distribution. DNS propagation may take up to 48 hours globally, but most users will see the changes within minutes. The alias record ensures optimal performance by resolving directly to CloudFront IP addresses without intermediate DNS lookups.
+   Your custom domain configuration is complete. Both the apex domain and www subdomain now point to your CloudFront distribution using optimized alias records that provide the best possible DNS performance.
 
 ## Validation & Testing
 
-1. Verify CloudFront distribution status:
+1. **Verify CloudFront distribution deployment status**:
 
    ```bash
-   # Check CloudFront distribution status
+   # Check distribution status and configuration
    aws cloudfront get-distribution \
        --id $DISTRIBUTION_ID \
-       --query 'Distribution.{Status:Status,DomainName:DomainName,Enabled:Enabled}' \
+       --query 'Distribution.{Status:Status,DomainName:DomainName,Enabled:Enabled,HttpVersion:HttpVersion}' \
        --output table
    ```
 
-   Expected output: Status should be "Deployed" and Enabled should be "true".
+   Expected output: Status should be "Deployed", Enabled should be "true", and HttpVersion should be "http2and3".
 
-2. Test website access via CloudFront:
+2. **Test website access via CloudFront domain**:
 
    ```bash
-   # Get the CloudFront domain name
+   # Test CloudFront domain access
    CLOUDFRONT_URL="https://$DISTRIBUTION_DOMAIN"
    
-   echo "Testing access to website via CloudFront..."
-   echo "CloudFront URL: $CLOUDFRONT_URL"
+   echo "Testing CloudFront domain access..."
+   echo "URL: $CLOUDFRONT_URL"
    
-   # Use curl to test access to the index.html file
-   curl -s $CLOUDFRONT_URL/index.html | grep -q "Hello from Amazon S3 and CloudFront"
-   
-   if [ $? -eq 0 ]; then
-       echo "✅ Successfully accessed website via CloudFront!"
+   # Test main page
+   HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" $CLOUDFRONT_URL)
+   if [ "$HTTP_STATUS" = "200" ]; then
+       echo "✅ CloudFront domain returns HTTP 200"
+       
+       # Check for expected content
+       if curl -s $CLOUDFRONT_URL | grep -q "Hello from Amazon S3 and CloudFront"; then
+           echo "✅ Website content loaded successfully via CloudFront"
+       else
+           echo "⚠️  CloudFront accessible but content may not be fully loaded"
+       fi
    else
-       echo "❌ Could not access website via CloudFront."
-       echo "Wait 5-10 minutes for the distribution to fully deploy and try again."
+       echo "❌ CloudFront domain returned HTTP $HTTP_STATUS"
+       echo "Wait 5-10 minutes for full deployment, then try again"
    fi
    ```
 
-3. Test custom domain (if configured):
+3. **Test custom domain access (if configured)**:
 
    ```bash
    if [ "$SETUP_DOMAIN" = "y" ]; then
-       DOMAIN_URL="https://$DOMAIN_NAME"
+       echo "Testing custom domain access..."
        
-       echo "Testing access to website via custom domain..."
-       echo "Domain URL: $DOMAIN_URL"
+       # Test apex domain
+       APEX_URL="https://$DOMAIN_NAME"
+       echo "Testing: $APEX_URL"
        
-       echo "Note: DNS changes may take time to propagate."
-       echo "If this test fails, try accessing the URL in your browser later."
-       
-       # Use curl to test access via the custom domain
-       curl -s $DOMAIN_URL/index.html | grep -q "Hello from Amazon S3 and CloudFront"
-       
-       if [ $? -eq 0 ]; then
-           echo "✅ Successfully accessed website via custom domain!"
+       HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" $APEX_URL)
+       if [ "$HTTP_STATUS" = "200" ]; then
+           echo "✅ Apex domain ($DOMAIN_NAME) accessible"
        else
-           echo "DNS may still be propagating. Try again later."
+           echo "⚠️  Apex domain returned HTTP $HTTP_STATUS (DNS may still be propagating)"
        fi
+       
+       # Test www subdomain
+       WWW_URL="https://www.$DOMAIN_NAME"
+       echo "Testing: $WWW_URL"
+       
+       HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" $WWW_URL)
+       if [ "$HTTP_STATUS" = "200" ]; then
+           echo "✅ WWW subdomain (www.$DOMAIN_NAME) accessible"
+       else
+           echo "⚠️  WWW subdomain returned HTTP $HTTP_STATUS (DNS may still be propagating)"
+       fi
+       
+       echo "Note: DNS propagation can take up to 48 hours globally"
    fi
    ```
 
-4. Verify caching is working:
+4. **Verify caching and security headers**:
 
    ```bash
-   # Make two requests and check the "X-Cache" header
-   echo "Testing CloudFront caching..."
+   echo "Testing CloudFront caching and security features..."
    
-   echo "First request:"
-   curl -s -I $CLOUDFRONT_URL/index.html | grep "X-Cache"
+   # Test caching behavior
+   echo "First request (should be cache MISS):"
+   curl -s -I $CLOUDFRONT_URL | grep -E "(X-Cache|X-Amz-Cf-Id)"
    
-   echo "Second request:"
-   curl -s -I $CLOUDFRONT_URL/index.html | grep "X-Cache"
+   echo "Second request (should be cache HIT):"
+   curl -s -I $CLOUDFRONT_URL | grep -E "(X-Cache|X-Amz-Cf-Id)"
    
-   echo "The first request should show 'X-Cache: Miss' and subsequent"
-   echo "requests should show 'X-Cache: Hit' if caching is working correctly."
+   # Test security headers
+   echo "Security headers:"
+   curl -s -I $CLOUDFRONT_URL | grep -E "(Strict-Transport|X-Content-Type|X-Frame)"
+   
+   # Test HTTP/2 support
+   echo "Protocol version:"
+   curl -s -I --http2 $CLOUDFRONT_URL | head -1
+   ```
+
+5. **Verify S3 bucket is not directly accessible**:
+
+   ```bash
+   echo "Verifying S3 bucket security (should return access denied)..."
+   
+   S3_DIRECT_URL="https://${BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/index.html"
+   HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" $S3_DIRECT_URL)
+   
+   if [ "$HTTP_STATUS" = "403" ]; then
+       echo "✅ S3 bucket correctly blocks direct access (HTTP 403)"
+       echo "Content is only accessible through CloudFront"
+   else
+       echo "⚠️  S3 bucket returned HTTP $HTTP_STATUS - check bucket policy"
+   fi
    ```
 
 ## Cleanup
 
-1. Delete Route 53 record (if created):
+1. **Remove Route 53 DNS records (if created)**:
 
    ```bash
    if [ "$SETUP_DOMAIN" = "y" ] && [[ "$HOSTED_ZONE_ID" != "None" && "$HOSTED_ZONE_ID" != "null" ]]; then
-       # Delete Route 53 A record
+       # Delete apex domain A record
        aws route53 change-resource-record-sets \
            --hosted-zone-id $HOSTED_ZONE_ID \
            --change-batch '{
@@ -697,110 +791,112 @@ fi
                }]
            }'
        
-       # Delete Route 53 CNAME record for certificate validation
-       VALIDATION_RECORD=$(aws acm describe-certificate \
-           --certificate-arn $CERT_ARN \
-           --region us-east-1 \
-           --query 'Certificate.DomainValidationOptions[0].ResourceRecord' \
-           --output json)
-       
-       VALIDATION_NAME=$(echo $VALIDATION_RECORD | jq -r '.Name')
-       VALIDATION_VALUE=$(echo $VALIDATION_RECORD | jq -r '.Value')
-       
+       # Delete www subdomain A record
        aws route53 change-resource-record-sets \
            --hosted-zone-id $HOSTED_ZONE_ID \
            --change-batch '{
                "Changes": [{
                    "Action": "DELETE",
                    "ResourceRecordSet": {
-                       "Name": "'"$VALIDATION_NAME"'",
-                       "Type": "CNAME",
-                       "TTL": 300,
-                       "ResourceRecords": [{"Value": "'"$VALIDATION_VALUE"'"}]
+                       "Name": "www.'"$DOMAIN_NAME"'",
+                       "Type": "A",
+                       "AliasTarget": {
+                           "HostedZoneId": "Z2FDTNDATAQYW2",
+                           "DNSName": "'"$DISTRIBUTION_DOMAIN"'",
+                           "EvaluateTargetHealth": false
+                       }
                    }
                }]
            }'
        
-       echo "✅ Deleted Route 53 records"
+       # Delete certificate validation CNAME record
+       if [ ! -z "$CERT_ARN" ]; then
+           VALIDATION_RECORD=$(aws acm describe-certificate \
+               --certificate-arn $CERT_ARN \
+               --region us-east-1 \
+               --query 'Certificate.DomainValidationOptions[0].ResourceRecord' \
+               --output json)
+           
+           VALIDATION_NAME=$(echo $VALIDATION_RECORD | jq -r '.Name')
+           VALIDATION_VALUE=$(echo $VALIDATION_RECORD | jq -r '.Value')
+           
+           aws route53 change-resource-record-sets \
+               --hosted-zone-id $HOSTED_ZONE_ID \
+               --change-batch '{
+                   "Changes": [{
+                       "Action": "DELETE",
+                       "ResourceRecordSet": {
+                           "Name": "'"$VALIDATION_NAME"'",
+                           "Type": "CNAME",
+                           "TTL": 300,
+                           "ResourceRecords": [{"Value": "'"$VALIDATION_VALUE"'"}]
+                       }
+                   }]
+               }'
+       fi
+       
+       echo "✅ Deleted Route 53 DNS records"
    fi
    ```
 
-2. Disable and delete CloudFront distribution:
+2. **Disable and delete CloudFront distribution**:
 
    ```bash
-   # First, disable the CloudFront distribution
+   # Get current distribution configuration
+   ETAG=$(aws cloudfront get-distribution \
+       --id $DISTRIBUTION_ID \
+       --query 'ETag' \
+       --output text)
+   
+   # Update distribution to disable it
+   DISABLE_CONFIG=$(echo $DISTRIBUTION_CONFIG | jq '.Enabled = false')
+   echo $DISABLE_CONFIG > disable-config.json
+   
    aws cloudfront update-distribution \
        --id $DISTRIBUTION_ID \
-       --if-match $(aws cloudfront get-distribution \
-           --id $DISTRIBUTION_ID \
-           --query 'ETag' \
-           --output text) \
-       --distribution-config '{
-           "CallerReference": "'${RANDOM_STRING}'",
-           "Comment": "Distribution for static website (disabling)",
-           "DefaultRootObject": "index.html",
-           "Origins": {
-               "Quantity": 1,
-               "Items": [
-                   {
-                       "Id": "S3Origin",
-                       "DomainName": "'${BUCKET_NAME}'.s3.'${AWS_REGION}'.amazonaws.com",
-                       "S3OriginConfig": {
-                           "OriginAccessIdentity": ""
-                       },
-                       "OriginAccessControlId": "'${OAC_ID}'"
-                   }
-               ]
-           },
-           "DefaultCacheBehavior": {
-               "TargetOriginId": "S3Origin",
-               "ViewerProtocolPolicy": "redirect-to-https",
-               "AllowedMethods": {
-                   "Quantity": 2,
-                   "Items": ["GET", "HEAD"],
-                   "CachedMethods": {
-                       "Quantity": 2,
-                       "Items": ["GET", "HEAD"]
-                   }
-               },
-               "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
-               "Compress": true
-           },
-           "Enabled": false,
-           "PriceClass": "PriceClass_100"
-       }'
+       --if-match $ETAG \
+       --distribution-config file://disable-config.json
    
-   echo "Waiting for CloudFront distribution to be disabled..."
+   echo "Waiting for distribution to be disabled..."
    aws cloudfront wait distribution-deployed \
        --id $DISTRIBUTION_ID
    
-   # Delete the CloudFront distribution
+   # Get new ETag and delete distribution
+   ETAG=$(aws cloudfront get-distribution \
+       --id $DISTRIBUTION_ID \
+       --query 'ETag' \
+       --output text)
+   
    aws cloudfront delete-distribution \
        --id $DISTRIBUTION_ID \
-       --if-match $(aws cloudfront get-distribution \
-           --id $DISTRIBUTION_ID \
-           --query 'ETag' \
-           --output text)
+       --if-match $ETAG
    
-   # Delete Origin Access Control
-   aws cloudfront delete-origin-access-control \
-       --id $OAC_ID \
-       --if-match $(aws cloudfront get-origin-access-control \
-           --id $OAC_ID \
-           --query 'ETag' \
-           --output text)
-   
-   echo "✅ Deleted CloudFront distribution and Origin Access Control"
+   echo "✅ CloudFront distribution disabled and deleted"
    ```
 
-3. Delete SSL certificate (if created):
+3. **Delete Origin Access Control**:
 
    ```bash
-   if [ "$SETUP_DOMAIN" = "y" ]; then
-       # Give time for CloudFront distribution to fully delete
-       sleep 30
+   # Delete OAC
+   OAC_ETAG=$(aws cloudfront get-origin-access-control \
+       --id $OAC_ID \
+       --query 'ETag' \
+       --output text)
+   
+   aws cloudfront delete-origin-access-control \
+       --id $OAC_ID \
+       --if-match $OAC_ETAG
+   
+   echo "✅ Deleted Origin Access Control"
+   ```
+
+4. **Delete SSL certificate (if created)**:
+
+   ```bash
+   if [ "$SETUP_DOMAIN" = "y" ] && [ ! -z "$CERT_ARN" ]; then
+       # Wait for CloudFront to fully delete before removing certificate
+       sleep 60
        
-       # Delete ACM certificate
        aws acm delete-certificate \
            --certificate-arn $CERT_ARN \
            --region us-east-1
@@ -809,56 +905,61 @@ fi
    fi
    ```
 
-4. Delete S3 buckets and content:
+5. **Delete S3 buckets and content**:
 
    ```bash
-   # Empty and delete S3 buckets
+   # Remove all objects and delete main bucket
    aws s3 rm s3://$BUCKET_NAME/ --recursive
    aws s3api delete-bucket --bucket $BUCKET_NAME
    
+   # Remove all objects and delete logs bucket
    aws s3 rm s3://$LOGS_BUCKET_NAME/ --recursive
    aws s3api delete-bucket --bucket $LOGS_BUCKET_NAME
    
-   echo "✅ Deleted S3 buckets and content"
+   echo "✅ Deleted S3 buckets and all content"
    ```
 
-5. Clean up local files:
+6. **Clean up local files and environment**:
 
    ```bash
-   # Remove local files
+   # Remove local configuration files
    rm -f bucket-policy.json
    rm -f distribution-config.json
+   rm -f disable-config.json
    
-   echo "✅ Cleaned up local files"
+   # Clean up environment variables
+   unset BUCKET_NAME LOGS_BUCKET_NAME DISTRIBUTION_ID OAC_ID
+   unset DOMAIN_NAME HOSTED_ZONE_ID CERT_ARN DISTRIBUTION_DOMAIN
    
-   echo "Cleanup complete! All resources have been removed."
+   echo "✅ Cleaned up local files and environment"
+   echo "Cleanup complete! All AWS resources have been removed."
    ```
 
 ## Discussion
 
-Hosting static websites with Amazon S3 and CloudFront offers numerous advantages over traditional hosting methods. This serverless architecture eliminates the need to provision, manage, and patch servers, significantly reducing operational overhead. CloudFront's global edge network automatically caches content close to users, reducing latency and providing a faster browsing experience regardless of visitor location.
+This serverless static website hosting solution demonstrates AWS best practices for security, performance, and cost optimization. The architecture leverages Amazon S3's eleven 9's of durability (99.999999999%) combined with CloudFront's global edge network of over 400 locations to deliver exceptional performance worldwide. By keeping the S3 bucket private and using Origin Access Control (OAC), we implement defense-in-depth security that prevents unauthorized direct access to content.
 
-From a security perspective, this solution provides several benefits. CloudFront automatically encrypts data in transit with HTTPS, protecting user information and helping to meet compliance requirements. The Origin Access Control mechanism ensures that website content can only be accessed through CloudFront and not directly from S3, reducing potential attack vectors. Additionally, CloudFront includes built-in DDoS protection through AWS Shield Standard at no additional cost.
+The use of Origin Access Control instead of the legacy Origin Access Identity represents current AWS best practices. OAC provides enhanced security through short-term credentials, frequent credential rotation, and resource-based policies that strengthen protection against confused deputy attacks. Additionally, OAC supports all AWS regions, including those launched after December 2022, and works seamlessly with S3 server-side encryption using AWS KMS (SSE-KMS). For more information, see the [AWS CloudFront OAC announcement](https://aws.amazon.com/blogs/networking-and-content-delivery/amazon-cloudfront-introduces-origin-access-control-oac/).
 
-Cost optimization is another significant advantage of this approach. With S3, you only pay for the storage actually used by your website files, with no minimum fees. CloudFront's pay-as-you-go pricing model means you're only charged for actual data transfer and requests, making this solution very cost-effective for websites with unpredictable traffic patterns. For smaller websites, costs are typically just a few dollars per month.
+Cost optimization is achieved through several mechanisms. S3's pay-as-you-go pricing means you only pay for storage actually used, with no minimum fees or upfront commitments. CloudFront's PriceClass_100 setting limits edge locations to North America and Europe, reducing costs while maintaining excellent performance for most global audiences. The managed cache policy optimizes cache efficiency by excluding query strings and cookies from the cache key, maximizing cache hit ratios and reducing origin requests. For detailed pricing information, refer to the [S3 pricing](https://aws.amazon.com/s3/pricing/) and [CloudFront pricing](https://aws.amazon.com/cloudfront/pricing/) pages.
 
-> **Tip**: To optimize your website's performance, leverage CloudFront's caching capabilities by setting appropriate Cache-Control headers on your S3 objects. For static assets that don't change often (like images, CSS, and JavaScript files), consider setting a longer TTL (Time To Live) to maximize cache hits and reduce origin requests.
+> **Warning**: Always ensure your S3 bucket remains private with public access blocked. The combination of OAC and bucket policies provides the security layer that prevents direct access while allowing CloudFront to serve content efficiently.
 
-When considering maintenance, this architecture excels because content updates are as simple as uploading new files to S3. There's no need to worry about scaling during traffic spikes, as both S3 and CloudFront automatically handle increased load. For websites with dynamic components, consider integrating with serverless solutions like AWS Lambda and API Gateway to maintain the benefits of a serverless architecture.
+Performance optimizations include HTTP/2 and HTTP/3 support for reduced latency, automatic compression for faster content delivery, and strategic cache-control headers that balance content freshness with performance. HTML files use immediate cache revalidation to enable quick content updates, while static assets leverage long cache durations since they typically don't change frequently or are versioned.
 
 ## Challenge
 
-Extend this basic static website hosting solution with the following enhancements:
+Extend this static website hosting solution with these advanced enhancements:
 
-1. Implement content versioning by setting up S3 versioning and CloudFront invalidations to manage content updates without downtime or cached outdated content.
+1. **Implement automated content deployment** by creating an AWS CodePipeline that automatically uploads website changes to S3 and creates CloudFront invalidations whenever code is pushed to a Git repository, ensuring zero-downtime deployments.
 
-2. Add basic authentication to protect access to your website by implementing Lambda@Edge to check for authentication headers before serving content.
+2. **Add Lambda@Edge for dynamic functionality** by implementing authentication, A/B testing, or request/response manipulation at CloudFront edge locations, enabling dynamic behavior while maintaining the performance benefits of static hosting.
 
-3. Create a CI/CD pipeline using AWS CodePipeline that automatically deploys website updates to S3 whenever changes are pushed to a Git repository.
+3. **Configure comprehensive monitoring and alerting** using CloudWatch dashboards to track website performance metrics, set up alarms for error rates and latency thresholds, and use AWS X-Ray for detailed request tracing across the CloudFront-S3 architecture.
 
-4. Implement a contact form on your static website by creating an API Gateway endpoint and Lambda function to process form submissions and store them in DynamoDB.
+4. **Enhance security with AWS WAF integration** by configuring AWS Web Application Firewall rules to protect against common web attacks, implement rate limiting, and create custom security rules based on geographic or IP-based restrictions.
 
-5. Set up detailed access analytics by configuring CloudFront access logs to be analyzed with Amazon Athena, allowing you to query and visualize visitor patterns.
+5. **Implement multi-environment deployment strategy** by creating separate S3 buckets and CloudFront distributions for development, staging, and production environments, with automated promotion pipelines and blue-green deployment capabilities for risk-free updates.
 
 ## Infrastructure Code
 

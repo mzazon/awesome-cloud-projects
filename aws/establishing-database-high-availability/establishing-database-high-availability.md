@@ -6,10 +6,10 @@ difficulty: 300
 subject: aws
 services: rds, vpc, cloudwatch, systems-manager
 estimated-time: 120 minutes
-recipe-version: 1.1
+recipe-version: 1.2
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: rds, vpc, cloudwatch, systems-manager, multi-az, high-availability
 recipe-generator-version: 1.3
@@ -23,7 +23,7 @@ E-commerce and financial services companies experience significant revenue losse
 
 ## Solution
 
-Amazon RDS Multi-AZ deployments provide automated high availability by maintaining synchronous standby replicas in separate Availability Zones. This solution uses semisynchronous replication for Multi-AZ DB clusters, ensuring that write operations are acknowledged by at least one reader before being committed, delivering failover times under 35 seconds. The architecture includes automated failover detection, DNS endpoint updates, and comprehensive monitoring to maintain business continuity during infrastructure failures.
+Amazon RDS Multi-AZ DB clusters provide automated high availability by maintaining semisynchronous standby replicas in separate Availability Zones. This solution ensures that write operations are acknowledged by at least one reader before being committed, delivering failover times typically under 35 seconds. The architecture includes automated failover detection, DNS endpoint updates, and comprehensive monitoring to maintain business continuity during infrastructure failures.
 
 ## Architecture Diagram
 
@@ -48,6 +48,7 @@ graph TB
         subgraph "Monitoring & Management"
             CW[CloudWatch<br/>Monitoring]
             SM[Systems Manager<br/>Parameter Store]
+            SNS[SNS Topic<br/>Alerts]
         end
     end
     
@@ -77,12 +78,14 @@ graph TB
     READER_EP-->READER1
     READER_EP-->READER2
     
-    WRITER-.->|Synchronous Replication|READER1
-    WRITER-.->|Synchronous Replication|READER2
+    WRITER-.->|Semisynchronous Replication|READER1
+    WRITER-.->|Semisynchronous Replication|READER2
     
     WRITER-->CW
     READER1-->CW
     READER2-->CW
+    
+    CW-->SNS
     
     SM-->APP1
     SM-->APP2
@@ -93,16 +96,17 @@ graph TB
     style READER2 fill:#3F8624
     style CLUSTER fill:#232F3E
     style CW fill:#FF4B4B
+    style SNS fill:#FF6B6B
 ```
 
 ## Prerequisites
 
-1. AWS account with appropriate permissions for RDS, VPC, CloudWatch, and Systems Manager
+1. AWS account with appropriate permissions for RDS, VPC, IAM, CloudWatch, SNS, and Systems Manager
 2. AWS CLI v2 installed and configured (or AWS CloudShell)
 3. Understanding of database high availability concepts and Multi-AZ deployments
 4. Familiarity with PostgreSQL or MySQL database engines
 5. Knowledge of networking concepts including VPC, subnets, and security groups
-6. Estimated cost: $200-400/month for Multi-AZ DB cluster (depends on instance size and storage)
+6. Estimated cost: $300-500/month for Multi-AZ DB cluster (depends on instance size and storage)
 
 > **Note**: Multi-AZ DB clusters require at least three Availability Zones and support only PostgreSQL and MySQL engines. Costs are higher than single-AZ deployments due to multiple instances and cross-AZ data transfer.
 
@@ -124,6 +128,8 @@ export CLUSTER_NAME="multiaz-cluster-${RANDOM_SUFFIX}"
 export DB_SUBNET_GROUP_NAME="multiaz-subnet-group-${RANDOM_SUFFIX}"
 export DB_PARAMETER_GROUP_NAME="multiaz-param-group-${RANDOM_SUFFIX}"
 export VPC_SECURITY_GROUP_NAME="multiaz-sg-${RANDOM_SUFFIX}"
+export RDS_MONITORING_ROLE_NAME="rds-monitoring-role-${RANDOM_SUFFIX}"
+export SNS_TOPIC_NAME="rds-alerts-${RANDOM_SUFFIX}"
 
 # Generate secure database password
 DB_PASSWORD=$(aws secretsmanager get-random-password \
@@ -143,7 +149,71 @@ echo "✅ Environment variables set and password stored securely"
 
 ## Steps
 
-1. **Create VPC Security Group for Database Access**:
+1. **Create IAM Role for RDS Enhanced Monitoring**:
+
+   Enhanced monitoring requires an IAM role that allows RDS to send OS-level metrics to CloudWatch Logs. This role provides the necessary permissions for detailed performance monitoring that goes beyond standard CloudWatch metrics, enabling deeper insights into database performance.
+
+   ```bash
+   # Create trust policy document for RDS monitoring
+   cat > /tmp/rds-monitoring-trust-policy.json << 'EOF'
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Principal": {
+           "Service": "monitoring.rds.amazonaws.com"
+         },
+         "Action": "sts:AssumeRole"
+       }
+     ]
+   }
+   EOF
+   
+   # Create IAM role for RDS enhanced monitoring
+   aws iam create-role \
+       --role-name "${RDS_MONITORING_ROLE_NAME}" \
+       --assume-role-policy-document file:///tmp/rds-monitoring-trust-policy.json \
+       --description "Role for RDS Enhanced Monitoring"
+   
+   # Attach AWS managed policy for RDS enhanced monitoring
+   aws iam attach-role-policy \
+       --role-name "${RDS_MONITORING_ROLE_NAME}" \
+       --policy-arn "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+   
+   # Get the role ARN for later use
+   RDS_MONITORING_ROLE_ARN=$(aws iam get-role \
+       --role-name "${RDS_MONITORING_ROLE_NAME}" \
+       --query 'Role.Arn' --output text)
+   
+   echo "✅ RDS monitoring role created: ${RDS_MONITORING_ROLE_ARN}"
+   ```
+
+   The IAM role now enables RDS to publish detailed OS metrics to CloudWatch Logs. This monitoring capability provides visibility into CPU utilization, memory usage, disk I/O, and network statistics at the operating system level, complementing database-level metrics.
+
+2. **Create SNS Topic for Database Alerts**:
+
+   Proactive alerting through SNS ensures that operations teams receive immediate notifications when database performance thresholds are exceeded. This centralized notification system enables rapid response to potential issues before they impact application availability.
+
+   ```bash
+   # Create SNS topic for RDS alerts
+   SNS_TOPIC_ARN=$(aws sns create-topic \
+       --name "${SNS_TOPIC_NAME}" \
+       --query 'TopicArn' --output text)
+   
+   # Optional: Subscribe email address to receive alerts
+   # Uncomment and replace with your email address
+   # aws sns subscribe \
+   #     --topic-arn "${SNS_TOPIC_ARN}" \
+   #     --protocol email \
+   #     --notification-endpoint your-email@example.com
+   
+   echo "✅ SNS topic created: ${SNS_TOPIC_ARN}"
+   ```
+
+   The SNS topic provides a scalable notification infrastructure that can deliver alerts via multiple channels including email, SMS, HTTP endpoints, and Lambda functions. This flexibility ensures that critical database alerts reach the appropriate team members regardless of their preferred communication method.
+
+3. **Create VPC Security Group for Database Access**:
 
    Database security requires carefully configured network access controls that allow legitimate application traffic while preventing unauthorized access. This security group establishes the network perimeter for your Multi-AZ database cluster, enabling secure communication within your VPC infrastructure.
 
@@ -182,7 +252,7 @@ echo "✅ Environment variables set and password stored securely"
 
    The security group now provides controlled database access by allowing connections on PostgreSQL (5432) and MySQL (3306) ports from within the VPC. This configuration ensures that only resources within your private network can access the database while blocking external threats.
 
-2. **Create DB Subnet Group Across Multiple AZs**:
+4. **Create DB Subnet Group Across Multiple AZs**:
 
    Multi-AZ database deployments require subnet groups that span multiple Availability Zones to enable automatic failover capabilities. This configuration ensures that database instances can be placed in different AZs, providing geographic redundancy and resilience against infrastructure failures.
 
@@ -204,7 +274,7 @@ echo "✅ Environment variables set and password stored securely"
 
    The subnet group now spans multiple Availability Zones, enabling RDS to automatically place database instances across different physical locations. This configuration is essential for Multi-AZ deployments and provides the foundation for high availability and disaster recovery capabilities.
 
-3. **Create DB Cluster Parameter Group with Optimized Settings**:
+5. **Create DB Cluster Parameter Group with Optimized Settings**:
 
    Database parameter groups define configuration settings that optimize performance, security, and behavior for your specific workload requirements. Custom parameter groups allow you to tune database settings for Multi-AZ deployments while maintaining consistency across all cluster instances.
 
@@ -229,9 +299,9 @@ echo "✅ Environment variables set and password stored securely"
 
 > **Tip**: Enable pg_stat_statements extension to capture detailed query performance metrics. This provides valuable insights for identifying slow queries and optimizing database performance during high-load scenarios.
 
-4. **Create Multi-AZ RDS Cluster with High Availability Configuration**:
+6. **Create Multi-AZ RDS Cluster with High Availability Configuration**:
 
-   Aurora Multi-AZ DB clusters provide enterprise-grade high availability through semisynchronous replication across multiple Availability Zones. This architecture ensures that database writes are acknowledged by at least one standby replica before being committed, delivering both data durability and rapid failover capabilities essential for mission-critical applications.
+   Multi-AZ DB clusters provide enterprise-grade high availability through semisynchronous replication across multiple Availability Zones. This architecture ensures that database writes are acknowledged by at least one standby replica before being committed, delivering both data durability and rapid failover capabilities essential for mission-critical applications.
 
    ```bash
    # Create Multi-AZ DB cluster
@@ -261,7 +331,7 @@ echo "✅ Environment variables set and password stored securely"
 
    The cluster is now operational with encryption at rest, automated backups, and CloudWatch Logs integration. The configuration includes deletion protection and optimized maintenance windows to minimize operational impact while maintaining security and compliance requirements.
 
-5. **Create Writer DB Instance for the Cluster**:
+7. **Create Writer DB Instance for the Cluster**:
 
    The writer instance serves as the primary database node that handles all write operations and coordinates replication to reader instances. Performance Insights and enhanced monitoring provide deep visibility into database performance, enabling proactive optimization and rapid troubleshooting during high-load scenarios.
 
@@ -273,7 +343,7 @@ echo "✅ Environment variables set and password stored securely"
        --engine aurora-postgresql \
        --db-instance-class db.r6g.large \
        --monitoring-interval 60 \
-       --monitoring-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/rds-monitoring-role" \
+       --monitoring-role-arn "${RDS_MONITORING_ROLE_ARN}" \
        --performance-insights-retention-period 7 \
        --enable-performance-insights
    
@@ -287,7 +357,7 @@ echo "✅ Environment variables set and password stored securely"
 
    The writer instance is now available and ready to accept connections. This instance automatically handles failover coordination and ensures that all write operations maintain consistency across the cluster through the semisynchronous replication protocol.
 
-6. **Create Reader DB Instances for High Availability**:
+8. **Create Reader DB Instances for High Availability**:
 
    Reader instances provide both high availability and read scaling capabilities by maintaining synchronized copies of the database across different Availability Zones. These instances can automatically promote to writer status during failover events, ensuring continuous database availability with minimal application disruption.
 
@@ -299,7 +369,7 @@ echo "✅ Environment variables set and password stored securely"
        --engine aurora-postgresql \
        --db-instance-class db.r6g.large \
        --monitoring-interval 60 \
-       --monitoring-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/rds-monitoring-role" \
+       --monitoring-role-arn "${RDS_MONITORING_ROLE_ARN}" \
        --performance-insights-retention-period 7 \
        --enable-performance-insights
    
@@ -310,7 +380,7 @@ echo "✅ Environment variables set and password stored securely"
        --engine aurora-postgresql \
        --db-instance-class db.r6g.large \
        --monitoring-interval 60 \
-       --monitoring-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/rds-monitoring-role" \
+       --monitoring-role-arn "${RDS_MONITORING_ROLE_ARN}" \
        --performance-insights-retention-period 7 \
        --enable-performance-insights
    
@@ -326,9 +396,9 @@ echo "✅ Environment variables set and password stored securely"
 
    Both reader instances are now active and participating in the Multi-AZ cluster. They continuously replicate data from the writer instance and are ready to assume writer responsibilities during planned or unplanned failover scenarios, providing sub-minute recovery times.
 
-> **Note**: Aurora Multi-AZ clusters support automatic failover with typical recovery times of 35 seconds or less. This represents a significant improvement over traditional Multi-AZ deployments which typically require 60-120 seconds for failover completion.
+> **Note**: Multi-AZ DB clusters support automatic failover with typical recovery times of 35 seconds or less. This represents a significant improvement over traditional Multi-AZ deployments which typically require 60-120 seconds for failover completion.
 
-7. **Configure CloudWatch Alarms for Monitoring**:
+9. **Configure CloudWatch Alarms for Monitoring**:
 
    Proactive monitoring is essential for maintaining database performance and preventing outages before they impact applications. CloudWatch alarms provide automated alerting for key performance indicators, enabling operations teams to respond quickly to capacity constraints and performance degradation.
 
@@ -344,7 +414,7 @@ echo "✅ Environment variables set and password stored securely"
        --threshold 80 \
        --comparison-operator GreaterThanThreshold \
        --evaluation-periods 2 \
-       --alarm-actions "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:rds-alerts" \
+       --alarm-actions "${SNS_TOPIC_ARN}" \
        --dimensions Name=DBClusterIdentifier,Value="${CLUSTER_NAME}"
    
    # Create alarm for CPU utilization
@@ -358,7 +428,21 @@ echo "✅ Environment variables set and password stored securely"
        --threshold 80 \
        --comparison-operator GreaterThanThreshold \
        --evaluation-periods 3 \
-       --alarm-actions "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:rds-alerts" \
+       --alarm-actions "${SNS_TOPIC_ARN}" \
+       --dimensions Name=DBClusterIdentifier,Value="${CLUSTER_NAME}"
+   
+   # Create alarm for read replica lag
+   aws cloudwatch put-metric-alarm \
+       --alarm-name "${CLUSTER_NAME}-high-replica-lag" \
+       --alarm-description "High replica lag for Multi-AZ cluster" \
+       --metric-name AuroraReplicaLag \
+       --namespace AWS/RDS \
+       --statistic Maximum \
+       --period 300 \
+       --threshold 5000 \
+       --comparison-operator GreaterThanThreshold \
+       --evaluation-periods 2 \
+       --alarm-actions "${SNS_TOPIC_ARN}" \
        --dimensions Name=DBClusterIdentifier,Value="${CLUSTER_NAME}"
    
    echo "✅ CloudWatch alarms configured for monitoring"
@@ -366,88 +450,89 @@ echo "✅ Environment variables set and password stored securely"
 
    The monitoring system now actively tracks database health and performance metrics. These alarms integrate with SNS notifications to provide immediate alerts when thresholds are exceeded, enabling rapid response to potential issues before they affect application performance.
 
-8. **Store Database Connection Information in Parameter Store**:
+10. **Store Database Connection Information in Parameter Store**:
 
-   AWS Systems Manager Parameter Store provides secure, centralized configuration management for database connection strings and credentials. This approach enables applications to dynamically retrieve connection information without hardcoding sensitive data, supporting both security best practices and operational flexibility.
+    AWS Systems Manager Parameter Store provides secure, centralized configuration management for database connection strings and credentials. This approach enables applications to dynamically retrieve connection information without hardcoding sensitive data, supporting both security best practices and operational flexibility.
 
-   ```bash
-   # Get cluster endpoint information
-   WRITER_ENDPOINT=$(aws rds describe-db-clusters \
-       --db-cluster-identifier "${CLUSTER_NAME}" \
-       --query 'DBClusters[0].Endpoint' --output text)
-   
-   READER_ENDPOINT=$(aws rds describe-db-clusters \
-       --db-cluster-identifier "${CLUSTER_NAME}" \
-       --query 'DBClusters[0].ReaderEndpoint' --output text)
-   
-   # Store connection information in Parameter Store
-   aws ssm put-parameter \
-       --name "/rds/multiaz/${CLUSTER_NAME}/writer-endpoint" \
-       --value "${WRITER_ENDPOINT}" \
-       --type "String" \
-       --description "Writer endpoint for Multi-AZ RDS cluster"
-   
-   aws ssm put-parameter \
-       --name "/rds/multiaz/${CLUSTER_NAME}/reader-endpoint" \
-       --value "${READER_ENDPOINT}" \
-       --type "String" \
-       --description "Reader endpoint for Multi-AZ RDS cluster"
-   
-   aws ssm put-parameter \
-       --name "/rds/multiaz/${CLUSTER_NAME}/username" \
-       --value "dbadmin" \
-       --type "String" \
-       --description "Database username for Multi-AZ RDS cluster"
-   
-   echo "✅ Database connection information stored in Parameter Store"
-   ```
+    ```bash
+    # Get cluster endpoint information
+    WRITER_ENDPOINT=$(aws rds describe-db-clusters \
+        --db-cluster-identifier "${CLUSTER_NAME}" \
+        --query 'DBClusters[0].Endpoint' --output text)
+    
+    READER_ENDPOINT=$(aws rds describe-db-clusters \
+        --db-cluster-identifier "${CLUSTER_NAME}" \
+        --query 'DBClusters[0].ReaderEndpoint' --output text)
+    
+    # Store connection information in Parameter Store
+    aws ssm put-parameter \
+        --name "/rds/multiaz/${CLUSTER_NAME}/writer-endpoint" \
+        --value "${WRITER_ENDPOINT}" \
+        --type "String" \
+        --description "Writer endpoint for Multi-AZ RDS cluster"
+    
+    aws ssm put-parameter \
+        --name "/rds/multiaz/${CLUSTER_NAME}/reader-endpoint" \
+        --value "${READER_ENDPOINT}" \
+        --type "String" \
+        --description "Reader endpoint for Multi-AZ RDS cluster"
+    
+    aws ssm put-parameter \
+        --name "/rds/multiaz/${CLUSTER_NAME}/username" \
+        --value "dbadmin" \
+        --type "String" \
+        --description "Database username for Multi-AZ RDS cluster"
+    
+    echo "✅ Database connection information stored in Parameter Store"
+    ```
 
-   Applications can now securely retrieve database endpoints and credentials from Parameter Store, enabling dynamic configuration updates without code changes. This centralized approach simplifies connection management and supports automated deployment pipelines.
+    Applications can now securely retrieve database endpoints and credentials from Parameter Store, enabling dynamic configuration updates without code changes. This centralized approach simplifies connection management and supports automated deployment pipelines.
 
-9. **Create Test Database and Tables**:
+11. **Create Test Database and Tables**:
 
-   Creating a test schema with sample data validates the database cluster functionality and provides a foundation for testing failover scenarios. This step ensures that the database is properly configured and accessible through both writer and reader endpoints before production deployment.
+    Creating a test schema with sample data validates the database cluster functionality and provides a foundation for testing failover scenarios. This step ensures that the database is properly configured and accessible through both writer and reader endpoints before production deployment.
 
-   ```bash
-   # Install PostgreSQL client if not available
-   sudo yum install -y postgresql15 || sudo apt-get install -y postgresql-client-15
-   
-   # Connect to database and create test schema
-   PGPASSWORD="${DB_PASSWORD}" psql \
-       -h "${WRITER_ENDPOINT}" \
-       -U dbadmin \
-       -d postgres \
-       -c "CREATE DATABASE testdb;"
-   
-   # Create test table with sample data
-   PGPASSWORD="${DB_PASSWORD}" psql \
-       -h "${WRITER_ENDPOINT}" \
-       -U dbadmin \
-       -d testdb \
-       -c "CREATE TABLE orders (
-           order_id SERIAL PRIMARY KEY,
-           customer_id INTEGER NOT NULL,
-           order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-           total_amount DECIMAL(10,2) NOT NULL,
-           status VARCHAR(20) DEFAULT 'pending'
-       );"
-   
-   # Insert sample data
-   PGPASSWORD="${DB_PASSWORD}" psql \
-       -h "${WRITER_ENDPOINT}" \
-       -U dbadmin \
-       -d testdb \
-       -c "INSERT INTO orders (customer_id, total_amount) VALUES 
-           (1001, 249.99),
-           (1002, 89.50),
-           (1003, 156.75);"
-   
-   echo "✅ Test database and tables created with sample data"
-   ```
+    ```bash
+    # Install PostgreSQL client if not available (skip if already installed)
+    # For Amazon Linux/RHEL: sudo yum install -y postgresql15
+    # For Ubuntu/Debian: sudo apt-get install -y postgresql-client-15
+    
+    # Connect to database and create test schema
+    PGPASSWORD="${DB_PASSWORD}" psql \
+        -h "${WRITER_ENDPOINT}" \
+        -U dbadmin \
+        -d postgres \
+        -c "CREATE DATABASE testdb;"
+    
+    # Create test table with sample data
+    PGPASSWORD="${DB_PASSWORD}" psql \
+        -h "${WRITER_ENDPOINT}" \
+        -U dbadmin \
+        -d testdb \
+        -c "CREATE TABLE orders (
+            order_id SERIAL PRIMARY KEY,
+            customer_id INTEGER NOT NULL,
+            order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            total_amount DECIMAL(10,2) NOT NULL,
+            status VARCHAR(20) DEFAULT 'pending'
+        );"
+    
+    # Insert sample data
+    PGPASSWORD="${DB_PASSWORD}" psql \
+        -h "${WRITER_ENDPOINT}" \
+        -U dbadmin \
+        -d testdb \
+        -c "INSERT INTO orders (customer_id, total_amount) VALUES 
+            (1001, 249.99),
+            (1002, 89.50),
+            (1003, 156.75);"
+    
+    echo "✅ Test database and tables created with sample data"
+    ```
 
-   The test database now contains structured data that can be used to validate replication consistency and failover behavior. This baseline data enables comprehensive testing of read/write operations across all cluster instances.
+    The test database now contains structured data that can be used to validate replication consistency and failover behavior. This baseline data enables comprehensive testing of read/write operations across all cluster instances.
 
-10. **Configure Automated Backups and Point-in-Time Recovery**:
+12. **Configure Automated Backups and Point-in-Time Recovery**:
 
     Automated backups and point-in-time recovery provide essential data protection capabilities for production database systems. The 14-day retention period balances operational flexibility with storage costs, while scheduled backup windows minimize performance impact during peak business hours.
 
@@ -473,7 +558,7 @@ echo "✅ Environment variables set and password stored securely"
 
     The backup strategy now provides comprehensive data protection with both automated daily backups and manual snapshots for important milestones. This configuration enables recovery from various failure scenarios while meeting business continuity requirements.
 
-11. **Test Failover Capabilities**:
+13. **Test Failover Capabilities**:
 
     Manual failover testing validates the high availability architecture and ensures that applications can handle database role transitions gracefully. This verification step confirms that the semisynchronous replication is working correctly and that failover times meet business requirements.
 
@@ -487,29 +572,21 @@ echo "✅ Environment variables set and password stored securely"
     sleep 60
     
     # Verify cluster is still available after failover
-    aws rds describe-db-clusters \
+    CLUSTER_STATUS=$(aws rds describe-db-clusters \
         --db-cluster-identifier "${CLUSTER_NAME}" \
-        --query 'DBClusters[0].Status' --output text
+        --query 'DBClusters[0].Status' --output text)
     
+    echo "Cluster status after failover: ${CLUSTER_STATUS}"
     echo "✅ Manual failover test completed successfully"
     ```
 
     The failover test demonstrates that the cluster can successfully transition writer responsibilities between instances while maintaining data integrity. This validation confirms that the high availability architecture will perform as expected during real outage scenarios.
 
-12. **Configure Performance Monitoring and Optimization**:
+14. **Configure Performance Monitoring and Optimization**:
 
     Enhanced monitoring and custom dashboards provide comprehensive visibility into database performance and resource utilization. This monitoring infrastructure enables data-driven optimization decisions and supports capacity planning for growing applications.
 
     ```bash
-    # Enable enhanced monitoring for all instances
-    for instance in "${CLUSTER_NAME}-writer" "${CLUSTER_NAME}-reader-1" "${CLUSTER_NAME}-reader-2"; do
-        aws rds modify-db-instance \
-            --db-instance-identifier "${instance}" \
-            --monitoring-interval 60 \
-            --monitoring-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/rds-monitoring-role" \
-            --apply-immediately
-    done
-    
     # Create custom CloudWatch dashboard for monitoring
     aws cloudwatch put-dashboard \
         --dashboard-name "${CLUSTER_NAME}-monitoring" \
@@ -517,6 +594,10 @@ echo "✅ Environment variables set and password stored securely"
             \"widgets\": [
                 {
                     \"type\": \"metric\",
+                    \"x\": 0,
+                    \"y\": 0,
+                    \"width\": 12,
+                    \"height\": 6,
                     \"properties\": {
                         \"metrics\": [
                             [\"AWS/RDS\", \"CPUUtilization\", \"DBClusterIdentifier\", \"${CLUSTER_NAME}\"],
@@ -526,13 +607,14 @@ echo "✅ Environment variables set and password stored securely"
                         \"period\": 300,
                         \"stat\": \"Average\",
                         \"region\": \"${AWS_REGION}\",
-                        \"title\": \"Multi-AZ Cluster Performance\"
+                        \"title\": \"Multi-AZ Cluster Performance\",
+                        \"view\": \"timeSeries\"
                     }
                 }
             ]
         }"
     
-    echo "✅ Performance monitoring and dashboard configured"
+    echo "✅ Performance monitoring dashboard configured"
     ```
 
     The monitoring dashboard now provides real-time visibility into cluster performance metrics and resource utilization. This comprehensive monitoring enables proactive identification of performance bottlenecks and supports informed scaling decisions.
@@ -654,6 +736,22 @@ echo "✅ Environment variables set and password stored securely"
        }' --output table
    ```
 
+5. **Test CloudWatch Alarms**:
+
+   ```bash
+   # Verify alarm configuration
+   aws cloudwatch describe-alarms \
+       --alarm-names "${CLUSTER_NAME}-high-connections" \
+                    "${CLUSTER_NAME}-high-cpu" \
+                    "${CLUSTER_NAME}-high-replica-lag" \
+       --query 'MetricAlarms[*].{
+           Name:AlarmName,
+           State:StateValue,
+           Threshold:Threshold,
+           Metric:MetricName
+       }' --output table
+   ```
+
 ## Cleanup
 
 1. **Remove CloudWatch Alarms and Dashboard**:
@@ -662,7 +760,8 @@ echo "✅ Environment variables set and password stored securely"
    # Delete CloudWatch alarms
    aws cloudwatch delete-alarms \
        --alarm-names "${CLUSTER_NAME}-high-connections" \
-                    "${CLUSTER_NAME}-high-cpu"
+                    "${CLUSTER_NAME}-high-cpu" \
+                    "${CLUSTER_NAME}-high-replica-lag"
    
    # Delete CloudWatch dashboard
    aws cloudwatch delete-dashboards \
@@ -745,7 +844,26 @@ echo "✅ Environment variables set and password stored securely"
    echo "✅ Parameter group, subnet group, and security group deleted"
    ```
 
-6. **Clean Up Parameter Store and Environment Variables**:
+6. **Clean Up IAM Role and SNS Topic**:
+
+   ```bash
+   # Detach policy from IAM role
+   aws iam detach-role-policy \
+       --role-name "${RDS_MONITORING_ROLE_NAME}" \
+       --policy-arn "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+   
+   # Delete IAM role
+   aws iam delete-role \
+       --role-name "${RDS_MONITORING_ROLE_NAME}"
+   
+   # Delete SNS topic
+   aws sns delete-topic \
+       --topic-arn "${SNS_TOPIC_ARN}"
+   
+   echo "✅ IAM role and SNS topic deleted"
+   ```
+
+7. **Clean Up Parameter Store and Environment Variables**:
 
    ```bash
    # Delete parameters from Parameter Store
@@ -761,33 +879,37 @@ echo "✅ Environment variables set and password stored securely"
    # Clear environment variables
    unset CLUSTER_NAME DB_SUBNET_GROUP_NAME DB_PARAMETER_GROUP_NAME
    unset VPC_SECURITY_GROUP_NAME DB_PASSWORD SG_ID VPC_ID
+   unset RDS_MONITORING_ROLE_NAME SNS_TOPIC_NAME
+   
+   # Clean up temporary files
+   rm -f /tmp/rds-monitoring-trust-policy.json
    
    echo "✅ Parameter Store entries deleted and environment variables cleared"
    ```
 
 ## Discussion
 
-Multi-AZ DB clusters represent a significant advancement in database high availability architecture compared to traditional Multi-AZ deployments. The key architectural difference lies in the semisynchronous replication model, where write operations must be acknowledged by at least one reader instance before being committed to the writer. This design provides faster failover times (typically under 35 seconds) compared to the 60-120 seconds typical with Multi-AZ DB instances, while maintaining strong consistency guarantees.
+Multi-AZ DB clusters represent a significant advancement in database high availability architecture compared to traditional Multi-AZ deployments. The key architectural difference lies in the semisynchronous replication model, where write operations must be acknowledged by at least one reader instance before being committed to the writer. This design provides faster failover times (typically under 35 seconds) compared to the 60-120 seconds typical with Multi-AZ DB instances, while maintaining strong consistency guarantees as documented in the [AWS RDS Multi-AZ failover documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/multi-az-db-clusters-concepts-failover.html).
 
 The semisynchronous replication model strikes an optimal balance between consistency and performance. Unlike fully synchronous replication, which would wait for all replicas to acknowledge writes (potentially causing significant latency), semisynchronous replication ensures data durability while maintaining acceptable write performance. This approach is particularly beneficial for applications that require both high availability and consistent read performance, such as e-commerce platforms, financial systems, and SaaS applications where read and write workloads need to be distributed effectively.
 
-From a cost optimization perspective, Multi-AZ DB clusters do incur higher operational costs due to running multiple instances across different Availability Zones. However, organizations must weigh these costs against the business impact of database downtime. The ability to automatically failover with minimal service disruption, combined with the capability to serve read traffic from multiple instances, often justifies the additional expense. The enhanced monitoring capabilities, including Performance Insights and CloudWatch metrics, provide valuable operational visibility that can help optimize database performance and resource utilization.
+From a cost optimization perspective, Multi-AZ DB clusters do incur higher operational costs due to running multiple instances across different Availability Zones. However, organizations must weigh these costs against the business impact of database downtime. The ability to automatically failover with minimal service disruption, combined with the capability to serve read traffic from multiple instances, often justifies the additional expense. The enhanced monitoring capabilities, including Performance Insights and CloudWatch metrics, provide valuable operational visibility that can help optimize database performance and resource utilization according to [AWS Well-Architected Framework reliability principles](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html).
 
-Operational considerations include the importance of proper connection string management and application-level failover handling. While RDS manages the DNS endpoint updates during failover, applications should implement proper connection pooling and retry logic to handle temporary connection interruptions. The separation of writer and reader endpoints allows for read scaling strategies, where read-heavy workloads can be directed to the reader endpoint, effectively distributing the load and improving overall application performance.
+Operational considerations include the importance of proper IAM role configuration for enhanced monitoring and application-level failover handling. While RDS manages the DNS endpoint updates during failover, applications should implement proper connection pooling and retry logic to handle temporary connection interruptions. The separation of writer and reader endpoints allows for read scaling strategies, where read-heavy workloads can be directed to the reader endpoint, effectively distributing the load and improving overall application performance.
 
-> **Warning**: Multi-AZ DB clusters require careful planning around maintenance windows and backup schedules. Coordinate these activities with application traffic patterns to minimize performance impact during busy periods.
+> **Warning**: Multi-AZ DB clusters require careful planning around maintenance windows and backup schedules. Coordinate these activities with application traffic patterns to minimize performance impact during busy periods as recommended in [AWS RDS best practices](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_BestPractices.html).
 
 ## Challenge
 
 Extend this Multi-AZ database deployment by implementing these advanced high availability enhancements:
 
-1. **Implement Cross-Region Read Replicas**: Create read replicas in different AWS regions to provide geographic redundancy and support global read scaling for applications with worldwide user bases.
+1. **Implement Cross-Region Read Replicas**: Create read replicas in different AWS regions to provide geographic redundancy and support global read scaling for applications with worldwide user bases using Aurora Global Database.
 
 2. **Develop Application-Level Connection Pooling**: Build a custom connection pool manager that intelligently routes read queries to reader endpoints and write queries to writer endpoints, with automatic failover detection and circuit breaker patterns.
 
 3. **Create Automated Disaster Recovery Testing**: Implement a Lambda-based solution that periodically tests failover scenarios, validates data consistency, and generates reports on recovery time objectives (RTO) and recovery point objectives (RPO).
 
-4. **Build Performance Optimization Automation**: Develop CloudWatch-based monitoring that automatically adjusts instance classes based on CPU and memory utilization patterns, implementing cost-effective scaling strategies.
+4. **Build Performance Optimization Automation**: Develop CloudWatch-based monitoring that automatically adjusts instance classes based on CPU and memory utilization patterns, implementing cost-effective scaling strategies with AWS Auto Scaling.
 
 5. **Implement Zero-Downtime Schema Migrations**: Create a blue-green deployment strategy for database schema changes using AWS Database Migration Service (DMS) to replicate data between old and new schema versions without service interruption.
 

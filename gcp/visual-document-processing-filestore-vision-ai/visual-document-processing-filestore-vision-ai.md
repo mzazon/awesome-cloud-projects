@@ -6,10 +6,10 @@ difficulty: 200
 subject: gcp
 services: Cloud Filestore, Cloud Vision AI, Cloud Pub/Sub, Cloud Functions
 estimated-time: 120 minutes
-recipe-version: 1.0
+recipe-version: 1.1
 requested-by: mzazon
 last-updated: 2025-07-12
-last-reviewed: null
+last-reviewed: 2025-07-23
 passed-qa: null
 tags: document-processing, vision-ai, event-driven, analytics, storage
 recipe-generator-version: 1.3
@@ -262,16 +262,17 @@ echo "✅ APIs enabled and environment ready"
    
    EOF
    
-   # Create requirements file
+   # Create requirements file with current stable versions
    cat > requirements.txt << EOF
-   google-cloud-pubsub==2.18.4
-   google-cloud-storage==2.10.0
-   functions-framework==3.4.0
+   google-cloud-pubsub==2.23.1
+   google-cloud-storage==2.18.2
+   functions-framework==3.8.1
    EOF
    
    # Deploy the file monitor function
    gcloud functions deploy ${MONITOR_FUNCTION} \
-       --runtime=python311 \
+       --gen2 \
+       --runtime=python312 \
        --trigger-topic=${PUBSUB_TOPIC} \
        --entry-point=monitor_documents \
        --memory=256MB \
@@ -282,7 +283,7 @@ echo "✅ APIs enabled and environment ready"
    echo "✅ File monitor function deployed"
    ```
 
-   The monitoring function is now deployed and ready to detect new documents in the Filestore instance, automatically triggering the processing pipeline through Pub/Sub messaging.
+   The monitoring function is now deployed using the latest Cloud Functions Gen2 architecture with Python 3.12 runtime, providing improved performance and cold start times for serverless processing.
 
 5. **Deploy Vision AI Processing Cloud Function**:
 
@@ -435,18 +436,19 @@ echo "✅ APIs enabled and environment ready"
    
    EOF
    
-   # Create requirements file
+   # Create requirements file with current stable versions
    cat > requirements.txt << EOF
-   google-cloud-vision==3.4.5
-   google-cloud-pubsub==2.18.4
-   google-cloud-storage==2.10.0
-   functions-framework==3.4.0
-   Pillow==10.0.1
+   google-cloud-vision==3.8.0
+   google-cloud-pubsub==2.23.1
+   google-cloud-storage==2.18.2
+   functions-framework==3.8.1
+   Pillow==10.4.0
    EOF
    
    # Deploy the Vision AI processing function
    gcloud functions deploy ${PROCESSOR_FUNCTION} \
-       --runtime=python311 \
+       --gen2 \
+       --runtime=python312 \
        --trigger-topic=${PUBSUB_TOPIC} \
        --entry-point=process_document \
        --memory=512MB \
@@ -457,7 +459,7 @@ echo "✅ APIs enabled and environment ready"
    echo "✅ Vision AI processor function deployed"
    ```
 
-   The Vision AI processing function is now deployed and ready to analyze documents using Google's advanced machine learning models for text extraction, object detection, and document classification.
+   The Vision AI processing function is now deployed using the latest stable library versions and Python 3.12 runtime, ready to analyze documents using Google's advanced machine learning models for text extraction, object detection, and document classification.
 
 6. **Create Compute Engine Instance for Filestore Access**:
 
@@ -469,7 +471,7 @@ echo "✅ APIs enabled and environment ready"
        --zone=${ZONE} \
        --machine-type=e2-medium \
        --boot-disk-size=20GB \
-       --image-family=ubuntu-2004-lts \
+       --image-family=ubuntu-2204-lts \
        --image-project=ubuntu-os-cloud \
        --scopes=cloud-platform \
        --metadata=startup-script='#!/bin/bash
@@ -484,7 +486,7 @@ echo "✅ APIs enabled and environment ready"
    echo "✅ Filestore client instance created"
    ```
 
-   The client instance is configured to automatically mount the Filestore and create directory structures for different document types, simulating a real-world document management environment.
+   The client instance is configured to automatically mount the Filestore and create directory structures for different document types, simulating a real-world document management environment with Ubuntu 22.04 LTS for improved security and support.
 
 7. **Test Document Processing Pipeline**:
 
@@ -501,6 +503,7 @@ echo "✅ APIs enabled and environment ready"
    
    # Check function logs to verify processing
    gcloud functions logs read ${PROCESSOR_FUNCTION} \
+       --gen2 \
        --limit=10 \
        --format="value(timestamp,message)"
    
@@ -554,10 +557,12 @@ echo "✅ APIs enabled and environment ready"
    ```bash
    # Check Vision processor function metrics
    gcloud functions describe ${PROCESSOR_FUNCTION} \
-       --format="table(name,status,timeout,availableMemoryMb)"
+       --gen2 \
+       --format="table(name,state,memory,timeout)"
    
    # Review recent processing logs for errors
    gcloud functions logs read ${PROCESSOR_FUNCTION} \
+       --gen2 \
        --limit=5 \
        --format="value(timestamp,severity,message)"
    ```
@@ -570,8 +575,8 @@ echo "✅ APIs enabled and environment ready"
 
    ```bash
    # Delete Cloud Functions
-   gcloud functions delete ${MONITOR_FUNCTION} --quiet
-   gcloud functions delete ${PROCESSOR_FUNCTION} --quiet
+   gcloud functions delete ${MONITOR_FUNCTION} --gen2 --quiet
+   gcloud functions delete ${PROCESSOR_FUNCTION} --gen2 --quiet
    
    echo "✅ Cloud Functions deleted"
    ```
@@ -646,7 +651,7 @@ Extend this solution by implementing these enhancements:
 
 2. **Implement intelligent document validation** using [Document AI](https://cloud.google.com/document-ai/docs) to extract structured data from forms and validate completeness before processing, reducing manual review requirements.
 
-3. **Create real-time monitoring dashboards** using [Cloud Monitoring](https://cloud.google.com/monitoring/docs) and [Data Studio](https://datastudio.google.com) to track processing metrics, error rates, and document classification accuracy across different document types.
+3. **Create real-time monitoring dashboards** using [Cloud Monitoring](https://cloud.google.com/monitoring/docs) and [Looker Studio](https://cloud.google.com/looker-studio) to track processing metrics, error rates, and document classification accuracy across different document types.
 
 4. **Build enterprise security controls** by implementing [Cloud KMS](https://cloud.google.com/kms/docs) encryption for sensitive documents and using [Cloud DLP](https://cloud.google.com/dlp/docs) to automatically detect and redact personally identifiable information before storage.
 
