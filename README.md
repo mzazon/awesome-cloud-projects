@@ -1,13 +1,17 @@
 # 🌟 Awesome Cloud Projects
 
 [![Awesome](https://awesome.re/badge.svg)](https://awesome.re)
+[![Total projects](https://img.shields.io/badge/Total_Projects-1103-blue)](https://github.com/mzazon/awesome-cloud-projects)
+[![AWS projects](https://img.shields.io/badge/AWS-492-orange)](https://github.com/mzazon/awesome-cloud-projects/tree/main/aws)
+[![Azure projects](https://img.shields.io/badge/Azure-268-0078d4)](https://github.com/mzazon/awesome-cloud-projects/tree/main/azure)
+[![GCP projects](https://img.shields.io/badge/GCP-350-DB4437)](https://github.com/mzazon/awesome-cloud-projects/tree/main/gcp)
 [![GitHub stars](https://img.shields.io/github/stars/mzazon/awesome-cloud-projects.svg?style=social&label=Star)](https://github.com/mzazon/awesome-cloud-projects)
 [![GitHub forks](https://img.shields.io/github/forks/mzazon/awesome-cloud-projects.svg?style=social&label=Fork)](https://github.com/mzazon/awesome-cloud-projects/fork)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Level up your cloud knowledge and experience! Get something to talk about during your next interview, see how cloud services are used together, get experience and see how the cloud providers services work. Real solutions from real professions and organizations.
+Level up your cloud knowledge and experience with 1100+ cloud rojects in this repository. Get something to talk about during your next interview, see how cloud services are used together, and learn in depth by getting hands on. Real solutions from real professionals and organizations.
 
-_A curated collection of cloud architecture recipes, tutorials, and real-world solutions across Amazon Web Services (AWS), Microsoft Azure, and Google Cloud Platform (GCP)._
+_A collection of cloud architecture recipes, tutorials, and real-world solutions across Amazon Web Services (AWS), Microsoft Azure, and Google Cloud Platform (GCP)._
 
 Each and every project brings together a few cloud services to build a working scenario. Each contains a problem/solution format, diagram, command line steps to accomplish the solution, a short discussion section, and (*IMPORTANT!*) cleanup steps, to ensure you do not incur runaway costs. As a bonus, all popular formats of infrastructure as code that you can take, deploy, and customize to your liking (Terraform, CloudFormation, AWS CDK (typescript and python both), Azure Bicep, and even Bash shell scripts that run a cloud provider CLI commands.
 
@@ -16,8 +20,6 @@ Each and every project brings together a few cloud services to build a working s
 The format of these recipes has been inspired by [AWS Cookbook, by O'Reilly Media](https://www.oreilly.com/library/view/aws-cookbook/9781492092599/). As a co-author of this book, my readers' feedback about the format and approach was overwhealmingly positive with many readers using this content to gain experience they can talk about during job interviews. So I brought the format to this batch of content to help readers build cloud skills across the top 3 public cloud providers using real-world scenarios.
 
 > NOTE: These all use the cloud provider CLI (Command Line Interfaces) rather than GUI (browser consoles). One of the first things you should learn about cloud providers is that their interfaces are just APIs that perform actions on infrastructure. Because of that, it is important to understand the parameters that go into API requests to services! The CLI is the perfect way to learn this. Dust off your terminal window or preferred cloud shell and enjoy!
-
-[![Star History Chart](https://api.star-history.com/svg?repos=mzazon/awesome-cloud-projects&type=Date)](https://www.star-history.com/#mzazon/awesome-cloud-projects&Date)
 
 ## 📊 Project Statistics
 
@@ -2433,6 +2435,8 @@ If you use these recipes in your projects, please consider:
 - 💡 **Feature Requests**: [Start a Discussion](https://github.com/mzazon/awesome-cloud-projects/discussions)
 - 💬 **Questions**: Join our [Community Chat](#) (coming soon)
 - 📧 **Contact**: [mzazon@gmail.com](mailto:mzazon@gmail.com)
+
+[![Star History Chart](https://api.star-history.com/svg?repos=mzazon/awesome-cloud-projects&type=Date)](https://www.star-history.com/#mzazon/awesome-cloud-projects&Date)
 
 ---
 
